@@ -16,15 +16,31 @@ attack/maintenance surface: Python standard library only, no third-party deps.
 WHAT IT DOES (on an interval, via launchd)
 ------------------------------------------
   1. Persistence watch - enumerates third-party launchd agents/daemons + cron,
-     resolves each program, hashes it, validates its code signature, and diffs
-     against a known-good baseline. New/changed persistence is the #1 signal for
-     macOS infostealers (AMOS/Atomic, Poseidon) that persist via launchd.
+     resolves each program, hashes it, validates its code signature, inspects its
+     arguments AND its DYLD_* injection env, and diffs against a known-good
+     baseline. New/changed persistence is the #1 signal for macOS infostealers
+     (AMOS/Atomic, Poseidon) that persist via launchd.
   2. Process watch      - flags running processes whose executable is
      unsigned / ad-hoc-signed AND lives in a user-writable location.
   3. Hot-dir watch      - flags freshly-dropped unsigned Mach-O executables in
-     Downloads / Desktop / tmp / Shared.
+     Downloads / Desktop / tmp / Shared, annotated with quarantine provenance
+     (a NO-quarantine binary bypassed Gatekeeper — a side-load signal).
   4. Hardening posture  - SIP, Gatekeeper, FileVault, Application Firewall,
      stealth mode, remote login (SSH). Reports weak settings.
+  5. Shell startup files- baseline-diffs ~/.zshrc & friends (T1546.004); a
+     download-and-run / reverse-shell idiom in one scores HIGH.
+  6. Login/Logout hooks - legacy com.apple.loginwindow persistence primitives.
+  7. Config profiles    - a newly-installed profile (trusted certs / MDM / proxy
+     — an adware/DPRK vector).
+  8. Extra persistence  - /etc/crontab, /etc/periodic, StartupItems, rc.common.
+  9. Browser extensions - inventory diff (Chromium family + Firefox).
+ 10. Self-protection    - detects if Aegis's own launchd agent was removed or its
+     append-only evidence log was truncated (a monitor an attacker can silently
+     disable is theater).
+
+  Surfaces 5-9 are baseline-diffed and ADOPTED SILENTLY the first time each is
+  seen (per-surface "trust what's already installed"), so upgrading Aegis on an
+  existing install never produces a day-one alert storm.
 
 DESIGN PRINCIPLE (from the alert-fatigue literature): *log everything, alert
 rarely, never repeat*. The first run establishes a SILENT baseline (no day-one
@@ -103,6 +119,61 @@ MACHO_MAGIC = {
     b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # 32/64-bit LE
     b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",  # fat/universal
 }
+
+# Shell startup files (ATT&CK T1546.004). Readable with no special privilege; a
+# documented execution-persistence surface — stealers append `curl…|sh` or a
+# base64 blob here so a payload re-runs at every login/new-shell. We baseline
+# their content hashes and alert on any NEW file or CHANGE.
+SHELL_RC_FILES = [os.path.join(HOME, n) for n in (
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
+    ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile",
+    ".config/fish/config.fish", ".config/fish/conf.d/aegis.fish",
+)] + ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv", "/etc/profile", "/etc/bashrc"]
+
+# Extra persistence surfaces beyond ~/Library/Launch* (already covered) and the
+# user crontab. Files are content-hashed; dirs are walked one level for scripts.
+# Only entries that EXIST are snapshotted, so a machine without them stays quiet.
+EXTRA_PERSIST_FILES = ["/etc/crontab", "/etc/rc.common", "/etc/launchd.conf",
+                       os.path.join(HOME, ".launchd.conf")]
+EXTRA_PERSIST_DIRS = ["/etc/periodic", "/etc/emond.d/rules",
+                      "/Library/StartupItems", "/System/Library/StartupItems"]
+
+# Chromium-family + Firefox extension roots (in the user's own home — no special
+# privilege). A newly-appearing extension ID is the signal; we diff the inventory.
+BROWSER_EXT_ROOTS = [
+    (os.path.join(HOME, "Library/Application Support/Google/Chrome"), "chromium"),
+    (os.path.join(HOME, "Library/Application Support/BraveSoftware/Brave-Browser"), "chromium"),
+    (os.path.join(HOME, "Library/Application Support/Microsoft Edge"), "chromium"),
+    (os.path.join(HOME, "Library/Application Support/Chromium"), "chromium"),
+    (os.path.join(HOME, "Library/Application Support/Vivaldi"), "chromium"),
+    (os.path.join(HOME, "Library/Application Support/Firefox/Profiles"), "firefox"),
+]
+
+# Aegis's own launchd agent (label from install.sh). Self-protection self-learns
+# that this exists; if it later vanishes, the monitor may have been disabled.
+SELF_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.charlie.aegis.plist")
+SELFSTATE = os.path.join(STATE_DIR, "selfstate.json")
+
+# High-signal hostile shell/command patterns, shared by argument inspection
+# (launchd/cron) and file-content scanning (shell rc). Each is a "download-and-
+# run", "reverse shell", or "obfuscated-decode-and-exec" idiom — the live tail of
+# a 2025-era ClickFix / AMOS infection chain.
+_HOSTILE_CONTENT_RES = [
+    (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]*\bhttps?://", re.I), "network-fetch"),
+    (re.compile(r"\|\s*(?:/bin/)?(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
+    (re.compile(r"\bbase64\b\s+(?:--?d(?:ecode)?|-D)\b", re.I), "base64-decode"),
+    (re.compile(r"\beval\b[^\n]*\$\(", re.I), "eval-subshell"),
+    (re.compile(r"/dev/tcp/", re.I), "bash-reverse-shell"),
+    (re.compile(r"\bn(?:c|cat)\b[^\n]*\s-[a-z]*e\b", re.I), "netcat-exec"),
+    (re.compile(r"\bosascript\b[^\n]*do\s+shell\s+script", re.I), "osascript-shell"),
+    (re.compile(r"\bpython[0-9.]*\b[^\n]*-c[^\n]*\bimport\s+(?:os|socket|pty|subprocess)", re.I), "python-oneliner"),
+    (re.compile(r"\b(?:curl|wget)\b[^\n]*\bhttps?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
+    (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]*/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
+]
+
+# launchd EnvironmentVariables keys that inject code into other processes.
+_DYLD_INJECT_KEYS = ("DYLD_INSERT_LIBRARIES", "DYLD_FRAMEWORK_PATH",
+                     "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
 
 # --------------------------------------------------------------------------- #
 # Small utilities
@@ -191,6 +262,32 @@ def log_run(msg):
             f.write("%s  %s\n" % (now_iso(), msg))
     except Exception:
         pass
+
+
+def quarantine_origin(path):
+    """Provenance from the com.apple.quarantine xattr, via Apple's `xattr` CLI
+    (Python's os.getxattr is Linux-only — verified absent on macOS). Returns
+    (present, agent): whether the file carries a Gatekeeper quarantine flag and
+    the downloading agent name (Safari, Google Chrome, curl, Terminal, …).
+    ABSENCE on a freshly-dropped executable is itself a signal — it means the
+    file arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
+    the exact side-load path AMOS/DMG-lure chains use."""
+    out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
+    if rc != 0 or not out.strip():
+        return (False, None)
+    # value: flags;hex-timestamp;AgentName;UUID
+    fields = out.strip().split(";")
+    agent = fields[2].strip() if len(fields) >= 3 and fields[2].strip() else None
+    return (True, agent)
+
+
+def _hostile_content(text):
+    """Return the list of hostile-pattern names present in a blob of shell/command
+    text (empty list = clean). Shared by shell-rc scanning and could back any
+    future text surface."""
+    if not text:
+        return []
+    return sorted({name for rx, name in _HOSTILE_CONTENT_RES if rx.search(text)})
 
 
 # --------------------------------------------------------------------------- #
@@ -350,7 +447,7 @@ def snapshot_persistence():
             path = os.path.join(d, name)
             rec = {"label": name[:-6], "program": None, "args": None,
                    "sha256": None, "trust": "unknown", "run_at_load": False,
-                   "authority": None}
+                   "authority": None, "env": None}
             try:
                 with open(path, "rb") as f:
                     pl = plistlib.load(f)
@@ -361,6 +458,11 @@ def snapshot_persistence():
             rec["program"] = prog
             rec["args"] = args
             rec["run_at_load"] = bool(pl.get("RunAtLoad")) if isinstance(pl, dict) else False
+            ev = pl.get("EnvironmentVariables") if isinstance(pl, dict) else None
+            if isinstance(ev, dict):
+                # keep only injection-relevant keys — the rest is noise/PII
+                inj = {k: str(v) for k, v in ev.items() if k in _DYLD_INJECT_KEYS}
+                rec["env"] = inj or None
             if prog and os.path.exists(prog):
                 rec["sha256"] = sha256(prog)
                 sig = classify_signature(prog)
@@ -388,23 +490,32 @@ _FETCH_RE = re.compile(r"\b(?:curl|wget|nscurl)\b.*?https?://", re.I | re.S)
 def _hostile_args(args):
     """Intent-derived (README: catch AMOS/Poseidon launchd persistence), and
     independent of the interpreter binary's own signature/location. True on the
-    two HIGH-PRECISION infostealer signals: a signed interpreter driven by an
-    inline script (`bash -c …`, `osascript -e …`) or a network fetch in the args
-    (`curl|wget http…`). Deliberately does NOT flag scripts merely living in a
-    dotdir — legit tools live in ~/.local, ~/.cargo, ~/.pyenv, … and the tool's
-    prime directive is 'alert rarely' (a false HIGH is worse than a rare miss)."""
+    HIGH-PRECISION infostealer signals: a signed interpreter driven by an inline
+    script (`bash -c …`, `osascript -e …`); a network fetch in the args
+    (`curl|wget http…`); or any of the shared hostile idioms (`… | sh`,
+    `base64 -d`, `/dev/tcp`, `nc -e`, raw-IP fetch, launchctl-load-from-tmp).
+    Deliberately does NOT flag scripts merely living in a dotdir — legit tools
+    live in ~/.local, ~/.cargo, ~/.pyenv, … and the tool's prime directive is
+    'alert rarely' (a false HIGH is worse than a rare miss)."""
     if not isinstance(args, list) or not args or args[0] is None:
         return False
     base = os.path.basename(str(args[0]))
     rest = [str(a) for a in args[1:]]
     if base in _INTERPRETERS and any(a in _INLINE_EXEC_FLAGS for a in rest):
         return True
-    return bool(_FETCH_RE.search(" ".join(str(a) for a in args)))
+    joined = " ".join(str(a) for a in args)
+    if _FETCH_RE.search(joined):
+        return True
+    return bool(_hostile_content(joined))
 
 
 def _persistence_severity(rec):
     prog = rec.get("program")
     trust = rec.get("trust")
+    if rec.get("env"):
+        # a launchd job that injects a dylib/lib path into what it spawns
+        # (DYLD_INSERT_LIBRARIES &c.) is a code-injection persistence pattern.
+        return "CRITICAL" if is_risky_location(prog) else "HIGH"
     if _hostile_args(rec.get("args")):
         # signed-interpreter + hostile payload: the #1 infostealer pattern.
         return "CRITICAL" if is_risky_location(prog) else "HIGH"
@@ -541,13 +652,18 @@ def check_hot_dirs(max_age_days=14):
             sig = classify_signature(path)
             if suspicious_sig(sig["trust"]):
                 sha = sha256(path)  # content hash → path reuse ≠ same fingerprint
+                quar, agent = quarantine_origin(path)
+                prov = ("via %s" % agent if agent else
+                        ("quarantined" if quar else "NO quarantine flag — side-loaded (bypassed Gatekeeper)"))
                 findings.append(finding(
                     "HIGH", "hot-dir", "Unsigned executable in watched folder",
-                    "%s [%s], modified %s" % (
+                    "%s [%s], modified %s, %s" % (
                         path, sig["trust"],
-                        datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")),
+                        datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
+                        prov),
                     "hotdir:%s:%s:%s" % (path, sig["trust"], sha),
-                    path=path, trust=sig["trust"], sha256=sha))
+                    path=path, trust=sig["trust"], sha256=sha,
+                    quarantined=quar, download_agent=agent))
     return findings
 
 
@@ -601,6 +717,319 @@ def check_hardening():
 
 
 # --------------------------------------------------------------------------- #
+# Extra baseline-diffed surfaces (shell rc, login hooks, config profiles, extra
+# persistence files, browser extensions). Each is snapshotted to a small dict and
+# diffed vs the baseline; the first time a surface is ever observed it is adopted
+# SILENTLY (the KnockKnock "trust what's already installed" rule, applied
+# per-surface so upgrading Aegis on an existing install is not an alert storm),
+# then only NEW/CHANGED items alert. All are readable with no special privilege.
+# --------------------------------------------------------------------------- #
+
+
+def _read_text(path, limit=512 * 1024):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read(limit)
+    except Exception:
+        return None
+
+
+def _diff_map(prior, cur, new_fn, changed_fn=None):
+    """Generic snapshot diff: call new_fn(id, val) for keys absent from prior and
+    changed_fn(id, val, old) for keys whose value changed. Callables return a
+    finding (or None to skip). Never raises on a single bad entry."""
+    findings = []
+    prior = prior or {}
+    for k, v in cur.items():
+        try:
+            if k not in prior:
+                f = new_fn(k, v)
+            elif changed_fn is not None and prior[k] != v:
+                f = changed_fn(k, v, prior[k])
+            else:
+                f = None
+            if f:
+                findings.append(f)
+        except Exception:
+            continue
+    return findings
+
+
+# --- shell startup files (T1546.004) ------------------------------------------
+def snapshot_shellrc():
+    snap = {}
+    for p in SHELL_RC_FILES:
+        if not os.path.isfile(p):
+            continue
+        h = sha256(p)
+        if h is None:
+            continue
+        snap[p] = {"sha256": h, "hostile": _hostile_content(_read_text(p) or "")}
+    return snap
+
+
+def diff_shellrc(prior, cur):
+    def _mk(title, verb):
+        def f(p, rec, *old):
+            hs = rec.get("hostile") or []
+            sev = "HIGH" if hs else "MEDIUM"
+            extra = " — hostile pattern(s): %s" % ", ".join(hs) if hs else ""
+            tag = "new" if verb == "appeared" else "changed"
+            return finding(sev, "shell-init", title, "%s %s%s" % (p, verb, extra),
+                           "shellrc:%s:%s:%s" % (tag, p, rec["sha256"]),
+                           path=p, hostile=hs, sha256=rec["sha256"])
+        return f
+    return _diff_map(prior, cur, _mk("New shell startup file", "appeared"),
+                     _mk("Shell startup file CHANGED", "changed"))
+
+
+# --- legacy Login/Logout hooks ------------------------------------------------
+def snapshot_loginhooks():
+    snap = {}
+    for key in ("LoginHook", "LogoutHook"):
+        out, _, rc = run(["defaults", "read", "com.apple.loginwindow", key], timeout=6)
+        if rc == 0 and out.strip():
+            snap[key] = out.strip()
+    return snap
+
+
+def diff_loginhooks(prior, cur):
+    def _mk(suffix):
+        def f(k, v, *old):
+            return finding("HIGH", "persistence", "%s %s" % (k, suffix),
+                           "com.apple.loginwindow %s = %s (legacy login hook — "
+                           "rare-legit, a classic persistence primitive)" % (k, v),
+                           "loginhook:%s:%s:%s" % (
+                               "changed" if old else "new", k,
+                               hashlib.sha256(v.encode()).hexdigest()[:16]),
+                           hook=k, program=v)
+        return f
+    return _diff_map(prior, cur, _mk("installed"), _mk("CHANGED"))
+
+
+# --- configuration profiles ---------------------------------------------------
+def snapshot_profiles():
+    snap = {}
+    out, _, rc = run(["profiles", "list"], timeout=12)
+    if rc != 0:
+        return snap
+    for line in out.splitlines():
+        m = re.search(r"profileIdentifier:\s*(\S+)", line)
+        if m:
+            snap[m.group(1)] = True
+    return snap
+
+
+def diff_profiles(prior, cur):
+    def new_fn(ident, _v):
+        return finding("HIGH", "config-profile",
+                       "New configuration profile installed",
+                       "profile %s installed — config profiles can add trusted "
+                       "certs, proxies or MDM control (an adware/DPRK vector)"
+                       % ident, "profile:%s" % ident, identifier=ident)
+    return _diff_map(prior, cur, new_fn)
+
+
+# --- extra persistence files (extended cron / periodic / StartupItems) --------
+def snapshot_extra_persistence():
+    snap = {}
+
+    def add(p):
+        if os.path.isfile(p):
+            h = sha256(p)
+            if h:
+                snap[p] = h
+
+    for p in EXTRA_PERSIST_FILES:
+        add(p)
+    for d in EXTRA_PERSIST_DIRS:
+        try:
+            for name in sorted(os.listdir(d)):
+                add(os.path.join(d, name))
+        except Exception:
+            continue
+    return snap
+
+
+def diff_extra_persistence(prior, cur):
+    def _mk(title, verb):
+        def f(p, h, *old):
+            hs = _hostile_content(_read_text(p) or "")
+            sev = "HIGH" if (hs or old) else "MEDIUM"
+            extra = " — hostile: %s" % ", ".join(hs) if hs else ""
+            tag = "changed" if old else "new"
+            return finding(sev, "persistence", title, "%s %s%s" % (p, verb, extra),
+                           "xpersist:%s:%s:%s" % (tag, p, h),
+                           path=p, sha256=h, hostile=hs)
+        return f
+    return _diff_map(prior, cur, _mk("New system-persistence file", "appeared"),
+                     _mk("System-persistence file CHANGED", "changed"))
+
+
+# --- browser extensions -------------------------------------------------------
+def _manifest_name(mf):
+    try:
+        with open(mf, "r", errors="replace") as f:
+            name = json.load(f).get("name")
+        if isinstance(name, str) and not name.startswith("__MSG_"):
+            return name
+    except Exception:
+        pass
+    return None
+
+
+def _chromium_exts(root):
+    out = {}
+    try:
+        profiles = os.listdir(root)
+    except Exception:
+        return out
+    for prof in profiles:
+        extdir = os.path.join(root, prof, "Extensions")
+        try:
+            ids = os.listdir(extdir)
+        except Exception:
+            continue
+        for extid in ids:
+            if extid.startswith(".") or extid == "Temp":
+                continue
+            name = extid
+            try:
+                for v in sorted(os.listdir(os.path.join(extdir, extid))):
+                    nm = _manifest_name(os.path.join(extdir, extid, v, "manifest.json"))
+                    if nm:
+                        name = nm
+                        break
+            except Exception:
+                pass
+            out["%s/%s" % (prof, extid)] = name
+    return out
+
+
+def _firefox_exts(root):
+    out = {}
+    try:
+        profs = os.listdir(root)
+    except Exception:
+        return out
+    for prof in profs:
+        try:
+            for name in os.listdir(os.path.join(root, prof, "extensions")):
+                if not name.startswith("."):
+                    out["%s/%s" % (prof, name)] = name
+        except Exception:
+            continue
+    return out
+
+
+def snapshot_browserext():
+    snap = {}
+    for root, kind in BROWSER_EXT_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        exts = _chromium_exts(root) if kind == "chromium" else _firefox_exts(root)
+        bname = os.path.basename(root)
+        for k, v in exts.items():
+            snap["%s:%s" % (bname, k)] = v
+    return snap
+
+
+def diff_browserext(prior, cur):
+    def new_fn(k, name):
+        return finding("MEDIUM", "browser-ext", "New browser extension",
+                       "%s (%s) — verify you installed this; malicious "
+                       "extensions exfiltrate sessions, cookies and wallet data"
+                       % (k, name), "browserext:%s" % k, ext=k, name=name)
+    return _diff_map(prior, cur, new_fn)
+
+
+# Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
+SURFACES = [
+    ("shellrc", snapshot_shellrc, diff_shellrc),
+    ("loginhooks", snapshot_loginhooks, diff_loginhooks),
+    ("profiles", snapshot_profiles, diff_profiles),
+    ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
+    ("browserext", snapshot_browserext, diff_browserext),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Check 5: self-protection (a monitor an attacker can silently disable or blind
+# is theater). Two low-false-positive tamper signals, no privilege required.
+# --------------------------------------------------------------------------- #
+
+
+def check_self_protection():
+    findings = []
+    st = load_json(SELFSTATE, {})
+
+    # (a) Our own launchd agent vanished after we'd learned it exists — the
+    # monitor may have been unloaded/deleted. Self-learned, so a machine that
+    # never installed the agent is never falsely flagged.
+    if not os.path.exists(SELF_PLIST) and st.get("installed"):
+        findings.append(finding(
+            "HIGH", "self-protection", "Aegis launchd agent is missing",
+            "%s no longer exists — the background monitor may have been unloaded "
+            "or deleted. Re-run install.sh if this was not intentional."
+            % SELF_PLIST, "self:agent:removed"))
+
+    # (b) The append-only findings log shrank since last scan — someone truncated
+    # the durable evidence trail.
+    prev = st.get("findings_size")
+    try:
+        cur_size = os.path.getsize(FINDINGS_LOG)
+    except Exception:
+        cur_size = 0
+    if isinstance(prev, int) and cur_size < prev:
+        findings.append(finding(
+            "HIGH", "self-protection", "Findings log was truncated",
+            "%s shrank from %d to %d bytes since the last scan — the append-only "
+            "evidence log may have been tampered with." % (FINDINGS_LOG, prev, cur_size),
+            "self:log:truncated:%d" % prev))
+    return findings
+
+
+def record_selfstate():
+    """Persist self-protection watermarks AFTER a scan's log writes complete."""
+    st = load_json(SELFSTATE, {})
+    if os.path.exists(SELF_PLIST):
+        st["installed"] = True
+    try:
+        st["findings_size"] = os.path.getsize(FINDINGS_LOG)
+    except Exception:
+        st["findings_size"] = 0
+    save_json(SELFSTATE, st)
+
+
+def _scan_surfaces(baseline, corrupt, first_run):
+    """Diff every extra surface; silently adopt any not yet in the baseline.
+    Returns (findings, baseline). Persists the baseline when an EXISTING install
+    gains a newly-watched surface (so the next scan can diff); on the true first
+    run cmd_scan writes the single authoritative baseline. A corrupt baseline is
+    left untouched — its loud alert is handled in cmd_scan."""
+    findings = []
+    if corrupt:
+        return findings, baseline
+    if baseline is None:
+        baseline = {}
+    dirty = False
+    for key, snap_fn, diff_fn in SURFACES:
+        try:
+            cur = snap_fn()
+        except Exception:
+            cur = {}
+        prior = baseline.get(key)
+        if prior is None:
+            baseline[key] = cur  # first sighting → adopt silently
+            dirty = True
+        else:
+            findings += diff_fn(prior, cur)
+    if dirty and not first_run:
+        save_json(BASELINE, baseline)
+    return findings, baseline
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 
@@ -612,6 +1041,7 @@ def gather_all(baseline_snap, current_snap):
     findings += check_processes()
     findings += check_hot_dirs()
     findings += check_hardening()
+    findings += check_self_protection()
     # Sort by severity desc, then category.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
     return findings
@@ -720,6 +1150,13 @@ def cmd_scan(quiet=False):
     findings = gather_all(baseline.get("persistence") if baseline else None,
                           current)
 
+    # Extra baseline-diffed surfaces (shell rc, login hooks, config profiles,
+    # extra persistence, browser extensions). Adopted silently on first sight,
+    # diffed thereafter. `baseline` is returned possibly-mutated/persisted.
+    surface_findings, baseline = _scan_surfaces(baseline, baseline_corrupt,
+                                                first_run)
+    findings += surface_findings
+
     if baseline_corrupt:
         # Do not silently re-baseline. Surface it loudly and let every current
         # item be evaluated as new (base was None ⇒ check_persistence saw {}).
@@ -729,14 +1166,23 @@ def cmd_scan(quiet=False):
             "re-evaluated as new. Run `aegis.py baseline` to re-establish a "
             "known-good baseline once you trust the current state." % BASELINE,
             "integrity:baseline:corrupt"))
-        findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
 
     if first_run:
-        save_json(BASELINE, {"created": now_iso(), "persistence": current})
+        # single authoritative baseline write: persistence + every surface
+        # snapshot (_scan_surfaces adopted them into `baseline` in memory).
+        baseline = baseline or {}
+        baseline["created"] = baseline.get("created") or now_iso()
+        baseline["persistence"] = current
+        save_json(BASELINE, baseline)
+
+    # Re-sort: surface findings (and any corrupt-baseline finding) were appended
+    # after gather_all's sort.
+    findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
 
     md = write_report(findings, first_run)
     new_high = emit(findings, first_run)
     flush_sigcache()
+    record_selfstate()
     log_run("scan: %d findings, %d new-high, first_run=%s"
             % (len(findings), len(new_high), first_run))
 
@@ -748,10 +1194,17 @@ def cmd_scan(quiet=False):
 def cmd_baseline():
     ensure_state()
     current = snapshot_persistence()
-    save_json(BASELINE, {"created": now_iso(), "persistence": current})
+    b = {"created": now_iso(), "persistence": current}
+    for key, snap_fn, _diff in SURFACES:
+        try:
+            b[key] = snap_fn()
+        except Exception:
+            b[key] = {}
+    save_json(BASELINE, b)
     flush_sigcache()
-    print("Baseline reset: %d persistence item(s) recorded as known-good."
-          % len(current))
+    record_selfstate()
+    print("Baseline reset: %d persistence item(s) + %d extra surface(s) recorded "
+          "as known-good." % (len(current), len(SURFACES)))
     return 0
 
 

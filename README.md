@@ -17,17 +17,26 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 
 | Check | What it catches | Why it matters |
 |---|---|---|
-| **Persistence watch** | New/changed launchd agents & daemons + cron, with each program hashed + code-signature-classified, diffed vs a known-good baseline — **and its arguments inspected**, so a signed interpreter driven by a hostile payload (`bash -c "curl…\|sh"`, `osascript -e …`) is caught even though the binary itself is Apple-signed | The #1 macOS infostealer signal — AMOS/Atomic, Poseidon persist via `LaunchAgents` |
+| **Persistence watch** | New/changed launchd agents & daemons + cron, with each program hashed + code-signature-classified, diffed vs a known-good baseline — **arguments inspected** (`bash -c "curl…\|sh"`, `base64 -d\|sh`, `/dev/tcp` reverse shells) **and DYLD_* injection env flagged**, so a signed interpreter driven by a hostile payload is caught even though the binary itself is Apple-signed | The #1 macOS infostealer signal — AMOS/Atomic, Poseidon persist via `LaunchAgents` |
 | **Process watch** | Running processes whose executable is unsigned/ad-hoc **and** in a user-writable path | Malware runs ad-hoc-signed binaries from `/tmp`, `~/`, `/Users/Shared` |
-| **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables in Downloads/Desktop/tmp/Shared | Catches a payload the moment it lands, before it runs |
+| **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables in Downloads/Desktop/tmp/Shared, tagged with **quarantine provenance** — a binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop) | Catches a payload the moment it lands, before it runs |
+| **Shell startup files** | New or modified `~/.zshrc`/`.zprofile`/`.bashrc`/… (ATT&CK T1546.004); a download-and-run or reverse-shell idiom scores HIGH | ClickFix/AMOS chains drop a re-execing payload into your shell rc |
+| **Login/Logout hooks** | Legacy `com.apple.loginwindow` LoginHook/LogoutHook | Rare-legit today; a classic persistence primitive |
+| **Config profiles** | A newly-installed configuration profile | Adds trusted certs / proxies / MDM control — an adware & DPRK vector |
+| **Extra persistence** | `/etc/crontab`, `/etc/periodic`, StartupItems, `/etc/rc.common` tamper | Persistence surfaces beyond `LaunchAgents` and the user crontab |
+| **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
+| **Self-protection** | Aegis's own launchd agent removed, or its append-only log truncated | A monitor an attacker can silently disable or blind is theater |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, Application Firewall, stealth mode, Remote Login | Surfaces weak settings (a first run typically finds a control the operator assumed was on) |
 
 **Design principle — log everything, alert rarely, never repeat.** The first run
 records a *silent* baseline (no day-one alert storm — the KnockKnock/LuLu "trust
-what's already installed" rule). After that, only **new** findings at **HIGH+**
-raise a desktop notification, and each fires **once**. Everything, always, is
-appended to a durable log (`~/.aegis/findings.jsonl`) so nothing is lost if a
-notification is missed.
+what's already installed" rule). The shell-rc, profile, hook, extra-persistence
+and browser-extension surfaces extend this rule **per-surface**: each is adopted
+silently the first time it's seen, so *upgrading* Aegis on an existing install is
+also storm-free. After that, only **new** findings at **HIGH+** raise a desktop
+notification, and each fires **once**. Everything, always, is appended to a
+durable log (`~/.aegis/findings.jsonl`) so nothing is lost if a notification is
+missed.
 
 ---
 
