@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Aegis runtime state lives in ~/.aegis, never in the repo — but ignore any
+# stray local copies just in case.
+.aegis/
