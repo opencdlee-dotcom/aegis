@@ -17,7 +17,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 
 | Check | What it catches | Why it matters |
 |---|---|---|
-| **Persistence watch** | New/changed launchd agents & daemons + cron, with each program hashed + code-signature-classified, diffed vs a known-good baseline — **arguments inspected** (`bash -c "curl…\|sh"`, `base64 -d\|sh`, `/dev/tcp` reverse shells) **and DYLD_* injection env flagged**, so a signed interpreter driven by a hostile payload is caught even though the binary itself is Apple-signed | The #1 macOS infostealer signal — AMOS/Atomic, Poseidon persist via `LaunchAgents` |
+| **Persistence watch** | New/changed launchd agents & daemons + cron, each program hashed + signature-classified, diffed vs baseline — **arguments inspected** (`bash -c "curl…\|sh"`, `base64 -d\|sh`, `/dev/tcp`), **DYLD_* injection env flagged**, **an interpreter run against a hidden `$HOME`/tmp script caught** (AMOS `/bin/bash ~/.agent`), and **Apple-label impersonation caught** (a `com.apple.*` plist whose program isn't Apple-signed — RustBucket's `com.apple.systemupdate` behind a hijacked cert) | The #1 macOS infostealer signal — AMOS/Atomic, Poseidon/Odyssey persist via `LaunchAgents`/`LaunchDaemons` |
 | **Process watch** | Running processes whose executable is unsigned/ad-hoc **and** in a user-writable path | Malware runs ad-hoc-signed binaries from `/tmp`, `~/`, `/Users/Shared` |
 | **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables in Downloads/Desktop/tmp/Shared, tagged with **quarantine provenance** — a binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop) | Catches a payload the moment it lands, before it runs |
 | **Shell startup files** | New or modified `~/.zshrc`/`.zprofile`/`.bashrc`/… (ATT&CK T1546.004); a download-and-run or reverse-shell idiom scores HIGH | ClickFix/AMOS chains drop a re-execing payload into your shell rc |
@@ -25,6 +25,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Config profiles** | A newly-installed configuration profile | Adds trusted certs / proxies / MDM control — an adware & DPRK vector |
 | **Extra persistence** | `/etc/crontab`, `/etc/periodic`, StartupItems, `/etc/rc.common` tamper | Persistence surfaces beyond `LaunchAgents` and the user crontab |
 | **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
+| **Editor extensions** | New VSCode / Cursor / VSCodium / Windsurf extension | A backdoored editor extension is a live supply-chain vector (Objective-See's *Paradox*, 2025, shipped via a trojanised Cursor extension) |
 | **Self-protection** | Aegis's own launchd agent removed, or its append-only log truncated | A monitor an attacker can silently disable or blind is theater |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, Application Firewall, stealth mode, Remote Login | Surfaces weak settings (a first run typically finds a control the operator assumed was on) |
 
@@ -132,11 +133,22 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (21 tests, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (51 tests, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
-adversarial hardening pass documented in [BATTLE-LOG.md](BATTLE-LOG.md): a signed
-interpreter + hostile payload scores HIGH; a corrupt baseline refuses to silently
-re-trust; first-run silence is scoped to persistence so a live threat present at
-install still alerts; a swapped binary at an allowlisted path re-alerts (content
-hash in the fingerprint); `/usr/local` and `/private/var/folders` are treated as
-risky; the signature cache invalidates on content change and stays bounded.
+adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
+research-grounded detection surfaces added since: a signed interpreter + hostile
+payload scores HIGH; a corrupt baseline refuses to silently re-trust; first-run
+silence is scoped per-surface so a live threat present at install still alerts;
+a swapped binary at an allowlisted path re-alerts (content hash in the
+fingerprint); `/usr/local` and `/private/var/folders` are risky; the signature
+cache invalidates on content change and stays bounded.
+
+The newer detectors are pinned against real 2025-26 families: **AMOS** (`/bin/bash
+~/.agent` hidden-home script → HIGH), **RustBucket/BlueNoroff** (`com.apple.*`
+label impersonation behind a hijacked cert → HIGH/CRITICAL; novel `~/.zshenv`
+persistence), **Cuckoo/ClickFix** (`osascript … with hidden answer` password
+phish; `security dump-keychain`), **Phexia** (interpreter → user-writable script
+→ MEDIUM), and **Paradox** (backdoored Cursor extension → editor-extension diff).
+Each new surface is adopted silently on first sight, so upgrading is storm-free
+(verified on-host: 61 persistence + 30 browser + 19 editor extensions + 9 shell
+rc files absorbed with zero alerts).

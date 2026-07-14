@@ -56,6 +56,7 @@ class Sandbox(unittest.TestCase):
             "EXTRA_PERSIST_FILES": [],
             "EXTRA_PERSIST_DIRS": [],
             "BROWSER_EXT_ROOTS": [],
+            "IDE_EXT_ROOTS": [],
             "_sigcache": {},
         }
         for k, v in overrides.items():
@@ -577,6 +578,127 @@ class TestSurfaceAdoptionOnUpgrade(Sandbox):
         with open(aegis.BASELINE) as fh:
             base = json.load(fh)
         self.assertIn("shellrc", base)
+
+
+# --------------------------------------------------------------------------- #
+# N9 — AMOS/Atomic 2025: a launchd job running an Apple-signed interpreter
+# against a HIDDEN SCRIPT in $HOME (`/bin/bash ~/.agent`) must score HIGH — the
+# binary+location look safe, the script's home is the tell.
+# --------------------------------------------------------------------------- #
+class TestHiddenHomeScriptPersistence(Sandbox):
+    def _sev(self, args, program="/bin/bash"):
+        rec = {"label": "com.finder.helper", "program": program, "args": args,
+               "trust": "apple", "sha256": "s", "run_at_load": True, "env": None}
+        return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
+
+    def test_bash_hidden_home_script_is_high(self):
+        sev = self._sev(["/bin/bash", os.path.join(aegis.HOME, ".agent")])
+        self.assertGreaterEqual(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+    def test_interpreter_tmp_script_is_high(self):
+        sev = self._sev(["/usr/bin/python3", "/tmp/.x.py"], program="/usr/bin/python3")
+        self.assertGreaterEqual(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+    def test_legit_dotdir_tool_stays_low(self):
+        # ~/.local/bin, ~/.cargo/bin etc. are conventional — must NOT inflate.
+        for tool in (".local/bin/tool", ".cargo/bin/rg", ".pyenv/shims/python"):
+            sev = self._sev(["/bin/bash", os.path.join(aegis.HOME, tool)])
+            self.assertLess(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"],
+                            "%s -> %s (false positive)" % (tool, sev))
+
+
+# --------------------------------------------------------------------------- #
+# N10 — RustBucket/BlueNoroff: a plist whose label impersonates Apple
+# (`com.apple.systemupdate`) but whose program is NOT Apple-signed (hijacked
+# Developer-ID cert) must be HIGH — signature checks alone wave it through.
+# --------------------------------------------------------------------------- #
+class TestAppleLabelImpersonation(Sandbox):
+    def _sev(self, label, trust, program="/Users/x/Library/Metadata/Update"):
+        rec = {"label": label, "program": program, "args": None, "trust": trust,
+               "sha256": "s", "run_at_load": True, "env": None}
+        return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
+
+    def test_apple_label_developer_id_program_is_high(self):
+        sev = self._sev("com.apple.systemupdate", "developer-id")
+        self.assertGreaterEqual(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+    def test_genuinely_apple_signed_is_not_inflated_by_this_rule(self):
+        # A com.apple.* label whose program really IS Apple-signed and lives in a
+        # trusted path must not be forced HIGH by the impersonation rule.
+        sev = self._sev("com.apple.updater", "apple", program="/usr/bin/true")
+        self.assertLess(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+
+# --------------------------------------------------------------------------- #
+# N11 — DPRK "Hidden Risk": a newly-created login-scoped rc (~/.zshenv) is HIGH
+# even with benign-looking content; a new interactive-only ~/.zshrc is MEDIUM.
+# --------------------------------------------------------------------------- #
+class TestLoginScopedRc(Sandbox):
+    def _new(self, name, body="export PATH=$PATH\n"):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write(body)
+        aegis.SHELL_RC_FILES = [p]
+        return aegis.diff_shellrc({}, aegis.snapshot_shellrc())[0]
+
+    def test_new_zshenv_is_high(self):
+        self.assertEqual(self._new(".zshenv")["severity"], "HIGH")
+
+    def test_new_zshrc_is_medium(self):
+        self.assertEqual(self._new(".zshrc")["severity"], "MEDIUM")
+
+    def test_changed_zshenv_is_medium_when_benign(self):
+        p = os.path.join(self.tmp, ".zshenv")
+        with open(p, "w") as f:
+            f.write("export A=1\n")
+        aegis.SHELL_RC_FILES = [p]
+        prior = aegis.snapshot_shellrc()
+        with open(p, "a") as f:
+            f.write("export B=2\n")   # benign change, not a fresh install
+        self.assertEqual(
+            aegis.diff_shellrc(prior, aegis.snapshot_shellrc())[0]["severity"],
+            "MEDIUM")
+
+
+# --------------------------------------------------------------------------- #
+# N12 — Objective-See "Paradox" 2025: a backdoored IDE (VSCode/Cursor) extension
+# must be inventoried and a new one alerted.
+# --------------------------------------------------------------------------- #
+class TestIdeExtensions(Sandbox):
+    def test_new_cursor_extension_detected(self):
+        root = os.path.join(self.tmp, ".cursor", "extensions")
+        extdir = os.path.join(root, "evil.wallet-drainer-1.0.0")
+        os.makedirs(extdir)
+        with open(os.path.join(extdir, "package.json"), "w") as f:
+            json.dump({"name": "wallet-drainer", "displayName": "Wallet Helper"}, f)
+        aegis.IDE_EXT_ROOTS = [root]
+        snap = aegis.snapshot_ide_ext()
+        self.assertTrue(any("evil.wallet-drainer" in k for k in snap))
+        f = aegis.diff_ide_ext({}, snap)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["category"], "ide-ext")
+        self.assertEqual(f[0]["severity"], "MEDIUM")
+
+
+# --------------------------------------------------------------------------- #
+# N13 — Objective-See "Phexia" 2025: an interpreter (osascript) launched against
+# a script in a user-writable location scores MEDIUM (logged), not LOW (buried),
+# while a signed interpreter against a trusted-path script stays LOW.
+# --------------------------------------------------------------------------- #
+class TestInterpreterScriptTarget(Sandbox):
+    def _sev(self, args):
+        rec = {"label": "com.user.x", "program": args[0], "args": args,
+               "trust": "apple", "sha256": "s", "run_at_load": True, "env": None}
+        return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
+
+    def test_phexia_osascript_userlib_script_is_medium(self):
+        sev = self._sev(["/usr/bin/osascript",
+                         os.path.join(aegis.HOME, "Library", "gfskjsnghdjsvuxj")])
+        self.assertEqual(sev, "MEDIUM", sev)
+
+    def test_interpreter_against_trusted_script_stays_low(self):
+        # /etc is not in RISKY_PREFIXES and not hidden → stays LOW.
+        self.assertEqual(self._sev(["/bin/bash", "/etc/somewhere"]), "LOW")
 
 
 if __name__ == "__main__":

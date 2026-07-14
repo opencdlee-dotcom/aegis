@@ -17,9 +17,11 @@ WHAT IT DOES (on an interval, via launchd)
 ------------------------------------------
   1. Persistence watch - enumerates third-party launchd agents/daemons + cron,
      resolves each program, hashes it, validates its code signature, inspects its
-     arguments AND its DYLD_* injection env, and diffs against a known-good
-     baseline. New/changed persistence is the #1 signal for macOS infostealers
-     (AMOS/Atomic, Poseidon) that persist via launchd.
+     arguments AND its DYLD_* injection env, catches an interpreter aimed at a
+     hidden $HOME/tmp script (AMOS `/bin/bash ~/.agent`) and a com.apple.* label
+     whose program isn't Apple-signed (RustBucket cert-hijack), and diffs against
+     a known-good baseline. New/changed persistence is the #1 signal for macOS
+     infostealers (AMOS/Atomic, Poseidon/Odyssey) that persist via launchd.
   2. Process watch      - flags running processes whose executable is
      unsigned / ad-hoc-signed AND lives in a user-writable location.
   3. Hot-dir watch      - flags freshly-dropped unsigned Mach-O executables in
@@ -130,6 +132,13 @@ SHELL_RC_FILES = [os.path.join(HOME, n) for n in (
     ".config/fish/config.fish", ".config/fish/conf.d/aegis.fish",
 )] + ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv", "/etc/profile", "/etc/bashrc"]
 
+# Login/every-invocation-scoped rc files (sourced even by non-interactive shells
+# and scripts). A NEWLY-appearing one is a high-signal persistence install — the
+# DPRK/BlueNoroff "Hidden Risk" campaign used a fresh ~/.zshenv specifically
+# because it runs on every zsh, not just interactive logins.
+_LOGIN_SCOPED_RC = frozenset((
+    ".zshenv", ".zprofile", ".zlogin", ".bash_profile", ".bash_login", ".profile"))
+
 # Extra persistence surfaces beyond ~/Library/Launch* (already covered) and the
 # user crontab. Files are content-hashed; dirs are walked one level for scripts.
 # Only entries that EXIST are snapshotted, so a machine without them stays quiet.
@@ -148,6 +157,15 @@ BROWSER_EXT_ROOTS = [
     (os.path.join(HOME, "Library/Application Support/Vivaldi"), "chromium"),
     (os.path.join(HOME, "Library/Application Support/Firefox/Profiles"), "firefox"),
 ]
+
+# IDE / code-editor extension dirs. A backdoored editor extension is a live 2025
+# supply-chain vector (Objective-See's "Paradox" shipped via a trojanised Cursor
+# extension in Open VSX) — and directly relevant to a developer's box. Layout is
+# uniform: <root>/<publisher>.<name>-<version>/package.json.
+IDE_EXT_ROOTS = [os.path.join(HOME, d) for d in (
+    ".vscode/extensions", ".vscode-oss/extensions", ".vscode-insiders/extensions",
+    ".cursor/extensions", ".windsurf/extensions",
+)]
 
 # Aegis's own launchd agent (label from install.sh). Self-protection self-learns
 # that this exists; if it later vanishes, the monitor may have been disabled.
@@ -169,6 +187,8 @@ _HOSTILE_CONTENT_RES = [
     (re.compile(r"\bpython[0-9.]*\b[^\n]*-c[^\n]*\bimport\s+(?:os|socket|pty|subprocess)", re.I), "python-oneliner"),
     (re.compile(r"\b(?:curl|wget)\b[^\n]*\bhttps?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
     (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]*/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
+    (re.compile(r"display\s+dialog.*hidden\s+answer", re.I | re.S), "osascript-password-phish"),
+    (re.compile(r"\bsecurity\b[^\n]*\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I), "keychain-dump"),
 ]
 
 # launchd EnvironmentVariables keys that inject code into other processes.
@@ -487,6 +507,38 @@ _INLINE_EXEC_FLAGS = frozenset(("-c", "-e"))
 _FETCH_RE = re.compile(r"\b(?:curl|wget|nscurl)\b.*?https?://", re.I | re.S)
 
 
+def _script_target(args):
+    """The script an interpreter is told to run: the first path-like, non-flag
+    argument after the interpreter binary. None if args[0] isn't an interpreter
+    or no such argument exists."""
+    if not isinstance(args, list) or len(args) < 2 or args[0] is None:
+        return None
+    if os.path.basename(str(args[0])) not in _INTERPRETERS:
+        return None
+    for a in args[1:]:
+        s = str(a)
+        if s.startswith("-"):
+            continue
+        return s if s.startswith("/") else None
+    return None
+
+
+def _hidden_home_or_tmp(path):
+    """A script location that is anomalous for a launchd job to point an
+    interpreter at: a hidden file sitting DIRECTLY in $HOME (~/.agent, ~/.helper —
+    the AMOS/Atomic 2025 pattern), or a temp/shared drop dir. Deliberately does
+    NOT match conventional tool subdirs like ~/.local/bin or ~/.cargo/bin (those
+    have a multi-segment path, so dirname != $HOME) — that would be a false-
+    positive cannon against legitimate user tooling."""
+    if not path:
+        return False
+    if path.startswith(("/tmp", "/private/tmp", "/var/folders",
+                        "/private/var/folders", "/Users/Shared")):
+        return True
+    return (os.path.dirname(path) == HOME
+            and os.path.basename(path).startswith("."))
+
+
 def _hostile_args(args):
     """Intent-derived (README: catch AMOS/Poseidon launchd persistence), and
     independent of the interpreter binary's own signature/location. True on the
@@ -503,6 +555,13 @@ def _hostile_args(args):
     rest = [str(a) for a in args[1:]]
     if base in _INTERPRETERS and any(a in _INLINE_EXEC_FLAGS for a in rest):
         return True
+    # interpreter pointed at a hidden script in $HOME root or a temp dir — the
+    # AMOS `/bin/bash ~/.agent` / `.helper` 2025 persistence pattern. The binary
+    # (bash) is Apple-signed and in a trusted path, so signature+location scoring
+    # alone reads it as safe; the tell is WHERE the script it runs lives.
+    tgt = _script_target(args)
+    if tgt and _hidden_home_or_tmp(tgt):
+        return True
     joined = " ".join(str(a) for a in args)
     if _FETCH_RE.search(joined):
         return True
@@ -512,6 +571,13 @@ def _hostile_args(args):
 def _persistence_severity(rec):
     prog = rec.get("program")
     trust = rec.get("trust")
+    label = rec.get("label") or ""
+    if label.startswith("com.apple.") and trust not in ("apple", "app-store"):
+        # A third-party plist (we never scan /System) whose LABEL claims to be
+        # Apple's but whose program is not Apple-signed is impersonating the OS —
+        # RustBucket/BlueNoroff shipped `com.apple.systemupdate` behind a hijacked
+        # Developer-ID cert, which every signature-only check would wave through.
+        return "CRITICAL" if is_risky_location(prog) else "HIGH"
     if rec.get("env"):
         # a launchd job that injects a dylib/lib path into what it spawns
         # (DYLD_INSERT_LIBRARIES &c.) is a code-injection persistence pattern.
@@ -528,6 +594,13 @@ def _persistence_severity(rec):
     if trust == "missing":
         return "LOW"  # points at a program that isn't on disk: can't execute
     if is_risky_location(prog):
+        return "MEDIUM"
+    # An Apple-signed interpreter in a trusted path, but the SCRIPT it runs lives
+    # in a user-writable location (Phexia: `osascript ~/Library/<random>`). Not a
+    # notify-grade HIGH (legit agents run ~/Library helper scripts too), but worth
+    # surfacing at MEDIUM rather than the LOW the interpreter's own path implies.
+    tgt = _script_target(rec.get("args"))
+    if tgt and is_risky_location(tgt):
         return "MEDIUM"
     return "LOW"
 
@@ -772,10 +845,14 @@ def diff_shellrc(prior, cur):
     def _mk(title, verb):
         def f(p, rec, *old):
             hs = rec.get("hostile") or []
-            sev = "HIGH" if hs else "MEDIUM"
-            extra = " — hostile pattern(s): %s" % ", ".join(hs) if hs else ""
+            is_new = not old
+            login_scoped = os.path.basename(p) in _LOGIN_SCOPED_RC
+            sev = "HIGH" if (hs or (is_new and login_scoped)) else "MEDIUM"
+            note = (" — hostile pattern(s): %s" % ", ".join(hs) if hs else
+                    " — login-scoped rc newly created (runs on every shell)"
+                    if (is_new and login_scoped) else "")
             tag = "new" if verb == "appeared" else "changed"
-            return finding(sev, "shell-init", title, "%s %s%s" % (p, verb, extra),
+            return finding(sev, "shell-init", title, "%s %s%s" % (p, verb, note),
                            "shellrc:%s:%s:%s" % (tag, p, rec["sha256"]),
                            path=p, hostile=hs, sha256=rec["sha256"])
         return f
@@ -943,6 +1020,35 @@ def diff_browserext(prior, cur):
     return _diff_map(prior, cur, new_fn)
 
 
+# --- IDE / editor extensions --------------------------------------------------
+def snapshot_ide_ext():
+    snap = {}
+    for root in IDE_EXT_ROOTS:
+        editor = os.path.basename(os.path.dirname(root))  # ".vscode", ".cursor"…
+        try:
+            entries = os.listdir(root)
+        except Exception:
+            continue
+        for name in entries:
+            if name.startswith(".") or name == "extensions.json":
+                continue
+            p = os.path.join(root, name)
+            if not os.path.isdir(p):
+                continue
+            disp = _manifest_name(os.path.join(p, "package.json")) or name
+            snap["%s:%s" % (editor, name)] = disp
+    return snap
+
+
+def diff_ide_ext(prior, cur):
+    def new_fn(k, name):
+        return finding("MEDIUM", "ide-ext", "New editor extension",
+                       "%s (%s) — a backdoored VSCode/Cursor extension is a live "
+                       "supply-chain vector; confirm you installed it"
+                       % (k, name), "ideext:%s" % k, ext=k, name=name)
+    return _diff_map(prior, cur, new_fn)
+
+
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
 SURFACES = [
     ("shellrc", snapshot_shellrc, diff_shellrc),
@@ -950,6 +1056,7 @@ SURFACES = [
     ("profiles", snapshot_profiles, diff_profiles),
     ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
     ("browserext", snapshot_browserext, diff_browserext),
+    ("ide_ext", snapshot_ide_ext, diff_ide_ext),
 ]
 
 
