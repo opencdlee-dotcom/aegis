@@ -1,3 +1,43 @@
+# Aegis — Battle-Test Log (2026-07-15, pass 2 — residual-gap-detectors branch)
+
+Second `/battle-test` pass (fable-mode gates) targeting **only the new surfaces**
+added on `feat/residual-gap-detectors` (behavioral argv tier, XProtect harvest,
+shell-history, staging, wallet, canary, IDE-ext, vendor-label impersonation) — the
+older code was saturated in pass 1. **Tier: standard.** Subagent hunters were
+gated (Opus classifier down), so hunting ran inline: sandboxed reproducers, every
+oracle derived from README/docstring intent, each finding proven with captured
+tool output before it was trusted. No live notification, launchd load, or write
+outside a per-test tmp dir ever fired; real `~/.aegis` mtime unchanged across the
+whole pass.
+
+## Outcome (pass 2)
+
+**3 genuine defects fixed** (1 HIGH detection-evasion, 1 MEDIUM alert-fatigue,
+1 HIGH spec/code contradiction), each pinned by a permanent regression test. Test
+state: `selftest.py` 3/3, `tests/test_regression.py` **89/89** (86 + 3 new).
+
+| # | Sev | Where | Defect (vs stated intent) | Evidence | Fix |
+|---|-----|-------|---------------------------|----------|-----|
+| P2-1 | **HIGH** | `check_behavior` | Self-exclusion was a substring test (`"aegis" in argv` / `"aegis " in argv`). Aegis is open-source, so an attacker reading the check evades the **flagship CRITICAL password-phish detection** by putting the word "aegis" anywhere in argv (e.g. a dialog reading *"System aegis needs your password"*). | Repro: that exact phish argv → `check_behavior()` returned `[]` (no alert); the identical phish without "aegis" → CRITICAL. | Exclude self by the **unspoofable real PID** (`pid == os.getpid()`), not an argv substring. Post-fix the "aegis"-laden phish scores CRITICAL. |
+| P2-2 | **MEDIUM** | `check_shell_history` | Every hostile-idiom match was hard-coded **HIGH**, so a lone everyday `curl https://…` (no pipe-to-shell) in history fired a HIGH desktop notification — an "alert rarely" violation the live-process tier explicitly avoids by gating lone fetch to a fetch+exec combo. | Repro: history with one benign `curl -fsSL https://…` → `[HIGH] shell-history`. | Score via the **same `_argv_signals` oracle** as the behavioral tier: lone fetch → MEDIUM (logged, below notify floor); `curl…\|sh`, `dscl -authonly`, reverse shell → still HIGH+. Post-fix the benign curl is MEDIUM. |
+| P2-3 | **HIGH** | `emit` / `cmd_scan` | README (lines 41–44) promises shell-history is "adopted silently **per-surface**… so upgrading Aegis is storm-free." But suppression keyed on **global `first_run`** only; shell-history isn't a baseline surface, so on an **upgrade** (baseline already exists) months-old `curl\|sh` residue alerts as if live — the documented guarantee was false. | Code: `suppressed = first_run and category in (...)`; no per-surface adoption for the live history check. | Add a `shell_history_adopted` baseline marker; the first scan on an upgrade adopts existing residue silently (logged, not notified) and records the marker; new hostile lines thereafter alert. |
+
+## Not fixed (residual)
+
+- `check_behavior` ps parsing (`line.split(None, 3)`) garbles the reported
+  `program`/`pid` fields when a process's exec path contains spaces
+  (`/Users/Shared/My App/run`). Detection still **fires** (the fetch/exec idiom is
+  matched in the argv tail regardless), so this is a cosmetic misattribution in the
+  finding detail, not a missed threat — left un-fixed to avoid over-fitting `ps`
+  column parsing. Interpreter binaries (bash/osascript/curl), which front every
+  hostile chain, have space-free paths, so the common case is unaffected.
+- Probed and **saturated** (survived attack): XProtect malformed-ndjson / non-JSON
+  `eventMessage` parsing (no raise, still catches the real detection), vendor-label
+  impersonation on an Apple-signed backing binary (HIGH), fish-format history,
+  canary modify/delete, staging mtime-fingerprint stability (dedups, no re-alert).
+
+---
+
 # Aegis — Battle-Test Log (2026-07-13)
 
 Adversarial hardening pass under `/battle-test` (fable-mode gates + delegated

