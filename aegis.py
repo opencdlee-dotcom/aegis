@@ -179,6 +179,10 @@ SELFSTATE = os.path.join(STATE_DIR, "selfstate.json")
 _HOSTILE_CONTENT_RES = [
     (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]*\bhttps?://", re.I), "network-fetch"),
     (re.compile(r"\|\s*(?:/bin/)?(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
+    # Require a real command boundary after the interpreter (space/EOL) so a `|`
+    # INSIDE a quoted regex alternation — e.g. perl/sed `s{(a|node|b)}` — is not
+    # mistaken for a shell pipe into `node`. A genuine pipe reads `… | osascript`.
+    (re.compile(r"\|\s*(?:/usr/bin/)?(?:osascript|python[0-9.]*|perl|ruby|node|php)(?=\s|$)", re.I), "pipe-to-interpreter"),
     (re.compile(r"\bbase64\b\s+(?:--?d(?:ecode)?|-D)\b", re.I), "base64-decode"),
     (re.compile(r"\beval\b[^\n]*\$\(", re.I), "eval-subshell"),
     (re.compile(r"/dev/tcp/", re.I), "bash-reverse-shell"),
@@ -194,6 +198,162 @@ _HOSTILE_CONTENT_RES = [
 # launchd EnvironmentVariables keys that inject code into other processes.
 _DYLD_INJECT_KEYS = ("DYLD_INSERT_LIBRARIES", "DYLD_FRAMEWORK_PATH",
                      "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
+
+# --------------------------------------------------------------------------- #
+# BEHAVIORAL tier (research-grounded, 2025-26 macOS stealer wave).
+#
+# The dominant 2025 TTP (AMOS/Poseidon/ClickFix, per Sophos/SentinelOne/Jamf/
+# Microsoft/Objective-See) is FILELESS: a signed interpreter (bash/osascript/
+# curl — all Apple-signed, all in TRUSTED_PREFIXES) is driven by a hostile
+# COMMAND LINE. Persistence-diffing and unsigned-binary checks are blind to it;
+# the malice lives entirely in argv. So we sample the full process argv and the
+# unified log — two entitlement-free, no-cloud sources — and score by STRUCTURAL
+# invariants that are expensive for an attacker to vary (a non-Apple process
+# copying login.keychain-db; a quarantine-xattr strip; a hidden-answer password
+# dialog), not easily-shed strings.
+#
+# HONEST BOUNDARY: an unprivileged agent can only reliably read SAME-USER argv
+# (KERN_PROCARGS2). Consumer smash-and-grab is same-user, so this holds for the
+# common case; a root/multi-user payload's argv is invisible. Stated in README.
+# --------------------------------------------------------------------------- #
+
+# High-precision hostile process-argv signals. Each is rare-to-absent in normal
+# use, so a single match is alert-worthy (the Bitdefender-ATC lesson applied via
+# severity tiers: unambiguous → HIGH/CRITICAL, weak/context → MEDIUM won't-notify).
+_HOSTILE_ARGV_RES = [
+    # AMOS/Cthulhu core primitive: a fake system password prompt (hidden answer).
+    (re.compile(r"\bosascript\b.*display\s+dialog.*(?:hidden\s+answer|default\s+answer)", re.I | re.S),
+     "osascript-password-phish", "CRITICAL"),
+    # ClickFix validates the phished password locally before proceeding.
+    (re.compile(r"\bdscl\b\s+\.?\s+(?:-)?authonly\b", re.I), "dscl-authonly-passcheck", "HIGH"),
+    # Provenance strip: defeats Aegis's own quarantine check if we only read xattrs
+    # at rest — so we catch the STRIP invocation itself.
+    (re.compile(r"\bxattr\b[^\n]*\s-[a-z]*(?:c|d|dr)\b[^\n]*com\.apple\.quarantine", re.I), "quarantine-strip", "HIGH"),
+    (re.compile(r"\bxattr\b\s+-c\b", re.I), "xattr-clear-all", "HIGH"),
+    # Invisible DMG mount (new ClickFix DMG variant, Unit42 2026).
+    (re.compile(r"\bhdiutil\b\s+attach\b[^\n]*-nobrowse\b", re.I), "hdiutil-nobrowse", "HIGH"),
+    # Wipes the TCC privacy DB — resets Aegis's own grants; a tamper signal.
+    (re.compile(r"\btccutil\b\s+reset\b", re.I), "tccutil-reset", "HIGH"),
+    # Keychain theft residue: copy login.keychain-db out, or dump it.
+    (re.compile(r"login\.keychain-db\b", re.I), "keychain-db-access", "HIGH"),
+    (re.compile(r"\bsecurity\b[^\n]*\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I),
+     "keychain-security-dump", "HIGH"),
+    # Exfil POST of a staged archive (curl -F file=@/tmp/*.zip … to a remote host).
+    (re.compile(r"\bcurl\b[^\n]*-F\b[^\n]*file=@[^\n]*\.(?:zip|tar|gz)", re.I), "curl-exfil-post", "HIGH"),
+    # TLS-verification-disabled streaming download (curl -k | base64 -d | …).
+    (re.compile(r"\bcurl\b[^\n]*\s-[a-z]*k\b[^\n]*\|\s*(?:base64|gunzip|(?:ba|z)?sh|osascript)", re.I),
+     "curl-insecure-pipe", "HIGH"),
+    # Fileless staging: nohup curl pulling a payload run in memory.
+    (re.compile(r"\bnohup\b[^\n]*\bcurl\b", re.I), "nohup-curl-fileless", "HIGH"),
+]
+
+# Anti-VM / sandbox / geo gates run BEFORE the payload — an early-warning signal
+# on a real victim endpoint (where the malware WILL proceed). Lower severity
+# (won't notify): legitimate tools also probe hardware, so this only corroborates.
+_ANTIVM_ARGV_RES = [
+    (re.compile(r"\bsysctl\b[^\n]*hw\.optional\.arm\.FEAT_", re.I), "antivm-cpu-feature-probe"),
+    (re.compile(r"\bsystem_profiler\b[^\n]*SPHardwareDataType", re.I), "antivm-hardware-probe"),
+    (re.compile(r"\bioreg\b[^\n]*(?:VMware|VirtualBox|QEMU|Parallels)", re.I), "antivm-hypervisor-probe"),
+]
+
+# Apple-signed interpreters/utilities whose OWN path is trusted, so behavioral
+# scoring must key on their argv. (Superset of _INTERPRETERS — used to decide
+# whether a trusted-path process is worth argv-inspecting.)
+_ARGV_WATCH_BINS = frozenset((
+    "bash", "sh", "zsh", "dash", "ksh", "osascript", "python", "python2",
+    "python3", "perl", "ruby", "php", "node", "curl", "wget", "nscurl",
+    "xattr", "hdiutil", "tccutil", "dscl", "security", "nohup", "sysctl",
+    "system_profiler", "ioreg", "sqlite3", "ditto", "zip",
+))
+
+# --- Apple's own engine (XProtect Remediator), harvested for free ------------ #
+# XPR is Apple's periodic malware scanner/remediator (25 per-family modules on
+# this machine). Its scan+detection activity is written to the unified log under
+# this subsystem/category and is readable by an unentitled userspace process via
+# `log show` — no root, no ES entitlement. A detection here is Apple's own
+# professionally-maintained engine finding malware: the single highest-value
+# signal a free tool can surface, because it inherits Apple's signature pipeline.
+XPROTECT_SUBSYSTEM = "com.apple.XProtectFramework.PluginAPI"
+XPROTECT_BUNDLES = [
+    "/Library/Apple/System/Library/CoreServices/XProtect.bundle",
+    "/var/protected/xprotect/XProtect.bundle",
+]
+# A clean scan reports this; anything else (with a non-empty caused_by) is a hit.
+XPROTECT_CLEAN_STATUS = "NoThreatDetected"
+XPROTECT_STALE_DAYS = 60  # definitions older than this → surface (Apple ships ~monthly)
+
+# --- Shell HISTORY (ClickFix terminal-paste residue) ------------------------- #
+# ClickFix (now the dominant macOS initial-access vector, >500% growth 2024→25)
+# tricks the user into pasting a command into Terminal. The payload is fetched by
+# curl INSIDE an already-trusted Terminal, so it never gets a quarantine xattr and
+# there is no DMG/Gatekeeper provenance to inspect — but the pasted command leaves
+# a durable line in shell history. We scan recent history for the hostile idioms
+# and the ClickFix chain markers, alerting once per unique offending command.
+SHELL_HISTORY_FILES = [os.path.join(HOME, n) for n in (
+    ".zsh_history", ".bash_history", ".sh_history",
+    ".local/share/fish/fish_history",
+)]
+SHELL_HISTORY_TAIL = 400  # only inspect the most-recent N lines (cheap, recent-focused)
+
+# --- /tmp loot-staging IOC filenames (smash-and-grab) ------------------------ #
+# Persistence-free stealers stage loot in /tmp then curl-exfil in <1 min. These
+# exact staging names are documented across the 2025 families (Atomic, Odyssey/
+# Poseidon, MacSync, DigitStealer). A file matching one in a temp/shared dir is a
+# high-signal indicator even if we miss the process. Also catch a copied keychain.
+STAGING_IOC_RES = [
+    (re.compile(r"^app\.zip$", re.I), "atomic-loot"),
+    (re.compile(r"^ledger\.zip$", re.I), "odyssey-poseidon-loot"),
+    (re.compile(r"^salmonela\.zip$", re.I), "macsync-loot"),
+    (re.compile(r"^out\.zip$", re.I), "generic-loot-archive"),
+    (re.compile(r"^wid\.txt$", re.I), "stealer-victim-id"),
+    (re.compile(r"^\.pass$", re.I), "phished-password-stash"),
+    (re.compile(r"^shub_", re.I), "shub-stealer-staging"),
+    (re.compile(r"login\.keychain-db$", re.I), "staged-keychain-copy"),
+    (re.compile(r"^FileGrabber$", re.I), "amos-filegrabber-dir"),
+]
+STAGING_DIRS = ["/tmp", "/private/tmp", "/Users/Shared"]
+
+# --- Crypto-wallet integrity (wallet-drainer surface) ------------------------ #
+# 2025 stealers don't just steal — they tamper with installed wallet apps to
+# hijack funds: DigitStealer rewrites Ledger Live's app.json with attacker
+# endpoints; Odyssey replaces Ledger Live / Trezor Suite bundles with drainers.
+# We baseline-hash the config files + app main executables that EXIST; a change
+# is HIGH (wallet apps update rarely and the blast radius is a drained wallet).
+WALLET_CONFIG_FILES = [os.path.join(HOME, p) for p in (
+    "Library/Application Support/Ledger Live/app.json",
+    "Library/Application Support/Ledger Live/user.json",
+)]
+WALLET_APP_BINS = [
+    "/Applications/Ledger Live.app/Contents/MacOS/Ledger Live",
+    "/Applications/Trezor Suite.app/Contents/MacOS/Trezor Suite",
+    "/Applications/Exodus.app/Contents/MacOS/Exodus",
+    os.path.join(HOME, "Applications/Ledger Live.app/Contents/MacOS/Ledger Live"),
+]
+
+# --- Known-vendor label impersonation (generalizes the com.apple.* check) ---- #
+# A persistence LABEL claiming a well-known vendor whose backing program isn't
+# signed by that vendor's Team ID is impersonating trusted software. ClickFix
+# stages `com.google.keystone.agent.plist` (+ a fake GoogleUpdate.app) even when
+# Google software isn't installed; ModStealer masquerades similarly. Map a label
+# prefix → the substring that must appear in the program's signing authority/team.
+VENDOR_LABEL_TEAMS = {
+    "com.google.": ("Google", "EQHXZ8M8AV"),
+    "com.microsoft.": ("Microsoft", "UBF8T346G9"),
+    "com.dropbox.": ("Dropbox", "G7HH3F8CAK"),
+}
+
+# --- Canary / honeypot files (ransomware + mass-modification, near-zero-FP) --- #
+# Attribution-independent tripwires: hidden decoy files with valid-looking
+# content. Any modification/deletion of a canary is a high-confidence alarm
+# (ransomware encrypting a folder, or bulk tampering). Opt-in: the user runs
+# `aegis.py canary` to plant them (Aegis never writes outside ~/.aegis without
+# an explicit command), and each scan verifies they're intact.
+CANARY_DIRS = [os.path.join(HOME, d) for d in ("Documents", "Desktop", "Pictures")]
+CANARY_NAME = ".aegis_canary_DO_NOT_DELETE.txt"
+CANARY_STATE = os.path.join(STATE_DIR, "canaries.json")
+CANARY_CONTENT = (
+    "This is an Aegis canary file. It exists to detect ransomware and bulk file\n"
+    "tampering. If a program modified or deleted it, Aegis will alert. Leave it.\n")
 
 # --------------------------------------------------------------------------- #
 # Small utilities
@@ -578,6 +738,24 @@ def _persistence_severity(rec):
         # RustBucket/BlueNoroff shipped `com.apple.systemupdate` behind a hijacked
         # Developer-ID cert, which every signature-only check would wave through.
         return "CRITICAL" if is_risky_location(prog) else "HIGH"
+    # Generalize OS-impersonation to well-known vendors: a label claiming to be
+    # Google/Microsoft/Dropbox whose program isn't signed by that vendor's Team ID
+    # is impersonating trusted software. ClickFix stages a fake
+    # `com.google.keystone.agent` + GoogleUpdate.app even with no Google software
+    # installed; ModStealer masquerades likewise. Verified against the signing
+    # authority/team so a genuine vendor agent (correctly signed) is not flagged.
+    for prefix, (_vendor, team) in VENDOR_LABEL_TEAMS.items():
+        if label.startswith(prefix):
+            # Impersonation requires a RESOLVABLE program that is NOT signed by the
+            # vendor's Team ID. A vendor agent whose program we simply can't resolve
+            # (trust unknown/missing — e.g. the real Google Keystone, whose plist
+            # points at a path absent at scan time) is a weaker "missing" signal,
+            # not an impostor — falling through avoids a HIGH FP on legit software.
+            # Key on the non-forgeable Team ID (present in a Developer-ID leaf
+            # authority as "… (TEAMID)"), NOT the vendor NAME — a substring match on
+            # "Google" would be fooled by an authority reading "Not Google".
+            if trust not in ("missing", "unknown") and team not in (rec.get("authority") or ""):
+                return "CRITICAL" if is_risky_location(prog) else "HIGH"
     if rec.get("env"):
         # a launchd job that injects a dylib/lib path into what it spawns
         # (DYLD_INSERT_LIBRARIES &c.) is a code-injection persistence pattern.
@@ -692,6 +870,249 @@ def check_processes():
 
 
 # --------------------------------------------------------------------------- #
+# Check 2b: BEHAVIORAL process-argv inspection (the fileless-stealer tier).
+#
+# check_processes() above keys on the executable PATH, so it is blind to the
+# dominant 2025 TTP: a hostile command line driven through an Apple-signed
+# interpreter (bash/osascript/curl), whose path is trusted and whose malice is
+# entirely in argv. This reads the full argv of SAME-USER processes and scores
+# the structural-invariant signals (password phish, quarantine strip, keychain
+# copy, invisible DMG mount, exfil POST, tccutil reset) plus the shared hostile
+# idioms. Same-user only (KERN_PROCARGS2) — the honest boundary for an
+# unprivileged agent; consumer smash-and-grab is same-user.
+# --------------------------------------------------------------------------- #
+
+
+# Idioms that become a fileless-exec pipeline only in combination with a fetch —
+# a lone one is common in benign dev work (a Homebrew/rustup `curl … | bash` in
+# flight), so we notify only on the COMBINATION to keep the live-process check
+# low-FP (the moderator's 'alert rarely' + Bitdefender-ATC threshold lesson).
+_PIPE_EXEC_IDIOMS = frozenset((
+    "pipe-to-shell", "pipe-to-interpreter", "osascript-shell", "base64-decode",
+    "python-oneliner", "eval-subshell"))
+_FETCH_IDIOMS = frozenset(("network-fetch", "raw-ip-fetch"))
+
+
+def _argv_signals(argv):
+    """Return [(name, severity)] for hostile patterns in a live process's argv
+    (empty = clean). Structural signals keep their assigned severity; the shared
+    shell idioms notify (HIGH) only as a fetch+exec COMBINATION, else stay MEDIUM;
+    anti-VM gates are MEDIUM corroborators below the notify floor."""
+    if not argv:
+        return []
+    best = {}
+
+    def add(name, sev):
+        if name not in best or SEV_ORDER[sev] > SEV_ORDER[best[name]]:
+            best[name] = sev
+
+    for rx, name, sev in _HOSTILE_ARGV_RES:
+        if rx.search(argv):
+            add(name, sev)
+    idioms = set(_hostile_content(argv))
+    fetch = idioms & _FETCH_IDIOMS
+    execp = idioms & _PIPE_EXEC_IDIOMS
+    if fetch and execp:
+        # network fetch piped into an interpreter = the fileless stealer pipeline.
+        add("fileless-fetch-exec", "HIGH")
+    # Unambiguous idioms are HIGH even alone (a reverse shell / netcat-exec is
+    # never benign); the fetch/pipe idioms alone stay MEDIUM (benign-installer FP).
+    for name in idioms:
+        if name in ("bash-reverse-shell", "netcat-exec", "launchctl-tmp",
+                    "osascript-password-phish", "keychain-dump"):
+            add(name, "HIGH")
+        else:
+            add(name, "MEDIUM")
+    for rx, name in _ANTIVM_ARGV_RES:
+        if rx.search(argv):
+            add(name, "MEDIUM")
+    return sorted(best.items())
+
+
+def check_behavior():
+    """Inspect running processes' full command lines for hostile behavior."""
+    findings = []
+    my_uid = str(os.getuid())
+    # -o …= suppresses headers; comm is the exec path, args is the full argv.
+    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
+    if rc != 0:
+        return findings
+    seen = set()
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, uid, comm, argv = parts
+        # Same-user only: an unprivileged process gets truncated/empty argv for
+        # other users' processes, so a match there would be unreliable. Skip our
+        # own process so a scan never flags the argv patterns in aegis.py itself.
+        if uid != my_uid:
+            continue
+        base = os.path.basename(comm)
+        # Cheap pre-filter: only argv-inspect known interpreter/utility binaries
+        # (keeps the regex work bounded on a 500-process list). A hostile chain
+        # always fronts one of these.
+        if base not in _ARGV_WATCH_BINS and "aegis" not in argv:
+            # still inspect if argv contains an obvious network-fetch idiom
+            if not _FETCH_RE.search(argv):
+                continue
+        if "aegis.py" in argv or "aegis " in argv:
+            continue  # never flag ourselves
+        signals = _argv_signals(argv)
+        if not signals:
+            continue
+        top = max(signals, key=lambda s: SEV_ORDER[s[1]])[1]
+        names = ", ".join(n for n, _ in signals)
+        # Fingerprint on the binary + signal set + a hash of the argv, so the
+        # same offending command alerts once but a new one re-alerts.
+        fp = "behavior:%s:%s:%s" % (
+            base, "|".join(sorted(n for n, _ in signals)),
+            hashlib.sha256(argv.encode()).hexdigest()[:16])
+        if fp in seen:
+            continue
+        seen.add(fp)
+        snippet = argv if len(argv) <= 200 else argv[:197] + "..."
+        findings.append(finding(
+            top, "behavior", "Suspicious process behavior",
+            "%s [%s]: %s" % (base, names, snippet),
+            fp, program=comm, pid=pid, signals=names))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Check 2c: harvest Apple's own XProtect Remediator detections + freshness.
+#
+# XPR is Apple's periodic malware scanner/remediator. Its scan+detection events
+# are in the unified log and readable WITHOUT root or an ES entitlement. A
+# detection here means Apple's professionally-maintained engine found malware —
+# the highest-value signal a free, signature-less tool can surface. We also flag
+# stale XProtect definitions (Apple ships ~monthly; a long gap implies a broken
+# update path or MDM tampering).
+# --------------------------------------------------------------------------- #
+
+
+def check_xprotect(window_hours=None):
+    findings = []
+
+    # (a) Harvest detection events from the unified log since the last scan.
+    #     Bound the window so `log show` stays cheap (≈1.5s for 2h on-host).
+    if window_hours is None:
+        window_hours = 6  # default cadence-sized window; capped below
+    win = "%dh" % max(1, min(int(window_hours), 48))
+    out, _, rc = run(["log", "show", "--last", win, "--style", "ndjson",
+                      "--predicate",
+                      'subsystem == "%s" AND category == "XPEvent.structured"'
+                      % XPROTECT_SUBSYSTEM], timeout=45)
+    if rc == 0 and out:
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            msg = ev.get("eventMessage") or ""
+            try:
+                detail = json.loads(msg)
+            except Exception:
+                detail = {}
+            status = detail.get("status_message") or ""
+            caused = detail.get("caused_by") or []
+            # A clean scan is status "NoThreatDetected" with empty caused_by.
+            # Anything else with evidence is a detection/remediation by Apple.
+            if status and status != XPROTECT_CLEAN_STATUS and (caused or "Detect" in status
+                                                               or "Remediat" in status
+                                                               or "Threat" in status):
+                fam = os.path.basename(ev.get("processImagePath") or "XProtectRemediator")
+                fam = fam.replace("XProtectRemediator", "") or "?"
+                ts = ev.get("timestamp") or ""
+                findings.append(finding(
+                    "CRITICAL", "xprotect",
+                    "Apple XProtect Remediator flagged malware",
+                    "module %s reported '%s' at %s%s — Apple's own engine "
+                    "detected/remediated a threat. Investigate immediately."
+                    % (fam, status, ts,
+                       (" (%s)" % ", ".join(str(c) for c in caused[:3])) if caused else ""),
+                    "xprotect:detect:%s:%s:%s" % (
+                        fam, status,
+                        hashlib.sha256((msg + ts).encode()).hexdigest()[:16]),
+                    module=fam, status=status))
+
+    # (b) Definition freshness — newest bundle mtime across the known locations.
+    newest = None
+    version = None
+    for b in XPROTECT_BUNDLES:
+        try:
+            m = os.path.getmtime(b)
+        except Exception:
+            continue
+        if newest is None or m > newest:
+            newest = m
+            info = os.path.join(b, "Contents", "Info.plist")
+            v, _, vrc = run(["/usr/libexec/PlistBuddy", "-c",
+                             "Print :CFBundleShortVersionString", info], timeout=6)
+            if vrc == 0:
+                version = v.strip()
+    if newest is not None:
+        age_days = (time.time() - newest) / 86400.0
+        if age_days > XPROTECT_STALE_DAYS:
+            findings.append(finding(
+                "MEDIUM", "xprotect", "XProtect definitions are stale",
+                "XProtect (v%s) last updated %.0f days ago (> %d). Apple ships "
+                "updates roughly monthly; a long gap suggests a broken update "
+                "path or MDM interference. Check Software Update."
+                % (version or "?", age_days, XPROTECT_STALE_DAYS),
+                "xprotect:stale:%s" % (version or "unknown")))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Check 2d: shell HISTORY — ClickFix terminal-paste residue.
+#
+# ClickFix (dominant 2025 initial-access vector) tricks the user into pasting a
+# command into Terminal. The payload is fetched by curl inside an already-trusted
+# Terminal, so it never gets a quarantine xattr — but the pasted command leaves a
+# durable line in shell history. We scan the recent tail for hostile idioms /
+# ClickFix markers and alert once per unique offending command line.
+# --------------------------------------------------------------------------- #
+
+
+def check_shell_history():
+    findings = []
+    for path in SHELL_HISTORY_FILES:
+        if not os.path.isfile(path):
+            continue
+        text = _read_text(path)
+        if not text:
+            continue
+        lines = text.splitlines()[-SHELL_HISTORY_TAIL:]
+        for raw in lines:
+            # zsh EXTENDED_HISTORY prefixes ": <ts>:<dur>;cmd" — strip it.
+            cmd = raw
+            if cmd.startswith(":") and ";" in cmd:
+                cmd = cmd.split(";", 1)[1]
+            names = _hostile_content(cmd)
+            for rx, nm, _sev in _HOSTILE_ARGV_RES:
+                if rx.search(cmd):
+                    names.append(nm)
+            names = sorted(set(names))
+            if not names:
+                continue
+            snippet = cmd.strip()
+            snippet = snippet if len(snippet) <= 200 else snippet[:197] + "..."
+            findings.append(finding(
+                "HIGH", "shell-history",
+                "Hostile command in shell history",
+                "%s [%s]: %s" % (os.path.basename(path), ", ".join(names), snippet),
+                "shellhist:%s:%s" % (
+                    os.path.basename(path),
+                    hashlib.sha256(cmd.strip().encode()).hexdigest()[:16]),
+                path=path, hostile=names))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
 # Check 3: hot-directory freshly-dropped executables
 # --------------------------------------------------------------------------- #
 
@@ -737,6 +1158,51 @@ def check_hot_dirs(max_age_days=14):
                     "hotdir:%s:%s:%s" % (path, sig["trust"], sha),
                     path=path, trust=sig["trust"], sha256=sha,
                     quarantined=quar, download_agent=agent))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Check 3b: /tmp loot-staging IOC filenames (smash-and-grab stealers).
+#
+# Persistence-free stealers stage loot in a temp dir then curl-exfil in under a
+# minute — defeating both persistence-diffing and the Mach-O hot-dir check (the
+# loot is a .zip, not an executable). These exact staging filenames are
+# documented across the 2025 families; a match is a high-signal residue even if
+# the sub-minute process was missed between poll ticks. Recent files only.
+# --------------------------------------------------------------------------- #
+
+
+def check_staging(max_age_days=3):
+    findings = []
+    cutoff = time.time() - max_age_days * 86400
+    for d in STAGING_DIRS:
+        try:
+            entries = os.listdir(d)
+        except Exception:
+            continue
+        for name in entries[:4000]:
+            ioc = None
+            for rx, label in STAGING_IOC_RES:
+                if rx.search(name):
+                    ioc = label
+                    break
+            if not ioc:
+                continue
+            path = os.path.join(d, name)
+            try:
+                st = os.stat(path)
+            except Exception:
+                continue
+            if st.st_mtime < cutoff:
+                continue
+            findings.append(finding(
+                "HIGH", "staging",
+                "Stealer loot-staging artifact in temp dir",
+                "%s (%s) — matches a documented 2025 macOS stealer staging "
+                "pattern; a process may have staged loot here for exfiltration."
+                % (path, ioc),
+                "staging:%s:%s" % (path, int(st.st_mtime)),
+                path=path, ioc=ioc))
     return findings
 
 
@@ -1049,6 +1515,37 @@ def diff_ide_ext(prior, cur):
     return _diff_map(prior, cur, new_fn)
 
 
+# --- crypto-wallet integrity --------------------------------------------------
+# 2025 stealers tamper with installed wallet apps to hijack funds (DigitStealer
+# rewrites Ledger Live's app.json; Odyssey swaps wallet bundles for drainers). We
+# baseline-hash the wallet config files + app main executables that EXIST; a
+# CHANGE is HIGH — wallet apps update rarely and the blast radius is a drained
+# wallet. Only present files are snapshotted, so a machine without wallets is quiet.
+def snapshot_wallet():
+    snap = {}
+    for p in WALLET_CONFIG_FILES + WALLET_APP_BINS:
+        if os.path.isfile(p):
+            h = sha256(p)
+            if h:
+                snap[p] = h
+    return snap
+
+
+def diff_wallet(prior, cur):
+    def _mk(title, verb):
+        def f(p, h, *old):
+            kind = "config" if p.endswith(".json") else "application binary"
+            return finding("HIGH", "wallet-integrity", title,
+                           "%s (%s) %s — crypto-wallet apps are a wallet-drainer "
+                           "target; verify this was a legitimate update, not a "
+                           "malicious swap." % (p, kind, verb),
+                           "wallet:%s:%s:%s" % ("changed" if old else "new", p, h),
+                           path=p, sha256=h)
+        return f
+    return _diff_map(prior, cur, _mk("New wallet file", "appeared"),
+                     _mk("Wallet file CHANGED", "changed"))
+
+
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
 SURFACES = [
     ("shellrc", snapshot_shellrc, diff_shellrc),
@@ -1057,6 +1554,7 @@ SURFACES = [
     ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
     ("browserext", snapshot_browserext, diff_browserext),
     ("ide_ext", snapshot_ide_ext, diff_ide_ext),
+    ("wallet", snapshot_wallet, diff_wallet),
 ]
 
 
@@ -1093,6 +1591,24 @@ def check_self_protection():
             "%s shrank from %d to %d bytes since the last scan — the append-only "
             "evidence log may have been tampered with." % (FINDINGS_LOG, prev, cur_size),
             "self:log:truncated:%d" % prev))
+
+    # (c) Local trust-store tampering (moderator blind-spot): baseline.json and
+    # allowlist.json live in ~/.aegis, writable by the SAME uid as the dominant
+    # same-user stealer class. An attacker who poisons the baseline (blesses its
+    # own persistence) or pre-inserts an allowlist entry makes Aegis diff against
+    # corrupted ground truth. We record each file's hash right after WE write it;
+    # a mismatch at the next scan means it changed by a hand that wasn't ours.
+    for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
+        recorded = st.get("%s_sha" % name)
+        cur_sha = sha256(path) if os.path.exists(path) else None
+        if recorded and cur_sha and recorded != cur_sha:
+            findings.append(finding(
+                "HIGH", "self-protection",
+                "Aegis %s modified out-of-band" % name,
+                "%s changed since Aegis last wrote it — its integrity hash no "
+                "longer matches. If you did not run `aegis.py baseline`/`allow`, "
+                "the trust store may have been poisoned to hide an intrusion."
+                % path, "self:%s:tampered:%s" % (name, cur_sha[:16])))
     return findings
 
 
@@ -1105,7 +1621,45 @@ def record_selfstate():
         st["findings_size"] = os.path.getsize(FINDINGS_LOG)
     except Exception:
         st["findings_size"] = 0
+    # Record trust-store hashes so the NEXT scan can detect out-of-band edits.
+    for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
+        st["%s_sha" % name] = sha256(path) if os.path.exists(path) else None
     save_json(SELFSTATE, st)
+
+
+# --------------------------------------------------------------------------- #
+# Check 6: canary / honeypot files (ransomware + bulk-tamper tripwire).
+#
+# Attribution-independent, near-zero-FP (the moderator's recommendation over a
+# statistically-weak entropy port): hidden decoy files with valid content. Any
+# modification or deletion of a planted canary is a high-confidence alarm — a
+# process encrypting a folder or bulk-tampering will hit them. Opt-in: the user
+# runs `aegis.py canary` to plant (Aegis never writes outside ~/.aegis without an
+# explicit command); each scan then verifies the planted canaries are intact.
+# --------------------------------------------------------------------------- #
+
+
+def check_canaries():
+    findings = []
+    state = load_json(CANARY_STATE, {})
+    for path, expected in state.items():
+        if not os.path.exists(path):
+            findings.append(finding(
+                "CRITICAL", "canary", "Canary file was DELETED",
+                "%s no longer exists — a planted decoy was removed, a strong "
+                "ransomware / bulk-tamper signal. Check the folder for mass "
+                "encryption or deletion." % path, "canary:deleted:%s" % path,
+                path=path))
+            continue
+        cur = sha256(path)
+        if cur != expected:
+            findings.append(finding(
+                "CRITICAL", "canary", "Canary file was MODIFIED",
+                "%s was altered — a planted decoy that nothing legitimate should "
+                "touch changed content. Strong ransomware / bulk-tamper signal."
+                % path, "canary:modified:%s:%s" % (path, (cur or "gone")[:16]),
+                path=path))
+    return findings
 
 
 def _scan_surfaces(baseline, corrupt, first_run):
@@ -1146,7 +1700,12 @@ def gather_all(baseline_snap, current_snap):
     findings += check_persistence(baseline_snap, current_snap)
     findings += check_cron()
     findings += check_processes()
+    findings += check_behavior()        # fileless-stealer argv tier
+    findings += check_xprotect()        # harvest Apple's XProtect Remediator
+    findings += check_shell_history()   # ClickFix terminal-paste residue
     findings += check_hot_dirs()
+    findings += check_staging()         # /tmp loot-staging IOCs
+    findings += check_canaries()        # ransomware/bulk-tamper tripwire (opt-in)
     findings += check_hardening()
     findings += check_self_protection()
     # Sort by severity desc, then category.
@@ -1216,12 +1775,16 @@ def emit(findings, first_run):
             seen[fp] = f["ts"]
             log.write(json.dumps(f) + "\n")
             # First-run silence is the KnockKnock "trust what's already installed"
-            # rule — it applies to PERSISTENCE only. A payload already sitting in
-            # a hot dir, a suspicious running process, or a weak hardening setting
-            # is a live risk the user must hear about even on the very first scan;
-            # suppressing those permanently (they'd land in `seen` and never
-            # re-alert) would silence a threat that predated install.
-            suppressed = first_run and f["category"] == "persistence"
+            # rule — it applies to PERSISTENCE and SHELL-HISTORY only, the two
+            # surfaces made of accreted-over-time RESIDUE (a launchd item, or a
+            # months-old `curl|sh` install line). Suppressing them on the first
+            # scan adopts the existing state silently (still LOGGED) so upgrading
+            # Aegis on a busy machine is not an alert storm; NEW ones thereafter
+            # alert. A payload already sitting in a hot dir, a suspicious RUNNING
+            # process (behavior), an XProtect detection, /tmp staging, a modified
+            # canary, or a weak hardening setting is a LIVE risk the user must
+            # hear about even on the very first scan — those are never suppressed.
+            suppressed = first_run and f["category"] in ("persistence", "shell-history")
             if not suppressed and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
                 new_high.append(f)
     save_json(SEEN, _cap_seen(seen))
@@ -1315,6 +1878,47 @@ def cmd_baseline():
     return 0
 
 
+def cmd_canary(action="plant"):
+    """Plant / remove ransomware canary (honeypot) files. Opt-in remediation-
+    adjacent capability: this is the ONLY path by which Aegis writes outside
+    ~/.aegis, and only on explicit user command."""
+    ensure_state()
+    if action == "remove":
+        state = load_json(CANARY_STATE, {})
+        removed = 0
+        for path in list(state):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                removed += 1
+            except Exception:
+                pass
+        save_json(CANARY_STATE, {})
+        print("Removed %d canary file(s)." % removed)
+        return 0
+    # plant
+    state = {}
+    for d in CANARY_DIRS:
+        if not os.path.isdir(d):
+            continue
+        path = os.path.join(d, CANARY_NAME)
+        try:
+            with open(path, "w") as f:
+                f.write(CANARY_CONTENT)
+            try:  # hide it from casual view (best-effort; not a security control)
+                run(["chflags", "hidden", path], timeout=5)
+            except Exception:
+                pass
+            state[path] = sha256(path)
+        except Exception:
+            continue
+    save_json(CANARY_STATE, state)
+    print("Planted %d canary file(s). Aegis will alert CRITICAL if any is "
+          "modified or deleted (ransomware / bulk-tamper tripwire).\n"
+          "Remove with: aegis.py canary remove" % len(state))
+    return 0
+
+
 def cmd_report():
     if os.path.exists(LATEST_MD):
         with open(LATEST_MD) as f:
@@ -1342,6 +1946,26 @@ def cmd_status():
             print("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
         else:
             print("  ✓ %-32s ok" % label)
+
+    # Apple's own engine: report XProtect definition version/age (piggybacks the
+    # professionally-maintained signature pipeline; a stale value is a red flag).
+    newest, version = None, None
+    for b in XPROTECT_BUNDLES:
+        try:
+            m = os.path.getmtime(b)
+        except Exception:
+            continue
+        if newest is None or m > newest:
+            newest = m
+            info = os.path.join(b, "Contents", "Info.plist")
+            v, _, vrc = run(["/usr/libexec/PlistBuddy", "-c",
+                             "Print :CFBundleShortVersionString", info], timeout=6)
+            version = v.strip() if vrc == 0 else None
+    if newest is not None:
+        age = (time.time() - newest) / 86400.0
+        mark = "✓" if age <= XPROTECT_STALE_DAYS else "✗"
+        print("  %s %-32s v%s, updated %.0f days ago"
+              % (mark, "XProtect definitions", version or "?", age))
     return 0
 
 
@@ -1375,12 +1999,13 @@ def cmd_watch(interval=300):
 
 HELP = """aegis.py - personal macOS security monitor (detect-and-alert)
 
-  scan            run all checks once; update report; alert on new HIGH+
-  report          print the latest report
-  status          print hardening posture only (fast)
-  baseline        reset the known-good persistence baseline to current state
-  allow <path>    suppress future alerts for findings matching <path>
-  watch [secs]    foreground loop (default 300s; prefer launchd in production)
+  scan             run all checks once; update report; alert on new HIGH+
+  report           print the latest report
+  status           print hardening posture + XProtect definition age (fast)
+  baseline         reset the known-good persistence baseline to current state
+  allow <path>     suppress future alerts for findings matching <path>
+  canary [remove]  plant (or remove) ransomware canary/honeypot files
+  watch [secs]     foreground loop (default 300s; prefer launchd in production)
 """
 
 
@@ -1396,6 +2021,8 @@ def main(argv):
         return cmd_baseline()
     if cmd == "allow" and len(argv) > 2:
         return cmd_allow(argv[2])
+    if cmd == "canary":
+        return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 300)
     sys.stdout.write(HELP)
