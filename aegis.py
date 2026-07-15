@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-Aegis - a personal macOS background security monitor (detect-and-alert).
+Aegis - a personal macOS background security monitor (detect + opt-in response).
 
 HONEST SCOPE
 ------------
-This is a KnockKnock / osquery-tier *detection* tool, not an antivirus and not
-a real-time *blocker*. Real-time blocking on macOS requires Apple's Endpoint
-Security framework, which needs the restricted
+This is a KnockKnock / osquery-tier *detection* tool with an opt-in RESPONSE
+tier — not an antivirus and not a real-time *blocker*. Real-time blocking on
+macOS requires Apple's Endpoint Security framework, which needs the restricted
 `com.apple.developer.endpoint-security.client` entitlement PLUS a Developer-ID
 signing certificate (Apple grants these case-by-case, often not to individuals).
 Aegis deliberately uses only unprivileged, entitlement-free APIs and the stable
 system CLIs, so it runs today with zero setup, no signing cert, and a minimal
 attack/maintenance surface: Python standard library only, no third-party deps.
+
+The scan/watch path is DETECT-ONLY and never destructive. Acting on a threat is
+a separate, opt-in RESPONSE tier that you invoke by hand on a reviewed finding —
+never automatically. It mirrors the industry ladder (SentinelOne Kill→Quarantine
+→Remediate→Rollback; Microsoft Defender's reversible-store + review-every-action
+doctrine): quarantine neutralizes and confines a file to a REVERSIBLE store,
+restore undoes it byte-for-byte (a false positive costs minutes, not data), and
+destroy — the only irreversible verb — can act ONLY on an already-quarantined
+item (quarantine-first, never-delete-first). Plus kill (same-user process),
+sandbox (detonate a suspect binary in a deny-default Seatbelt jail), and
+neutralize (ordered bootout→kill→quarantine kill-chain for launchd persistence).
 
 WHAT IT DOES (on an interval, via launchd)
 ------------------------------------------
@@ -51,8 +62,11 @@ Afterwards only genuinely-new findings at >= HIGH severity raise a macOS
 notification, and each fingerprint fires at most once. Everything is written to
 a durable append-only log so nothing is missed if a notification is.
 
-STATE  -> ~/.aegis/   (baseline.json, findings.jsonl, latest.md, seen.json, ...)
-USAGE  -> aegis.py [scan|report|status|baseline|allow <path>|watch]
+STATE  -> ~/.aegis/   (baseline.json, findings.jsonl, latest.md, seen.json,
+                       quarantine/ store + manifest, actions.jsonl audit, ...)
+USAGE  -> aegis.py [scan|report|status|baseline|allow <path>|canary|watch]
+          aegis.py [quarantine <path>|quarantine-list|restore <id>|
+                    destroy <id> --yes|kill <pid>|sandbox <path>|neutralize <plist>]
 """
 
 import json
@@ -80,6 +94,29 @@ SEEN = os.path.join(STATE_DIR, "seen.json")
 SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
+
+# --- Response tier (opt-in; never automatic) --------------------------------- #
+# The quarantine STORE: a confined, reversible holding area for neutralized
+# threat files. Mirrors the industry ladder (SentinelOne Kill→Quarantine→
+# Remediate, Defender's reversible store with restore metadata): quarantine
+# MOVES a file here and neutralizes it, `restore` reverses it byte-identically,
+# `destroy` is the only irreversible step and can ONLY act on an already-
+# quarantined item (the "quarantine-first, never-delete-first" doctrine). Every
+# response action is appended to a durable action log.
+QUARANTINE_DIR = os.path.join(STATE_DIR, "quarantine")
+QUARANTINE_MANIFEST = os.path.join(QUARANTINE_DIR, "manifest.json")
+ACTION_LOG = os.path.join(STATE_DIR, "actions.jsonl")
+
+# Neutralization key for the stored sample. This is deliberate OBFUSCATION, not
+# cryptography: a repeating-key XOR renders the quarantined bytes non-executable
+# (a double-click / accidental run can't launch it) and stops another on-host
+# scanner — or Aegis itself on the next pass — from re-flagging the store as live
+# malware (the classic AV "neutered sample" trick). XOR is symmetric, so `restore`
+# reverses it exactly. It is NOT a confidentiality control and is not claimed as one.
+_QUAR_XOR_KEY = b"AegisQuarantine\x17"  # 16 bytes
+
+# Absolute path of this script — never quarantine/kill/destroy Aegis itself.
+_SELF_PATH = os.path.abspath(__file__)
 
 SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
 SEV_ICON = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦", "INFO": "⬜"}
@@ -2023,8 +2060,519 @@ def cmd_watch(interval=300):
             return 0
 
 
-HELP = """aegis.py - personal macOS security monitor (detect-and-alert)
+# --------------------------------------------------------------------------- #
+# RESPONSE TIER (opt-in; never automatic; staged and reversible-by-default).
+#
+# The scanner above is detect-only by design. This tier adds the ability to
+# ACT on a finding — but only ever by explicit user command, mirroring the
+# industry doctrine the research surfaced (SentinelOne's Kill→Quarantine→
+# Remediate→Rollback ladder; Microsoft Defender's "every automated action must
+# be reviewable and reversible" playbook):
+#
+#   quarantine <path>  neutralize + confine a file to a reversible store
+#   restore <id>       un-quarantine: reverse the neutralization byte-for-byte
+#   destroy <id>       securely erase a quarantined item (IRREVERSIBLE; --yes)
+#   kill <pid>         terminate a SAME-USER process (SIGTERM→SIGKILL)
+#   sandbox <path>     detonate a suspect binary in a deny-default Seatbelt jail
+#   neutralize <plist> ordered kill-chain for launchd-backed malware
+#
+# Hard safety rails (all destructive verbs): quarantine-first-never-delete-first
+# (`destroy` only touches the store, never a live path), protected-path refusal
+# (SIP/system/Apple, Aegis's own files, $HOME and its ancestors), same-user-only
+# process actions, never-act-on-self, and an append-only actions.jsonl audit.
+# None of the ES-entitlement-gated real-time blocking is claimed; this is
+# on-demand response to a file/process a human has reviewed.
+# --------------------------------------------------------------------------- #
 
+
+def ensure_quarantine():
+    ensure_state()
+    os.makedirs(QUARANTINE_DIR, exist_ok=True)
+    try:
+        os.chmod(QUARANTINE_DIR, 0o700)  # store is owner-only
+    except Exception:
+        pass
+
+
+def log_action(action, target, result, **extra):
+    """Durable, append-only audit of every response action (success OR refusal)."""
+    rec = {"ts": now_iso(), "action": action, "target": target, "result": result}
+    rec.update(extra)
+    try:
+        with open(ACTION_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    log_run("%s %s -> %s" % (action, target, result))
+
+
+# Top-level paths whose removal/quarantine would be catastrophic — refuse even
+# though they exist and are "files" to os. HOME itself and any ancestor of HOME
+# are added dynamically in _is_protected_path.
+_PROTECTED_EXACT = frozenset((
+    "/", "/Users", "/Applications", "/System", "/Library", "/bin", "/sbin",
+    "/usr", "/etc", "/var", "/private", "/opt", HOME))
+
+
+def _is_protected_path(path):
+    """True if `path` must never be quarantined/destroyed. Refuses SIP/system/
+    Apple locations (we can't and shouldn't touch them), Aegis's own files, the
+    quarantine store itself, $HOME, and any ANCESTOR of $HOME (so a mistyped
+    parent dir can't take the home directory with it)."""
+    if not path:
+        return True
+    rp = os.path.realpath(path)
+    if rp in _PROTECTED_EXACT:
+        return True
+    if any(rp == p or rp.startswith(p.rstrip("/") + "/") for p in TRUSTED_PREFIXES):
+        return True
+    # Aegis's own state, store, and script. Compare against REAL paths so a
+    # symlinked ~/.aegis or script location is still covered (same reason as HOME).
+    self_rp = os.path.realpath(_SELF_PATH)
+    state_rp = os.path.realpath(STATE_DIR)
+    if rp == self_rp or rp == state_rp or rp.startswith(state_rp + os.sep):
+        return True
+    # HOME itself, or any ANCESTOR of HOME (e.g. "/Users") — protects the home
+    # tree. Compare against the REAL path of HOME so a symlinked/relocated home
+    # (networked mount, /var-style indirection) is still covered.
+    home_rp = os.path.realpath(HOME)
+    if rp == home_rp or home_rp.startswith(rp.rstrip("/") + "/"):
+        return True
+    return False
+
+
+def _xor_copy(src, dst, key=_QUAR_XOR_KEY):
+    """Stream src -> dst applying a repeating-key XOR. Returns the sha256 of the
+    PLAINTEXT (pre-XOR) bytes so the caller can record it. Symmetric: calling it
+    again on the XORed file reverses the transform."""
+    h = hashlib.sha256()
+    klen = len(key)
+    i = 0
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while True:
+            chunk = fi.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            out = bytes(b ^ key[(i + n) % klen] for n, b in enumerate(chunk))
+            fo.write(out)
+            i += len(chunk)
+    return h.hexdigest()
+
+
+def _xor_verify_plaintext_sha(quar_path, key=_QUAR_XOR_KEY):
+    """Stream the XORed store file back through XOR and return the sha256 of the
+    reconstructed plaintext — used to PROVE a quarantined item can be restored
+    byte-identically BEFORE we unlink the original (the never-lose-data invariant)."""
+    h = hashlib.sha256()
+    klen = len(key)
+    i = 0
+    with open(quar_path, "rb") as fi:
+        while True:
+            chunk = fi.read(1 << 20)
+            if not chunk:
+                break
+            plain = bytes(b ^ key[(i + n) % klen] for n, b in enumerate(chunk))
+            h.update(plain)
+            i += len(chunk)
+    return h.hexdigest()
+
+
+def _raw_quarantine_xattr(path):
+    """The raw com.apple.quarantine xattr value (or None), so restore can replay
+    the exact provenance the file carried. os.getxattr is absent on macOS
+    (stdlib), so we shell out to Apple's `xattr` like the rest of the tool."""
+    out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def cmd_quarantine(path, detection="manual"):
+    """Neutralize + confine a file to the reversible quarantine store.
+
+    Order of operations is chosen so the ORIGINAL is never lost if any step
+    fails: copy-with-neutralization into the store → verify the stored copy
+    reconstructs to the original hash → only THEN unlink the original. A failure
+    before the verify leaves the original exactly where it was."""
+    ensure_quarantine()
+    rp = os.path.realpath(path)
+
+    if not os.path.exists(rp):
+        print("refuse: %s does not exist" % path)
+        log_action("quarantine", rp, "refused-missing")
+        return 1
+    if os.path.islink(path):
+        # We resolved with realpath; refuse to act through a symlink to avoid
+        # quarantining an unexpected target.
+        print("refuse: %s is a symlink; pass the real target path" % path)
+        log_action("quarantine", path, "refused-symlink")
+        return 1
+    if os.path.isdir(rp):
+        print("refuse: %s is a directory; Aegis quarantines regular files only "
+              "(a Mach-O, plist, or staged archive), not trees" % rp)
+        log_action("quarantine", rp, "refused-directory")
+        return 1
+    if not os.path.isfile(rp):
+        print("refuse: %s is not a regular file" % rp)
+        log_action("quarantine", rp, "refused-not-regular")
+        return 1
+    if _is_protected_path(rp):
+        print("refuse: %s is a protected system/Aegis path and will not be "
+              "quarantined" % rp)
+        log_action("quarantine", rp, "refused-protected")
+        return 1
+
+    try:
+        st = os.stat(rp)
+    except Exception as e:
+        print("refuse: cannot stat %s (%s)" % (rp, e))
+        return 1
+
+    orig_sha = sha256(rp)
+    qxattr = _raw_quarantine_xattr(rp)
+    qid = "%s-%s" % (datetime.now().strftime("%Y%m%dT%H%M%S"),
+                     (orig_sha or hashlib.sha256(rp.encode()).hexdigest())[:10])
+    item_dir = os.path.join(QUARANTINE_DIR, qid)
+    payload = os.path.join(item_dir, "payload.quar")
+    try:
+        os.makedirs(item_dir, exist_ok=False)
+        os.chmod(item_dir, 0o700)
+    except Exception as e:
+        print("error: could not create store entry (%s)" % e)
+        log_action("quarantine", rp, "error-store", detail=str(e))
+        return 1
+
+    # 1) Neutralize-copy into the store and 2) prove it reconstructs.
+    try:
+        copied_sha = _xor_copy(rp, payload)
+        if copied_sha != orig_sha:
+            raise ValueError("read mismatch during copy")
+        if _xor_verify_plaintext_sha(payload) != orig_sha:
+            raise ValueError("store copy does not reconstruct to the original")
+        os.chmod(payload, 0o000)  # not readable/executable at rest
+    except Exception as e:
+        shutil.rmtree(item_dir, ignore_errors=True)
+        print("error: neutralization/verify failed, original left untouched (%s)" % e)
+        log_action("quarantine", rp, "error-verify", detail=str(e))
+        return 1
+
+    # 3) Only now remove the original — restore is provably possible.
+    try:
+        os.remove(rp)
+    except Exception as e:
+        shutil.rmtree(item_dir, ignore_errors=True)
+        print("error: could not remove original (%s); nothing quarantined "
+              "(check permissions; a system file may need sudo)" % e)
+        log_action("quarantine", rp, "error-remove", detail=str(e))
+        return 1
+
+    meta = {"id": qid, "orig_path": rp, "sha256": orig_sha, "size": st.st_size,
+            "mode": st.st_mode & 0o7777, "uid": st.st_uid, "gid": st.st_gid,
+            "quarantine_xattr": qxattr, "detection": detection, "ts": now_iso()}
+    save_json(os.path.join(item_dir, "meta.json"), meta)
+    manifest = load_json(QUARANTINE_MANIFEST, {})
+    manifest[qid] = meta
+    save_json(QUARANTINE_MANIFEST, manifest)
+    log_action("quarantine", rp, "ok", id=qid, sha256=orig_sha)
+    print("Quarantined: %s\n  id:      %s\n  store:   %s (neutralized, chmod 000)\n"
+          "  restore: aegis.py restore %s\n  destroy: aegis.py destroy %s --yes  "
+          "(irreversible)" % (rp, qid, payload, qid, qid))
+    return 0
+
+
+def cmd_quarantine_list():
+    manifest = load_json(QUARANTINE_MANIFEST, {})
+    if not manifest:
+        print("Quarantine store is empty.")
+        return 0
+    print("# Quarantine store (%d item%s)\n"
+          % (len(manifest), "" if len(manifest) == 1 else "s"))
+    for qid in sorted(manifest):
+        m = manifest[qid]
+        print("  %s  %s\n      from %s  (%s bytes, detected: %s)"
+              % (qid, m.get("ts", "?"), m.get("orig_path", "?"),
+                 m.get("size", "?"), m.get("detection", "?")))
+    print("\nrestore: aegis.py restore <id>   destroy: aegis.py destroy <id> --yes")
+    return 0
+
+
+def cmd_restore(qid):
+    """Reverse a quarantine byte-for-byte: reconstruct the original, put it back
+    at its recorded path (or path+'.restored' if something now occupies it),
+    replay mode + quarantine xattr, and drop the store entry."""
+    ensure_quarantine()
+    manifest = load_json(QUARANTINE_MANIFEST, {})
+    m = manifest.get(qid)
+    if not m:
+        print("no such quarantine id: %s (see: aegis.py quarantine-list)" % qid)
+        return 1
+    payload = os.path.join(QUARANTINE_DIR, qid, "payload.quar")
+    if not os.path.exists(payload):
+        print("error: store payload for %s is missing; cannot restore" % qid)
+        log_action("restore", qid, "error-payload-missing")
+        return 1
+    dest = m["orig_path"]
+    if os.path.exists(dest):
+        dest = dest + ".restored"
+        print("note: %s now exists; restoring to %s" % (m["orig_path"], dest))
+    tmp = dest + ".aegis-restore.tmp"
+    try:
+        os.chmod(payload, 0o600)  # we chmod 000'd it at rest
+        _xor_copy(payload, tmp)  # XOR is symmetric → writes plaintext back out
+        # _xor_copy returns the sha of its INPUT (here the ciphertext), so verify
+        # against the sha of the reconstructed OUTPUT instead.
+        if sha256(tmp) != m.get("sha256"):
+            raise ValueError("recovered hash does not match recorded original")
+        os.replace(tmp, dest)
+        os.chmod(dest, m.get("mode", 0o644))
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        print("error: restore failed (%s); store entry left intact" % e)
+        log_action("restore", qid, "error", detail=str(e))
+        return 1
+    if m.get("quarantine_xattr"):
+        run(["xattr", "-w", "com.apple.quarantine", m["quarantine_xattr"], dest],
+            timeout=6)
+    shutil.rmtree(os.path.join(QUARANTINE_DIR, qid), ignore_errors=True)
+    manifest.pop(qid, None)
+    save_json(QUARANTINE_MANIFEST, manifest)
+    log_action("restore", m["orig_path"], "ok", id=qid, dest=dest)
+    print("Restored %s -> %s (verified byte-identical to the original)."
+          % (qid, dest))
+    return 0
+
+
+def cmd_destroy(qid, confirmed=False):
+    """IRREVERSIBLE. Securely-ish erase a quarantined item from the store. This
+    is the only destructive verb, and by construction it can act ONLY on
+    something already quarantined — there is no 'delete a live path' command
+    (the industry's quarantine-first-never-delete-first invariant)."""
+    ensure_quarantine()
+    manifest = load_json(QUARANTINE_MANIFEST, {})
+    m = manifest.get(qid)
+    if not m:
+        print("no such quarantine id: %s" % qid)
+        return 1
+    if not confirmed:
+        print("REFUSING without confirmation. `destroy` is IRREVERSIBLE and the "
+              "item cannot be restored afterwards.\n  Item: %s (from %s)\n  "
+              "Re-run: aegis.py destroy %s --yes" % (qid, m.get("orig_path"), qid))
+        return 1
+    item_dir = os.path.join(QUARANTINE_DIR, qid)
+    payload = os.path.join(item_dir, "payload.quar")
+    try:
+        if os.path.exists(payload):
+            os.chmod(payload, 0o600)
+            size = os.path.getsize(payload)
+            with open(payload, "r+b") as f:  # single overwrite pass, then unlink
+                remaining = size
+                while remaining > 0:
+                    n = min(remaining, 1 << 20)
+                    f.write(os.urandom(n))
+                    remaining -= n
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception as e:
+        print("warning: overwrite pass failed (%s); removing anyway" % e)
+    shutil.rmtree(item_dir, ignore_errors=True)
+    manifest.pop(qid, None)
+    save_json(QUARANTINE_MANIFEST, manifest)
+    log_action("destroy", m.get("orig_path"), "ok", id=qid, sha256=m.get("sha256"))
+    print("Destroyed %s (from %s). This cannot be undone.\n"
+          "Note: on an APFS/SSD volume a single overwrite is not a guaranteed "
+          "secure-erase (wear-levelling); FileVault is the real at-rest guarantee."
+          % (qid, m.get("orig_path")))
+    return 0
+
+
+# comm basenames we refuse to kill even if same-user — killing these wedges the
+# session. (kernel_task/launchd/WindowServer run as root/_windowserver, so the
+# same-user gate already excludes them; this is defence-in-depth for the rest.)
+_PROTECTED_COMMS = frozenset((
+    "launchd", "logind", "loginwindow", "WindowServer", "Dock", "Finder",
+    "SystemUIServer", "coreauthd", "opendirectoryd", "cfprefsd", "Terminal",
+    "iTerm2", "sshd", "aegis.py", "python3", "python"))
+
+
+def cmd_kill(pid):
+    """Terminate a SAME-USER process (SIGTERM, then SIGKILL if it survives).
+    Refuses other users' processes (we have no right and no reliable argv),
+    Aegis's own process tree, and a small set of session-critical comms."""
+    try:
+        pid = int(pid)
+    except Exception:
+        print("usage: aegis.py kill <pid>")
+        return 1
+    if pid in (0, 1, os.getpid(), os.getppid()):
+        print("refuse: will not kill pid %d (self/parent/init)" % pid)
+        log_action("kill", str(pid), "refused-self")
+        return 1
+    out, _, rc = run(["ps", "-o", "uid=,comm=", "-p", str(pid)], timeout=8)
+    if rc != 0 or not out.strip():
+        print("no such process: %d" % pid)
+        return 1
+    parts = out.strip().split(None, 1)
+    puid = parts[0]
+    comm = os.path.basename(parts[1]) if len(parts) > 1 else "?"
+    if puid != str(os.getuid()):
+        print("refuse: pid %d belongs to uid %s, not you; Aegis only acts on "
+              "your own processes" % (pid, puid))
+        log_action("kill", str(pid), "refused-other-user", uid=puid, comm=comm)
+        return 1
+    if comm in _PROTECTED_COMMS:
+        print("refuse: pid %d is a session-critical process (%s)" % (pid, comm))
+        log_action("kill", str(pid), "refused-protected-comm", comm=comm)
+        return 1
+    import signal as _signal
+    try:
+        os.kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        print("pid %d already gone" % pid)
+        return 0
+    except PermissionError:
+        print("refuse: not permitted to signal pid %d" % pid)
+        return 1
+    for _ in range(10):  # up to ~1s for a graceful exit
+        time.sleep(0.1)
+        if run(["ps", "-p", str(pid)], timeout=5)[2] != 0:
+            log_action("kill", str(pid), "ok-sigterm", comm=comm)
+            print("Killed pid %d (%s) with SIGTERM." % (pid, comm))
+            return 0
+    try:
+        os.kill(pid, _signal.SIGKILL)
+    except Exception:
+        pass
+    gone = run(["ps", "-p", str(pid)], timeout=5)[2] != 0
+    log_action("kill", str(pid), "ok-sigkill" if gone else "failed", comm=comm)
+    print("%s pid %d (%s)%s" % ("Killed" if gone else "Could NOT kill", pid, comm,
+                                " with SIGKILL." if gone else " — still running."))
+    return 0 if gone else 1
+
+
+# Deny-default Seatbelt profile for detonating a suspect binary. Allows only
+# what a process needs to start and read its own image; denies network, all
+# writes, and the sensitive dirs. sandbox-exec/Seatbelt is deprecated by Apple
+# but fully functional (macOS 26 verified; Apple itself and shipping CLIs still
+# use .sb) — the only entitlement-free process-jail available to a userspace tool.
+_SANDBOX_PROFILE = """(version 1)
+(deny default)
+(allow process-fork)
+(allow process-exec)
+(allow file-read*)
+(allow sysctl-read)
+(allow mach-lookup)
+(deny network*)
+(deny file-write*)
+(deny file-read* (subpath "%s"))
+(deny file-read* (subpath "%s"))
+""" % (os.path.join(HOME, "Library", "Keychains"),
+       os.path.join(HOME, "Library", "Application Support"))
+
+
+def cmd_sandbox(path, extra_args=None):
+    """Detonate/inspect a suspect binary inside a deny-default Seatbelt jail:
+    no network, no filesystem writes, no keychain/App-Support reads. Lets you
+    watch what it *tries* to do without letting it phone home or steal data.
+    Honest caveat: this is a jail, not a VM — kernel bugs or a sandbox escape
+    could still bite; use a throwaway VM for true detonation."""
+    rp = os.path.realpath(path)
+    if not os.path.isfile(rp):
+        print("refuse: %s is not a file" % rp)
+        return 1
+    if not os.path.exists("/usr/bin/sandbox-exec"):
+        print("error: /usr/bin/sandbox-exec is not present on this macOS")
+        return 1
+    ensure_state()
+    prof = os.path.join(STATE_DIR, "sandbox.sb")
+    try:
+        with open(prof, "w") as f:
+            f.write(_SANDBOX_PROFILE)
+    except Exception as e:
+        print("error: could not write sandbox profile (%s)" % e)
+        return 1
+    cmd = ["/usr/bin/sandbox-exec", "-f", prof, rp] + list(extra_args or [])
+    print("Detonating in deny-default Seatbelt jail (no net, no writes):\n  %s\n"
+          "  (deprecated-but-functional sandbox-exec; not a VM substitute)\n---"
+          % " ".join(cmd))
+    log_action("sandbox", rp, "launched")
+    out, err, rc = run(cmd, timeout=30)
+    if out:
+        sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
+    print("--- sandboxed process exited rc=%d" % rc)
+    return 0
+
+
+def cmd_neutralize(plist_path):
+    """Ordered kill-chain for a launchd-backed threat (a persistence finding):
+      1) bootout the launchd job so it can't relaunch,
+      2) SIGKILL any still-running same-user process for its program,
+      3) quarantine the .plist (and, if it lives in a risky location, its binary).
+    Unloading BEFORE killing matters: a KeepAlive job killed first is immediately
+    respawned by launchd, so we remove the job definition first."""
+    rp = os.path.realpath(plist_path)
+    if not os.path.isfile(rp) or not rp.endswith(".plist"):
+        print("usage: aegis.py neutralize <path-to-launchd-.plist>")
+        return 1
+    if _is_protected_path(rp):
+        print("refuse: %s is a protected/system path" % rp)
+        return 1
+    try:
+        with open(rp, "rb") as f:
+            pl = plistlib.load(f)
+    except Exception as e:
+        print("error: could not parse plist (%s)" % e)
+        return 1
+    label = pl.get("Label") or os.path.basename(rp)[:-6]
+    program, _args = _plist_program(pl if isinstance(pl, dict) else {})
+    is_daemon = "/Library/LaunchDaemons/" in rp and not rp.startswith(HOME)
+
+    print("Neutralizing launchd job: %s" % label)
+    # 1) bootout — user domain is gui/<uid>; system LaunchDaemons need root.
+    if is_daemon:
+        print("  [1/3] system LaunchDaemon — bootout needs root; run:\n"
+              "        sudo launchctl bootout system %s" % rp)
+        log_action("neutralize", rp, "daemon-needs-root", label=label)
+    else:
+        dom = "gui/%d/%s" % (os.getuid(), label)
+        _o, _e, brc = run(["launchctl", "bootout", dom], timeout=10)
+        # Also try the file form; both are accepted across versions.
+        run(["launchctl", "bootout", "gui/%d" % os.getuid(), rp], timeout=10)
+        print("  [1/3] bootout %s -> %s" % (dom, "ok" if brc == 0 else "not loaded/none"))
+        log_action("neutralize", rp, "bootout-%s" % ("ok" if brc == 0 else "noop"),
+                   label=label)
+
+    # 2) kill any surviving same-user process for the program.
+    killed = 0
+    if program:
+        out, _, rc = run(["ps", "-axo", "pid=,uid=,comm="], timeout=10)
+        if rc == 0:
+            for line in out.splitlines():
+                p = line.split(None, 2)
+                if len(p) == 3 and p[1] == str(os.getuid()) and p[2] == program:
+                    try:
+                        import signal as _signal
+                        os.kill(int(p[0]), _signal.SIGKILL)
+                        killed += 1
+                    except Exception:
+                        pass
+    print("  [2/3] killed %d running instance(s) of %s" % (killed, program or "?"))
+
+    # 3) quarantine the plist (stops reload next login), then the binary if risky.
+    print("  [3/3] quarantining artifacts:")
+    rc_plist = cmd_quarantine(rp, detection="neutralize:%s" % label)
+    if program and os.path.isfile(program) and is_risky_location(program) \
+            and not _is_protected_path(program):
+        cmd_quarantine(program, detection="neutralize:%s:binary" % label)
+    return 0 if rc_plist == 0 else 1
+
+
+HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
+
+ DETECT (default; runs on a launchd interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
   report           print the latest report
   status           print hardening posture + XProtect definition age (fast)
@@ -2032,6 +2580,15 @@ HELP = """aegis.py - personal macOS security monitor (detect-and-alert)
   allow <path>     suppress future alerts for findings matching <path>
   canary [remove]  plant (or remove) ransomware canary/honeypot files
   watch [secs]     foreground loop (default 300s; prefer launchd in production)
+
+ RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
+  quarantine <path>      neutralize + confine a file to a reversible store
+  quarantine-list        list the quarantine store (ids to restore/destroy)
+  restore <id>           un-quarantine byte-for-byte (undo a false positive)
+  destroy <id> --yes     securely erase a quarantined item (IRREVERSIBLE)
+  kill <pid>             terminate one of YOUR processes (SIGTERM->SIGKILL)
+  sandbox <path> [args]  detonate a suspect binary in a deny-default jail
+  neutralize <plist>     kill-chain a launchd threat: bootout->kill->quarantine
 """
 
 
@@ -2051,6 +2608,21 @@ def main(argv):
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 300)
+    # --- response tier (opt-in) ---
+    if cmd == "quarantine" and len(argv) > 2:
+        return cmd_quarantine(argv[2])
+    if cmd in ("quarantine-list", "ql"):
+        return cmd_quarantine_list()
+    if cmd == "restore" and len(argv) > 2:
+        return cmd_restore(argv[2])
+    if cmd == "destroy" and len(argv) > 2:
+        return cmd_destroy(argv[2], confirmed=("--yes" in argv[3:]))
+    if cmd == "kill" and len(argv) > 2:
+        return cmd_kill(argv[2])
+    if cmd == "sandbox" and len(argv) > 2:
+        return cmd_sandbox(argv[2], argv[3:])
+    if cmd == "neutralize" and len(argv) > 2:
+        return cmd_neutralize(argv[2])
     sys.stdout.write(HELP)
     return 0
 

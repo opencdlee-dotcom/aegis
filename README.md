@@ -1,13 +1,18 @@
 # Aegis — a personal macOS background security monitor
 
-A small, honest, **detect-and-alert** security monitor for your own Mac. It runs
-in the background (launchd), watches the surfaces macOS malware actually uses,
-and tells you when something new and suspicious appears — with **zero third-party
-dependencies** (Python standard library only), **local-only** (no telemetry, no
-cloud), and **no signing cert required**.
+A small, honest **detect-and-alert** security monitor for your own Mac, with an
+opt-in **response tier** to act on what it finds. It runs in the background
+(launchd), watches the surfaces macOS malware actually uses, and tells you when
+something new and suspicious appears — then, only when *you* run a response
+command by hand, it can **quarantine, neutralize, sandbox, or destroy** the
+threat. Zero third-party dependencies (Python standard library only),
+**local-only** (no telemetry, no cloud), **no signing cert required**.
 
-> It is not "Norton," and it deliberately doesn't pretend to be. Read *Honest
-> scope* below — the ceiling is set by Apple, not by effort.
+> It is not "Norton," and it deliberately doesn't pretend to be. The background
+> scan is **detect-only and never destructive**; response is a separate, opt-in,
+> reversible-by-default tier you invoke deliberately (see *Response tier* below).
+> Read *Honest scope* too — the real-time-*blocking* ceiling is set by Apple, not
+> by effort.
 
 ---
 
@@ -66,6 +71,15 @@ python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py canary        # plant ransomware canary/honeypot files (opt-in)
 python3 aegis.py canary remove # ...and remove them
 
+# RESPONSE TIER — opt-in, run by hand on a reviewed finding (never automatic):
+python3 aegis.py quarantine PATH     # neutralize + confine a file to a reversible store
+python3 aegis.py quarantine-list     # list the store (ids to restore/destroy)
+python3 aegis.py restore ID          # un-quarantine byte-for-byte (undo a false positive)
+python3 aegis.py destroy ID --yes    # securely erase a quarantined item (IRREVERSIBLE)
+python3 aegis.py kill PID            # terminate one of YOUR processes (SIGTERM→SIGKILL)
+python3 aegis.py sandbox PATH        # detonate a suspect binary in a deny-default jail
+python3 aegis.py neutralize PLIST    # launchd kill-chain: bootout → kill → quarantine
+
 bash install.sh              # background it via launchd (hourly); one baseline first
 bash install.sh 1800         # ...or every 30 min (re-run keeps your baseline)
 bash uninstall.sh            # remove the launchd agent
@@ -74,11 +88,67 @@ python3 -m unittest discover -s tests  # full regression suite (stdlib only)
 ```
 
 State lives in `~/.aegis/`: `baseline.json`, `findings.jsonl` (durable log),
-`latest.md` (last report), `seen.json` (dedup), `allowlist.json`, `sigcache.json`.
+`latest.md` (last report), `seen.json` (dedup), `allowlist.json`, `sigcache.json`,
+`actions.jsonl` (response-action audit), and `quarantine/` (the reversible store).
 
 **Full Disk Access (optional):** grant it to `/usr/bin/python3` in *System
 Settings ▸ Privacy & Security ▸ Full Disk Access* so Aegis can read TCC-protected
 locations. Core persistence/hardening checks work without it.
+
+---
+
+## Response tier — act on a finding (opt-in, staged, reversible-by-default)
+
+The scan/watch path is **detect-only** and never touches your files. Acting on a
+threat is a separate tier you invoke **by hand, on a finding you've reviewed** —
+Aegis never auto-remediates. Its shape is copied straight from how commercial
+EDR does it (this is the research payload behind the design):
+
+- **The staged ladder** mirrors **SentinelOne's** *Kill → Quarantine → Remediate
+  → Rollback*. Quarantine is reversible; **Remediate (destroy) is the only
+  irreversible step**, and by construction it can act **only on something already
+  quarantined** — there is *no* "delete a live path" command. This is the
+  industry's **quarantine-first, never-delete-first** rule, encoded structurally.
+- **Quarantine is a reversible store with restore metadata**, exactly as
+  **Microsoft Defender** documents it: the original path, mode, owner, hash, and
+  the `com.apple.quarantine` provenance are recorded so `restore` puts the file
+  back **byte-for-byte**. A false positive costs you minutes, not data — the
+  Defender "every automated action must be reviewable and reversible" doctrine.
+
+| Command | What it does | Reversible? |
+|---|---|---|
+| `quarantine PATH` | Copies the file into a confined store (`~/.aegis/quarantine/`, mode 700), **neutralizes** the stored bytes (repeating-key XOR so it can't be double-clicked into running and won't be re-flagged by another on-host scanner — the classic AV "neutered sample" trick), `chmod 000`, records restore metadata, then removes the original. **Verifies the store copy reconstructs to the original hash *before* deleting the original** (never-lose-data). | ✅ `restore` |
+| `restore ID` | Reverses the neutralization, puts the file back at its recorded path (or `PATH.restored` if occupied), replays mode + quarantine xattr. | — |
+| `destroy ID --yes` | **Irreversible.** Overwrites and unlinks a quarantined item. Refuses without `--yes`. | ❌ |
+| `kill PID` | `SIGTERM`→`SIGKILL` a **same-user** process. Refuses other users' processes, `pid 0/1`, Aegis's own tree, and session-critical comms. | — |
+| `sandbox PATH` | Detonates a suspect binary in a **deny-default Seatbelt jail** (`sandbox-exec`): no network, no filesystem writes, no keychain/App-Support reads — watch what it *tries* to do without letting it phone home or steal data. | — |
+| `neutralize PLIST` | Ordered launchd kill-chain: **`launchctl bootout` first** (so a `KeepAlive` job can't relaunch), then kill any surviving instance, then quarantine the plist (+ its binary if risky). | ✅ (artifacts land in the store) |
+
+Every response action — success **or** refusal — is appended to
+`~/.aegis/actions.jsonl` as a durable audit trail.
+
+**Hard safety rails** (all destructive verbs): quarantine-first-never-delete-first;
+**protected-path refusal** (SIP/system/Apple locations, Aegis's own files, `$HOME`
+and any ancestor of it — so a mistyped parent can't take your home directory);
+same-user-only process actions; never-act-on-self; and directories/symlinks are
+refused (regular files only).
+
+**Honest caveats, stated plainly:**
+
+- **`sandbox-exec` is Apple-deprecated but fully functional** (verified on macOS
+  26; Apple itself and shipping CLIs like OpenAI's Codex still use `.sb` profiles).
+  It's the *only* entitlement-free process jail available to a userspace tool — but
+  it's a jail, **not a VM**; use a throwaway VM for true detonation, and know Apple
+  could remove it in a future release.
+- **Re-quarantining via the `com.apple.quarantine` xattr is a weaker lever than it
+  looks.** On modern macOS, launch-approval also persists in the **MACL xattr and
+  the provenance database**, so re-applying the quarantine flag may *not* force a
+  full Gatekeeper re-evaluation of an app you already approved. Aegis's real
+  containment is therefore **move-to-store + strip-exec + neutralize-bytes**, not
+  the xattr — the xattr is only replayed on `restore` to preserve provenance.
+- **Secure-erase is not guaranteed on APFS/SSD** (wear-levelling means a single
+  overwrite can leave copies). FileVault is the real at-rest guarantee; `destroy`
+  says so when it runs.
 
 ---
 
@@ -150,8 +220,12 @@ A security tool sees everything, so it must be trustworthy *by construction*:
 - **Stdlib-only** — no pip packages = no supply-chain surface to audit.
 - **Readable** — one ~2,000-line file you can read end to end; it shells out only to
   Apple's own signed CLIs (`codesign`, `spctl`, `csrutil`, `launchctl`, `log`, …).
-- **Read-only to your system** — it writes only inside `~/.aegis/`, with **one**
-  explicit exception: `aegis.py canary` plants decoy files (only on that command).
+- **Read-only to your system on the scan path** — the background monitor writes
+  only inside `~/.aegis/`. It touches anything *outside* that directory **only**
+  on an explicit response command you type by hand: `canary` plants decoy files;
+  the response tier (`quarantine`/`restore`/`destroy`/`kill`/`neutralize`) acts on
+  the specific target you name, gated by the protected-path/same-user rails above
+  and logged to `actions.jsonl`. The automatic launchd scan is never destructive.
 - **No new privileged parser.** Aegis deliberately does *not* ship a YARA/file
   scanner that parses untrusted binaries — that reintroduces the exact
   privileged-parser RCE surface (cf. Norton/Symantec CVE-2016-2208) that a minimal
@@ -180,7 +254,8 @@ A security tool sees everything, so it must be trustworthy *by construction*:
 > **Note on the name.** "Norton" is a Gen Digital trademark; Aegis is *not*
 > affiliated with it and does not claim to replace it. "Free Norton" is shorthand
 > for *"a unified, local-only consumer security monitor"* — Aegis detects and
-> alerts; it is not a blocking antivirus.
+> alerts, and can quarantine / neutralize / destroy a threat **on command**, but it
+> is not a *real-time blocking* antivirus (that needs Apple's ES entitlement).
 
 ## Verified
 
@@ -190,7 +265,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**86 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**110 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -199,6 +274,16 @@ silence is scoped per-surface so a live threat present at install still alerts;
 a swapped binary at an allowlisted path re-alerts (content hash in the
 fingerprint); `/usr/local` and `/private/var/folders` are risky; the signature
 cache invalidates on content change and stays bounded.
+
+The **response tier** (this release) is pinned by 24 tests: a quarantined file's
+stored bytes are neutralized (≠ the original), `chmod 000`, and the original is
+removed only after the store copy is proven to reconstruct; `restore` returns the
+file **byte-identical** and replays its mode; a name collision restores to
+`PATH.restored`; `destroy` refuses without `--yes` and there is no live-path
+delete; protected-path refusal covers SIP/system paths, Aegis's own files, `$HOME`
+and its ancestors; `kill` refuses self/`pid 1`/other-user processes *without
+signalling them*; `neutralize` quarantines a launchd plist; and `sandbox` runs a
+benign binary to completion inside the real deny-default Seatbelt jail.
 
 The **behavioral tier** (this release) is pinned against the 2025-26 stealer TTPs:
 a fake `osascript … hidden answer` password prompt → **CRITICAL**; `dscl -authonly`,

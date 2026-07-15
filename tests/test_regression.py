@@ -78,11 +78,12 @@ class Sandbox(unittest.TestCase):
         self.notifications = []
         self._saved["notify"] = aegis.notify
         aegis.notify = lambda title, msg: self.notifications.append((title, msg))
-        # check_behavior() reads the live process table and check_xprotect() shells
-        # out to `log show`; both are non-deterministic on a dev host. Stub them to
-        # empty for cmd_scan-level tests — dedicated tests call the pure helpers
-        # (_argv_signals) and check_xprotect parsing directly.
-        for fn in ("check_behavior", "check_xprotect"):
+        # check_processes()/check_behavior() read the live process table and
+        # check_xprotect() shells out to `log show`; all three are non-deterministic
+        # on a dev host (what's running / installed varies). Stub them to empty for
+        # cmd_scan-level tests — dedicated tests pull the real function from
+        # self._saved[...] or call the pure helpers (_argv_signals) directly.
+        for fn in ("check_processes", "check_behavior", "check_xprotect"):
             self._saved[fn] = getattr(aegis, fn)
             setattr(aegis, fn, (lambda *a, **k: []))
 
@@ -278,7 +279,9 @@ class TestRiskyLocations(Sandbox):
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
                                               "authority": None}
         try:
-            fs = aegis.check_processes()
+            # base setUp stubs check_processes to [] for determinism; this test
+            # exercises the REAL one, pulled from self._saved.
+            fs = self._saved["check_processes"]()
             self.assertTrue(any(f["path"] == "/usr/local/bin/evil" for f in fs))
         finally:
             aegis.run, aegis.classify_signature = saved_run, saved_cls
@@ -1096,6 +1099,189 @@ class TestTrustStoreTamper(Sandbox):
         aegis.record_selfstate()
         fs = aegis.check_self_protection()
         self.assertFalse(any("tampered" in f["fingerprint"] for f in fs), fs)
+
+
+class TestResponseTier(Sandbox):
+    """The opt-in quarantine/restore/destroy/kill/sandbox/neutralize response
+    tier. Every path is redirected into the per-test tmp store; no real ~/.aegis
+    quarantine dir is touched and nothing on the host is killed (the kill guards
+    fire before any signal is sent)."""
+
+    def setUp(self):
+        super().setUp()
+        extra = {
+            "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
+            "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
+                                                "manifest.json"),
+            "ACTION_LOG": os.path.join(self.state, "actions.jsonl"),
+        }
+        for k, v in extra.items():
+            self._saved[k] = getattr(aegis, k)
+            setattr(aegis, k, v)
+
+    def _victim(self, data=b"\x00MALWARE\xffpayload\x10bytes", mode=0o755):
+        p = os.path.join(self.tmp, "evil.bin")
+        with open(p, "wb") as f:
+            f.write(data)
+        os.chmod(p, mode)
+        return p, aegis.sha256(p), data
+
+    def _only_qid(self):
+        man = aegis.load_json(aegis.QUARANTINE_MANIFEST, {})
+        self.assertEqual(len(man), 1, man)
+        return next(iter(man))
+
+    # quarantine ----------------------------------------------------------
+    def test_quarantine_removes_original(self):
+        p, _sha, _d = self._victim()
+        self.assertEqual(aegis.cmd_quarantine(p), 0)
+        self.assertFalse(os.path.exists(p), "original not removed after quarantine")
+
+    def test_quarantine_neutralizes_stored_bytes(self):
+        p, _sha, data = self._victim()
+        aegis.cmd_quarantine(p)
+        qid = self._only_qid()
+        payload = os.path.join(aegis.QUARANTINE_DIR, qid, "payload.quar")
+        os.chmod(payload, 0o600)
+        stored = open(payload, "rb").read()
+        # The store copy must NOT be the raw malware bytes (neutered-sample rule:
+        # can't be accidentally executed, won't be re-flagged by another scanner).
+        self.assertNotEqual(stored, data, "quarantined payload is NOT neutralized")
+
+    def test_quarantine_payload_not_world_readable(self):
+        p, _sha, _d = self._victim()
+        aegis.cmd_quarantine(p)
+        payload = os.path.join(aegis.QUARANTINE_DIR, self._only_qid(), "payload.quar")
+        self.assertEqual(os.stat(payload).st_mode & 0o777, 0, "payload not chmod 000")
+
+    # restore -------------------------------------------------------------
+    def test_restore_is_byte_identical(self):
+        p, sha, _d = self._victim()
+        aegis.cmd_quarantine(p)
+        qid = self._only_qid()
+        self.assertEqual(aegis.cmd_restore(qid), 0)
+        self.assertTrue(os.path.exists(p))
+        self.assertEqual(aegis.sha256(p), sha, "restore not byte-identical")
+        self.assertEqual(aegis.load_json(aegis.QUARANTINE_MANIFEST, {}), {},
+                         "manifest not cleared after restore")
+
+    def test_restore_replays_mode(self):
+        p, _sha, _d = self._victim(mode=0o700)
+        aegis.cmd_quarantine(p)
+        aegis.cmd_restore(self._only_qid())
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o700)
+
+    def test_restore_to_collision_path(self):
+        p, sha, _d = self._victim()
+        aegis.cmd_quarantine(p)
+        qid = self._only_qid()
+        with open(p, "wb") as f:  # something else now occupies the original path
+            f.write(b"a different file took the slot")
+        aegis.cmd_restore(qid)
+        self.assertTrue(os.path.exists(p + ".restored"),
+                        "collision restore did not fall back to .restored")
+        self.assertEqual(aegis.sha256(p + ".restored"), sha)
+
+    # destroy (the only irreversible verb) --------------------------------
+    def test_destroy_refuses_without_confirmation(self):
+        p, _sha, _d = self._victim()
+        aegis.cmd_quarantine(p)
+        qid = self._only_qid()
+        self.assertNotEqual(aegis.cmd_destroy(qid, confirmed=False), 0)
+        self.assertIn(qid, aegis.load_json(aegis.QUARANTINE_MANIFEST, {}),
+                      "refused destroy still removed the item")
+
+    def test_destroy_removes_from_store(self):
+        p, _sha, _d = self._victim()
+        aegis.cmd_quarantine(p)
+        qid = self._only_qid()
+        self.assertEqual(aegis.cmd_destroy(qid, confirmed=True), 0)
+        self.assertFalse(os.path.exists(os.path.join(aegis.QUARANTINE_DIR, qid)))
+        self.assertEqual(aegis.load_json(aegis.QUARANTINE_MANIFEST, {}), {})
+
+    def test_destroy_unknown_id_fails(self):
+        # There is NO 'delete a live path' command — destroy only knows store ids.
+        self.assertNotEqual(aegis.cmd_destroy("does-not-exist", confirmed=True), 0)
+
+    # safety rails --------------------------------------------------------
+    def test_refuse_directory(self):
+        d = os.path.join(self.tmp, "adir")
+        os.makedirs(d)
+        self.assertNotEqual(aegis.cmd_quarantine(d), 0)
+        self.assertTrue(os.path.isdir(d), "directory was touched")
+
+    def test_refuse_protected_system_path(self):
+        self.assertTrue(aegis._is_protected_path("/System/Library/CoreServices/x"))
+        self.assertTrue(aegis._is_protected_path("/usr/bin/python3"))
+        self.assertTrue(aegis._is_protected_path("/"))
+
+    def test_refuse_self_and_state(self):
+        self.assertTrue(aegis._is_protected_path(aegis._SELF_PATH))
+        self.assertTrue(aegis._is_protected_path(
+            os.path.join(aegis.STATE_DIR, "baseline.json")))
+
+    def test_refuse_home_and_ancestors(self):
+        self.assertTrue(aegis._is_protected_path(aegis.HOME))
+        self.assertTrue(aegis._is_protected_path("/Users"))
+
+    def test_missing_file_refused(self):
+        self.assertNotEqual(
+            aegis.cmd_quarantine(os.path.join(self.tmp, "nope.bin")), 0)
+
+    def test_action_log_records_quarantine(self):
+        p, _sha, _d = self._victim()
+        aegis.cmd_quarantine(p)
+        self.assertTrue(os.path.exists(aegis.ACTION_LOG))
+        recs = [json.loads(l) for l in open(aegis.ACTION_LOG) if l.strip()]
+        self.assertTrue(any(r["action"] == "quarantine" and r["result"] == "ok"
+                            for r in recs), recs)
+
+    # kill (guards fire before any signal is sent) ------------------------
+    def test_kill_refuses_self(self):
+        self.assertNotEqual(aegis.cmd_kill(os.getpid()), 0)
+
+    def test_kill_refuses_init(self):
+        self.assertNotEqual(aegis.cmd_kill(1), 0)
+
+    def test_kill_nonexistent_pid(self):
+        self.assertNotEqual(aegis.cmd_kill(999999), 0)
+
+    def test_kill_refuses_other_user_process(self):
+        # Find a live process owned by another uid (e.g. a root daemon) and prove
+        # the guard refuses it WITHOUT killing it. Skip if none is visible.
+        out = subprocess.run(["ps", "-axo", "pid=,uid="], capture_output=True,
+                             text=True).stdout
+        target = None
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] != str(os.getuid()) \
+                    and parts[0] not in ("0", "1"):
+                target = int(parts[0])
+                break
+        if target is None:
+            self.skipTest("no other-user process visible")
+        self.assertNotEqual(aegis.cmd_kill(target), 0)
+        self.assertEqual(subprocess.run(["ps", "-p", str(target)]).returncode, 0,
+                         "guard should not have killed the other-user process")
+
+    # neutralize (ordered launchd kill-chain) -----------------------------
+    def test_neutralize_quarantines_plist(self):
+        plist = self.write_plist("com.evil.agent.plist",
+                                 ["/bin/echo", "persist"], run_at_load=True)
+        rc = aegis.cmd_neutralize(plist)
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(plist), "plist not quarantined/removed")
+        man = aegis.load_json(aegis.QUARANTINE_MANIFEST, {})
+        self.assertTrue(any(m.get("orig_path") == os.path.realpath(plist)
+                            for m in man.values()), man)
+
+    # sandbox (real deny-default Seatbelt jail) ---------------------------
+    def test_sandbox_runs_and_refuses_nonfile(self):
+        self.assertNotEqual(
+            aegis.cmd_sandbox(os.path.join(self.tmp, "nope")), 0)
+        if os.path.exists("/usr/bin/sandbox-exec") and os.path.exists("/bin/echo"):
+            # A benign binary runs to completion inside the jail (returns 0).
+            self.assertEqual(aegis.cmd_sandbox("/bin/echo", ["ok"]), 0)
 
 
 if __name__ == "__main__":
