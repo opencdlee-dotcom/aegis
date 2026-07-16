@@ -1,10 +1,19 @@
 #!/bin/bash
-# Aegis installer - registers a per-user launchd agent that runs `aegis.py scan`
-# on an interval (background, low priority). Idempotent: re-run to change the
-# interval. Usage:  bash install.sh [interval_seconds]   (default 3600 = hourly)
+# Aegis installer - registers a per-user launchd agent. Two modes, idempotent
+# (re-run to change mode or interval):
+#   bash install.sh [interval_seconds]        scan on an interval (default 3600)
+#   bash install.sh watch [interval_seconds]  event-driven: kqueue rescan within
+#                                             seconds of a change to a watched
+#                                             path; [interval] = full-scan floor
+#                                             (default 600). launchd KeepAlive.
 set -euo pipefail
 
-INTERVAL="${1:-3600}"
+MODE="scan"
+if [ "${1:-}" = "watch" ]; then MODE="watch"; shift; fi
+INTERVAL="${1:-$([ "$MODE" = "watch" ] && echo 600 || echo 3600)}"
+case "$INTERVAL" in
+    ''|*[!0-9]*) echo "interval must be a whole number of seconds" >&2; exit 1;;
+esac
 DIR="$(cd "$(dirname "$0")" && pwd)"
 AEGIS="$DIR/aegis.py"
 LABEL="com.charlie.aegis"
@@ -26,7 +35,22 @@ AEGIS_X="$(xml_escape "$AEGIS")"
 OUT_X="$(xml_escape "$HOME/.aegis/run.out")"
 ERR_X="$(xml_escape "$HOME/.aegis/run.err")"
 
-echo "==> Writing launchd agent ($LABEL, every ${INTERVAL}s)…"
+# scan mode: launchd fires a one-shot scan every StartInterval seconds.
+# watch mode: launchd keeps a persistent `aegis.py watch` alive (KeepAlive);
+# the process itself is event-driven via kqueue with INTERVAL as its full-scan
+# floor, so a change to a watched path is scanned within seconds.
+if [ "$MODE" = "watch" ]; then
+    PROG_TAIL="        <string>watch</string>
+        <string>$INTERVAL</string>"
+    SCHEDULE="    <key>KeepAlive</key>      <true/>"
+    DESC="event-driven watch; full scan every ${INTERVAL}s"
+else
+    PROG_TAIL="        <string>scan</string>"
+    SCHEDULE="    <key>StartInterval</key>  <integer>$INTERVAL</integer>"
+    DESC="every ${INTERVAL}s"
+fi
+
+echo "==> Writing launchd agent ($LABEL, $DESC)…"
 cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37,10 +61,10 @@ cat > "$PLIST" <<PLISTEOF
     <array>
         <string>$PY_X</string>
         <string>$AEGIS_X</string>
-        <string>scan</string>
+$PROG_TAIL
     </array>
     <key>RunAtLoad</key>      <true/>
-    <key>StartInterval</key>  <integer>$INTERVAL</integer>
+$SCHEDULE
     <key>ProcessType</key>    <string>Background</string>
     <key>LowPriorityIO</key>  <true/>
     <key>Nice</key>           <integer>10</integer>
@@ -72,10 +96,11 @@ fi
 launchctl enable "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 
 echo ""
-echo "✅ Aegis is now running in the background (every ${INTERVAL}s)."
+echo "✅ Aegis is now running in the background ($DESC)."
 echo "   Report : python3 $AEGIS report      (or: cat ~/.aegis/latest.md)"
 echo "   Log    : ~/.aegis/findings.jsonl    (durable; alerts also notify you)"
-echo "   Tune   : bash $DIR/install.sh 1800  (re-run with a new interval)"
+echo "   Tune   : bash $DIR/install.sh 1800        (interval scans)"
+echo "            bash $DIR/install.sh watch       (event-driven, rescan in seconds)"
 echo "   Remove : bash $DIR/uninstall.sh"
 echo ""
 echo "⚠  Aegis DETECTS and alerts; it does not block (that needs Apple's"

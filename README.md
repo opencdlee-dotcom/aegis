@@ -26,7 +26,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Process watch** | Running processes whose executable is unsigned/ad-hoc **and** in a user-writable path | Malware runs ad-hoc-signed binaries from `/tmp`, `~/`, `/Users/Shared` |
 | **Behavioral watch** *(new)* | The full **command line** of every same-user process, scored for the fileless-stealer TTPs: a fake `osascript … display dialog … hidden answer` **password phish** (CRITICAL), `dscl . -authonly` local-password check, `xattr -c/-d com.apple.quarantine` **provenance strip**, `hdiutil attach -nobrowse` **invisible DMG mount**, `tccutil reset`, a `login.keychain-db` copy, a `curl -F file=@/tmp/*.zip` **exfil POST**, and a `curl … \| bash/osascript` **fileless pipeline** | The dominant 2025-26 stealer TTP is fileless — it runs through Apple-signed interpreters (bash/osascript/curl) whose *path* is trusted, so only the argv reveals the attack. This is the biggest coverage gain in this release |
 | **XProtect harvest** *(new)* | Reads Apple's own **XProtect Remediator** detections straight from the unified log (`com.apple.XProtectFramework.PluginAPI`) — a `status != NoThreatDetected` event means Apple's engine found/removed malware (CRITICAL) — plus flags **stale XProtect definitions** (>60 days) | Piggybacks Apple's professionally-maintained, always-updating signature/behavioral engine for free — no entitlement, no cloud. The single highest-value signal a signature-less tool can add |
-| **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables in Downloads/Desktop/tmp/Shared, tagged with **quarantine provenance** — a binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop) | Catches a payload the moment it lands, before it runs |
+| **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables **and `.app` bundles** in Downloads/Desktop/tmp/Shared, tagged with **quarantine provenance** — a binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop). A fresh signed-but-**unnotarized** app additionally gets Gatekeeper's own `spctl` verdict surfaced (MEDIUM — a normal quarantined launch would refuse it, so one that runs was side-loaded or force-approved) | Catches a payload the moment it lands, before it runs — including the #1 delivery shape, a DMG/ZIP-dragged `.app`, which is a *directory* and invisible to any file-only check |
 | **Staging watch** *(new)* | Documented stealer **loot-staging artifacts** in `/tmp`/`/Users/Shared` — `app.zip` (Atomic), `ledger.zip` (Odyssey/Poseidon), `salmonela.zip` (MacSync), `wid.txt`, `.pass`, `shub_*`, a copied `login.keychain-db` | Smash-and-grab stealers stage loot then exfil in under a minute, leaving no persistence — this catches the residue |
 | **Shell history** *(new)* | The recent tail of `~/.zsh_history`/`.bash_history`/fish for the **ClickFix terminal-paste** chain — `dscl . -authonly`, `curl … \| sh`, `xattr -c`, `hdiutil -nobrowse` — one alert per unique hostile command | ClickFix (fake-CAPTCHA paste) is now the dominant macOS initial-access vector; the payload is fetched inside a trusted Terminal so it never gets a quarantine xattr — history is the residue |
 | **Wallet integrity** *(new)* | Content-hash of installed crypto-wallet configs + app binaries (Ledger Live `app.json`, Trezor Suite, Exodus); any change alerts HIGH | 2025 stealers hijack funds by rewriting Ledger Live's `app.json` or swapping wallet bundles for drainers (DigitStealer, Odyssey) |
@@ -34,7 +34,8 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Shell startup files** | New or modified `~/.zshrc`/`.zprofile`/`.bashrc`/… (ATT&CK T1546.004); a download-and-run or reverse-shell idiom scores HIGH | ClickFix/AMOS chains drop a re-execing payload into your shell rc |
 | **Login/Logout hooks** | Legacy `com.apple.loginwindow` LoginHook/LogoutHook | Rare-legit today; a classic persistence primitive |
 | **Config profiles** | A newly-installed configuration profile | Adds trusted certs / proxies / MDM control — an adware & DPRK vector |
-| **Extra persistence** | `/etc/crontab`, `/etc/periodic`, StartupItems, `/etc/rc.common` tamper | Persistence surfaces beyond `LaunchAgents` and the user crontab |
+| **Extra persistence** | `/etc/crontab`, `/etc/periodic`, StartupItems, `/etc/rc.common` tamper — plus `/etc/hosts` (adware/phishing redirect), `/etc/pam.d` + `/etc/sudoers.d` (auth-chain backdoor, T1556), `sshd_config`, and **`~/.ssh/authorized_keys` / `~/.ssh/config`** (a newly-appearing key = the classic durable-remote-access implant, T1098.004; a `ProxyCommand` hijack runs code on every ssh) | Persistence surfaces beyond `LaunchAgents` and the user crontab |
+| **Network listeners** *(new)* | A **new** process accepting connections *from the network* (non-loopback TCP LISTEN, via `lsof`), baseline-diffed. Unsigned/ad-hoc binary in a user-writable path listening → HIGH (bind-shell / rogue-server shape); anything else → MEDIUM (logged). Loopback dev servers and SIP-pinned Apple daemons are excluded by design — but an Apple-signed *interpreter* serving the network (`python3 -m http.server 0.0.0.0`, `nc -l`) **is** tracked | LuLu-tier *outbound* blocking needs an Apple entitlement; the *listening* side is visible unprivileged, and a reachable listener is rare, durable, and high-signal |
 | **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
 | **Editor extensions** | New VSCode / Cursor / VSCodium / Windsurf extension | A backdoored editor extension is a live supply-chain vector (Objective-See's *Paradox*, 2025, shipped via a trojanised Cursor extension) |
 | **Self-protection** | Aegis's own launchd agent removed, its append-only log truncated, or its **trust store (baseline/allowlist) edited out-of-band** | A monitor an attacker can silently disable, blind, or feed a poisoned baseline is theater |
@@ -43,8 +44,8 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 **Design principle — log everything, alert rarely, never repeat.** The first run
 records a *silent* baseline (no day-one alert storm — the KnockKnock/LuLu "trust
 what's already installed" rule). The shell-rc, profile, hook, extra-persistence,
-browser-extension, wallet and **shell-history** surfaces extend this rule
-**per-surface**: each is adopted silently the first time it's seen (a months-old
+browser-extension, wallet, **network-listener** and **shell-history** surfaces
+extend this rule **per-surface**: each is adopted silently the first time it's seen (a months-old
 `curl…|sh` install line already in your history is *residue*, not a live threat),
 so *upgrading* Aegis on an existing install is also storm-free. The **live-threat**
 surfaces — a running hostile process (behavioral), an XProtect detection, a `/tmp`
@@ -82,6 +83,10 @@ python3 aegis.py neutralize PLIST    # launchd kill-chain: bootout → kill → 
 
 bash install.sh              # background it via launchd (hourly); one baseline first
 bash install.sh 1800         # ...or every 30 min (re-run keeps your baseline)
+bash install.sh watch        # ...or EVENT-DRIVEN (recommended): a stdlib kqueue over
+                             #    the persistence/hot/staging/rc/history paths rescans
+                             #    within SECONDS of a change (debounced, ≤1 event-scan
+                             #    per minute), full scan every 10 min as a floor
 bash uninstall.sh            # remove the launchd agent
 python3 selftest.py                    # quick detection-logic smoke (stdlib only)
 python3 -m unittest discover -s tests  # full regression suite (stdlib only)
@@ -202,7 +207,12 @@ targets exactly this residue. Two boundaries stated plainly:
   hourly ticks. The behavioral/argv checks catch a payload that is **still
   running** or that left a durable trace (shell history, a `/tmp` archive, an
   XProtect log entry, a keychain copy) — not one that ran and vanished in the gap.
-  Aegis **detects residue within a poll interval; it does not block.**
+  **`install.sh watch` narrows this gap to seconds** for every file-touch surface
+  (a persistence write, a `/tmp` staging drop, an rc edit, a pasted ClickFix line
+  hitting history — each triggers a kqueue rescan within ~3s, rate-limited to one
+  event-scan/min), while argv/XProtect/listener sampling still runs at the
+  full-scan floor. Even so it is detection *after* the write — Aegis **detects
+  residue; it does not block.**
 - **Same-user only.** An unprivileged agent can read the command line of *your*
   processes but not root's or another user's (`KERN_PROCARGS2`). Consumer stealers
   run as you, so this covers the common case — but a root-escalated payload's argv
@@ -236,15 +246,21 @@ A security tool sees everything, so it must be trustworthy *by construction*:
 
 ## Roadmap (if this grows past "personal tool")
 
-- **Real-time (not polling):** watch persistence dirs + `/tmp` via `select.kqueue`
-  (in the stdlib) or an FSEvents helper for instant drops; tail `log stream` in a
-  persistent subprocess for live behavioral events instead of windowed `log show`.
-  This is the highest-value next step — it closes the sub-minute polling gap.
+- ✅ **Real-time (not polling) — SHIPPED** as `install.sh watch`: a stdlib
+  `select.kqueue` over the persistence/hot/staging/rc/history/wallet paths
+  rescans within seconds of a change (debounced; ≤1 event-scan/min), full scan
+  every 10 min as the floor. Remaining half: tail `log stream` in a persistent
+  subprocess for live behavioral events instead of the windowed `log show`.
 - **Reputation:** optional VirusTotal hash lookups for flagged binaries (bring your
   own API key; **off by default** so the local-only guarantee stays literally true).
-- **Notarization introspection:** `spctl -a -t exec` verdict on hot-dir drops to
-  distinguish notarized-Developer-ID from ad-hoc (with the honest caveat that a
-  local tool can't see *online* ticket revocation, so notarization can be stale-good).
+- ✅ **Notarization introspection — SHIPPED for `.app` bundles**, where the
+  `spctl -a -t exec` verdict is authoritative (fresh unsigned/ad-hoc app → HIGH;
+  signed-but-unnotarized → MEDIUM). Bare CLI Mach-Os are *not* assessed — modern
+  spctl rejects any non-app binary regardless of notarization ("valid but does
+  not seem to be an app", verified on-host against `/bin/ls`), so the verdict
+  carries no signal there. Standing caveat: a local tool can't see *online*
+  ticket revocation, so notarization can be stale-good; the assessment itself is
+  Apple's machinery and may consult Apple's servers (Aegis still sends nothing).
 - **Web/phishing (local, no cloud):** a StevenBlack-style hosts blocklist check.
 - **Blocking tier / eslogger power mode:** only as an explicit, opt-in, clearly
   privilege-raising mode (eslogger needs root + Full Disk Access) — never silently.
@@ -265,7 +281,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**110 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**124 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -297,6 +313,20 @@ are pinned. The earlier detectors remain pinned against **AMOS**, **RustBucket/
 BlueNoroff** (now generalized to `com.google.*`/`com.microsoft.*` vendor
 impersonation), **Cuckoo/ClickFix**, **Phexia**, and **Paradox**.
 
+The **event/listener/app-bundle tier** (this release) is pinned by 14 tests: the
+lsof parse drops loopback binds and keeps wildcard + non-loopback IPv6; Apple
+platform daemons are skipped while `/usr/bin/python3`, `/usr/bin/nc` and any
+third-party path stay tracked; a new ad-hoc listener from a user-writable path
+scores HIGH and a signed one MEDIUM (below the notify floor); an unchanged
+listener never re-alerts and the surface is adopted silently into the baseline;
+a fresh ad-hoc `.app` bundle in a hot dir scores HIGH, a (stubbed)
+signed-but-unnotarized one MEDIUM carrying Gatekeeper's verdict, a notarized one
+stays silent, and a malformed bundle neither alerts nor raises; a real ad-hoc
+binary is `spctl`-rejected; and the kqueue watch demonstrably wakes **within
+seconds** of a file landing in a watched dir (and times out quietly without one).
+`install.sh` output for both modes passes `plutil -lint` in a sandboxed `$HOME`
+(launchctl stubbed), and re-running in scan mode leaves no `KeepAlive` residue.
+
 **Live end-to-end run** on this machine (real data, sandboxed state): the full
 `scan` completed, the behavioral check ran clean across ~500 real processes with
 **zero false positives**, XProtect harvest parsed the unified log in ~1.5s, and the
@@ -304,3 +334,11 @@ run surfaced two real FPs that were then fixed and regression-pinned — a `perl
 one-liner whose regex alternation looked like a pipe, and the *legitimate* Google
 Keystone agent (unresolvable program ⇒ now LOW, not a HIGH impersonation). Existing
 shell history was adopted silently on first run; the second run was clean.
+
+**Re-run for this release** (same method — real machine, sandboxed state): the
+listener snapshot tracked **0 entries** on this Mac (loopback dev servers and
+Apple platform daemons correctly excluded — zero baseline churn), the fresh-state
+scan surfaced only true positives already known to this machine (its own CI
+runners, a real `curl…|sh` install line in history, the disabled firewall), no
+hot-dir or listener false positives appeared, and the second scan was quiet at
+~2.3s warm.

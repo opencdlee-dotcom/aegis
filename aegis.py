@@ -35,9 +35,11 @@ WHAT IT DOES (on an interval, via launchd)
      infostealers (AMOS/Atomic, Poseidon/Odyssey) that persist via launchd.
   2. Process watch      - flags running processes whose executable is
      unsigned / ad-hoc-signed AND lives in a user-writable location.
-  3. Hot-dir watch      - flags freshly-dropped unsigned Mach-O executables in
-     Downloads / Desktop / tmp / Shared, annotated with quarantine provenance
-     (a NO-quarantine binary bypassed Gatekeeper — a side-load signal).
+  3. Hot-dir watch      - flags freshly-dropped unsigned Mach-O executables AND
+     .app bundles in Downloads / Desktop / tmp / Shared, annotated with
+     quarantine provenance (a NO-quarantine binary bypassed Gatekeeper — a
+     side-load signal); a signed-but-unnotarized fresh app gets Gatekeeper's
+     own `spctl` verdict surfaced at MEDIUM.
   4. Hardening posture  - SIP, Gatekeeper, FileVault, Application Firewall,
      stealth mode, remote login (SSH). Reports weak settings.
   5. Shell startup files- baseline-diffs ~/.zshrc & friends (T1546.004); a
@@ -50,10 +52,18 @@ WHAT IT DOES (on an interval, via launchd)
  10. Self-protection    - detects if Aegis's own launchd agent was removed or its
      append-only evidence log was truncated (a monitor an attacker can silently
      disable is theater).
+ 11. Network listeners  - a NEW process accepting connections from the network
+     (non-loopback TCP LISTEN, via lsof): a bind shell / rogue server shape.
+     Loopback dev servers and SIP-pinned Apple daemons are excluded by design.
 
-  Surfaces 5-9 are baseline-diffed and ADOPTED SILENTLY the first time each is
-  seen (per-surface "trust what's already installed"), so upgrading Aegis on an
-  existing install never produces a day-one alert storm.
+  Surfaces 5-9 and 11 are baseline-diffed and ADOPTED SILENTLY the first time
+  each is seen (per-surface "trust what's already installed"), so upgrading
+  Aegis on an existing install never produces a day-one alert storm.
+
+  `watch` mode (bash install.sh watch) is EVENT-DRIVEN: a stdlib kqueue over
+  the persistence/hot/staging/rc/history paths rescans within seconds of a
+  change (debounced + rate-limited), with the interval scan as a floor —
+  closing most of the polling-latency gap without any Apple entitlement.
 
 DESIGN PRINCIPLE (from the alert-fatigue literature): *log everything, alert
 rarely, never repeat*. The first run establishes a SILENT baseline (no day-one
@@ -73,6 +83,7 @@ import json
 import os
 import plistlib
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -179,10 +190,22 @@ _LOGIN_SCOPED_RC = frozenset((
 # Extra persistence surfaces beyond ~/Library/Launch* (already covered) and the
 # user crontab. Files are content-hashed; dirs are walked one level for scripts.
 # Only entries that EXIST are snapshotted, so a machine without them stays quiet.
+# The hosts file (adware/phishing redirect), sshd config and the user's SSH trust
+# files are here too: a NEWLY-appearing ~/.ssh/authorized_keys — or an edit to
+# it — is the classic durable-remote-access implant (ATT&CK T1098.004), and an
+# ~/.ssh/config ProxyCommand hijack runs code on every ssh.
 EXTRA_PERSIST_FILES = ["/etc/crontab", "/etc/rc.common", "/etc/launchd.conf",
-                       os.path.join(HOME, ".launchd.conf")]
+                       os.path.join(HOME, ".launchd.conf"),
+                       "/etc/hosts", "/etc/ssh/sshd_config",
+                       os.path.join(HOME, ".ssh", "authorized_keys"),
+                       os.path.join(HOME, ".ssh", "config")]
+# pam.d / sudoers.d: an added pam module line or sudoers drop-in is silent
+# privilege persistence (T1556). Root-only-readable entries (most sudoers.d
+# files) hash to None and are skipped — coverage degrades gracefully, and a
+# world-readable drop or a pam edit (644 root:wheel — readable) is still caught.
 EXTRA_PERSIST_DIRS = ["/etc/periodic", "/etc/emond.d/rules",
-                      "/Library/StartupItems", "/System/Library/StartupItems"]
+                      "/Library/StartupItems", "/System/Library/StartupItems",
+                      "/etc/pam.d", "/etc/sudoers.d", "/etc/ssh/sshd_config.d"]
 
 # Chromium-family + Firefox extension roots (in the user's own home — no special
 # privilege). A newly-appearing extension ID is the signal; we diff the inventory.
@@ -366,6 +389,20 @@ WALLET_APP_BINS = [
     "/Applications/Exodus.app/Contents/MacOS/Exodus",
     os.path.join(HOME, "Applications/Ledger Live.app/Contents/MacOS/Ledger Live"),
 ]
+
+# --- Network listeners (bind-shell / rogue-server surface) -------------------- #
+# LuLu-tier OUTBOUND blocking needs an Apple Network Extension entitlement, but
+# the LISTENING side — a process accepting connections FROM the network — is
+# visible to an unprivileged process via lsof. Loopback-only binds are skipped
+# (dev servers churn on 127.0.0.1 constantly; a loopback bind is unreachable
+# from outside). Apple platform daemons are skipped too UNLESS the binary is an
+# interpreter/net-utility: rapportd/ControlCenter bind ephemeral wildcard ports
+# every boot (pure churn), and SIP means malware can never BE at a platform
+# path — but `/usr/bin/python3 -m http.server 0.0.0.0` or an `nc -l` IS exactly
+# a bind-shell/staging-server shape. Baseline-diffed with per-surface silent
+# adoption (existing listeners never storm).
+LSOF_LISTEN_CMD = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]
+_LISTENER_NET_UTILS = frozenset(("nc", "ncat", "socat"))
 
 # --- Known-vendor label impersonation (generalizes the com.apple.* check) ---- #
 # A persistence LABEL claiming a well-known vendor whose backing program isn't
@@ -1168,6 +1205,77 @@ def _is_macho(path):
         return False
 
 
+def gatekeeper_verdict(path):
+    """Gatekeeper's own assessment (`spctl -a -t exec`) → (verdict, source).
+    On an .app BUNDLE this is authoritative: 'accepted'/'Notarized Developer ID'
+    vs 'rejected' (unnotarized, ad-hoc, unsigned). On a bare CLI Mach-O modern
+    spctl rejects nearly everything ('valid but does not seem to be an app' —
+    verified on-host, incl. /bin/ls), so it is only consulted for bundles.
+    Honest note: the assessment is Apple's own machinery and may consult Apple's
+    notarization service; Aegis itself still transmits nothing."""
+    out, err, rc = run(["spctl", "-a", "-t", "exec", "-vv", path], timeout=12)
+    text = (out or "") + (err or "")
+    m = re.search(r"source=(.+)", text)
+    return ("accepted" if rc == 0 else "rejected",
+            m.group(1).strip() if m else None)
+
+
+def _bundle_executable(app_path):
+    """An .app bundle's main executable (Contents/MacOS/<CFBundleExecutable>),
+    or None if the bundle is malformed or the executable is missing."""
+    try:
+        with open(os.path.join(app_path, "Contents", "Info.plist"), "rb") as f:
+            name = plistlib.load(f).get("CFBundleExecutable")
+    except Exception:
+        return None
+    if not name:
+        return None
+    exe = os.path.join(app_path, "Contents", "MacOS", str(name))
+    return exe if os.path.isfile(exe) else None
+
+
+def _check_hot_app(path, st):
+    """Score a freshly-arrived .app bundle. The #1 macOS delivery vector
+    (DMG/ZIP lure → drag the app out) lands an .app — a DIRECTORY, which the
+    file-oriented Mach-O check below never sees. Unsigned/ad-hoc main executable
+    → HIGH, same bar as a bare Mach-O. Signed-but-NOT-notarized → MEDIUM
+    (logged, below the notify floor: self-built and legacy apps are common, but
+    Gatekeeper would refuse a normal quarantined launch of one — so if it runs,
+    it was side-loaded or force-approved). Notarized → silent (normal software)."""
+    exe = _bundle_executable(path)
+    if not exe:
+        return []
+    sig = classify_signature(exe)
+    when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")
+    if suspicious_sig(sig["trust"]):
+        sha = sha256(exe)
+        quar, agent = quarantine_origin(path)
+        prov = ("via %s" % agent if agent else
+                ("quarantined" if quar else
+                 "NO quarantine flag — side-loaded (bypassed Gatekeeper)"))
+        return [finding(
+            "HIGH", "hot-dir", "Unsigned app bundle in watched folder",
+            "%s [%s], modified %s, %s" % (path, sig["trust"], when, prov),
+            "hotdir:app:%s:%s:%s" % (path, sig["trust"], sha),
+            path=path, trust=sig["trust"], sha256=sha,
+            quarantined=quar, download_agent=agent)]
+    if sig["trust"] in ("apple", "app-store"):
+        return []
+    verdict, source = gatekeeper_verdict(path)
+    if verdict == "accepted":
+        return []  # notarized — the normal shape of downloaded software
+    sha = sha256(exe)
+    return [finding(
+        "MEDIUM", "hot-dir", "Un-notarized app in watched folder",
+        "%s [%s] is signed but NOT notarized (Gatekeeper: %s%s), modified %s — "
+        "a normal quarantined launch would be refused, so if it runs it was "
+        "side-loaded or force-approved. Verify you built/trust it."
+        % (path, sig["trust"], verdict,
+           ", %s" % source if source else "", when),
+        "hotdir:notary:%s:%s" % (path, sha),
+        path=path, trust=sig["trust"], sha256=sha, gatekeeper=verdict)]
+
+
 def check_hot_dirs(max_age_days=14):
     findings = []
     cutoff = time.time() - max_age_days * 86400
@@ -1182,7 +1290,12 @@ def check_hot_dirs(max_age_days=14):
                 st = os.stat(path)
             except Exception:
                 continue
-            if not os.path.isfile(path) or st.st_mtime < cutoff:
+            if st.st_mtime < cutoff:
+                continue
+            if name.endswith(".app") and os.path.isdir(path):
+                findings.extend(_check_hot_app(path, st))
+                continue
+            if not os.path.isfile(path):
                 continue
             if not _is_macho(path):
                 continue
@@ -1589,6 +1702,82 @@ def diff_wallet(prior, cur):
                      _mk("Wallet file CHANGED", "changed"))
 
 
+# --- network listeners ---------------------------------------------------------
+# See the LSOF_LISTEN_CMD block up top for the design rationale (non-loopback
+# only; platform daemons skipped unless interpreter-fronted; baseline-diffed).
+def _listener_worth_tracking(path):
+    """False for Apple platform daemons: SIP-pinned paths malware can never
+    occupy, and they bind ephemeral wildcard ports every boot (churn, not
+    signal). Kept anyway when the binary is an interpreter or net-utility —
+    `/usr/bin/python3` serving 0.0.0.0 or `nc -l` is a classic payload shape."""
+    if not path or not path.startswith("/"):
+        return True  # unresolvable → keep; we cannot prove it is platform
+    if any(path.startswith(p) for p in TRUSTED_PREFIXES):
+        base = os.path.basename(path)
+        return base in _ARGV_WATCH_BINS or base in _LISTENER_NET_UTILS
+    return True
+
+
+def _parse_lsof_listeners(text):
+    """{pid: set(addr)} of NON-loopback TCP listen sockets from `lsof -Fpn`
+    machine output (p<pid> / n<addr> field lines). IPv6 brackets handled;
+    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside."""
+    out = {}
+    pid = None
+    for line in (text or "").splitlines():
+        if len(line) < 2:
+            continue
+        tag, val = line[0], line[1:].strip()
+        if tag == "p":
+            pid = val
+        elif tag == "n" and pid is not None and ":" in val:
+            host = val.rsplit(":", 1)[0].strip("[]")
+            if host in ("127.0.0.1", "::1", "localhost"):
+                continue
+            out.setdefault(pid, set()).add(val)
+    return out
+
+
+def snapshot_listeners():
+    """{'<exec-path>:<port>': exec-path} for every tracked non-loopback TCP
+    listener. Keyed on path+port (not pid) so a routine process restart is not
+    a 'new listener'; the same server on a new port — or a new binary on the
+    same port — is."""
+    # lsof exits non-zero when it hit ANY warning (unstattable fuse mount, a
+    # vanished fd) while still emitting perfectly good records — so trust the
+    # OUTPUT, not the exit code. Empty output (incl. lsof missing) → empty snap.
+    out, _, _rc = run(LSOF_LISTEN_CMD, timeout=20)
+    if not out:
+        return {}
+    snap = {}
+    for pid, addrs in _parse_lsof_listeners(out).items():
+        pout, _, prc = run(["ps", "-o", "comm=", "-p", pid], timeout=8)
+        path = pout.strip() if prc == 0 and pout.strip() else None
+        if not _listener_worth_tracking(path):
+            continue
+        for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
+            snap["%s:%s" % (path or "?", port)] = path or "?"
+    return snap
+
+
+def diff_listeners(prior, cur):
+    def new_fn(key, path):
+        port = key.rsplit(":", 1)[1]
+        trust = (classify_signature(path)["trust"]
+                 if path.startswith("/") else "unknown")
+        hostile = suspicious_sig(trust) and is_risky_location(path)
+        return finding(
+            "HIGH" if hostile else "MEDIUM",
+            "net-listener", "New network listener",
+            "%s is accepting connections on TCP port %s [%s]%s"
+            % (path, port, trust,
+               " — an unsigned/ad-hoc binary in a user-writable path listening "
+               "on the network is a bind-shell / rogue-server shape" if hostile
+               else " — reachable from the network; verify you started this"),
+            "listener:%s" % key, path=path, port=port, trust=trust)
+    return _diff_map(prior, cur, new_fn)
+
+
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
 SURFACES = [
     ("shellrc", snapshot_shellrc, diff_shellrc),
@@ -1598,6 +1787,7 @@ SURFACES = [
     ("browserext", snapshot_browserext, diff_browserext),
     ("ide_ext", snapshot_ide_ext, diff_ide_ext),
     ("wallet", snapshot_wallet, diff_wallet),
+    ("listeners", snapshot_listeners, diff_listeners),
 ]
 
 
@@ -2048,13 +2238,109 @@ def cmd_allow(path):
     return 0
 
 
-def cmd_watch(interval=300):
-    """Foreground loop (for testing; production uses launchd StartInterval)."""
-    print("Aegis watch: scanning every %ds. Ctrl-C to stop." % interval)
-    while True:
-        cmd_scan(quiet=True)
+# --------------------------------------------------------------------------- #
+# Event-driven watch ("real-time, not polling" — the roadmap's top item). A
+# stdlib kqueue over the dirs/files malware must TOUCH — persistence dirs, hot
+# dirs, staging dirs, shell rc + history, wallet configs — triggers a rescan
+# within seconds of a change instead of at the next interval tick. Debounced (a
+# multi-file download burst is ONE scan) and rate-limited (a churning /tmp or a
+# busy terminal writing history can never scan more than once per
+# WATCH_MIN_GAP_SECS); a full scan still runs every `interval` seconds as a
+# floor, so the non-file surfaces (process argv, XProtect log, listeners,
+# hardening) are never starved. This closes most of the sub-minute polling gap
+# honestly documented in the README: a payload's persistence write or /tmp
+# staging drop now triggers detection in seconds, not at the next hourly tick.
+# It is still detection-after-the-write, NOT blocking (that ceiling is Apple's).
+# --------------------------------------------------------------------------- #
+
+WATCH_DEBOUNCE_SECS = 3   # let a write burst settle so it costs one scan
+WATCH_MIN_GAP_SECS = 60   # floor between event-triggered scans (battery bound)
+
+
+def _watch_paths():
+    """The dirs+files (that exist right now) whose change should trigger an
+    immediate rescan. Rebuilt before every wait, so paths that appear later
+    (a first wallet install, a new rc file) are picked up automatically."""
+    paths = []
+    for d in PERSISTENCE_DIRS + HOT_DIRS + STAGING_DIRS + EXTRA_PERSIST_DIRS:
+        if os.path.isdir(d):
+            paths.append(d)
+    for f in (SHELL_RC_FILES + SHELL_HISTORY_FILES + WALLET_CONFIG_FILES
+              + EXTRA_PERSIST_FILES):
+        if os.path.isfile(f):
+            paths.append(f)
+    return paths
+
+
+def _build_watch():
+    """A kqueue armed over _watch_paths() (EVFILT_VNODE: write/extend/delete/
+    rename). Returns (kq, fds); caller must _close_watch(kq, fds)."""
+    kq = select.kqueue()
+    fds, evs = [], []
+    fflags = (select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND |
+              select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)
+    for p in _watch_paths():
         try:
-            time.sleep(interval)
+            fd = os.open(p, os.O_EVTONLY)  # macOS: watch without blocking unmount
+        except OSError:
+            continue
+        fds.append(fd)
+        evs.append(select.kevent(
+            fd, filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=fflags))
+    if evs:
+        kq.control(evs, 0, 0)
+    return kq, fds
+
+
+def _wait_for_change(kq, timeout):
+    """True if any watched path changed within `timeout` seconds."""
+    try:
+        return bool(kq.control(None, 64, timeout))
+    except OSError:
+        return False
+
+
+def _close_watch(kq, fds):
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        kq.close()
+    except Exception:
+        pass
+
+
+def cmd_watch(interval=600):
+    """Foreground watch loop. Event-driven where kqueue exists (macOS: always):
+    a change to a watched path rescans within ~WATCH_DEBOUNCE_SECS (rate-limited
+    to one event scan per WATCH_MIN_GAP_SECS), and a full scan runs every
+    `interval` seconds as a floor. Production: `bash install.sh watch` runs this
+    under launchd KeepAlive. Falls back to plain interval polling if kqueue is
+    somehow unavailable."""
+    has_kq = hasattr(select, "kqueue")
+    print("Aegis watch: %s. Ctrl-C to stop."
+          % ("event-driven (kqueue) + full scan every %ds" % interval
+             if has_kq else "interval polling every %ds (no kqueue)" % interval))
+    while True:
+        try:
+            started = time.time()
+            cmd_scan(quiet=True)
+            if not has_kq:
+                time.sleep(interval)
+                continue
+            kq, fds = _build_watch()
+            try:
+                if _wait_for_change(kq, interval):
+                    time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
+                    remain = WATCH_MIN_GAP_SECS - (time.time() - started)
+                    if remain > 0:
+                        time.sleep(remain)  # rate-limit event-triggered scans
+                    log_run("watch: change event -> rescan")
+            finally:
+                _close_watch(kq, fds)
         except KeyboardInterrupt:
             print("\nstopped.")
             return 0
@@ -2579,7 +2865,9 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
   baseline         reset the known-good persistence baseline to current state
   allow <path>     suppress future alerts for findings matching <path>
   canary [remove]  plant (or remove) ransomware canary/honeypot files
-  watch [secs]     foreground loop (default 300s; prefer launchd in production)
+  watch [secs]     event-driven monitor: kqueue rescan seconds after a watched
+                   path changes + a full scan every [secs] (default 600) as a
+                   floor. Production: bash install.sh watch
 
  RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
   quarantine <path>      neutralize + confine a file to a reversible store
@@ -2607,7 +2895,7 @@ def main(argv):
     if cmd == "canary":
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
-        return cmd_watch(int(argv[2]) if len(argv) > 2 else 300)
+        return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
     # --- response tier (opt-in) ---
     if cmd == "quarantine" and len(argv) > 2:
         return cmd_quarantine(argv[2])

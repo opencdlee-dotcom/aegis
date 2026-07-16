@@ -69,6 +69,11 @@ class Sandbox(unittest.TestCase):
             "XPROTECT_BUNDLES": [],
             "CANARY_DIRS": [],
             "CANARY_STATE": os.path.join(self.state, "canaries.json"),
+            # The listener surface shells to lsof (live host state). Point it
+            # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
+            # tests are deterministic; listener tests call the parse/diff
+            # helpers directly on fixture data.
+            "LSOF_LISTEN_CMD": ["/usr/bin/true"],
             "_sigcache": {},
         }
         for k, v in overrides.items():
@@ -1282,6 +1287,156 @@ class TestResponseTier(Sandbox):
         if os.path.exists("/usr/bin/sandbox-exec") and os.path.exists("/bin/echo"):
             # A benign binary runs to completion inside the jail (returns 0).
             self.assertEqual(aegis.cmd_sandbox("/bin/echo", ["ok"]), 0)
+
+
+# --------------------------------------------------------------------------- #
+# Network-listener surface — non-loopback TCP LISTEN diffing (bind-shell shape).
+# Loopback dev servers and SIP-pinned Apple daemons must NOT alert; a new
+# unsigned/ad-hoc listener from a user-writable path must be HIGH.
+# --------------------------------------------------------------------------- #
+class TestListenerSurface(Sandbox):
+    def test_parse_skips_loopback_keeps_wildcard_and_v6(self):
+        text = ("p633\nczotero\nLuser\nf30\nn127.0.0.1:23119\n"
+                "p636\ncCC\nf8\nn*:7000\nf9\nn[::1]:8080\nf10\nn[fe80::1]:9999\n")
+        got = aegis._parse_lsof_listeners(text)
+        self.assertNotIn("633", got, "loopback-only pid must be dropped")
+        self.assertEqual(got["636"], {"*:7000", "[fe80::1]:9999"})
+
+    def test_platform_daemon_skipped_interpreter_and_thirdparty_kept(self):
+        self.assertFalse(aegis._listener_worth_tracking("/usr/libexec/rapportd"))
+        self.assertFalse(aegis._listener_worth_tracking("/System/Library/CoreServices/x"))
+        # An Apple-signed interpreter serving the network IS a payload shape.
+        self.assertTrue(aegis._listener_worth_tracking("/usr/bin/python3"))
+        self.assertTrue(aegis._listener_worth_tracking("/usr/bin/nc"))
+        # Third-party and unresolvable paths are always tracked.
+        self.assertTrue(aegis._listener_worth_tracking("/opt/homebrew/bin/nginx"))
+        self.assertTrue(aegis._listener_worth_tracking(None))
+
+    def test_new_suspicious_listener_is_high(self):
+        evil = self.adhoc_binary(os.path.join(self.hot, "srv"))
+        fs = aegis.diff_listeners({}, {"%s:4444" % evil: evil})
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+        self.assertEqual(fs[0]["port"], "4444")
+
+    def test_new_signed_listener_is_medium_not_notify(self):
+        fs = aegis.diff_listeners({}, {"/bin/ls:8000": "/bin/ls"})
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "MEDIUM",
+                         "a signed listener must stay below the notify floor")
+
+    def test_preexisting_listener_not_realerted(self):
+        cur = {"/bin/ls:8000": "/bin/ls"}
+        self.assertEqual(aegis.diff_listeners(dict(cur), cur), [])
+
+    def test_listener_surface_participates_in_scan_quietly(self):
+        # Pin that the registry entry is live: a scan baselines the surface
+        # (adopted per-surface) and an unchanged re-scan stays silent.
+        aegis.cmd_scan(quiet=True)  # first run: baseline (LSOF stub ⇒ empty)
+        self.notifications.clear()
+        aegis.cmd_scan(quiet=True)
+        self.assertEqual(self.notifications, [])
+        base = json.load(open(aegis.BASELINE))
+        self.assertIn("listeners", base)
+
+
+# --------------------------------------------------------------------------- #
+# Hot-dir .app bundles — the DMG/ZIP drag-out delivery vector is a DIRECTORY,
+# invisible to the file-oriented Mach-O check. Ad-hoc bundle ⇒ HIGH; signed-but-
+# unnotarized ⇒ MEDIUM with Gatekeeper's own verdict; notarized ⇒ silent.
+# --------------------------------------------------------------------------- #
+class TestHotDirAppBundle(Sandbox):
+    def _mk_app(self, name="Evil.app"):
+        app = os.path.join(self.hot, name)
+        macos = os.path.join(app, "Contents", "MacOS")
+        os.makedirs(macos)
+        exe = self.adhoc_binary(os.path.join(macos, name[:-4]))
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleExecutable": name[:-4]}, f)
+        return app, exe
+
+    def test_adhoc_app_bundle_is_high(self):
+        app, _exe = self._mk_app()
+        fs = [f for f in aegis.check_hot_dirs()
+              if f["category"] == "hot-dir" and f.get("path") == app]
+        self.assertEqual(len(fs), 1, fs)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+        self.assertTrue(fs[0]["fingerprint"].startswith("hotdir:app:"))
+
+    def test_unnotarized_devid_app_is_medium_with_verdict(self):
+        app, _exe = self._mk_app("Tool.app")
+        saved_cs, saved_gk = aegis.classify_signature, aegis.gatekeeper_verdict
+        aegis.classify_signature = lambda p: {
+            "trust": "developer-id", "team": "T",
+            "authority": "Developer ID Application: X (T)"}
+        aegis.gatekeeper_verdict = lambda p: ("rejected", None)
+        try:
+            fs = [f for f in aegis.check_hot_dirs() if f.get("path") == app]
+        finally:
+            aegis.classify_signature = saved_cs
+            aegis.gatekeeper_verdict = saved_gk
+        self.assertEqual(len(fs), 1, fs)
+        self.assertEqual(fs[0]["severity"], "MEDIUM")
+        self.assertEqual(fs[0]["gatekeeper"], "rejected")
+        self.assertTrue(fs[0]["fingerprint"].startswith("hotdir:notary:"))
+
+    def test_notarized_app_is_silent(self):
+        app, _exe = self._mk_app("Fine.app")
+        saved_cs, saved_gk = aegis.classify_signature, aegis.gatekeeper_verdict
+        aegis.classify_signature = lambda p: {
+            "trust": "developer-id", "team": "T", "authority": "x"}
+        aegis.gatekeeper_verdict = lambda p: ("accepted", "Notarized Developer ID")
+        try:
+            fs = [f for f in aegis.check_hot_dirs() if f.get("path") == app]
+        finally:
+            aegis.classify_signature = saved_cs
+            aegis.gatekeeper_verdict = saved_gk
+        self.assertEqual(fs, [], "a notarized fresh app must not alert")
+
+    def test_malformed_bundle_no_finding_no_raise(self):
+        app = os.path.join(self.hot, "Broken.app")
+        os.makedirs(os.path.join(app, "Contents"))
+        self.assertEqual([f for f in aegis.check_hot_dirs()
+                          if f.get("path") == app], [])
+
+    def test_gatekeeper_verdict_rejects_adhoc(self):
+        b = self.adhoc_binary(os.path.join(self.tmp, "gk_t"))
+        verdict, _src = aegis.gatekeeper_verdict(b)
+        self.assertEqual(verdict, "rejected")
+
+
+# --------------------------------------------------------------------------- #
+# Event-driven watch — the kqueue plumbing must actually wake on a change to a
+# watched dir (and not wake without one). Uses the sandboxed dirs only.
+# --------------------------------------------------------------------------- #
+class TestWatchKqueue(Sandbox):
+    def test_watch_paths_cover_sandbox_dirs(self):
+        ps = aegis._watch_paths()
+        self.assertIn(self.pers, ps)
+        self.assertIn(self.hot, ps)
+
+    def test_event_wakes_watch_within_seconds(self):
+        import threading
+        kq, fds = aegis._build_watch()
+        try:
+            t = threading.Timer(
+                0.3, lambda: open(os.path.join(self.hot, "drop"), "w").close())
+            t.start()
+            t0 = time.time()
+            fired = aegis._wait_for_change(kq, 10)
+            elapsed = time.time() - t0
+            t.join()
+            self.assertTrue(fired, "file creation in a watched dir must wake")
+            self.assertLess(elapsed, 5, "wake must be event-speed, not timeout")
+        finally:
+            aegis._close_watch(kq, fds)
+
+    def test_no_event_times_out_false(self):
+        kq, fds = aegis._build_watch()
+        try:
+            self.assertFalse(aegis._wait_for_change(kq, 0.3))
+        finally:
+            aegis._close_watch(kq, fds)
 
 
 if __name__ == "__main__":
