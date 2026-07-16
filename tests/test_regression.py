@@ -1404,6 +1404,36 @@ class TestHotDirAppBundle(Sandbox):
         verdict, _src = aegis.gatekeeper_verdict(b)
         self.assertEqual(verdict, "rejected")
 
+    def test_bundle_executable_rejects_path_separator(self):
+        # CFBundleExecutable is attacker-authored plist data: '/bin/sh' (or a
+        # ../ escape) would point classification at a clean out-of-bundle Apple
+        # binary instead of the payload. Anything but a bare filename ⇒ None.
+        app, _exe = self._mk_app("Escape.app")
+        for evil in ("/bin/sh", "../../../../bin/sh"):
+            with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+                plistlib.dump({"CFBundleExecutable": evil}, f)
+            self.assertIsNone(aegis._bundle_executable(app), evil)
+
+    def test_payload_swap_into_old_bundle_still_flagged(self):
+        # Swapping a payload into an old bundle's Contents/MacOS never touches
+        # the .app ROOT mtime — freshness must be max(root, exe) so root-only
+        # aging is not a staleness evasion.
+        app, _exe = self._mk_app("Stale.app")
+        old = time.time() - 90 * 86400
+        os.utime(app, (old, old))
+        fs = [f for f in aegis.check_hot_dirs()
+              if f["category"] == "hot-dir" and f.get("path") == app]
+        self.assertEqual(len(fs), 1, "fresh exe in old bundle must still alert")
+        self.assertEqual(fs[0]["severity"], "HIGH")
+
+    def test_genuinely_old_bundle_is_skipped(self):
+        app, exe = self._mk_app("Ancient.app")
+        old = time.time() - 90 * 86400
+        os.utime(exe, (old, old))
+        os.utime(app, (old, old))
+        self.assertEqual([f for f in aegis.check_hot_dirs()
+                          if f.get("path") == app], [])
+
 
 # --------------------------------------------------------------------------- #
 # Event-driven watch — the kqueue plumbing must actually wake on a change to a
@@ -1437,6 +1467,62 @@ class TestWatchKqueue(Sandbox):
             self.assertFalse(aegis._wait_for_change(kq, 0.3))
         finally:
             aegis._close_watch(kq, fds)
+
+
+# --------------------------------------------------------------------------- #
+# Live XProtect log-stream tail — the tail is a WAKE SOURCE for the watch loop
+# (data on its stdout must wake the kqueue like a file change; the fd must be
+# drainable so the level-triggered filter cannot busy-spin).
+# --------------------------------------------------------------------------- #
+class TestLiveStreamTail(Sandbox):
+    def test_drain_fd_reads_all_and_reports(self):
+        r, w = os.pipe()
+        try:
+            os.set_blocking(r, False)
+            # Writer must be non-blocking too: pipe capacity is ~64KB and
+            # nothing reads until _drain_fd below, so a blocking oversized
+            # write would deadlock this test. Fill the pipe to capacity.
+            os.set_blocking(w, False)
+            self.assertFalse(aegis._drain_fd(r), "empty fd must report False")
+            written = 0
+            try:
+                while written < 200000:
+                    written += os.write(w, b"x" * 65536)
+            except BlockingIOError:
+                pass  # pipe full — as much buffered as the OS allows
+            self.assertGreater(written, 0)
+            self.assertTrue(aegis._drain_fd(r))
+            self.assertFalse(aegis._drain_fd(r), "drain must consume everything")
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_data_on_extra_fd_wakes_watch(self):
+        import threading
+        r, w = os.pipe()
+        os.set_blocking(r, False)
+        kq, fds = aegis._build_watch(extra_read_fds=(r,))
+        try:
+            t = threading.Timer(0.3, lambda: os.write(w, b'{"event":1}\n'))
+            t.start()
+            t0 = time.time()
+            fired = aegis._wait_for_change(kq, 10)
+            t.join()
+            self.assertTrue(fired, "stream data must wake the watch loop")
+            self.assertLess(time.time() - t0, 5)
+        finally:
+            aegis._close_watch(kq, fds)
+            os.close(r)
+            os.close(w)
+
+    def test_spawn_and_stop_real_log_stream(self):
+        p = aegis._spawn_xprotect_stream()
+        self.assertIsNotNone(p, "log stream should spawn on macOS")
+        try:
+            self.assertIsNone(p.poll(), "tail must stay running")
+        finally:
+            aegis._stop_stream(p)
+        self.assertIsNotNone(p.poll(), "tail must be terminated after stop")
 
 
 if __name__ == "__main__":

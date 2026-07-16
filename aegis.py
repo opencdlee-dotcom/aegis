@@ -1222,31 +1222,45 @@ def gatekeeper_verdict(path):
 
 def _bundle_executable(app_path):
     """An .app bundle's main executable (Contents/MacOS/<CFBundleExecutable>),
-    or None if the bundle is malformed or the executable is missing."""
+    or None if the bundle is malformed or the executable is missing.
+    CFBundleExecutable is attacker-authored plist data: a name containing a path
+    separator ('/bin/sh', '../../x') would ESCAPE the bundle — os.path.join
+    swallows everything before an absolute component — and make Aegis classify
+    some other (clean, Apple) binary instead of the payload. A legit value is
+    always a bare filename, so anything else is rejected."""
     try:
         with open(os.path.join(app_path, "Contents", "Info.plist"), "rb") as f:
             name = plistlib.load(f).get("CFBundleExecutable")
     except Exception:
         return None
-    if not name:
+    if not name or "/" in str(name):
         return None
     exe = os.path.join(app_path, "Contents", "MacOS", str(name))
     return exe if os.path.isfile(exe) else None
 
 
-def _check_hot_app(path, st):
+def _check_hot_app(path, st, cutoff):
     """Score a freshly-arrived .app bundle. The #1 macOS delivery vector
     (DMG/ZIP lure → drag the app out) lands an .app — a DIRECTORY, which the
     file-oriented Mach-O check below never sees. Unsigned/ad-hoc main executable
     → HIGH, same bar as a bare Mach-O. Signed-but-NOT-notarized → MEDIUM
     (logged, below the notify floor: self-built and legacy apps are common, but
     Gatekeeper would refuse a normal quarantined launch of one — so if it runs,
-    it was side-loaded or force-approved). Notarized → silent (normal software)."""
+    it was side-loaded or force-approved). Notarized → silent (normal software).
+    Freshness is the NEWEST of the bundle root and its main executable: swapping
+    a payload into an old bundle's Contents/MacOS does not touch the .app root
+    mtime, so root-only aging would be a trivial staleness evasion."""
     exe = _bundle_executable(path)
     if not exe:
         return []
+    try:
+        newest = max(st.st_mtime, os.stat(exe).st_mtime)
+    except Exception:
+        newest = st.st_mtime
+    if newest < cutoff:
+        return []
     sig = classify_signature(exe)
-    when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")
+    when = datetime.fromtimestamp(newest).strftime("%Y-%m-%d")
     if suspicious_sig(sig["trust"]):
         sha = sha256(exe)
         quar, agent = quarantine_origin(path)
@@ -1290,10 +1304,11 @@ def check_hot_dirs(max_age_days=14):
                 st = os.stat(path)
             except Exception:
                 continue
-            if st.st_mtime < cutoff:
-                continue
             if name.endswith(".app") and os.path.isdir(path):
-                findings.extend(_check_hot_app(path, st))
+                # cutoff decided inside — bundle freshness is max(root, exe).
+                findings.extend(_check_hot_app(path, st, cutoff))
+                continue
+            if st.st_mtime < cutoff:
                 continue
             if not os.path.isfile(path):
                 continue
@@ -2272,9 +2287,12 @@ def _watch_paths():
     return paths
 
 
-def _build_watch():
+def _build_watch(extra_read_fds=()):
     """A kqueue armed over _watch_paths() (EVFILT_VNODE: write/extend/delete/
-    rename). Returns (kq, fds); caller must _close_watch(kq, fds)."""
+    rename), plus EVFILT_READ on any `extra_read_fds` (the live log-stream tail
+    — data arriving there wakes the loop exactly like a file change). Returns
+    (kq, fds); caller must _close_watch(kq, fds) — extra fds are NOT closed
+    here, they belong to their subprocess."""
     kq = select.kqueue()
     fds, evs = [], []
     fflags = (select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND |
@@ -2288,6 +2306,11 @@ def _build_watch():
         evs.append(select.kevent(
             fd, filter=select.KQ_FILTER_VNODE,
             flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=fflags))
+    for fd in extra_read_fds:
+        # Level-triggered (no EV_CLEAR): the caller drains the fd on every wake,
+        # so a partial read can never wedge the loop into a busy spin.
+        evs.append(select.kevent(
+            fd, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD))
     if evs:
         kq.control(evs, 0, 0)
     return kq, fds
@@ -2313,6 +2336,53 @@ def _close_watch(kq, fds):
         pass
 
 
+def _spawn_xprotect_stream():
+    """Persistent `log stream` tail of Apple's XProtect subsystem — the LIVE
+    counterpart to check_xprotect()'s windowed harvest (the roadmap's remaining
+    real-time half). Design: the tail is a WAKE SOURCE, not a second emit path —
+    any event on the stream triggers an immediate scan, whose windowed harvest
+    then picks the event up through the one normal report/dedup/notify pipeline
+    (no duplicated parsing state to drift). XPR events are rare (~daily module
+    runs), so the wake cost is nil. Returns a Popen with a non-blocking stdout,
+    or None if `log` is unavailable — watch degrades to file events + the floor."""
+    try:
+        p = subprocess.Popen(
+            ["log", "stream", "--style", "ndjson", "--predicate",
+             'subsystem == "%s" AND category == "XPEvent.structured"'
+             % XPROTECT_SUBSYSTEM],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        os.set_blocking(p.stdout.fileno(), False)
+        return p
+    except Exception:
+        return None
+
+
+def _drain_fd(fd):
+    """Consume whatever is buffered on a non-blocking fd (True if anything was
+    read). Must be called on every wake for level-triggered read fds."""
+    got = False
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return got
+        except OSError:
+            return got
+        if not chunk:
+            return got
+        got = True
+
+
+def _stop_stream(proc):
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
 def cmd_watch(interval=600):
     """Foreground watch loop. Event-driven where kqueue exists (macOS: always):
     a change to a watched path rescans within ~WATCH_DEBOUNCE_SECS (rate-limited
@@ -2322,28 +2392,41 @@ def cmd_watch(interval=600):
     somehow unavailable."""
     has_kq = hasattr(select, "kqueue")
     print("Aegis watch: %s. Ctrl-C to stop."
-          % ("event-driven (kqueue) + full scan every %ds" % interval
+          % ("event-driven (kqueue + live XProtect tail) + full scan every %ds"
+             % interval
              if has_kq else "interval polling every %ds (no kqueue)" % interval))
-    while True:
-        try:
-            started = time.time()
-            cmd_scan(quiet=True)
-            if not has_kq:
-                time.sleep(interval)
-                continue
-            kq, fds = _build_watch()
+    stream = _spawn_xprotect_stream() if has_kq else None
+    try:
+        while True:
             try:
-                if _wait_for_change(kq, interval):
-                    time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
-                    remain = WATCH_MIN_GAP_SECS - (time.time() - started)
-                    if remain > 0:
-                        time.sleep(remain)  # rate-limit event-triggered scans
-                    log_run("watch: change event -> rescan")
-            finally:
-                _close_watch(kq, fds)
-        except KeyboardInterrupt:
-            print("\nstopped.")
-            return 0
+                started = time.time()
+                cmd_scan(quiet=True)
+                if not has_kq:
+                    time.sleep(interval)
+                    continue
+                if stream is not None and stream.poll() is not None:
+                    stream = _spawn_xprotect_stream()  # tail died → respawn
+                extra = (stream.stdout.fileno(),) if stream else ()
+                # A write landing between the scan above and this arm is missed
+                # by the kqueue; the interval floor scan covers that ms-wide gap.
+                kq, fds = _build_watch(extra)
+                try:
+                    if _wait_for_change(kq, interval):
+                        time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
+                        if stream is not None:
+                            # level-triggered read fd: MUST drain or spin
+                            _drain_fd(stream.stdout.fileno())
+                        remain = WATCH_MIN_GAP_SECS - (time.time() - started)
+                        if remain > 0:
+                            time.sleep(remain)  # rate-limit event scans
+                        log_run("watch: change event -> rescan")
+                finally:
+                    _close_watch(kq, fds)
+            except KeyboardInterrupt:
+                print("\nstopped.")
+                return 0
+    finally:
+        _stop_stream(stream)
 
 
 # --------------------------------------------------------------------------- #
