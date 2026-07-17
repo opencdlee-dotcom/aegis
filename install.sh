@@ -21,9 +21,19 @@ AGENTS_DIR="$HOME/Library/Launch""Agents"          # split to keep intent obviou
 PLIST="$AGENTS_DIR/$LABEL.plist"
 PY="/usr/bin/python3"                                # system python; stdlib-only
 UID_NUM="$(id -u)"
+# The launchd agent runs this INSTALLED COPY, never the repo file. Reason: a repo
+# under ~/Documents/… sits in a TCC-protected location, and a launchd-spawned
+# python3 has no Full Disk Access, so it gets "Operation not permitted" merely
+# OPENING the script — the whole monitor then fails every scheduled run with no
+# signal (observed in the wild). ~/.aegis is NOT TCC-protected (the agent already
+# writes its logs there), so a copy here runs with zero setup. Manual `python3
+# aegis.py …` from the repo still works (your shell has TCC access). Trade-off:
+# the agent runs a snapshot — RE-RUN install.sh after editing aegis.py to update it.
+RUNTIME="$HOME/.aegis/aegis.py"
 
 [ -f "$AEGIS" ] || { echo "aegis.py not found at $AEGIS" >&2; exit 1; }
 mkdir -p "$AGENTS_DIR" "$HOME/.aegis"
+cp "$AEGIS" "$RUNTIME"                               # install/refresh the runnable copy
 
 # The install path is interpolated into plist XML, so any &, <, > in it (e.g. a
 # repo under "…/Work & Projects/…") MUST be entity-escaped or the plist is
@@ -31,7 +41,7 @@ mkdir -p "$AGENTS_DIR" "$HOME/.aegis"
 # then never runs on schedule.
 xml_escape() { local s=$1; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; printf '%s' "$s"; }
 PY_X="$(xml_escape "$PY")"
-AEGIS_X="$(xml_escape "$AEGIS")"
+AEGIS_X="$(xml_escape "$RUNTIME")"                   # agent runs the TCC-safe copy
 OUT_X="$(xml_escape "$HOME/.aegis/run.out")"
 ERR_X="$(xml_escape "$HOME/.aegis/run.err")"
 
@@ -104,7 +114,8 @@ echo "            bash $DIR/install.sh watch       (event-driven, rescan in seco
 echo "   Remove : bash $DIR/uninstall.sh"
 echo ""
 echo "⚠  Aegis DETECTS and alerts; it does not block (that needs Apple's"
-echo "   Endpoint Security entitlement). It also can't read TCC-protected"
-echo "   folders without Full Disk Access — grant it to /usr/bin/python3 in"
-echo "   System Settings ▸ Privacy & Security ▸ Full Disk Access for full"
-echo "   coverage (optional; core persistence/hardening checks work without it)."
+echo "   Endpoint Security entitlement). The agent runs a TCC-safe copy at"
+echo "   ~/.aegis/aegis.py, so persistence/process/hardening/history/BTM checks"
+echo "   work with NO Full Disk Access. To ALSO scan Downloads/Desktop drops,"
+echo "   grant FDA to /usr/bin/python3 in System Settings ▸ Privacy & Security ▸"
+echo "   Full Disk Access (optional). Re-run this installer after editing aegis.py."

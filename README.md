@@ -99,9 +99,21 @@ State lives in `~/.aegis/`: `baseline.json`, `findings.jsonl` (durable log),
 `latest.md` (last report), `seen.json` (dedup), `allowlist.json`, `sigcache.json`,
 `actions.jsonl` (response-action audit), and `quarantine/` (the reversible store).
 
-**Full Disk Access (optional):** grant it to `/usr/bin/python3` in *System
-Settings ▸ Privacy & Security ▸ Full Disk Access* so Aegis can read TCC-protected
-locations. Core persistence/hardening checks work without it.
+**Where the agent runs from (why it's a copy).** `install.sh` copies `aegis.py`
+to `~/.aegis/aegis.py` and points the launchd agent there — **not** at the repo.
+A repo under `~/Documents/…` sits in a **TCC-protected** location, and a
+launchd-spawned `python3` has no Full Disk Access, so it gets *"Operation not
+permitted"* merely **opening** the script — every scheduled run then fails with
+no signal (this was live on the author's own machine: the background monitor had
+never actually run). `~/.aegis` is not TCC-protected, so the copy runs with zero
+setup. Manual `python3 aegis.py …` from the repo still works (your shell has TCC
+access). **Re-run `install.sh` after editing `aegis.py`** to refresh the copy.
+
+**Full Disk Access (optional):** with the copy install above, persistence /
+process / hardening / shell-history / BTM / listener checks all work with **no**
+FDA. To *also* scan `~/Downloads` and `~/Desktop` drops (themselves TCC-protected),
+grant FDA to `/usr/bin/python3` in *System Settings ▸ Privacy & Security ▸ Full
+Disk Access*.
 
 ---
 
