@@ -69,6 +69,8 @@ class Sandbox(unittest.TestCase):
             "XPROTECT_BUNDLES": [],
             "CANARY_DIRS": [],
             "CANARY_STATE": os.path.join(self.state, "canaries.json"),
+            # vt_key must be sandboxed so no test reads or writes the real key.
+            "VT_KEY_FILE": os.path.join(self.state, "vt_key"),
             # The listener surface shells to lsof (live host state). Point it
             # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
             # tests are deterministic; listener tests call the parse/diff
@@ -1329,6 +1331,15 @@ class TestListenerSurface(Sandbox):
         cur = {"/bin/ls:8000": "/bin/ls"}
         self.assertEqual(aegis.diff_listeners(dict(cur), cur), [])
 
+    def test_parse_never_raises_on_garbage(self):
+        for text in ("", "n*:80\n", "n:::\n", "p\nn\n", "x\n\n", "p1\nnnoport\n",
+                     "p1\nn[::0e]:\n", "\x00\xff\np9\nn*:1\n"):
+            got = aegis._parse_lsof_listeners(text)
+            self.assertIsInstance(got, dict, repr(text))
+        # a path containing ':' must survive the key round-trip on the port side
+        fs = aegis.diff_listeners({}, {"/tmp/a:b/srv:9090": "/tmp/a:b/srv"})
+        self.assertEqual(fs[0]["port"], "9090")
+
     def test_listener_surface_participates_in_scan_quietly(self):
         # Pin that the registry entry is live: a scan baselines the surface
         # (adopted per-surface) and an unchanged re-scan stays silent.
@@ -1523,6 +1534,137 @@ class TestLiveStreamTail(Sandbox):
         finally:
             aegis._stop_stream(p)
         self.assertIsNotNone(p.poll(), "tail must be terminated after stop")
+
+
+# --------------------------------------------------------------------------- #
+# Background Task Management surface (sfltool dumpbtm) — catches SMAppService
+# login items that never drop a LaunchAgents plist. New no-team item in a
+# writable path → HIGH; teamed → MEDIUM; embedded sub-refs are not items.
+# --------------------------------------------------------------------------- #
+_BTM_FIXTURE = """========================
+ Records for UID 501
+========================
+ Items:
+
+ #1:
+                 UUID: AAAA-1
+                 Name: Legit Agent
+      Team Identifier: ABCDE12345
+                 Type: legacy agent (0x10008)
+           Identifier: com.legit.agent
+                  URL: file:///Library/LaunchAgents/com.legit.agent.plist
+
+ #2:
+                 UUID: BBBB-2
+                 Name: Container
+       Developer Name: X
+                 Type: developer (0x20)
+           Identifier: com.vendor.container
+                  URL: (null)
+  Embedded Item Identifiers:
+    #1: 16.com.vendor.helper
+"""
+
+
+class TestBTMSurface(Sandbox):
+    def test_parse_distinguishes_items_from_embedded(self):
+        got = aegis._parse_btm(_BTM_FIXTURE)
+        self.assertEqual(set(got), {"com.legit.agent", "com.vendor.container"})
+        self.assertEqual(got["com.legit.agent"]["team"], "ABCDE12345")
+        self.assertIsNone(got["com.vendor.container"]["team"])
+
+    def test_parse_never_raises_on_garbage(self):
+        for t in ("", "#1:\n", "  #1: embedded\n", "Name: x\n", "#1:\nType: y\n"):
+            self.assertIsInstance(aegis._parse_btm(t), dict, repr(t))
+
+    def test_new_noteam_item_in_writable_path_is_high(self):
+        cur = {"com.evil.x": {"name": "Evil", "team": None, "type": "agent",
+                              "url": "file://%s/evil.plist" % self.hot}}
+        fs = aegis.diff_btm({}, cur)
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+
+    def test_new_teamed_item_is_medium(self):
+        cur = {"com.ok.x": {"name": "OK", "team": "ABCDE12345", "type": "agent",
+                            "url": "file:///Applications/OK.app/"}}
+        fs = aegis.diff_btm({}, cur)
+        self.assertEqual(fs[0]["severity"], "MEDIUM")
+
+    def test_preexisting_item_not_realerted(self):
+        cur = {"com.ok.x": {"name": "OK", "team": "T", "type": "a", "url": None}}
+        self.assertEqual(aegis.diff_btm(dict(cur), cur), [])
+
+    def test_url_percent_decoded_for_path_scoring(self):
+        # a %20-encoded writable path must decode so location scoring sees it
+        p = aegis._btm_path_from_url("file:///Users/Shared/My%20Tool/x")
+        self.assertEqual(p, "/Users/Shared/My Tool/x")
+
+
+# --------------------------------------------------------------------------- #
+# VirusTotal opt-in reputation — the ONLY network command, and only with a key.
+# No key ⇒ never touches the network. Only the hash is ever sent.
+# --------------------------------------------------------------------------- #
+class TestVTReputation(Sandbox):
+    def test_no_key_refuses_and_makes_no_call(self):
+        os.environ.pop("AEGIS_VT_API_KEY", None)
+        # No vt_key file in the sandboxed state dir ⇒ off.
+        self.assertEqual(aegis.cmd_vt("a" * 64), 2)
+
+    def test_key_from_file(self):
+        os.environ.pop("AEGIS_VT_API_KEY", None)
+        with open(aegis.VT_KEY_FILE, "w") as f:
+            f.write("filekey123\n")
+        self.assertEqual(aegis._vt_api_key(), "filekey123")
+
+    def test_env_key_wins_over_file(self):
+        with open(aegis.VT_KEY_FILE, "w") as f:
+            f.write("filekey\n")
+        os.environ["AEGIS_VT_API_KEY"] = "envkey"
+        try:
+            self.assertEqual(aegis._vt_api_key(), "envkey")
+        finally:
+            os.environ.pop("AEGIS_VT_API_KEY", None)
+
+    def test_sha256_recogniser(self):
+        self.assertTrue(aegis._looks_like_sha256("a" * 64))
+        self.assertFalse(aegis._looks_like_sha256("a" * 63))
+        self.assertFalse(aegis._looks_like_sha256("/tmp/file"))
+
+    def test_bad_target_with_key_refused(self):
+        os.environ["AEGIS_VT_API_KEY"] = "k"
+        try:
+            self.assertEqual(aegis.cmd_vt("/no/such/file/here"), 1)
+        finally:
+            os.environ.pop("AEGIS_VT_API_KEY", None)
+
+    def test_clean_verdict_sends_only_hash(self):
+        import urllib.request
+        sha = "b" * 64
+        seen = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return json.dumps({"data": {"attributes": {
+                    "last_analysis_stats": {"malicious": 0, "harmless": 70}}}}).encode()
+
+        def fake_urlopen(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["key"] = req.headers.get("X-apikey")
+            return _Resp()
+
+        os.environ["AEGIS_VT_API_KEY"] = "secret"
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            rc = aegis.cmd_vt(sha)
+        finally:
+            urllib.request.urlopen = saved
+            os.environ.pop("AEGIS_VT_API_KEY", None)
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen["url"].endswith(sha), "only the hash is in the URL")
+        self.assertEqual(seen["key"], "secret")
 
 
 if __name__ == "__main__":

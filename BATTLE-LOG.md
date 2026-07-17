@@ -1,3 +1,80 @@
+# Aegis — Battle-Test Log (2026-07-16, pass 3 — residual-gap-detectors branch)
+
+Adversarial probe of the **newest** surfaces (event-driven kqueue watch, live
+`log stream` XProtect tail, hot-dir `.app` bundle + notarization, network-listener
+diff) added after pass 2. Same discipline: every oracle derived from stated intent,
+each finding proven with a fail-before/pass-after reproducer captured against the
+pre-fix commit, no live notification/launchd load/write outside a tmp dir.
+
+## Outcome (pass 3)
+
+**2 genuine detection-evasion defects fixed** (both HIGH — a false negative that
+lets a real payload through), each proven vs `5b95c2c` and pinned by a permanent
+regression test, plus a fuzz-hardening test for the lsof parser. Test state:
+`selftest.py` green, `tests/test_regression.py` **132/132** (124 + 8 new across the
+live-tail and probe fixes).
+
+| # | Sev | Where | Defect (vs stated intent) | Evidence | Fix |
+|---|-----|-------|---------------------------|----------|-----|
+| P3-1 | **HIGH** | `_bundle_executable` | `CFBundleExecutable` is attacker-authored plist data. A value with a path separator (`/bin/sh`, `../../x`) makes `os.path.join(.../MacOS, name)` **escape the bundle** — an absolute name is swallowed whole — so Aegis classifies some *other, clean* binary (`/bin/sh`, Apple-signed) instead of the bundle's real payload → the `.app` scores as benign. | Repro vs `5b95c2c`: a bundle whose `CFBundleExecutable="/bin/sh"` → pre-fix `_bundle_executable` returned `/bin/sh` (would classify Apple, verdict silent); post-fix returns `None` (bundle rejected as malformed). | Reject any `CFBundleExecutable` containing `/`; a legit value is always a bare filename. |
+| P3-2 | **HIGH** | `_check_hot_app` | Bundle freshness keyed only on the `.app` **root** mtime. Swapping a fresh payload into an *existing, old* bundle's `Contents/MacOS/` doesn't touch the root mtime, so an attacker ages the root once and every later payload swap falls outside the `max_age_days` hot window → never scanned. | Repro vs `5b95c2c`: fresh ad-hoc exe inside a bundle whose root mtime is 60 days old → pre-fix **0 findings**; post-fix **1 HIGH**. A genuinely-old bundle (root+exe both old) still ages out. | Freshness = `max(root_mtime, exe_mtime)`; decide the cutoff inside `_check_hot_app` after resolving the executable. |
+
+## Hardened (no defect, pinned anyway)
+
+- `_parse_lsof_listeners` fuzzed with 8 malformed/garbage inputs (empty, headerless
+  `n` lines, `n:::`, truncated fields, embedded NULs, a port-less bracketed v6) —
+  never raises, always returns a dict. A path containing `:` round-trips: the port
+  is split off the **right**, so `/tmp/a:b/srv:9090` still reports port `9090`.
+- Live `log stream` tail proven as a **wake source**: spawns and terminates cleanly,
+  real data on its fd wakes the shared kqueue within seconds, and `_drain_fd`
+  consumes a >64 KiB burst fully so the level-triggered read filter can't busy-spin.
+
+## Not fixed (residual)
+
+- The listener surface depends on `lsof`; if a future macOS removes it the surface
+  degrades to empty (no crash) — acceptable, `lsof` ships on every current macOS.
+- `spctl` notarization introspection covers `.app` bundles only (bare CLI Mach-Os
+  carry no signal there — verified on-host); unchanged by this pass, documented in
+  the README roadmap.
+
+---
+
+# Aegis — Adversarial probe (2026-07-16, pass 3 — new-surface hardening)
+
+Inline adversarial probe of the surfaces added this session (event-driven kqueue
+watch + live `log stream` tail, hot-dir `.app`/notarization, network listeners,
+BTM/Login-Items, opt-in VirusTotal). Every oracle derived from README/docstring
+intent; each finding proven fail-before/pass-after against the committed baseline
+before it was trusted; no live notification, launchd load, VT network call, or
+write outside a per-test tmp dir fired. Suite: `selftest` 3/3,
+`tests/test_regression.py` **143/143**.
+
+## Outcome (pass 3)
+
+**2 genuine defects fixed** (1 HIGH detection-evasion, 1 MEDIUM staleness-evasion),
+each pinned; plus 1 real-state test-pollution bug caught and fixed in-pass.
+
+| # | Sev | Where | Defect (vs intent) | Evidence | Fix |
+|---|-----|-------|--------------------|----------|-----|
+| P3-1 | **HIGH** | `_bundle_executable` | `CFBundleExecutable` is attacker-authored plist data. A value with a path separator (`/bin/sh`, `../../x`) makes `os.path.join(app,'Contents/MacOS',name)` **escape the bundle** — `join` discards everything before an absolute component — so Aegis would classify a *clean Apple binary out-of-bundle* instead of the ad-hoc payload, silently downgrading a HIGH `.app` finding to nothing. | Probed the committed `5b95c2c` `_bundle_executable` with a `/bin/sh` name → resolved outside the bundle. | Reject any `CFBundleExecutable` containing `/`; a legit value is always a bare filename. Post-fix → `None` (no finding suppression). Pinned. |
+| P3-2 | **MEDIUM** | `_check_hot_app` | Bundle freshness keyed on the `.app` **root** mtime only. Swapping a fresh payload into an *existing old* bundle's `Contents/MacOS` never touches the root mtime → a re-weaponized old app ages out of the hot window and is never scored. | A 60-day-old bundle root with a freshly-written exe → no finding pre-fix. | Freshness = `max(root_mtime, exe_mtime)`; a fresh exe in an old bundle still flags HIGH, a fully-old bundle still ages out. Both pinned. |
+| P3-3 | **MEDIUM** | `TestVTReputation` (test) | A new VT test wrote a key to the **real** `~/.aegis/vt_key` (the sandbox overrode `STATE_DIR` but not `VT_KEY_FILE`), polluting real host state — the suite's own "never touch real `~/.aegis`" invariant. | Real `~/.aegis/vt_key` (11 bytes) appeared after a run. | Sandbox now overrides `VT_KEY_FILE`; the stray file was removed. Guards the invariant that would otherwise let any future key-path test leak. |
+
+## Saturated (survived attack, no fix needed)
+
+- lsof listener parser fuzzed with 8 malformed inputs (empty ports, bare `:::`,
+  truncated records, NUL/high bytes) → never raises; a `:`-in-path key still
+  round-trips the port correctly.
+- BTM parser on garbage / header-only / embedded-only input → never raises,
+  never mis-emits an embedded sub-ref as a top-level item.
+- `vt` with no key → refuses, **zero** network calls; with a stubbed transport
+  the request carries only the sha256 + key header (file bytes never leave host).
+- kqueue watch + `EVFILT_READ` stream fd: wakes within seconds on a real write /
+  real pipe data, times out quietly otherwise, drains fully (no busy-spin), tail
+  respawns if it dies.
+
+---
+
 # Aegis — Battle-Test Log (2026-07-15, pass 2 — residual-gap-detectors branch)
 
 Second `/battle-test` pass (fable-mode gates) targeting **only the new surfaces**

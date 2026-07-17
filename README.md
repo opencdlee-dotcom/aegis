@@ -38,6 +38,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Network listeners** *(new)* | A **new** process accepting connections *from the network* (non-loopback TCP LISTEN, via `lsof`), baseline-diffed. Unsigned/ad-hoc binary in a user-writable path listening → HIGH (bind-shell / rogue-server shape); anything else → MEDIUM (logged). Loopback dev servers and SIP-pinned Apple daemons are excluded by design — but an Apple-signed *interpreter* serving the network (`python3 -m http.server 0.0.0.0`, `nc -l`) **is** tracked | LuLu-tier *outbound* blocking needs an Apple entitlement; the *listening* side is visible unprivileged, and a reachable listener is rare, durable, and high-signal |
 | **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
 | **Editor extensions** | New VSCode / Cursor / VSCodium / Windsurf extension | A backdoored editor extension is a live supply-chain vector (Objective-See's *Paradox*, 2025, shipped via a trojanised Cursor extension) |
+| **Background items** *(new)* | A **new** Login Item / SMAppService background agent from `sfltool dumpbtm` (macOS's own Background Task Management record), baseline-diffed. A new item with **no Team ID whose URL is in a user-writable path** → HIGH, else MEDIUM | Catches the modern persistence path the LaunchAgents-directory scan **cannot see**: an `SMAppService`-registered agent/daemon that never drops a plist in `~/Library/LaunchAgents` (how legit apps *and* 2024+ malware now register) |
 | **Self-protection** | Aegis's own launchd agent removed, its append-only log truncated, or its **trust store (baseline/allowlist) edited out-of-band** | A monitor an attacker can silently disable, blind, or feed a poisoned baseline is theater |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, Application Firewall, stealth mode, Remote Login, **+ XProtect definition age** | Surfaces weak settings (a first run typically finds a control the operator assumed was on) |
 
@@ -69,6 +70,8 @@ python3 aegis.py status        # fast hardening posture + XProtect definition ag
 python3 aegis.py report        # reprint the latest report
 python3 aegis.py baseline      # accept current state as known-good (resets diff)
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
+python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
+                               #   the hash, never the file; scan stays local-only)
 python3 aegis.py canary        # plant ransomware canary/honeypot files (opt-in)
 python3 aegis.py canary remove # ...and remove them
 
@@ -226,10 +229,15 @@ Not defensible, and not claimed: *"blocks malware."*
 ## Trust model (a monitor is itself a privileged surveillance surface)
 
 A security tool sees everything, so it must be trustworthy *by construction*:
-- **Local-only** — never phones home; no telemetry, no cloud.
+- **Local-only on the scan/watch path** — the automatic monitor never phones home;
+  no telemetry, no cloud. The **only** command that touches the network is
+  `aegis.py vt`, which you run **by hand**, only with a key you supply, and which
+  sends **only a hash, never a file** — the background scanner never invokes it and
+  never even imports the networking module.
 - **Stdlib-only** — no pip packages = no supply-chain surface to audit.
-- **Readable** — one ~2,000-line file you can read end to end; it shells out only to
-  Apple's own signed CLIs (`codesign`, `spctl`, `csrutil`, `launchctl`, `log`, …).
+- **Readable** — one ~2,600-line file you can read end to end; it shells out only to
+  Apple's own signed CLIs (`codesign`, `spctl`, `csrutil`, `launchctl`, `log`,
+  `sfltool`, `lsof`, …).
 - **Read-only to your system on the scan path** — the background monitor writes
   only inside `~/.aegis/`. It touches anything *outside* that directory **only**
   on an explicit response command you type by hand: `canary` plants decoy files;
@@ -249,10 +257,22 @@ A security tool sees everything, so it must be trustworthy *by construction*:
 - ✅ **Real-time (not polling) — SHIPPED** as `install.sh watch`: a stdlib
   `select.kqueue` over the persistence/hot/staging/rc/history/wallet paths
   rescans within seconds of a change (debounced; ≤1 event-scan/min), full scan
-  every 10 min as the floor. Remaining half: tail `log stream` in a persistent
-  subprocess for live behavioral events instead of the windowed `log show`.
-- **Reputation:** optional VirusTotal hash lookups for flagged binaries (bring your
-  own API key; **off by default** so the local-only guarantee stays literally true).
+  every 10 min as the floor. **Both halves now shipped:** a persistent
+  `log stream` tail of Apple's XProtect subsystem is armed as an `EVFILT_READ`
+  source on the same kqueue, so a live XProtect detection wakes a rescan the
+  moment Apple's engine writes it — the rescan's windowed harvest then reports
+  it through the one normal dedup/notify pipeline (the tail is a *wake source*,
+  never a second parser to drift). The tail auto-respawns if it dies and its fd
+  is drained on every wake, so a level-triggered read can't busy-spin.
+- ✅ **Reputation — SHIPPED** as `aegis.py vt <path|sha256>`: an **opt-in, by-hand**
+  VirusTotal lookup (BYO key via `AEGIS_VT_API_KEY` or `~/.aegis/vt_key`). It sends
+  **only the sha256, never the file bytes**, and the scan/watch path makes **zero**
+  network calls regardless — off by default, so the local-only guarantee stays
+  literally true. No key ⇒ the command explains how to add one and does nothing.
+- ✅ **Login-Item / SMAppService coverage — SHIPPED** via `sfltool dumpbtm`
+  (unprivileged): a new Background Task Management item is diffed even when it
+  registers *without* a `~/Library/LaunchAgents` plist — the gap the directory
+  scan structurally couldn't close.
 - ✅ **Notarization introspection — SHIPPED for `.app` bundles**, where the
   `spctl -a -t exec` verdict is authoritative (fresh unsigned/ad-hoc app → HIGH;
   signed-but-unnotarized → MEDIUM). Bare CLI Mach-Os are *not* assessed — modern
@@ -281,7 +301,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**124 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**143 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -326,6 +346,25 @@ binary is `spctl`-rejected; and the kqueue watch demonstrably wakes **within
 seconds** of a file landing in a watched dir (and times out quietly without one).
 `install.sh` output for both modes passes `plutil -lint` in a sandboxed `$HOME`
 (launchctl stubbed), and re-running in scan mode leaves no `KeepAlive` residue.
+The **live-tail + probe-hardening** follow-up adds 8 more: the `log stream` tail
+spawns and terminates cleanly, real data on its fd wakes the same kqueue within
+seconds, and the fd drains fully (no busy-spin); a booby-trapped
+`CFBundleExecutable` with a path separator (`/bin/sh`, `../../x`) is refused so
+it can't escape the bundle and misclassify a clean Apple binary
+(fail-before/pass-after proven vs `5b95c2c`); a fresh payload swapped into an
+*old* `.app` still flags HIGH because bundle freshness is `max(root, exe)` mtime
+(likewise proven); and the lsof parser never raises on fuzzed/garbage input.
+
+The **reputation + background-item tier** (this release) is pinned by 12 tests:
+`sfltool dumpbtm` parsing separates real items from embedded sub-refs and never
+raises on garbage; a new no-Team-ID item in a user-writable path scores HIGH, a
+teamed one MEDIUM, a pre-existing one never re-alerts, and a `%20`-encoded URL
+path is decoded for location scoring. The `vt` command **refuses without a key
+and makes no network call** (the scan path's local-only guarantee is structural,
+not incidental); the key is read env-first then file; a bad target is refused;
+and with a stubbed `urlopen` the request carries **only the sha256** and the key
+header — proving file bytes never leave the host. The lookup itself is exercised
+against a fake transport (no live VT call in the suite).
 
 **Live end-to-end run** on this machine (real data, sandboxed state): the full
 `scan` completed, the behavioral check ran clean across ~500 real processes with
