@@ -1740,5 +1740,78 @@ class TestVTReputation(Sandbox):
         self.assertEqual(seen["key"], "secret")
 
 
+# --------------------------------------------------------------------------- #
+# install.sh smoke test — the installer had two CRITICAL bugs with zero coverage:
+#   F0   an unescaped '&' from a "…/Work & Projects/…" path → invalid plist XML →
+#        launchd silently refuses the agent (whole tool never runs on schedule).
+#   P3-6 the agent ran <repo>/aegis.py under ~/Documents (TCC-protected) → the
+#        launchd python3 (no FDA) got "Operation not permitted" opening the
+#        script → every scheduled run failed; the monitor never actually ran.
+# Runs the REAL installer with a redirected HOME that CONTAINS '&' (so the
+# run.out/err paths exercise xml_escape) and a stubbed launchctl, so no real
+# agent is ever loaded. plutil validates the generated plist.
+# --------------------------------------------------------------------------- #
+class TestInstaller(unittest.TestCase):
+    def setUp(self):
+        self.repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.tmp = tempfile.mkdtemp(prefix="aegis_inst_")
+        self.home = os.path.join(self.tmp, "h & me")  # '&' → exercises F0 escape
+        os.makedirs(os.path.join(self.home, ".aegis"))
+        # Pre-seed a baseline so install skips the slow real `aegis.py baseline`.
+        with open(os.path.join(self.home, ".aegis", "baseline.json"), "w") as f:
+            f.write('{"created":"t","persistence":{}}')
+        self.bin = os.path.join(self.tmp, "bin")  # stub launchctl (exit 0)
+        os.makedirs(self.bin)
+        stub = os.path.join(self.bin, "launchctl")
+        with open(stub, "w") as f:
+            f.write("#!/bin/bash\nexit 0\n")
+        os.chmod(stub, 0o755)
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def _install(self, *args):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), *args],
+                           env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        plist = os.path.join(self.home,
+                             "Library/LaunchAgents/com.charlie.aegis.plist")
+        # F0: valid XML despite '&' in HOME (StandardOut/ErrorPath).
+        lint = subprocess.run(["plutil", "-lint", plist],
+                              capture_output=True, text=True)
+        self.assertIn("OK", lint.stdout, lint.stdout + lint.stderr)
+        with open(plist, "rb") as f:
+            return plistlib.load(f)
+
+    def test_scan_mode_valid_and_runs_tcc_safe_copy(self):
+        d = self._install("3600")
+        script = d["ProgramArguments"][1]
+        # P3-6: the agent must run the ~/.aegis copy, NEVER the repo path.
+        self.assertEqual(script, os.path.join(self.home, ".aegis", "aegis.py"))
+        self.assertNotIn(self.repo, script, "agent must not run the TCC-blocked repo")
+        self.assertTrue(os.path.isfile(script), "runtime copy must be installed")
+        self.assertEqual(d["ProgramArguments"][2], "scan")
+        self.assertEqual(d.get("StartInterval"), 3600)
+
+    def test_watch_mode_valid_keepalive_and_copy(self):
+        d = self._install("watch", "600")
+        self.assertEqual(d["ProgramArguments"][1],
+                         os.path.join(self.home, ".aegis", "aegis.py"))
+        self.assertEqual(d["ProgramArguments"][2], "watch")
+        self.assertTrue(d.get("KeepAlive"))
+        self.assertNotIn("StartInterval", d)
+
+    def test_rejects_non_numeric_interval(self):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), "abc"],
+                           env=env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

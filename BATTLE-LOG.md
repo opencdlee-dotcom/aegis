@@ -6,7 +6,8 @@ BTM/Login-Items, opt-in VirusTotal). Every oracle derived from README/docstring
 intent; each finding proven fail-before/pass-after against the committed baseline
 before it was trusted; no live notification, launchd load, VT network call, or
 write outside a per-test tmp dir fired. Suite: `selftest` 3/3,
-`tests/test_regression.py` **148/148**.
+`tests/test_regression.py` **151/151** (incl. an `install.sh` smoke test that now
+guards F0 + P3-6 — the installer surface that had two CRITICAL bugs and no coverage).
 
 ## Outcome (pass 3)
 
