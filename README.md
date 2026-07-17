@@ -301,7 +301,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**143 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**146 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -364,7 +364,11 @@ and makes no network call** (the scan path's local-only guarantee is structural,
 not incidental); the key is read env-first then file; a bad target is refused;
 and with a stubbed `urlopen` the request carries **only the sha256** and the key
 header — proving file bytes never leave the host. The lookup itself is exercised
-against a fake transport (no live VT call in the suite).
+against a fake transport (no live VT call in the suite). A **fallible snapshot**
+(sfltool/lsof timing out) returns `None`, a *non-answer* the scan **skips** — so
+a slow `sfltool dumpbtm` can never adopt a false-empty baseline and then storm
+~90 bogus "new background item" alerts when it recovers (three tests pin the
+None-skip and no-storm-on-diff behavior; found by an on-machine end-to-end scan).
 
 **Live end-to-end run** on this machine (real data, sandboxed state): the full
 `scan` completed, the behavioral check ran clean across ~500 real processes with

@@ -1748,6 +1748,11 @@ def diff_wallet(prior, cur):
 # a NEW item with no Team ID whose URL is in a user-writable path → HIGH, else
 # MEDIUM (login items are usually legit; overlap with the launchd check is kept
 # below the notify floor so a plist-backed item is not double-alerted at HIGH).
+# The command is a module constant so tests can point it at a fixture/echo
+# instead of the real (slow) sfltool — the same override pattern as LSOF_LISTEN_CMD.
+BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
+
+
 def _parse_btm(text):
     """{identifier: {name, team, type, url}} from `sfltool dumpbtm`. A top-level
     item header is a line that is exactly '#<n>:' (embedded sub-refs read
@@ -1786,9 +1791,18 @@ def _parse_btm(text):
 
 
 def snapshot_btm():
-    out, _, _rc = run(["sfltool", "dumpbtm"], timeout=15)
-    if not out:
-        return {}
+    """{identifier: rec} of Background Task Management items, or None if sfltool
+    could not be read this scan. `sfltool dumpbtm` is SLOW (~12s on a typical
+    machine) and under scan-time load it can exceed the timeout; aegis.run()
+    then returns empty. An empty result from a timeout/failure must NOT be
+    recorded as 'no background items' — a Mac always has some (DisplayLink,
+    auto-updaters …), so a false-empty adopted into the baseline would storm
+    ~90 bogus 'new background item' findings the instant sfltool later succeeds.
+    We therefore signal the non-answer as None (skipped by _scan_surfaces) and
+    give sfltool generous headroom so the normal-but-slow case still succeeds."""
+    out, _, rc = run(BTM_DUMP_CMD, timeout=30)
+    if rc != 0 or not out:
+        return None  # timeout/failure — a non-answer, NOT "zero items"
     return _parse_btm(out)
 
 
@@ -1863,8 +1877,14 @@ def snapshot_listeners():
     same port — is."""
     # lsof exits non-zero when it hit ANY warning (unstattable fuse mount, a
     # vanished fd) while still emitting perfectly good records — so trust the
-    # OUTPUT, not the exit code. Empty output (incl. lsof missing) → empty snap.
-    out, _, _rc = run(LSOF_LISTEN_CMD, timeout=20)
+    # OUTPUT, not the exit code for WARNINGS. But a HARD failure (timeout=124,
+    # binary-missing=127) is a non-answer, not "zero listeners": returning {}
+    # there would adopt a false-empty baseline and later storm on the real
+    # listeners. Signal those as None (skipped); genuine "ran fine, nothing
+    # listening" stays {} (a common, legitimate state — unlike BTM).
+    out, _, rc = run(LSOF_LISTEN_CMD, timeout=20)
+    if rc in (124, 127):
+        return None
     if not out:
         return {}
     snap = {}
@@ -2030,7 +2050,14 @@ def _scan_surfaces(baseline, corrupt, first_run):
         try:
             cur = snap_fn()
         except Exception:
-            cur = {}
+            cur = None
+        # A snapshot fn returns None when its backing command could not be read
+        # this scan (e.g. sfltool/lsof timed out). That is a NON-ANSWER, not an
+        # empty world: never adopt it as a baseline and never diff against it
+        # (both would fabricate findings the moment the command next succeeds).
+        # Skip the surface for this scan; the prior baseline is left intact.
+        if cur is None:
+            continue
         prior = baseline.get(key)
         if prior is None:
             baseline[key] = cur  # first sighting → adopt silently
@@ -2239,9 +2266,14 @@ def cmd_baseline():
     b = {"created": now_iso(), "persistence": current}
     for key, snap_fn, _diff in SURFACES:
         try:
-            b[key] = snap_fn()
+            snap = snap_fn()
         except Exception:
-            b[key] = {}
+            snap = None
+        # A None snapshot means the backing command couldn't be read now; omit
+        # the surface so the next scan adopts it once it can, rather than
+        # baselining a false-empty (see snapshot_btm).
+        if snap is not None:
+            b[key] = snap
     save_json(BASELINE, b)
     flush_sigcache()
     record_selfstate()

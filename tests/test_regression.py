@@ -76,6 +76,11 @@ class Sandbox(unittest.TestCase):
             # tests are deterministic; listener tests call the parse/diff
             # helpers directly on fixture data.
             "LSOF_LISTEN_CMD": ["/usr/bin/true"],
+            # BTM shells to the SLOW real sfltool dumpbtm (~12s, can wedge >60s
+            # under load). Point it at echo → rc 0, non-empty, parses to {} so
+            # the surface adopts empty deterministically and fast; BTM-specific
+            # tests patch SURFACES / call helpers directly.
+            "BTM_DUMP_CMD": ["/bin/echo", "no items"],
             "_sigcache": {},
         }
         for k, v in overrides.items():
@@ -1598,6 +1603,55 @@ class TestBTMSurface(Sandbox):
         # a %20-encoded writable path must decode so location scoring sees it
         p = aegis._btm_path_from_url("file:///Users/Shared/My%20Tool/x")
         self.assertEqual(p, "/Users/Shared/My Tool/x")
+
+    # P3-4: sfltool dumpbtm is slow (~12s) and can time out under load; a
+    # timeout/failure must return None (a non-answer), NOT {} — else a
+    # false-empty is adopted and later storms ~90 bogus 'new item' findings.
+    def test_snapshot_returns_none_on_sfltool_failure(self):
+        saved = aegis.run
+        try:
+            aegis.run = lambda *a, **k: ("", "timeout", 124)  # simulate hang
+            self.assertIsNone(aegis.snapshot_btm())
+            aegis.run = lambda *a, **k: ("", "", 1)            # non-zero, empty
+            self.assertIsNone(aegis.snapshot_btm())
+        finally:
+            aegis.run = saved
+
+    def test_none_snapshot_is_not_adopted_and_does_not_storm(self):
+        # A baseline that already recorded items for a surface must NOT be diffed
+        # against a None (failed) snapshot — that would fire a finding per item.
+        # Patch SURFACES (its tuple captured the real snap fn at import, so a
+        # module-attr monkeypatch wouldn't reach it) with a None-returning snap
+        # and a diff that explodes if ever called.
+        real = {"com.a": {"n": 1}, "com.b": {"n": 2}}
+        aegis.save_json(aegis.BASELINE,
+                        {"created": "t", "persistence": {}, "xtest": real})
+
+        def boom(prior, cur):
+            raise AssertionError("diff must NOT run against a None snapshot")
+        saved = aegis.SURFACES
+        try:
+            aegis.SURFACES = [("xtest", lambda: None, boom)]
+            base, corrupt = aegis.load_baseline()
+            findings, base = aegis._scan_surfaces(base, corrupt, first_run=False)
+            self.assertEqual(findings, [], "None snapshot must not diff→storm")
+            self.assertEqual(set(base["xtest"]), {"com.a", "com.b"},
+                             "baseline must be left intact")
+        finally:
+            aegis.SURFACES = saved
+
+    def test_none_snapshot_not_adopted_on_first_sight(self):
+        # First sight of a surface whose command fails must NOT record None/{} —
+        # it stays absent so a later working scan adopts the true state.
+        aegis.save_json(aegis.BASELINE, {"created": "t", "persistence": {}})
+        saved = aegis.SURFACES
+        try:
+            aegis.SURFACES = [("xtest", lambda: None, lambda p, c: [])]
+            base, corrupt = aegis.load_baseline()
+            _f, base = aegis._scan_surfaces(base, corrupt, first_run=False)
+            self.assertNotIn("xtest", base, "failed first-sight must not adopt")
+        finally:
+            aegis.SURFACES = saved
 
 
 # --------------------------------------------------------------------------- #
