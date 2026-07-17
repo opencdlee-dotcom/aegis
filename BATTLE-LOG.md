@@ -1,3 +1,15 @@
+# Aegis — Deployment finding (2026-07-16, post-pass-3 — first live `watch` enablement)
+
+Found while switching the live agent from hourly to event-driven watch mode and
+verifying the event path end-to-end (not by the suite — same lesson as P3-4/5/6:
+the on-machine run is what exposes deployment-class defects).
+
+| # | Sev | Where | Defect (vs intent) | Evidence | Fix |
+|---|-----|-------|--------------------|----------|-----|
+| D-1 | **HIGH** | `_build_watch` | `os.O_EVTONLY` only exists in Python ≥ 3.10, but the launchd agent runs the system `/usr/bin/python3` (CLT **3.9**). First arm → `AttributeError` → process dies → launchd `KeepAlive` respawns → full scan (~90s) → dies again: watch mode degenerated into a **crash-loop of back-to-back full scans** — never event-driven, continuous CPU/`sfltool` load (the exact pressure P3-4 guards against), and the dev-python suite (3.10+, attr present) could never catch it. | `~/.aegis/run.err` traceback at `os.open(p, os.O_EVTONLY)`; `run.log` showed full scans at 23:23/23:24/23:25/23:26 (should be one per 600s); launchctl last-exit `1`. | Module-level `O_EVTONLY = getattr(os, "O_EVTONLY", 0x8000)` (the macOS `<fcntl.h>` value). 2 tests pinned: attr-hidden `_build_watch` arms, and a smoke test running `_build_watch` under the **agent's own interpreter** `/usr/bin/python3` — the class of gap (dev-python ≠ agent-python) is now guarded, not just this instance. Suite 153/153. **Verified live:** redeployed, watcher PID survived past the old crash point, and a file drop in `/Users/Shared` logged `watch: change event -> rescan` **16s** after the write (3s debounce + 60s rate-limit envelope) vs the prior 3600s tick. |
+
+---
+
 # Aegis — Battle-Test Log (2026-07-16, pass 3 — residual-gap-detectors branch)
 
 Inline adversarial probe of the surfaces added this session (event-driven kqueue

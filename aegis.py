@@ -2505,6 +2505,12 @@ def cmd_allow(path):
 WATCH_DEBOUNCE_SECS = 3   # let a write burst settle so it costs one scan
 WATCH_MIN_GAP_SECS = 60   # floor between event-triggered scans (battery bound)
 
+# os.O_EVTONLY only exists in Python >= 3.10; the launchd agent runs the system
+# /usr/bin/python3 (CLT Python 3.9), where the missing attr crashed _build_watch
+# and turned watch mode into a KeepAlive crash-loop of back-to-back full scans.
+# 0x8000 is O_EVTONLY from macOS <fcntl.h>.
+O_EVTONLY = getattr(os, "O_EVTONLY", 0x8000)
+
 
 def _watch_paths():
     """The dirs+files (that exist right now) whose change should trigger an
@@ -2533,7 +2539,7 @@ def _build_watch(extra_read_fds=()):
               select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)
     for p in _watch_paths():
         try:
-            fd = os.open(p, os.O_EVTONLY)  # macOS: watch without blocking unmount
+            fd = os.open(p, O_EVTONLY)  # macOS: watch without blocking unmount
         except OSError:
             continue
         fds.append(fd)
