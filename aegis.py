@@ -49,21 +49,29 @@ WHAT IT DOES (on an interval, via launchd)
      — an adware/DPRK vector).
   8. Extra persistence  - /etc/crontab, /etc/periodic, StartupItems, rc.common.
   9. Browser extensions - inventory diff (Chromium family + Firefox).
- 10. Self-protection    - detects if Aegis's own launchd agent was removed or its
-     append-only evidence log was truncated (a monitor an attacker can silently
-     disable is theater).
+ 10. Self-protection    - detects if Aegis's own launchd agent was removed, its
+     plist is present-but-malformed (invalid XML launchd will refuse on reboot),
+     or its append-only evidence log was truncated (a monitor an attacker can
+     silently disable — or that quietly rots itself into non-execution — is theater).
  11. Network listeners  - a NEW process accepting connections from the network
      (non-loopback TCP LISTEN, via lsof): a bind shell / rogue server shape.
      Loopback dev servers and SIP-pinned Apple daemons are excluded by design.
+ 12. Background items    - `sfltool dumpbtm`: a NEW Login Item / SMAppService
+     background agent, incl. ones that persist WITHOUT a LaunchAgents plist
+     (the modern registration path the directory scan can't see).
 
-  Surfaces 5-9 and 11 are baseline-diffed and ADOPTED SILENTLY the first time
-  each is seen (per-surface "trust what's already installed"), so upgrading
+  Surfaces 5-9, 11 and 12 are baseline-diffed and ADOPTED SILENTLY the first
+  time each is seen (per-surface "trust what's already installed"), so upgrading
   Aegis on an existing install never produces a day-one alert storm.
 
   `watch` mode (bash install.sh watch) is EVENT-DRIVEN: a stdlib kqueue over
   the persistence/hot/staging/rc/history paths rescans within seconds of a
   change (debounced + rate-limited), with the interval scan as a floor —
-  closing most of the polling-latency gap without any Apple entitlement.
+  closing most of the polling-latency gap without any Apple entitlement. A
+  persistent `log stream` tail of Apple's XProtect subsystem is armed on the
+  same kqueue (EVFILT_READ), so a live XProtect detection wakes a rescan the
+  instant Apple writes it; the tail is a wake source only — the rescan's
+  windowed harvest still does the one authoritative parse/dedup/notify.
 
 DESIGN PRINCIPLE (from the alert-fatigue literature): *log everything, alert
 rarely, never repeat*. The first run establishes a SILENT baseline (no day-one
@@ -74,7 +82,8 @@ a durable append-only log so nothing is missed if a notification is.
 
 STATE  -> ~/.aegis/   (baseline.json, findings.jsonl, latest.md, seen.json,
                        quarantine/ store + manifest, actions.jsonl audit, ...)
-USAGE  -> aegis.py [scan|report|status|baseline|allow <path>|canary|watch]
+USAGE  -> aegis.py [scan|report|status|baseline|allow <path>|vt <path|sha>|
+                    canary|watch]
           aegis.py [quarantine <path>|quarantine-list|restore <id>|
                     destroy <id> --yes|kill <pid>|sandbox <path>|neutralize <plist>]
 """
@@ -117,6 +126,19 @@ RUN_LOG = os.path.join(STATE_DIR, "run.log")
 QUARANTINE_DIR = os.path.join(STATE_DIR, "quarantine")
 QUARANTINE_MANIFEST = os.path.join(QUARANTINE_DIR, "manifest.json")
 ACTION_LOG = os.path.join(STATE_DIR, "actions.jsonl")
+
+# --- Reputation lookup (OPT-IN, off by default; NEVER on the scan path) ------- #
+# The scan/watch path is local-only by construction — it makes ZERO network
+# calls, and that guarantee is load-bearing to the trust model. `vt` is a
+# separate, by-hand INVESTIGATION command (like the response tier): given a file
+# or a hash, it queries VirusTotal's multi-engine reputation for that hash. It
+# sends ONLY the sha256 — never the file bytes — so it can't leak file contents,
+# and it runs only when you type it with a key present. Key: env AEGIS_VT_API_KEY
+# or ~/.aegis/vt_key (chmod 600). No key ⇒ the command explains how to add one
+# and does nothing. This keeps "the monitor never phones home" literally true
+# while still offering reputation when you deliberately ask for it.
+VT_KEY_FILE = os.path.join(STATE_DIR, "vt_key")
+VT_API_URL = "https://www.virustotal.com/api/v3/files/"
 
 # Neutralization key for the stored sample. This is deliberate OBFUSCATION, not
 # cryptography: a repeating-key XOR renders the quarantined bytes non-executable
@@ -1717,6 +1739,102 @@ def diff_wallet(prior, cur):
                      _mk("Wallet file CHANGED", "changed"))
 
 
+# --- Background Task Management (Login Items + SMAppService agents) ------------
+# `sfltool dumpbtm` (Ventura+, unprivileged) is macOS's OWN authoritative record
+# of every background item — login items and ServiceManagement-registered agents/
+# daemons. It catches what the LaunchAgents-directory scan CANNOT: an
+# SMAppService item registered via the API that never drops a plist in
+# ~/Library/LaunchAgents (the modern persistence path — e.g. how legit apps and
+# some 2024+ malware register). Baseline-diffed with silent first-sight adoption;
+# a NEW item with no Team ID whose URL is in a user-writable path → HIGH, else
+# MEDIUM (login items are usually legit; overlap with the launchd check is kept
+# below the notify floor so a plist-backed item is not double-alerted at HIGH).
+# The command is a module constant so tests can point it at a fixture/echo
+# instead of the real (slow) sfltool — the same override pattern as LSOF_LISTEN_CMD.
+BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
+
+
+def _parse_btm(text):
+    """{identifier: {name, team, type, url}} from `sfltool dumpbtm`. A top-level
+    item header is a line that is exactly '#<n>:' (embedded sub-refs read
+    '#1: <id>' — content after the colon — so they don't match and can't be
+    mistaken for items)."""
+    items = {}
+    cur = None
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if re.fullmatch(r"#\d+:", s):
+            cur = {}
+            continue
+        if cur is None or ": " not in s:
+            continue
+        key, val = s.split(": ", 1)
+        key, val = key.strip(), val.strip()
+        if key == "Identifier":
+            ident = val or cur.get("_uuid")
+            if ident:
+                rec = {k: v for k, v in cur.items() if not k.startswith("_")}
+                # Stable shape so downstream always finds these keys.
+                for f in ("name", "team", "type", "url"):
+                    rec.setdefault(f, None)
+                items[ident] = rec
+        elif key == "UUID":
+            cur["_uuid"] = val
+        elif key == "Name":
+            cur["name"] = val
+        elif key == "Team Identifier":
+            cur["team"] = None if val in ("(null)", "") else val
+        elif key == "Type":
+            cur["type"] = val
+        elif key in ("URL", "Executable Path"):
+            cur.setdefault("url", val if val != "(null)" else None)
+    return items
+
+
+def snapshot_btm():
+    """{identifier: rec} of Background Task Management items, or None if sfltool
+    could not be read this scan. `sfltool dumpbtm` is SLOW (~12s on a typical
+    machine) and under scan-time load it can exceed the timeout; aegis.run()
+    then returns empty. An empty result from a timeout/failure must NOT be
+    recorded as 'no background items' — a Mac always has some (DisplayLink,
+    auto-updaters …), so a false-empty adopted into the baseline would storm
+    ~90 bogus 'new background item' findings the instant sfltool later succeeds.
+    We therefore signal the non-answer as None (skipped by _scan_surfaces) and
+    give sfltool generous headroom so the normal-but-slow case still succeeds."""
+    out, _, rc = run(BTM_DUMP_CMD, timeout=30)
+    if rc != 0 or not out:
+        return None  # timeout/failure — a non-answer, NOT "zero items"
+    return _parse_btm(out)
+
+
+def _btm_path_from_url(url):
+    """A filesystem path from a BTM URL field (file:///… percent-encoded) for
+    location scoring; None if it isn't a local file URL."""
+    if not url or not url.startswith("file://"):
+        return None
+    from urllib.parse import unquote, urlparse
+    return unquote(urlparse(url).path) or None
+
+
+def diff_btm(prior, cur):
+    def new_fn(ident, rec):
+        url = rec.get("url")
+        path = _btm_path_from_url(url)
+        no_team = not rec.get("team")
+        risky = bool(path and is_risky_location(path))
+        sev = "HIGH" if (no_team and risky) else "MEDIUM"
+        return finding(
+            sev, "btm", "New background item (Login Item / SMAppService)",
+            "%s [%s] registered as a background item%s%s — verify you installed "
+            "it; SMAppService items persist WITHOUT a LaunchAgents plist."
+            % (rec.get("name") or ident, rec.get("type") or "?",
+               " team=%s" % rec["team"] if rec.get("team") else " (no Team ID)",
+               " at %s" % path if path else ""),
+            "btm:%s" % ident, identifier=ident, name=rec.get("name"),
+            team=rec.get("team"), url=url)
+    return _diff_map(prior, cur, new_fn)
+
+
 # --- network listeners ---------------------------------------------------------
 # See the LSOF_LISTEN_CMD block up top for the design rationale (non-loopback
 # only; platform daemons skipped unless interpreter-fronted; baseline-diffed).
@@ -1760,8 +1878,14 @@ def snapshot_listeners():
     same port — is."""
     # lsof exits non-zero when it hit ANY warning (unstattable fuse mount, a
     # vanished fd) while still emitting perfectly good records — so trust the
-    # OUTPUT, not the exit code. Empty output (incl. lsof missing) → empty snap.
-    out, _, _rc = run(LSOF_LISTEN_CMD, timeout=20)
+    # OUTPUT, not the exit code for WARNINGS. But a HARD failure (timeout=124,
+    # binary-missing=127) is a non-answer, not "zero listeners": returning {}
+    # there would adopt a false-empty baseline and later storm on the real
+    # listeners. Signal those as None (skipped); genuine "ran fine, nothing
+    # listening" stays {} (a common, legitimate state — unlike BTM).
+    out, _, rc = run(LSOF_LISTEN_CMD, timeout=20)
+    if rc in (124, 127):
+        return None
     if not out:
         return {}
     snap = {}
@@ -1803,6 +1927,7 @@ SURFACES = [
     ("ide_ext", snapshot_ide_ext, diff_ide_ext),
     ("wallet", snapshot_wallet, diff_wallet),
     ("listeners", snapshot_listeners, diff_listeners),
+    ("btm", snapshot_btm, diff_btm),
 ]
 
 
@@ -1825,6 +1950,24 @@ def check_self_protection():
             "%s no longer exists — the background monitor may have been unloaded "
             "or deleted. Re-run install.sh if this was not intentional."
             % SELF_PLIST, "self:agent:removed"))
+    # (a2) The agent plist EXISTS but is malformed — invalid XML (e.g. a raw '&'
+    # from an install path like ".../Work & Projects/...", the F0 bug in an
+    # install predating its fix). launchd may still run a previously-loaded copy,
+    # so the monitor looks alive — but on the next reboot/reload launchd will
+    # silently refuse the bad plist and the monitor dies with no signal. Catch it
+    # WHILE it is still limping (and fixable) rather than after it is silently
+    # gone. Only checked when the file exists (absence is handled above).
+    elif os.path.exists(SELF_PLIST):
+        try:
+            with open(SELF_PLIST, "rb") as f:
+                plistlib.load(f)
+        except Exception:
+            findings.append(finding(
+                "HIGH", "self-protection", "Aegis launchd plist is malformed",
+                "%s exists but is not valid — launchd will silently refuse to "
+                "(re)load it on the next reboot and the monitor will stop "
+                "running with no alert. Re-run install.sh to regenerate a valid "
+                "agent." % SELF_PLIST, "self:agent:malformed"))
 
     # (b) The append-only findings log shrank since last scan — someone truncated
     # the durable evidence trail.
@@ -1926,7 +2069,14 @@ def _scan_surfaces(baseline, corrupt, first_run):
         try:
             cur = snap_fn()
         except Exception:
-            cur = {}
+            cur = None
+        # A snapshot fn returns None when its backing command could not be read
+        # this scan (e.g. sfltool/lsof timed out). That is a NON-ANSWER, not an
+        # empty world: never adopt it as a baseline and never diff against it
+        # (both would fabricate findings the moment the command next succeeds).
+        # Skip the surface for this scan; the prior baseline is left intact.
+        if cur is None:
+            continue
         prior = baseline.get(key)
         if prior is None:
             baseline[key] = cur  # first sighting → adopt silently
@@ -2135,9 +2285,14 @@ def cmd_baseline():
     b = {"created": now_iso(), "persistence": current}
     for key, snap_fn, _diff in SURFACES:
         try:
-            b[key] = snap_fn()
+            snap = snap_fn()
         except Exception:
-            b[key] = {}
+            snap = None
+        # A None snapshot means the backing command couldn't be read now; omit
+        # the surface so the next scan adopts it once it can, rather than
+        # baselining a false-empty (see snapshot_btm).
+        if snap is not None:
+            b[key] = snap
     save_json(BASELINE, b)
     flush_sigcache()
     record_selfstate()
@@ -2234,6 +2389,85 @@ def cmd_status():
         mark = "✓" if age <= XPROTECT_STALE_DAYS else "✗"
         print("  %s %-32s v%s, updated %.0f days ago"
               % (mark, "XProtect definitions", version or "?", age))
+    return 0
+
+
+def _vt_api_key():
+    """The VirusTotal API key from env (AEGIS_VT_API_KEY) or ~/.aegis/vt_key,
+    or None. Env wins so a key can be injected for one call without touching
+    disk. Whitespace-stripped; empty ⇒ None."""
+    k = os.environ.get("AEGIS_VT_API_KEY", "").strip()
+    if k:
+        return k
+    try:
+        with open(VT_KEY_FILE) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _looks_like_sha256(s):
+    return bool(re.fullmatch(r"[0-9a-fA-F]{64}", s or ""))
+
+
+def cmd_vt(target):
+    """OPT-IN reputation lookup — the ONLY command that touches the network, and
+    only when you type it with a key present. `target` is a file path (hashed
+    locally; ONLY the sha256 is sent — never the bytes) or a bare sha256. Prints
+    VirusTotal's multi-engine verdict. No key ⇒ prints how to add one, exits 2 —
+    the scan/watch path is unaffected and stays local-only."""
+    ensure_state()
+    key = _vt_api_key()
+    if not key:
+        print("VirusTotal lookup is OFF (no API key — the scan path stays "
+              "local-only regardless).\n  Add a free key (virustotal.com) via "
+              "either:\n    export AEGIS_VT_API_KEY=<key>\n    printf %%s <key> "
+              "> %s && chmod 600 %s" % (VT_KEY_FILE, VT_KEY_FILE))
+        return 2
+    if _looks_like_sha256(target):
+        sha = target.lower()
+    else:
+        rp = os.path.realpath(target)
+        if not os.path.isfile(rp):
+            print("refuse: %s is not a file or a sha256" % target)
+            return 1
+        sha = sha256(rp)
+        if not sha:
+            print("error: could not hash %s" % rp)
+            return 1
+    import urllib.request  # lazy: the scan path never even imports urllib
+    import urllib.error
+    req = urllib.request.Request(VT_API_URL + sha, headers={"x-apikey": key})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("Not found on VirusTotal: %s\n  (unknown hash — no engine has "
+                  "seen this file; treat as UNVETTED, not proven clean)" % sha)
+            return 0
+        if e.code == 401:
+            print("error: VirusTotal rejected the API key (401)")
+            return 1
+        if e.code == 429:
+            print("error: VirusTotal rate limit hit (429) — the free tier is "
+                  "4 lookups/min; wait and retry")
+            return 1
+        print("error: VirusTotal HTTP %s" % e.code)
+        return 1
+    except Exception as e:
+        print("error: VirusTotal lookup failed (%s)" % e)
+        return 1
+    stats = (((data.get("data") or {}).get("attributes") or {})
+             .get("last_analysis_stats") or {})
+    mal = stats.get("malicious", 0)
+    susp = stats.get("suspicious", 0)
+    total = sum(v for v in stats.values() if isinstance(v, int)) or 0
+    verdict = ("MALICIOUS" if mal else "suspicious" if susp else "clean")
+    print("VirusTotal verdict for %s\n  %s — %d malicious / %d suspicious / %d "
+          "engines\n  https://www.virustotal.com/gui/file/%s"
+          % (sha, verdict.upper(), mal, susp, total, sha))
+    log_run("vt %s -> %s (%d/%d)" % (sha[:16], verdict, mal, total))
     return 0
 
 
@@ -2947,6 +3181,9 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
   status           print hardening posture + XProtect definition age (fast)
   baseline         reset the known-good persistence baseline to current state
   allow <path>     suppress future alerts for findings matching <path>
+  vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
+                   hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
+                   the scan path stays local-only regardless)
   canary [remove]  plant (or remove) ransomware canary/honeypot files
   watch [secs]     event-driven monitor: kqueue rescan seconds after a watched
                    path changes + a full scan every [secs] (default 600) as a
@@ -2975,6 +3212,8 @@ def main(argv):
         return cmd_baseline()
     if cmd == "allow" and len(argv) > 2:
         return cmd_allow(argv[2])
+    if cmd == "vt" and len(argv) > 2:
+        return cmd_vt(argv[2])
     if cmd == "canary":
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":

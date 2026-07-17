@@ -69,11 +69,18 @@ class Sandbox(unittest.TestCase):
             "XPROTECT_BUNDLES": [],
             "CANARY_DIRS": [],
             "CANARY_STATE": os.path.join(self.state, "canaries.json"),
+            # vt_key must be sandboxed so no test reads or writes the real key.
+            "VT_KEY_FILE": os.path.join(self.state, "vt_key"),
             # The listener surface shells to lsof (live host state). Point it
             # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
             # tests are deterministic; listener tests call the parse/diff
             # helpers directly on fixture data.
             "LSOF_LISTEN_CMD": ["/usr/bin/true"],
+            # BTM shells to the SLOW real sfltool dumpbtm (~12s, can wedge >60s
+            # under load). Point it at echo → rc 0, non-empty, parses to {} so
+            # the surface adopts empty deterministically and fast; BTM-specific
+            # tests patch SURFACES / call helpers directly.
+            "BTM_DUMP_CMD": ["/bin/echo", "no items"],
             "_sigcache": {},
         }
         for k, v in overrides.items():
@@ -537,6 +544,25 @@ class TestSelfProtection(Sandbox):
         aegis.save_json(aegis.SELFSTATE, {"findings_size": 50})  # grew, fine
         fps = [x["fingerprint"] for x in aegis.check_self_protection()]
         self.assertFalse(any("truncated" in fp for fp in fps))
+
+    # F0-in-the-wild: a plist that EXISTS but is invalid XML (a raw '&' from a
+    # "…/Work & Projects/…" path) won't survive a reboot — launchd will silently
+    # refuse it. Catch it while it is still limping and fixable.
+    def test_malformed_plist_is_high(self):
+        with open(aegis.SELF_PLIST, "w") as f:
+            f.write('<?xml version="1.0"?><plist><dict><key>Program</key>'
+                    '<string>/x & /y</string></dict></plist>')  # raw & = invalid
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertIn("self:agent:malformed", fps)
+
+    def test_valid_plist_no_malformed_finding(self):
+        import plistlib as _p
+        with open(aegis.SELF_PLIST, "wb") as f:
+            _p.dump({"Label": "com.charlie.aegis",
+                     "ProgramArguments": ["/usr/bin/python3", "/x & y/a.py"]}, f)
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertNotIn("self:agent:malformed", fps)
+        self.assertNotIn("self:agent:removed", fps)
 
 
 # --------------------------------------------------------------------------- #
@@ -1329,6 +1355,15 @@ class TestListenerSurface(Sandbox):
         cur = {"/bin/ls:8000": "/bin/ls"}
         self.assertEqual(aegis.diff_listeners(dict(cur), cur), [])
 
+    def test_parse_never_raises_on_garbage(self):
+        for text in ("", "n*:80\n", "n:::\n", "p\nn\n", "x\n\n", "p1\nnnoport\n",
+                     "p1\nn[::0e]:\n", "\x00\xff\np9\nn*:1\n"):
+            got = aegis._parse_lsof_listeners(text)
+            self.assertIsInstance(got, dict, repr(text))
+        # a path containing ':' must survive the key round-trip on the port side
+        fs = aegis.diff_listeners({}, {"/tmp/a:b/srv:9090": "/tmp/a:b/srv"})
+        self.assertEqual(fs[0]["port"], "9090")
+
     def test_listener_surface_participates_in_scan_quietly(self):
         # Pin that the registry entry is live: a scan baselines the surface
         # (adopted per-surface) and an unchanged re-scan stays silent.
@@ -1523,6 +1558,259 @@ class TestLiveStreamTail(Sandbox):
         finally:
             aegis._stop_stream(p)
         self.assertIsNotNone(p.poll(), "tail must be terminated after stop")
+
+
+# --------------------------------------------------------------------------- #
+# Background Task Management surface (sfltool dumpbtm) — catches SMAppService
+# login items that never drop a LaunchAgents plist. New no-team item in a
+# writable path → HIGH; teamed → MEDIUM; embedded sub-refs are not items.
+# --------------------------------------------------------------------------- #
+_BTM_FIXTURE = """========================
+ Records for UID 501
+========================
+ Items:
+
+ #1:
+                 UUID: AAAA-1
+                 Name: Legit Agent
+      Team Identifier: ABCDE12345
+                 Type: legacy agent (0x10008)
+           Identifier: com.legit.agent
+                  URL: file:///Library/LaunchAgents/com.legit.agent.plist
+
+ #2:
+                 UUID: BBBB-2
+                 Name: Container
+       Developer Name: X
+                 Type: developer (0x20)
+           Identifier: com.vendor.container
+                  URL: (null)
+  Embedded Item Identifiers:
+    #1: 16.com.vendor.helper
+"""
+
+
+class TestBTMSurface(Sandbox):
+    def test_parse_distinguishes_items_from_embedded(self):
+        got = aegis._parse_btm(_BTM_FIXTURE)
+        self.assertEqual(set(got), {"com.legit.agent", "com.vendor.container"})
+        self.assertEqual(got["com.legit.agent"]["team"], "ABCDE12345")
+        self.assertIsNone(got["com.vendor.container"]["team"])
+
+    def test_parse_never_raises_on_garbage(self):
+        for t in ("", "#1:\n", "  #1: embedded\n", "Name: x\n", "#1:\nType: y\n"):
+            self.assertIsInstance(aegis._parse_btm(t), dict, repr(t))
+
+    def test_new_noteam_item_in_writable_path_is_high(self):
+        cur = {"com.evil.x": {"name": "Evil", "team": None, "type": "agent",
+                              "url": "file://%s/evil.plist" % self.hot}}
+        fs = aegis.diff_btm({}, cur)
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+
+    def test_new_teamed_item_is_medium(self):
+        cur = {"com.ok.x": {"name": "OK", "team": "ABCDE12345", "type": "agent",
+                            "url": "file:///Applications/OK.app/"}}
+        fs = aegis.diff_btm({}, cur)
+        self.assertEqual(fs[0]["severity"], "MEDIUM")
+
+    def test_preexisting_item_not_realerted(self):
+        cur = {"com.ok.x": {"name": "OK", "team": "T", "type": "a", "url": None}}
+        self.assertEqual(aegis.diff_btm(dict(cur), cur), [])
+
+    def test_url_percent_decoded_for_path_scoring(self):
+        # a %20-encoded writable path must decode so location scoring sees it
+        p = aegis._btm_path_from_url("file:///Users/Shared/My%20Tool/x")
+        self.assertEqual(p, "/Users/Shared/My Tool/x")
+
+    # P3-4: sfltool dumpbtm is slow (~12s) and can time out under load; a
+    # timeout/failure must return None (a non-answer), NOT {} — else a
+    # false-empty is adopted and later storms ~90 bogus 'new item' findings.
+    def test_snapshot_returns_none_on_sfltool_failure(self):
+        saved = aegis.run
+        try:
+            aegis.run = lambda *a, **k: ("", "timeout", 124)  # simulate hang
+            self.assertIsNone(aegis.snapshot_btm())
+            aegis.run = lambda *a, **k: ("", "", 1)            # non-zero, empty
+            self.assertIsNone(aegis.snapshot_btm())
+        finally:
+            aegis.run = saved
+
+    def test_none_snapshot_is_not_adopted_and_does_not_storm(self):
+        # A baseline that already recorded items for a surface must NOT be diffed
+        # against a None (failed) snapshot — that would fire a finding per item.
+        # Patch SURFACES (its tuple captured the real snap fn at import, so a
+        # module-attr monkeypatch wouldn't reach it) with a None-returning snap
+        # and a diff that explodes if ever called.
+        real = {"com.a": {"n": 1}, "com.b": {"n": 2}}
+        aegis.save_json(aegis.BASELINE,
+                        {"created": "t", "persistence": {}, "xtest": real})
+
+        def boom(prior, cur):
+            raise AssertionError("diff must NOT run against a None snapshot")
+        saved = aegis.SURFACES
+        try:
+            aegis.SURFACES = [("xtest", lambda: None, boom)]
+            base, corrupt = aegis.load_baseline()
+            findings, base = aegis._scan_surfaces(base, corrupt, first_run=False)
+            self.assertEqual(findings, [], "None snapshot must not diff→storm")
+            self.assertEqual(set(base["xtest"]), {"com.a", "com.b"},
+                             "baseline must be left intact")
+        finally:
+            aegis.SURFACES = saved
+
+    def test_none_snapshot_not_adopted_on_first_sight(self):
+        # First sight of a surface whose command fails must NOT record None/{} —
+        # it stays absent so a later working scan adopts the true state.
+        aegis.save_json(aegis.BASELINE, {"created": "t", "persistence": {}})
+        saved = aegis.SURFACES
+        try:
+            aegis.SURFACES = [("xtest", lambda: None, lambda p, c: [])]
+            base, corrupt = aegis.load_baseline()
+            _f, base = aegis._scan_surfaces(base, corrupt, first_run=False)
+            self.assertNotIn("xtest", base, "failed first-sight must not adopt")
+        finally:
+            aegis.SURFACES = saved
+
+
+# --------------------------------------------------------------------------- #
+# VirusTotal opt-in reputation — the ONLY network command, and only with a key.
+# No key ⇒ never touches the network. Only the hash is ever sent.
+# --------------------------------------------------------------------------- #
+class TestVTReputation(Sandbox):
+    def test_no_key_refuses_and_makes_no_call(self):
+        os.environ.pop("AEGIS_VT_API_KEY", None)
+        # No vt_key file in the sandboxed state dir ⇒ off.
+        self.assertEqual(aegis.cmd_vt("a" * 64), 2)
+
+    def test_key_from_file(self):
+        os.environ.pop("AEGIS_VT_API_KEY", None)
+        with open(aegis.VT_KEY_FILE, "w") as f:
+            f.write("filekey123\n")
+        self.assertEqual(aegis._vt_api_key(), "filekey123")
+
+    def test_env_key_wins_over_file(self):
+        with open(aegis.VT_KEY_FILE, "w") as f:
+            f.write("filekey\n")
+        os.environ["AEGIS_VT_API_KEY"] = "envkey"
+        try:
+            self.assertEqual(aegis._vt_api_key(), "envkey")
+        finally:
+            os.environ.pop("AEGIS_VT_API_KEY", None)
+
+    def test_sha256_recogniser(self):
+        self.assertTrue(aegis._looks_like_sha256("a" * 64))
+        self.assertFalse(aegis._looks_like_sha256("a" * 63))
+        self.assertFalse(aegis._looks_like_sha256("/tmp/file"))
+
+    def test_bad_target_with_key_refused(self):
+        os.environ["AEGIS_VT_API_KEY"] = "k"
+        try:
+            self.assertEqual(aegis.cmd_vt("/no/such/file/here"), 1)
+        finally:
+            os.environ.pop("AEGIS_VT_API_KEY", None)
+
+    def test_clean_verdict_sends_only_hash(self):
+        import urllib.request
+        sha = "b" * 64
+        seen = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return json.dumps({"data": {"attributes": {
+                    "last_analysis_stats": {"malicious": 0, "harmless": 70}}}}).encode()
+
+        def fake_urlopen(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["key"] = req.headers.get("X-apikey")
+            return _Resp()
+
+        os.environ["AEGIS_VT_API_KEY"] = "secret"
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            rc = aegis.cmd_vt(sha)
+        finally:
+            urllib.request.urlopen = saved
+            os.environ.pop("AEGIS_VT_API_KEY", None)
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen["url"].endswith(sha), "only the hash is in the URL")
+        self.assertEqual(seen["key"], "secret")
+
+
+# --------------------------------------------------------------------------- #
+# install.sh smoke test — the installer had two CRITICAL bugs with zero coverage:
+#   F0   an unescaped '&' from a "…/Work & Projects/…" path → invalid plist XML →
+#        launchd silently refuses the agent (whole tool never runs on schedule).
+#   P3-6 the agent ran <repo>/aegis.py under ~/Documents (TCC-protected) → the
+#        launchd python3 (no FDA) got "Operation not permitted" opening the
+#        script → every scheduled run failed; the monitor never actually ran.
+# Runs the REAL installer with a redirected HOME that CONTAINS '&' (so the
+# run.out/err paths exercise xml_escape) and a stubbed launchctl, so no real
+# agent is ever loaded. plutil validates the generated plist.
+# --------------------------------------------------------------------------- #
+class TestInstaller(unittest.TestCase):
+    def setUp(self):
+        self.repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.tmp = tempfile.mkdtemp(prefix="aegis_inst_")
+        self.home = os.path.join(self.tmp, "h & me")  # '&' → exercises F0 escape
+        os.makedirs(os.path.join(self.home, ".aegis"))
+        # Pre-seed a baseline so install skips the slow real `aegis.py baseline`.
+        with open(os.path.join(self.home, ".aegis", "baseline.json"), "w") as f:
+            f.write('{"created":"t","persistence":{}}')
+        self.bin = os.path.join(self.tmp, "bin")  # stub launchctl (exit 0)
+        os.makedirs(self.bin)
+        stub = os.path.join(self.bin, "launchctl")
+        with open(stub, "w") as f:
+            f.write("#!/bin/bash\nexit 0\n")
+        os.chmod(stub, 0o755)
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def _install(self, *args):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), *args],
+                           env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        plist = os.path.join(self.home,
+                             "Library/LaunchAgents/com.charlie.aegis.plist")
+        # F0: valid XML despite '&' in HOME (StandardOut/ErrorPath).
+        lint = subprocess.run(["plutil", "-lint", plist],
+                              capture_output=True, text=True)
+        self.assertIn("OK", lint.stdout, lint.stdout + lint.stderr)
+        with open(plist, "rb") as f:
+            return plistlib.load(f)
+
+    def test_scan_mode_valid_and_runs_tcc_safe_copy(self):
+        d = self._install("3600")
+        script = d["ProgramArguments"][1]
+        # P3-6: the agent must run the ~/.aegis copy, NEVER the repo path.
+        self.assertEqual(script, os.path.join(self.home, ".aegis", "aegis.py"))
+        self.assertNotIn(self.repo, script, "agent must not run the TCC-blocked repo")
+        self.assertTrue(os.path.isfile(script), "runtime copy must be installed")
+        self.assertEqual(d["ProgramArguments"][2], "scan")
+        self.assertEqual(d.get("StartInterval"), 3600)
+
+    def test_watch_mode_valid_keepalive_and_copy(self):
+        d = self._install("watch", "600")
+        self.assertEqual(d["ProgramArguments"][1],
+                         os.path.join(self.home, ".aegis", "aegis.py"))
+        self.assertEqual(d["ProgramArguments"][2], "watch")
+        self.assertTrue(d.get("KeepAlive"))
+        self.assertNotIn("StartInterval", d)
+
+    def test_rejects_non_numeric_interval(self):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), "abc"],
+                           env=env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":
