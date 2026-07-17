@@ -1503,6 +1503,40 @@ class TestWatchKqueue(Sandbox):
         finally:
             aegis._close_watch(kq, fds)
 
+    def test_build_watch_survives_missing_os_evtonly(self):
+        # os.O_EVTONLY only exists in Python >= 3.10; the launchd agent runs
+        # the system /usr/bin/python3 (3.9), where the missing attr crashed
+        # _build_watch and turned watch mode into a KeepAlive crash-loop of
+        # back-to-back full scans. aegis must carry its own fallback constant.
+        had = hasattr(os, "O_EVTONLY")
+        saved = getattr(os, "O_EVTONLY", None)
+        if had:
+            del os.O_EVTONLY
+        try:
+            kq, fds = aegis._build_watch()
+            try:
+                self.assertTrue(fds, "watch must arm without os.O_EVTONLY")
+            finally:
+                aegis._close_watch(kq, fds)
+        finally:
+            if had:
+                os.O_EVTONLY = saved
+
+    def test_build_watch_arms_under_agent_interpreter(self):
+        # Run under the exact interpreter the launchd agent uses — the dev
+        # python is newer and hides version-gated stdlib attrs like O_EVTONLY.
+        agent_py = "/usr/bin/python3"
+        if not os.path.exists(agent_py):
+            self.skipTest("no system python3")
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = subprocess.run(
+            [agent_py, "-c",
+             "import aegis; kq, fds = aegis._build_watch(); "
+             "assert fds, 'no paths armed'; aegis._close_watch(kq, fds)"],
+            cwd=repo, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0,
+                         "agent-interpreter _build_watch failed:\n" + r.stderr)
+
 
 # --------------------------------------------------------------------------- #
 # Live XProtect log-stream tail — the tail is a WAKE SOURCE for the watch loop
