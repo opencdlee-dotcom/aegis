@@ -39,7 +39,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
 | **Editor extensions** | New VSCode / Cursor / VSCodium / Windsurf extension | A backdoored editor extension is a live supply-chain vector (Objective-See's *Paradox*, 2025, shipped via a trojanised Cursor extension) |
 | **Background items** *(new)* | A **new** Login Item / SMAppService background agent from `sfltool dumpbtm` (macOS's own Background Task Management record), baseline-diffed. A new item with **no Team ID whose URL is in a user-writable path** → HIGH, else MEDIUM | Catches the modern persistence path the LaunchAgents-directory scan **cannot see**: an `SMAppService`-registered agent/daemon that never drops a plist in `~/Library/LaunchAgents` (how legit apps *and* 2024+ malware now register) |
-| **Self-protection** | Aegis's own launchd agent removed, its append-only log truncated, or its **trust store (baseline/allowlist) edited out-of-band** | A monitor an attacker can silently disable, blind, or feed a poisoned baseline is theater |
+| **Self-protection** | Aegis's own launchd agent removed, **its own plist present-but-malformed** (invalid XML that launchd will silently refuse on the next reboot — the monitor dies with no signal), its append-only log truncated, or its **trust store (baseline/allowlist) edited out-of-band** | A monitor an attacker can silently disable, blind, or feed a poisoned baseline — or that quietly rots itself into non-execution — is theater |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, Application Firewall, stealth mode, Remote Login, **+ XProtect definition age** | Surfaces weak settings (a first run typically finds a control the operator assumed was on) |
 
 **Design principle — log everything, alert rarely, never repeat.** The first run
@@ -301,7 +301,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**146 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**148 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile

@@ -545,6 +545,25 @@ class TestSelfProtection(Sandbox):
         fps = [x["fingerprint"] for x in aegis.check_self_protection()]
         self.assertFalse(any("truncated" in fp for fp in fps))
 
+    # F0-in-the-wild: a plist that EXISTS but is invalid XML (a raw '&' from a
+    # "…/Work & Projects/…" path) won't survive a reboot — launchd will silently
+    # refuse it. Catch it while it is still limping and fixable.
+    def test_malformed_plist_is_high(self):
+        with open(aegis.SELF_PLIST, "w") as f:
+            f.write('<?xml version="1.0"?><plist><dict><key>Program</key>'
+                    '<string>/x & /y</string></dict></plist>')  # raw & = invalid
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertIn("self:agent:malformed", fps)
+
+    def test_valid_plist_no_malformed_finding(self):
+        import plistlib as _p
+        with open(aegis.SELF_PLIST, "wb") as f:
+            _p.dump({"Label": "com.charlie.aegis",
+                     "ProgramArguments": ["/usr/bin/python3", "/x & y/a.py"]}, f)
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertNotIn("self:agent:malformed", fps)
+        self.assertNotIn("self:agent:removed", fps)
+
 
 # --------------------------------------------------------------------------- #
 # N6 — config profiles & login hooks: a newly-installed profile or hook alerts.

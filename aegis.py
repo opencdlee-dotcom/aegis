@@ -49,9 +49,10 @@ WHAT IT DOES (on an interval, via launchd)
      — an adware/DPRK vector).
   8. Extra persistence  - /etc/crontab, /etc/periodic, StartupItems, rc.common.
   9. Browser extensions - inventory diff (Chromium family + Firefox).
- 10. Self-protection    - detects if Aegis's own launchd agent was removed or its
-     append-only evidence log was truncated (a monitor an attacker can silently
-     disable is theater).
+ 10. Self-protection    - detects if Aegis's own launchd agent was removed, its
+     plist is present-but-malformed (invalid XML launchd will refuse on reboot),
+     or its append-only evidence log was truncated (a monitor an attacker can
+     silently disable — or that quietly rots itself into non-execution — is theater).
  11. Network listeners  - a NEW process accepting connections from the network
      (non-loopback TCP LISTEN, via lsof): a bind shell / rogue server shape.
      Loopback dev servers and SIP-pinned Apple daemons are excluded by design.
@@ -1949,6 +1950,24 @@ def check_self_protection():
             "%s no longer exists — the background monitor may have been unloaded "
             "or deleted. Re-run install.sh if this was not intentional."
             % SELF_PLIST, "self:agent:removed"))
+    # (a2) The agent plist EXISTS but is malformed — invalid XML (e.g. a raw '&'
+    # from an install path like ".../Work & Projects/...", the F0 bug in an
+    # install predating its fix). launchd may still run a previously-loaded copy,
+    # so the monitor looks alive — but on the next reboot/reload launchd will
+    # silently refuse the bad plist and the monitor dies with no signal. Catch it
+    # WHILE it is still limping (and fixable) rather than after it is silently
+    # gone. Only checked when the file exists (absence is handled above).
+    elif os.path.exists(SELF_PLIST):
+        try:
+            with open(SELF_PLIST, "rb") as f:
+                plistlib.load(f)
+        except Exception:
+            findings.append(finding(
+                "HIGH", "self-protection", "Aegis launchd plist is malformed",
+                "%s exists but is not valid — launchd will silently refuse to "
+                "(re)load it on the next reboot and the monitor will stop "
+                "running with no alert. Re-run install.sh to regenerate a valid "
+                "agent." % SELF_PLIST, "self:agent:malformed"))
 
     # (b) The append-only findings log shrank since last scan — someone truncated
     # the durable evidence trail.

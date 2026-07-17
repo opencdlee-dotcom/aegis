@@ -6,13 +6,14 @@ BTM/Login-Items, opt-in VirusTotal). Every oracle derived from README/docstring
 intent; each finding proven fail-before/pass-after against the committed baseline
 before it was trusted; no live notification, launchd load, VT network call, or
 write outside a per-test tmp dir fired. Suite: `selftest` 3/3,
-`tests/test_regression.py` **146/146**.
+`tests/test_regression.py` **148/148**.
 
 ## Outcome (pass 3)
 
-**3 genuine defects fixed** (1 HIGH detection-evasion, 1 MEDIUM staleness-evasion,
-1 HIGH live-storm/false-positive found only by an on-machine end-to-end scan),
-each pinned; plus 1 real-state test-pollution bug caught and fixed in-pass.
+**4 genuine defects fixed** (1 HIGH detection-evasion, 1 MEDIUM staleness-evasion,
+1 HIGH live alert-storm, 1 HIGH self-protection blind-spot — the last two found
+only by an on-machine end-to-end run), each pinned; plus 1 real-state
+test-pollution bug caught and fixed in-pass; plus a live-installation repair.
 
 | # | Sev | Where | Defect (vs intent) | Evidence | Fix |
 |---|-----|-------|--------------------|----------|-----|
@@ -20,6 +21,7 @@ each pinned; plus 1 real-state test-pollution bug caught and fixed in-pass.
 | P3-2 | **MEDIUM** | `_check_hot_app` | Bundle freshness keyed on the `.app` **root** mtime only. Swapping a fresh payload into an *existing old* bundle's `Contents/MacOS` never touches the root mtime → a re-weaponized old app ages out of the hot window and is never scored. | A 60-day-old bundle root with a freshly-written exe → no finding pre-fix. | Freshness = `max(root_mtime, exe_mtime)`; a fresh exe in an old bundle still flags HIGH, a fully-old bundle still ages out. Both pinned. |
 | P3-3 | **MEDIUM** | `TestVTReputation` (test) | A new VT test wrote a key to the **real** `~/.aegis/vt_key` (the sandbox overrode `STATE_DIR` but not `VT_KEY_FILE`), polluting real host state — the suite's own "never touch real `~/.aegis`" invariant. | Real `~/.aegis/vt_key` (11 bytes) appeared after a run. | Sandbox now overrides `VT_KEY_FILE`; the stray file was removed. Guards the invariant that would otherwise let any future key-path test leak. |
 | P3-4 | **HIGH** | `snapshot_btm` / `snapshot_listeners` / `_scan_surfaces` | `sfltool dumpbtm` is SLOW (~12s; observed **wedged >60s** under load on this machine) and its 15s `run` timeout returned empty → `snapshot_btm` recorded `{}` = "no background items." A Mac always has ~90 (DisplayLink, auto-updaters…), so the **false-empty was adopted into the live baseline**, and the instant sfltool next succeeded the diff would fire **~95 bogus `New background item` findings — a real alert storm on the user's own installed monitor**, violating the storm-free invariant (same class as the pass-1 corrupt-baseline fix). | Live on-machine `aegis.py scan`: baseline recorded `btm: {}` while `snapshot_btm()` returned 95 real items; a `{}`→95 diff = 95 findings (reproduced in `test_none_snapshot_is_not_adopted_and_does_not_storm`). | A fallible snapshot now returns **`None` (non-answer)** on timeout/hard-failure vs `{}` (genuine empty); `_scan_surfaces`/`cmd_baseline` **skip** a `None` surface — never adopt it, never diff against it. sfltool timeout raised 15→30s; the live poisoned `btm` baseline key was healed. 3 tests pinned. |
+| P3-5 | **HIGH** | `check_self_protection` | Self-protection detected the agent being *removed* but not present-but-**broken**. The live machine's own plist was invalid XML — a raw `&` from the `…/Work & Projects/…` install path (the pass-1 **F0** bug, in a plist generated *before* F0 was fixed). launchd keeps running a previously-loaded copy so the monitor *looks* alive, but on the next reboot/reload it silently refuses the bad plist and the monitor **dies with no signal** — a security tool rotting itself into non-execution. | `plutil -lint ~/Library/LaunchAgents/com.charlie.aegis.plist` → "unknown ampersand-escape sequence at line 9"; launchctl last-exit status was `2`. | Self-check now `plistlib.load`s its own plist when present → HIGH `self:agent:malformed` while it is still limping and fixable. **Live repair:** regenerated the plist via the F0-fixed `install.sh` → `plutil -lint: OK`, running PID, exit 0, baseline preserved. 2 tests pinned. |
 
 ## Saturated (survived attack, no fix needed)
 
