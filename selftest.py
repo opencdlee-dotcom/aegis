@@ -58,8 +58,9 @@ new = {f["detail"].split(" -> ")[0]: f["severity"]
 check("new adhoc launch item in /tmp = CRITICAL",
       any("/tmp/payload" in f["detail"] and f["severity"] == "CRITICAL"
           for f in sev.get("New persistence item", [])))
-check("program-swap on existing item = HIGH",
-      any(f["severity"] == "HIGH" for f in sev.get("Persistence item CHANGED", [])))
+check("program-swap on existing item >= HIGH",
+      any(f["severity"] in ("HIGH", "CRITICAL")
+          for f in sev.get("Persistence item CHANGED", [])))
 check("new developer-id app item is not HIGH/CRITICAL",
       all(f["severity"] in ("LOW", "MEDIUM")
           for f in sev.get("New persistence item", [])

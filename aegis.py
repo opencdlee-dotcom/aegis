@@ -182,9 +182,12 @@ TRUSTED_PREFIXES = ("/System/", "/usr/bin/", "/usr/lib/", "/usr/sbin/",
 
 # Path prefixes that are user-writable and therefore higher-risk for exec.
 # /var is a symlink to /private/var on macOS, so the same location can appear
-# under either form — list both. /usr/local is included per the note above.
+# under either form — list both. /usr/local (Intel Homebrew) and /opt/homebrew
+# (Apple-Silicon Homebrew) are included per the note above: Homebrew chowns its
+# prefix to the invoking user, so both are writable without sudo and a real
+# malware drop target — neither is SIP-protected.
 RISKY_PREFIXES = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders",
-                  "/usr/local", "/Users/Shared", HOME)
+                  "/usr/local", "/opt/homebrew", "/Users/Shared", HOME)
 
 MACHO_MAGIC = {
     b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",  # 32/64-bit
@@ -346,7 +349,21 @@ _ARGV_WATCH_BINS = frozenset((
     "python3", "perl", "ruby", "php", "node", "curl", "wget", "nscurl",
     "xattr", "hdiutil", "tccutil", "dscl", "security", "nohup", "sysctl",
     "system_profiler", "ioreg", "sqlite3", "ditto", "zip",
+    # file-move/copy/archive utilities: harmless alone, but the vehicle a
+    # stealer uses to exfil a sensitive file (e.g. `cp login.keychain-db`).
+    # Adding them only means their argv gets SCORED — _argv_signals still
+    # requires a real hostile pattern (keychain-db, DYLD, xattr strip) to fire.
+    "cp", "mv", "cat", "tar", "rsync", "dd",
 ))
+
+# A watched interpreter/utility invoked ANYWHERE in an argv — used as a fallback
+# pre-filter gate when the exec basename can't be trusted (a renamed binary, or
+# an exec path containing spaces that shears clean tokenization). Longest names
+# first so alternation prefers the more specific match. Word-boundary anchored,
+# so "sh" won't match inside "bash" and "node" won't match "node_modules".
+_ARGV_WATCH_RE = re.compile(
+    r"\b(?:%s)\b" % "|".join(sorted(_ARGV_WATCH_BINS, key=len, reverse=True)),
+    re.I)
 
 # --- Apple's own engine (XProtect Remediator), harvested for free ------------ #
 # XPR is Apple's periodic malware scanner/remediator (25 per-family modules on
@@ -763,13 +780,28 @@ _INLINE_EXEC_FLAGS = frozenset(("-c", "-e"))
 _FETCH_RE = re.compile(r"\b(?:curl|wget|nscurl)\b.*?https?://", re.I | re.S)
 
 
-def _script_target(args):
+def _interp_fronted(args, program=None):
+    """Is this process an interpreter driving a payload? The interpreter identity
+    comes from the RESOLVED program (plist `Program` key) when present, falling
+    back to args[0]. launchd lets ProgramArguments[0] be an arbitrary custom
+    argv0 that need not equal the real binary, so a decoy argv0 (e.g.
+    Program=/bin/bash, argv0="com.apple.softwareupdate") must not hide the
+    interpreter — either basename being an interpreter counts."""
+    if not isinstance(args, list) or not args:
+        return False
+    for cand in (program, args[0]):
+        if cand is not None and os.path.basename(str(cand)) in _INTERPRETERS:
+            return True
+    return False
+
+
+def _script_target(args, program=None):
     """The script an interpreter is told to run: the first path-like, non-flag
-    argument after the interpreter binary. None if args[0] isn't an interpreter
-    or no such argument exists."""
+    argument after the interpreter binary. None if the process isn't interpreter-
+    fronted (by resolved program OR args[0]) or no such argument exists."""
     if not isinstance(args, list) or len(args) < 2 or args[0] is None:
         return None
-    if os.path.basename(str(args[0])) not in _INTERPRETERS:
+    if not _interp_fronted(args, program):
         return None
     for a in args[1:]:
         s = str(a)
@@ -788,14 +820,19 @@ def _hidden_home_or_tmp(path):
     positive cannon against legitimate user tooling."""
     if not path:
         return False
-    if path.startswith(("/tmp", "/private/tmp", "/var/folders",
+    # Lexically normalize FIRST so a no-op `/./` or redundant separators can't
+    # dodge the structural comparison (`~/./.agent` resolves to `~/.agent`, and
+    # execvp/launchd run the same file). normpath is pure-lexical by design — we
+    # do NOT want realpath here (it would hit the FS and resolve symlinks).
+    norm = os.path.normpath(path)
+    if norm.startswith(("/tmp", "/private/tmp", "/var/folders",
                         "/private/var/folders", "/Users/Shared")):
         return True
-    return (os.path.dirname(path) == HOME
-            and os.path.basename(path).startswith("."))
+    return (os.path.dirname(norm) == HOME
+            and os.path.basename(norm).startswith("."))
 
 
-def _hostile_args(args):
+def _hostile_args(args, program=None):
     """Intent-derived (README: catch AMOS/Poseidon launchd persistence), and
     independent of the interpreter binary's own signature/location. True on the
     HIGH-PRECISION infostealer signals: a signed interpreter driven by an inline
@@ -807,15 +844,14 @@ def _hostile_args(args):
     'alert rarely' (a false HIGH is worse than a rare miss)."""
     if not isinstance(args, list) or not args or args[0] is None:
         return False
-    base = os.path.basename(str(args[0]))
     rest = [str(a) for a in args[1:]]
-    if base in _INTERPRETERS and any(a in _INLINE_EXEC_FLAGS for a in rest):
+    if _interp_fronted(args, program) and any(a in _INLINE_EXEC_FLAGS for a in rest):
         return True
     # interpreter pointed at a hidden script in $HOME root or a temp dir — the
     # AMOS `/bin/bash ~/.agent` / `.helper` 2025 persistence pattern. The binary
     # (bash) is Apple-signed and in a trusted path, so signature+location scoring
     # alone reads it as safe; the tell is WHERE the script it runs lives.
-    tgt = _script_target(args)
+    tgt = _script_target(args, program)
     if tgt and _hidden_home_or_tmp(tgt):
         return True
     joined = " ".join(str(a) for a in args)
@@ -856,7 +892,7 @@ def _persistence_severity(rec):
         # a launchd job that injects a dylib/lib path into what it spawns
         # (DYLD_INSERT_LIBRARIES &c.) is a code-injection persistence pattern.
         return "CRITICAL" if is_risky_location(prog) else "HIGH"
-    if _hostile_args(rec.get("args")):
+    if _hostile_args(rec.get("args"), rec.get("program")):
         # signed-interpreter + hostile payload: the #1 infostealer pattern.
         return "CRITICAL" if is_risky_location(prog) else "HIGH"
     if suspicious_sig(trust) and is_risky_location(prog):
@@ -873,7 +909,7 @@ def _persistence_severity(rec):
     # in a user-writable location (Phexia: `osascript ~/Library/<random>`). Not a
     # notify-grade HIGH (legit agents run ~/Library helper scripts too), but worth
     # surfacing at MEDIUM rather than the LOW the interpreter's own path implies.
-    tgt = _script_target(rec.get("args"))
+    tgt = _script_target(rec.get("args"), rec.get("program"))
     if tgt and is_risky_location(tgt):
         return "MEDIUM"
     return "LOW"
@@ -894,13 +930,41 @@ def check_persistence(baseline_snap, current_snap):
                 run_at_load=rec.get("run_at_load")))
         else:
             old = base[path]
-            if (old.get("program") != rec.get("program")
-                    or old.get("sha256") != rec.get("sha256")):
+            # An in-place mutation of an already-baselined plist can inject a
+            # dylib (launchd EnvironmentVariables) or swap the payload argv
+            # WITHOUT touching the program path or its bytes — invisible to a
+            # program/hash-only diff. Compare env/args too, and rate the finding
+            # by the mutated record (reusing _persistence_severity) so a
+            # DYLD_INSERT_LIBRARIES injection surfaces at its true CRITICAL/HIGH.
+            prog_changed = (old.get("program") != rec.get("program")
+                            or old.get("sha256") != rec.get("sha256"))
+            env_changed = (old.get("env") or None) != (rec.get("env") or None)
+            args_changed = (old.get("args") or None) != (rec.get("args") or None)
+            if prog_changed or env_changed or args_changed:
+                what = "+".join(w for w, c in (
+                    ("program/hash", prog_changed), ("env", env_changed),
+                    ("args", args_changed)) if c)
+                # Fold the current sha256/env/args into the fingerprint (sha256
+                # alone is unchanged on an env-only mutation) so a real change
+                # re-alerts but a steady mutated state does not storm.
+                fp = hashlib.sha256(repr(
+                    (rec.get("sha256"), rec.get("env"), rec.get("args"))
+                ).encode()).hexdigest()[:16]
+                # The mutated record's own risk drives severity (env-injection /
+                # adhoc-in-tmp escalate to CRITICAL), but a swapped program binary
+                # is inherently serious even if the replacement is validly signed
+                # (supply-chain / stolen-cert swap), so a program/hash change never
+                # scores below HIGH — the change itself is the signal.
+                sev = _persistence_severity(rec)
+                if prog_changed and SEV_ORDER[sev] < SEV_ORDER["HIGH"]:
+                    sev = "HIGH"
                 findings.append(finding(
-                    "HIGH", "persistence", "Persistence item CHANGED",
-                    "%s: program/hash changed (%s -> %s)" % (
-                        rec["label"], old.get("program"), rec.get("program")),
-                    "persistence:changed:%s:%s" % (path, rec.get("sha256")),
+                    sev, "persistence",
+                    "Persistence item CHANGED",
+                    "%s: %s changed (%s -> %s)" % (
+                        rec["label"], what, old.get("program"),
+                        rec.get("program")),
+                    "persistence:changed:%s:%s" % (path, fp),
                     path=path, program=rec.get("program"), trust=rec.get("trust")))
     for path, old in base.items():
         if path not in current_snap:
@@ -1036,10 +1100,17 @@ def check_behavior():
         return findings
     seen = set()
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        # Only pid and uid are guaranteed space-free (integers); split just those
+        # off the left and keep the REST as one string. macOS `comm` prints the
+        # full exec path, which can contain spaces, so splitting comm out as a
+        # single token (the old split(None, 3)) sheared any spaced path and fed a
+        # bogus basename to the pre-filter. `rest` holds comm+argv; the exec path
+        # is duplicated at its head (argv[0] repeats comm) but that is harmless
+        # prefix noise to the pattern scorer.
+        parts = line.split(None, 2)
+        if len(parts) < 3:
             continue
-        pid, uid, comm, argv = parts
+        pid, uid, argv = parts
         # Same-user only: an unprivileged process gets truncated/empty argv for
         # other users' processes, so a match there would be unreliable. And never
         # inspect our OWN scanning process (its argv legitimately carries these
@@ -1049,11 +1120,15 @@ def check_behavior():
         # whose text reads "System aegis needs your password…").
         if uid != my_uid or pid == my_pid:
             continue
-        base = os.path.basename(comm)
+        base = os.path.basename(argv.split(None, 1)[0]) if argv else ""
         # Cheap pre-filter: only argv-inspect known interpreter/utility binaries
         # (keeps the regex work bounded on a 500-process list). A hostile chain
-        # always fronts one of these — or carries an obvious network-fetch idiom.
-        if base not in _ARGV_WATCH_BINS and not _FETCH_RE.search(argv):
+        # fronts one of these, carries an obvious network-fetch idiom, or — when
+        # the attacker renamed the binary / dropped it at a spaced path so `base`
+        # is unrecognizable — still NAMES a watched interpreter somewhere in argv.
+        if (base not in _ARGV_WATCH_BINS
+                and not _FETCH_RE.search(argv)
+                and not _ARGV_WATCH_RE.search(argv)):
             continue
         signals = _argv_signals(argv)
         if not signals:
@@ -1072,7 +1147,8 @@ def check_behavior():
         findings.append(finding(
             top, "behavior", "Suspicious process behavior",
             "%s [%s]: %s" % (base, names, snippet),
-            fp, program=comm, pid=pid, signals=names))
+            fp, program=argv.split(None, 1)[0] if argv else "",
+            pid=pid, signals=names))
     return findings
 
 
@@ -1109,11 +1185,15 @@ def check_xprotect(window_hours=None):
                 ev = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(ev, dict):
+                continue  # non-object ndjson record — skip, never fatal
             msg = ev.get("eventMessage") or ""
             try:
                 detail = json.loads(msg)
             except Exception:
                 detail = {}
+            if not isinstance(detail, dict):
+                detail = {}  # valid non-object JSON (list/scalar) — treat as empty
             status = detail.get("status_message") or ""
             caused = detail.get("caused_by") or []
             # A clean scan is status "NoThreatDetected" with empty caused_by.
@@ -1578,12 +1658,24 @@ def snapshot_extra_persistence():
 
     for p in EXTRA_PERSIST_FILES:
         add(p)
-    for d in EXTRA_PERSIST_DIRS:
-        try:
-            for name in sorted(os.listdir(d)):
-                add(os.path.join(d, name))
-        except Exception:
-            continue
+    # Walk a few levels deep, not one: /etc/periodic keeps its scripts under
+    # daily/weekly/monthly/ and StartupItems keeps <Item>/<Item> two-deep, so a
+    # flat listdir sees only the intermediate dirs and captures nothing. Bound
+    # it (max depth + entry cap, followlinks=False) so a deep/looping tree can't
+    # blow up — these surfaces are shallow.
+    MAX_DEPTH = 3
+    MAX_ENTRIES = 4000
+    seen_entries = 0
+    for root_d in EXTRA_PERSIST_DIRS:
+        base_depth = root_d.rstrip("/").count("/")
+        for dirpath, dirnames, filenames in os.walk(root_d, followlinks=False):
+            if dirpath.rstrip("/").count("/") - base_depth >= MAX_DEPTH:
+                dirnames[:] = []  # stop descending past the cap
+            for name in sorted(filenames):
+                add(os.path.join(dirpath, name))
+                seen_entries += 1
+                if seen_entries >= MAX_ENTRIES:
+                    return snap
     return snap
 
 
@@ -1761,9 +1853,27 @@ def _parse_btm(text):
     mistaken for items)."""
     items = {}
     cur = None
+
+    def _flush(c):
+        # Materialize an item ONCE it is fully read (next header or EOF), so
+        # fields printed AFTER `Identifier:` (real sfltool prints URL last) land
+        # in the stored record. An item is stored only if an `Identifier:` line
+        # was seen (its value may be empty → fall back to the UUID).
+        if not c or "_ident" not in c:
+            return
+        ident = c["_ident"] or c.get("_uuid")
+        if not ident:
+            return
+        rec = {k: v for k, v in c.items() if not k.startswith("_")}
+        # Stable shape so downstream always finds these keys.
+        for f in ("name", "team", "type", "url"):
+            rec.setdefault(f, None)
+        items[ident] = rec
+
     for raw in (text or "").splitlines():
         s = raw.strip()
         if re.fullmatch(r"#\d+:", s):
+            _flush(cur)
             cur = {}
             continue
         if cur is None or ": " not in s:
@@ -1771,13 +1881,7 @@ def _parse_btm(text):
         key, val = s.split(": ", 1)
         key, val = key.strip(), val.strip()
         if key == "Identifier":
-            ident = val or cur.get("_uuid")
-            if ident:
-                rec = {k: v for k, v in cur.items() if not k.startswith("_")}
-                # Stable shape so downstream always finds these keys.
-                for f in ("name", "team", "type", "url"):
-                    rec.setdefault(f, None)
-                items[ident] = rec
+            cur["_ident"] = val or None
         elif key == "UUID":
             cur["_uuid"] = val
         elif key == "Name":
@@ -1788,6 +1892,7 @@ def _parse_btm(text):
             cur["type"] = val
         elif key in ("URL", "Executable Path"):
             cur.setdefault("url", val if val != "(null)" else None)
+    _flush(cur)
     return items
 
 
@@ -1832,7 +1937,30 @@ def diff_btm(prior, cur):
                " at %s" % path if path else ""),
             "btm:%s" % ident, identifier=ident, name=rec.get("name"),
             team=rec.get("team"), url=url)
-    return _diff_map(prior, cur, new_fn)
+
+    def changed_fn(ident, rec, old):
+        # An in-place SMAppService hijack: the SAME identifier now backs a
+        # different record (target swapped, Team ID stripped). Severity mirrors
+        # new_fn — HIGH when the new target has no Team ID AND resolves to a
+        # risky location, else MEDIUM.
+        url = rec.get("url")
+        path = _btm_path_from_url(url)
+        no_team = not rec.get("team")
+        risky = bool(path and is_risky_location(path))
+        sev = "HIGH" if (no_team and risky) else "MEDIUM"
+        return finding(
+            sev, "btm", "Background item CHANGED (Login Item / SMAppService)",
+            "%s [%s] background item was modified in place%s%s — its backing "
+            "record changed (possible SMAppService hijack; persists WITHOUT a "
+            "LaunchAgents plist)."
+            % (rec.get("name") or ident, rec.get("type") or "?",
+               " team=%s" % rec["team"] if rec.get("team") else " (no Team ID)",
+               " now at %s" % path if path else ""),
+            "btm:changed:%s:%s" % (ident, url or "?"),
+            identifier=ident, name=rec.get("name"),
+            team=rec.get("team"), url=url)
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
 
 
 # --- network listeners ---------------------------------------------------------
@@ -1992,14 +2120,29 @@ def check_self_protection():
     for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
         recorded = st.get("%s_sha" % name)
         cur_sha = sha256(path) if os.path.exists(path) else None
-        if recorded and cur_sha and recorded != cur_sha:
+        # `recorded` is only set once record_selfstate saw the file exist, so a
+        # truthy `recorded` means it existed. cur_sha is None => the file is now
+        # gone (deletion — the more dangerous tamper: it forces the next scan onto
+        # the first_run path, silently re-baselining current persistence as
+        # known-good). A differing hash => modification. Both are tampering.
+        if recorded and cur_sha != recorded:
+            if cur_sha is None:
+                detail = ("%s was DELETED out-of-band — Aegis recorded its "
+                          "integrity hash but the file is now gone. A missing "
+                          "trust store forces the next scan to silently "
+                          "re-baseline current persistence as known-good, "
+                          "laundering any attacker-blessed state." % path)
+            else:
+                detail = ("%s changed since Aegis last wrote it — its integrity "
+                          "hash no longer matches. If you did not run "
+                          "`aegis.py baseline`/`allow`, the trust store may have "
+                          "been poisoned to hide an intrusion." % path)
             findings.append(finding(
                 "HIGH", "self-protection",
-                "Aegis %s modified out-of-band" % name,
-                "%s changed since Aegis last wrote it — its integrity hash no "
-                "longer matches. If you did not run `aegis.py baseline`/`allow`, "
-                "the trust store may have been poisoned to hide an intrusion."
-                % path, "self:%s:tampered:%s" % (name, cur_sha[:16])))
+                "Aegis %s %s" % (name, "was DELETED out-of-band"
+                                 if cur_sha is None else "modified out-of-band"),
+                detail,
+                "self:%s:tampered:%s" % (name, (cur_sha or "deleted")[:16])))
     return findings
 
 
