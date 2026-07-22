@@ -60,6 +60,10 @@ WHAT IT DOES (on an interval, via launchd)
  12. Background items    - `sfltool dumpbtm`: a NEW Login Item / SMAppService
      background agent, incl. ones that persist WITHOUT a LaunchAgents plist
      (the modern registration path the directory scan can't see).
+ 13. Web/phishing posture - locally parses `/etc/hosts` for a substantial domain
+     denylist and HIGH-confidence DNS overrides (sensitive identity/update or
+     punycode names redirected to a non-blocking address). Missing hosts-based
+     coverage is INFO because DNS/Network Extension policy may be out of view.
 
   Surfaces 5-9, 11 and 12 are baseline-diffed and ADOPTED SILENTLY the first
   time each is seen (per-surface "trust what's already installed"), so upgrading
@@ -122,6 +126,20 @@ ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
 BASELINE_SCHEMA_VERSION = 2
+HOSTS_FILE = "/etc/hosts"
+
+# A StevenBlack-style hosts denylist normally contains many thousands of
+# entries. This is a posture threshold, not a claim that every smaller list is
+# useless: below it Aegis emits INFO only and explicitly acknowledges that a DNS
+# or Network Extension filter may be protecting the host out of view.
+HOSTS_BLOCKLIST_MIN_DOMAINS = 1000
+_HOSTS_BLOCK_ADDRESSES = frozenset(("0", "0.0.0.0", "127.0.0.1", "::", "::1"))
+_SENSITIVE_HOST_ROOTS = frozenset((
+    "apple.com", "icloud.com", "google.com", "gmail.com",
+    "microsoft.com", "microsoftonline.com", "live.com", "office.com",
+    "github.com", "githubusercontent.com", "openai.com", "chatgpt.com",
+    "virustotal.com",
+))
 
 # --- Response tier (opt-in; never automatic) --------------------------------- #
 # The quarantine STORE: a confined, reversible holding area for native
@@ -686,12 +704,13 @@ _sigcache = None
 
 
 def _sig_stat(path):
-    # Nanosecond mtime + size. int(st_mtime) alone is content-blind within a
-    # single second: a same-length replacement in the same second would serve a
-    # stale classification. st_mtime_ns closes that window.
+    # Identity + ctime + nanosecond mtime + size. Updaters and attackers can
+    # preserve a replacement's mtime and size; ctime cannot be restored by an
+    # unprivileged same-user process, while inode/device catch atomic swaps.
+    # Omitting these let a changed executable retain a stale trusted verdict.
     try:
         st = os.stat(path)
-        return [st.st_mtime_ns, st.st_size]
+        return [st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size]
     except Exception:
         return None
 
@@ -2104,6 +2123,87 @@ def check_staging(max_age_days=3):
 
 
 # --------------------------------------------------------------------------- #
+# Check 3c: local web/phishing posture and hosts-file poisoning.
+#
+# `/etc/hosts` takes precedence over DNS, so it is both a useful entitlement-
+# free blocking layer and a credential-phishing target. This sensor never
+# downloads a list and never modifies the file: it verifies whether a substantial
+# local denylist exists and flags non-blocking redirects of high-value identity /
+# update domains. A missing denylist is INFO because DNS/NE filtering may exist
+# outside this process's view; a hostile override is HIGH.
+# --------------------------------------------------------------------------- #
+
+
+def _hosts_block_address(address):
+    address = (address or "").lower()
+    return address in _HOSTS_BLOCK_ADDRESSES or address.startswith("127.")
+
+
+def _sensitive_host(domain):
+    return any(domain == root or domain.endswith("." + root)
+               for root in _SENSITIVE_HOST_ROOTS)
+
+
+def check_web_protection():
+    try:
+        with open(HOSTS_FILE, "r", errors="replace") as f:
+            lines = f
+            blocked = set()
+            suspicious = set()
+            findings = []
+            for raw in lines:
+                content = raw.split("#", 1)[0].strip()
+                if not content:
+                    continue
+                fields = content.split()
+                if len(fields) < 2:
+                    continue
+                address = fields[0].lower()
+                for raw_domain in fields[1:]:
+                    domain = raw_domain.strip().lower().rstrip(".")
+                    if not domain or domain in ("localhost", "broadcasthost"):
+                        continue
+                    if _hosts_block_address(address):
+                        blocked.add(domain)
+                        continue
+                    reason = None
+                    if _sensitive_host(domain):
+                        reason = "sensitive identity/update domain"
+                    elif any(label.startswith("xn--")
+                             for label in domain.split(".")):
+                        reason = "punycode domain"
+                    key = (address, domain, reason)
+                    if reason and key not in suspicious:
+                        suspicious.add(key)
+                        findings.append(finding(
+                            "HIGH", "web-protection",
+                            "Suspicious hosts-file domain redirect",
+                            "%s maps %s to %s instead of a blocking address — "
+                            "%s overrides DNS locally and can redirect browser, "
+                            "identity, or updater traffic. Verify or remove it."
+                            % (HOSTS_FILE, domain, address, reason.capitalize()),
+                            "web:hosts:redirect:%s:%s" % (domain, address),
+                            path=HOSTS_FILE, domain=domain, address=address,
+                            reason=reason))
+    except (OSError, UnicodeError):
+        return None
+
+    if len(blocked) < HOSTS_BLOCKLIST_MIN_DOMAINS:
+        findings.append(finding(
+            "INFO", "web-protection",
+            "No substantial local hosts-file blocklist detected",
+            "%s blocks %d non-local domain%s (<%d). A DNS or Network "
+            "Extension filter may still protect this Mac; Aegis cannot observe "
+            "that from an unentitled local process."
+            % (HOSTS_FILE, len(blocked), "" if len(blocked) == 1 else "s",
+               HOSTS_BLOCKLIST_MIN_DOMAINS),
+            "web:hosts:blocklist:below-threshold", path=HOSTS_FILE,
+            blocked_domains=len(blocked),
+            threshold=HOSTS_BLOCKLIST_MIN_DOMAINS))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
 # Check 4: hardening posture
 # --------------------------------------------------------------------------- #
 
@@ -2902,6 +3002,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("hot-dir", check_hot_dirs, ()),
         ("staging", check_staging, ()),
         ("canary", check_canaries, ()),
+        ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
         ("self-protection", check_self_protection, ()),
     )

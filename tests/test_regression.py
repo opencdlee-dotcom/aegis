@@ -35,6 +35,9 @@ class Sandbox(unittest.TestCase):
         self.hot = os.path.join(self.tmp, "hot")
         for d in (self.state, self.pers, self.hot):
             os.makedirs(d)
+        self.hosts = os.path.join(self.state, "hosts")
+        with open(self.hosts, "w") as f:
+            f.write("127.0.0.1 localhost\n::1 localhost\n")
 
         self._saved = {}
         overrides = {
@@ -86,6 +89,8 @@ class Sandbox(unittest.TestCase):
             "BTM_DUMP_CMD": ["/bin/echo", "no items"],
             "_sigcache": {},
         }
+        if hasattr(aegis, "HOSTS_FILE"):
+            overrides["HOSTS_FILE"] = self.hosts
         for k, v in overrides.items():
             self._saved[k] = getattr(aegis, k)
             setattr(aegis, k, v)
@@ -332,6 +337,36 @@ class TestSigcacheKeying(Sandbox):
                                 "stat-signature refreshed on content change")
         finally:
             subprocess.run(["rm", "-f", p], check=False)
+
+    def test_cache_invalidates_when_size_and_mtime_are_preserved(self):
+        p = os.path.join(self.tmp, "same-stat-binary")
+        with open(p, "wb") as f:
+            f.write(b"AAAA")
+        fixed_ns = 1_700_000_000_000_000_000
+        os.utime(p, ns=(fixed_ns, fixed_ns))
+        calls = []
+        saved_run = aegis.run
+
+        def fake_run(cmd, timeout=15):
+            calls.append(tuple(cmd))
+            if "-dv" in cmd:
+                return ("", "Authority=Developer ID Application: Example\n"
+                        "TeamIdentifier=EXAMPLE123\nflags=0x10000(runtime)\n", 0)
+            return ("", "", 0)
+
+        aegis.run = fake_run
+        try:
+            aegis.classify_signature(p)
+            time.sleep(0.01)  # ensure ctime advances on coarse filesystems
+            with open(p, "wb") as f:
+                f.write(b"BBBB")  # same path and size
+            os.utime(p, ns=(fixed_ns, fixed_ns))  # attacker preserves mtime
+            aegis.classify_signature(p)
+        finally:
+            aegis.run = saved_run
+        verifies = [c for c in calls if "--verify" in c]
+        self.assertEqual(len(verifies), 2,
+                         "a same-size/mtime replacement must be re-verified")
 
 
 # --------------------------------------------------------------------------- #
@@ -2677,6 +2712,56 @@ class TestSensorHealthCore(Sandbox):
         self.assertTrue(any(fp.endswith(":unknown") for fp in fps), fps)
         self.assertFalse(any(fp.endswith(":off") or fp.endswith(":on")
                              for fp in fps), fps)
+
+
+class TestWebProtection(Sandbox):
+    def _write_hosts(self, text):
+        with open(self.hosts, "w") as f:
+            f.write(text)
+        aegis.HOSTS_FILE = self.hosts
+
+    def test_default_hosts_reports_missing_local_blocklist_without_overclaiming(self):
+        self._write_hosts("127.0.0.1 localhost\n::1 localhost\n")
+        findings = aegis.check_web_protection()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "INFO")
+        self.assertIn("may still", findings[0]["detail"])
+
+    def test_large_local_blocklist_is_recognized(self):
+        rows = ["0.0.0.0 blocked-%d.example" % i
+                for i in range(aegis.HOSTS_BLOCKLIST_MIN_DOMAINS)]
+        self._write_hosts("127.0.0.1 localhost\n" + "\n".join(rows) + "\n")
+        self.assertEqual(aegis.check_web_protection(), [])
+
+    def test_sensitive_domain_redirect_is_high(self):
+        self._write_hosts("203.0.113.9 login.microsoft.com\n")
+        finding = aegis.check_web_protection()[0]
+        self.assertEqual(finding["severity"], "HIGH")
+        self.assertEqual(finding["domain"], "login.microsoft.com")
+        self.assertEqual(finding["address"], "203.0.113.9")
+
+    def test_loopback_block_of_sensitive_domain_is_not_poisoning(self):
+        rows = ["0.0.0.0 login.microsoft.com"]
+        rows += ["0.0.0.0 blocked-%d.example" % i
+                 for i in range(aegis.HOSTS_BLOCKLIST_MIN_DOMAINS)]
+        self._write_hosts("\n".join(rows) + "\n")
+        self.assertEqual(aegis.check_web_protection(), [])
+
+    def test_nonblocked_punycode_mapping_is_high(self):
+        self._write_hosts("198.51.100.7 xn--paypa-4ve.example\n")
+        findings = aegis.check_web_protection()
+        self.assertTrue(any(f["severity"] == "HIGH" and
+                            f["domain"].startswith("xn--") for f in findings))
+
+    def test_unreadable_hosts_is_a_non_answer(self):
+        aegis.HOSTS_FILE = os.path.join(self.tmp, "missing-hosts")
+        self.assertIsNone(aegis.check_web_protection())
+
+    def test_sensor_is_wired_into_gather_all(self):
+        health = []
+        aegis.gather_all({}, {}, health=health)
+        self.assertIn("web-protection",
+                      {item["sensor_id"] for item in health})
 
 
 class TestDurabilityAndCommandBoundary(Sandbox):

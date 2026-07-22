@@ -32,6 +32,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **XProtect harvest** *(new)* | Reads Apple's own **XProtect Remediator** detections straight from the unified log (`com.apple.XProtectFramework.PluginAPI`) — a `status != NoThreatDetected` event means Apple's engine found/removed malware (CRITICAL) — plus flags **stale XProtect definitions** (>60 days) | Piggybacks Apple's professionally-maintained, always-updating signature/behavioral engine for free — no entitlement, no cloud. The single highest-value signal a signature-less tool can add |
 | **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables **and `.app` bundles** in Downloads/Desktop/tmp/Shared, tagged with **quarantine provenance** — a binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop). A fresh signed-but-**unnotarized** app additionally gets Gatekeeper's own `spctl` verdict surfaced (MEDIUM — a normal quarantined launch would refuse it, so one that runs was side-loaded or force-approved) | Catches a payload the moment it lands, before it runs — including the #1 delivery shape, a DMG/ZIP-dragged `.app`, which is a *directory* and invisible to any file-only check |
 | **Staging watch** *(new)* | Documented stealer **loot-staging artifacts** in `/tmp`/`/Users/Shared` — `app.zip` (Atomic), `ledger.zip` (Odyssey/Poseidon), `salmonela.zip` (MacSync), `wid.txt`, `.pass`, `shub_*`, a copied `login.keychain-db` | Smash-and-grab stealers stage loot then exfil in under a minute, leaving no persistence — this catches the residue |
+| **Web/phishing posture** | Parses `/etc/hosts` locally for a substantial hosts denylist and flags non-blocking redirects of sensitive identity/update domains or punycode names as HIGH. Missing blocklist coverage is INFO only because DNS or Network Extension filtering may exist outside Aegis's view | Adds an entitlement-free web-defense layer without phoning home, modifying DNS, or pretending that an unobservable network filter is absent |
 | **Shell history** *(new)* | The recent tail of `~/.zsh_history`/`.bash_history`/fish for the **ClickFix terminal-paste** chain — `dscl . -authonly`, `curl … \| sh`, `xattr -c`, `hdiutil -nobrowse` — one alert per unique hostile command | ClickFix (fake-CAPTCHA paste) is now the dominant macOS initial-access vector; the payload is fetched inside a trusted Terminal so it never gets a quarantine xattr — history is the residue |
 | **Wallet integrity** *(new)* | Content-hash of installed crypto-wallet configs + app binaries (Ledger Live `app.json`, Trezor Suite, Exodus); any change alerts HIGH | 2025 stealers hijack funds by rewriting Ledger Live's `app.json` or swapping wallet bundles for drainers (DigitStealer, Odyssey) |
 | **Canary files** *(new, opt-in)* | Hidden decoy files you plant with `aegis.py canary`; any modification/deletion alerts CRITICAL | Attribution-independent ransomware / bulk-tamper tripwire — a process encrypting a folder trips a canary with near-zero false positives |
@@ -303,7 +304,12 @@ A security tool sees everything, so it must be trustworthy *by construction*:
   carries no signal there. Standing caveat: a local tool can't see *online*
   ticket revocation, so notarization can be stale-good; the assessment itself is
   Apple's machinery and may consult Apple's servers (Aegis still sends nothing).
-- **Web/phishing (local, no cloud):** a StevenBlack-style hosts blocklist check.
+- ✅ **Web/phishing posture — SHIPPED, local/no-cloud:** Aegis parses `/etc/hosts`
+  in one bounded pass, recognizes a StevenBlack-scale denylist, and alerts HIGH
+  on non-blocking redirects of sensitive identity/update domains or punycode
+  names. Missing hosts coverage stays INFO because DNS/Network Extension
+  filtering may exist outside an unentitled process's view. The automatic path
+  never downloads or installs third-party policy.
 - **Power tier:** a separately signed/notarized app plus an ES system extension.
   Start in `NOTIFY` shadow mode, measure loss/drop/latency and false positives,
   then consider narrowly-scoped `AUTH` decisions with strict deadlines and a
@@ -325,7 +331,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**208 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**216 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -333,7 +339,17 @@ payload scores HIGH; a corrupt baseline refuses to silently re-trust; first-run
 silence is scoped per-surface so a live threat present at install still alerts;
 a swapped binary at an allowlisted path re-alerts (content hash in the
 fingerprint); `/usr/local` and `/private/var/folders` are risky; the signature
-cache invalidates on content change and stays bounded.
+cache invalidates on content change — including a same-size replacement whose
+mtime was restored — and stays bounded.
+
+The **web-protection + trust-cache tier** adds 8 fail-before/pass-after tests: a
+substantial local hosts denylist is recognized; default hosts files are reported
+as INFO without claiming DNS/NE protection is absent; sensitive-domain and
+punycode redirects to non-blocking addresses score HIGH; deliberate loopback
+blocks do not false-positive; unreadable hosts data degrades sensor health; the
+sensor is wired into every scan; and a same-size, same-mtime executable
+replacement is forced through strict `codesign` verification instead of reusing
+a stale trusted cache entry.
 
 The **response tier** pins files and valid `.app` bundles, native metadata-
 preserving round trips, durable crash recovery after the source rename, audit-

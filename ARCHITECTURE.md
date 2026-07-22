@@ -23,7 +23,7 @@ The non-negotiable boundary is:
 | Layer | Control | Failure it covers |
 |---|---|---|
 | Prevent | Gatekeeper/notarization posture, SIP, FileVault, firewall, least privilege | Reduces exposed paths before Aegis observes anything |
-| Observe | Persistence, processes/argv, hot directories/apps, XProtect, staging, shell history, canaries, listeners, background items, profiles, extensions, wallet integrity | Independent artifacts left by execution, persistence, credential theft, staging, or tampering |
+| Observe | Persistence, processes/argv, hot directories/apps, XProtect, staging, shell history, hosts-file web/phishing posture, canaries, listeners, background items, profiles, extensions, wallet integrity | Independent artifacts left by execution, persistence, credential theft, staging, redirection, or tampering |
 | Prove coverage | Durable per-sensor status, duration, item count, consecutive failures | Prevents an unavailable permission/tool from being reported as clean |
 | Normalize | Versioned finding contract and central redaction | Makes signals comparable without persisting command-line secrets |
 | Correlate | Same-entity, bounded-window chains | Raises confidence when independent layers agree without flooding on unrelated medium findings |
@@ -113,6 +113,9 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
 - System tools resolve to absolute Apple paths and run with a fixed system PATH.
 - State directory/file modes are `0700`/`0600`; runtime is installed atomically.
 - Automatic scan/watch never calls VirusTotal; manual `vt` sends only a SHA-256.
+- Web/phishing posture parses local `/etc/hosts` only; it neither downloads nor
+  installs third-party policy and never mistakes invisible DNS/NE coverage for
+  confirmed absence.
 - Logs rotate to bound storage. Sensitive values are redacted before persistence.
 - Watch mode is event-assisted, debounced, rate-limited, and always reconciles
   on a periodic full scan; vnode notification is not treated as a complete log.
