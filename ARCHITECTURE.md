@@ -118,6 +118,9 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   on a periodic full scan; vnode notification is not treated as a complete log.
 - `doctor` exposes permission and sensor degradation. Three consecutive sensor
   failures open one health incident; recovery resolves it and resets the count.
+- Capability-dependent inventories such as Background Task Management remain
+  DEGRADED when macOS requires interactive authorization; denied data is never
+  interpreted as an empty or clean snapshot.
 - Uninstall retains evidence by default. Purge requires the explicit `--purge`.
 
 ## Power-tier gate

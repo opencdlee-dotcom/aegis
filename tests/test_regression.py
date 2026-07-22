@@ -2431,6 +2431,48 @@ class TestSelfProtectionBaselineDeletion(Sandbox):
                         "out-of-band DELETION of baseline.json must be flagged")
 
 
+class TestBaselineSchemaMigration(Sandbox):
+    def _legacy(self, secret):
+        return {"created": "legacy", "persistence": {"/tmp/agent.plist": {
+            "label": "agent", "program": "/bin/sh",
+            "args": ["/bin/sh", "-c", "token=%s" % secret],
+            "trust": "apple", "sha256": "abc", "run_at_load": True,
+        }}}
+
+    def test_owned_legacy_baseline_is_hashed_redacted_and_rewatermarked(self):
+        secret = "sk-live-LegacySecretMustDisappear"
+        aegis.save_json(aegis.BASELINE, self._legacy(secret))
+        aegis.save_json(aegis.SELFSTATE,
+                        {"baseline_sha": aegis.sha256(aegis.BASELINE)})
+        baseline, corrupt = aegis.load_baseline()
+        self.assertFalse(corrupt)
+        self.assertEqual(baseline["schema_version"],
+                         aegis.BASELINE_SCHEMA_VERSION)
+        self.assertEqual(baseline["trust"], "unverified")
+        record = baseline["persistence"]["/tmp/agent.plist"]
+        self.assertRegex(record["args_sha256"], r"^[0-9a-f]{64}$")
+        with open(aegis.BASELINE, "rb") as stored:
+            self.assertNotIn(secret.encode(), stored.read())
+        state = aegis.load_json(aegis.SELFSTATE, {})
+        self.assertEqual(state["baseline_sha"], aegis.sha256(aegis.BASELINE))
+        self.assertFalse(any("tampered" in f["fingerprint"]
+                             for f in aegis.check_self_protection()))
+
+    def test_watermark_mismatch_blocks_migration_and_remains_detectable(self):
+        secret = "sk-live-DoNotLaunderTamper"
+        aegis.save_json(aegis.BASELINE, self._legacy(secret))
+        recorded = aegis.sha256(aegis.BASELINE)
+        aegis.save_json(aegis.SELFSTATE, {"baseline_sha": recorded})
+        changed = self._legacy(secret)
+        changed["attacker_edit"] = True
+        aegis.save_json(aegis.BASELINE, changed)
+        baseline, corrupt = aegis.load_baseline()
+        self.assertFalse(corrupt)
+        self.assertNotIn("schema_version", baseline)
+        self.assertTrue(any("tampered" in f["fingerprint"]
+                            for f in aegis.check_self_protection()))
+
+
 # --------------------------------------------------------------------------- #
 # Durable Swiss-cheese core: every layer reports health; findings become
 # redacted observations/signals; related signals become actionable incidents.

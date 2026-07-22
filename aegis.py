@@ -121,6 +121,7 @@ SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
+BASELINE_SCHEMA_VERSION = 2
 
 # --- Response tier (opt-in; never automatic) --------------------------------- #
 # The quarantine STORE: a confined, reversible holding area for native
@@ -2540,14 +2541,15 @@ def _parse_btm(text):
 
 def snapshot_btm():
     """{identifier: rec} of Background Task Management items, or None if sfltool
-    could not be read this scan. `sfltool dumpbtm` is SLOW (~12s on a typical
-    machine) and under scan-time load it can exceed the timeout; aegis.run()
-    then returns empty. An empty result from a timeout/failure must NOT be
+    could not be read this scan. Some macOS builds require interactive admin
+    authorization; a launchd observer cannot and must not synthesize that grant.
+    `sfltool dumpbtm` is also slow and can exceed the timeout; aegis.run() then
+    returns empty. An empty result from a timeout/failure must NOT be
     recorded as 'no background items' — a Mac always has some (DisplayLink,
     auto-updaters …), so a false-empty adopted into the baseline would storm
     ~90 bogus 'new background item' findings the instant sfltool later succeeds.
-    We therefore signal the non-answer as None (skipped by _scan_surfaces) and
-    give sfltool generous headroom so the normal-but-slow case still succeeds."""
+    We therefore signal the non-answer as None (skipped by _scan_surfaces) so
+    sensor health remains DEGRADED instead of silently baselining false-empty."""
     out, _, rc = run(BTM_DUMP_CMD, timeout=30)
     if rc != 0 or not out:
         return None  # timeout/failure — a non-answer, NOT "zero items"
@@ -3029,9 +3031,50 @@ def load_baseline():
         return None, False
     try:
         with open(BASELINE, "r") as f:
-            return json.load(f), False
+            data = json.load(f)
+        return _migrate_baseline(data), False
     except Exception:
         return None, True
+
+
+def _migrate_baseline(data):
+    """Upgrade legacy raw-argv baselines without laundering tamper evidence."""
+    if not isinstance(data, dict):
+        return data
+    records = data.get("persistence")
+    if not isinstance(records, dict) or not any(
+            isinstance(rec, dict) and "args_sha256" not in rec
+            for rec in records.values()):
+        return data
+
+    # Rewrite only when the existing self-protection watermark agrees. If an
+    # attacker changed the file out of band, leave it byte-for-byte untouched so
+    # check_self_protection can report the mismatch instead of blessing it.
+    state = load_json(SELFSTATE, {})
+    recorded = state.get("baseline_sha")
+    current = sha256(BASELINE)
+    if recorded and recorded != current:
+        return data
+
+    for key, rec in list(records.items()):
+        if not isinstance(rec, dict):
+            continue
+        raw_args = rec.get("args")
+        if "args_sha256" not in rec:
+            if raw_args is None:
+                rec["args_sha256"] = None
+            else:
+                encoded = json.dumps(raw_args, sort_keys=True, default=str)
+                rec["args_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
+        records[key] = _redact_value(rec)
+    data["schema_version"] = BASELINE_SCHEMA_VERSION
+    data["trust"] = data.get("trust") or "unverified"
+    save_json(BASELINE, data)
+    state["baseline_sha"] = sha256(BASELINE)
+    save_json(SELFSTATE, state)
+    log_run("migrated baseline schema to v%d (legacy argv redacted)" %
+            BASELINE_SCHEMA_VERSION)
+    return data
 
 
 @contextmanager
@@ -3100,6 +3143,7 @@ def _cmd_scan_locked(quiet=False):
         # snapshot (_scan_surfaces adopted them into `baseline` in memory).
         baseline = baseline or {}
         baseline["created"] = baseline.get("created") or now_iso()
+        baseline["schema_version"] = BASELINE_SCHEMA_VERSION
         baseline["trust"] = "unverified"
         baseline["persistence"] = current
         baseline["shell_history_adopted"] = True
@@ -3155,7 +3199,8 @@ def cmd_baseline(trust="verified"):
 def _cmd_baseline_locked(trust="verified"):
     ensure_state()
     current = snapshot_persistence()
-    b = {"created": now_iso(), "persistence": current, "trust": trust}
+    b = {"created": now_iso(), "schema_version": BASELINE_SCHEMA_VERSION,
+         "persistence": current, "trust": trust}
     for key, snap_fn, _diff in SURFACES:
         try:
             snap = snap_fn()

@@ -42,7 +42,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Network listeners** *(new)* | A **new** process accepting connections *from the network* (non-loopback TCP LISTEN, via `lsof`), baseline-diffed. Unsigned/ad-hoc binary in a user-writable path listening → HIGH (bind-shell / rogue-server shape); anything else → MEDIUM (logged). Loopback dev servers and SIP-pinned Apple daemons are excluded by design — but an Apple-signed *interpreter* serving the network (`python3 -m http.server 0.0.0.0`, `nc -l`) **is** tracked | LuLu-tier *outbound* blocking needs an Apple entitlement; the *listening* side is visible unprivileged, and a reachable listener is rare, durable, and high-signal |
 | **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
 | **Editor extensions** | New VSCode / Cursor / VSCodium / Windsurf extension | A backdoored editor extension is a live supply-chain vector (Objective-See's *Paradox*, 2025, shipped via a trojanised Cursor extension) |
-| **Background items** *(new)* | A **new** Login Item / SMAppService background agent from `sfltool dumpbtm` (macOS's own Background Task Management record), baseline-diffed. A new item with **no Team ID whose URL is in a user-writable path** → HIGH, else MEDIUM | Catches the modern persistence path the LaunchAgents-directory scan **cannot see**: an `SMAppService`-registered agent/daemon that never drops a plist in `~/Library/LaunchAgents` (how legit apps *and* 2024+ malware now register) |
+| **Background items** *(capability-dependent)* | Where macOS permits `sfltool dumpbtm`, a **new** Login Item / SMAppService background agent is baseline-diffed. A new item with **no Team ID whose URL is in a user-writable path** → HIGH, else MEDIUM. If Apple requires interactive authorization, the sensor reports DEGRADED rather than clean. | Catches the modern persistence path the LaunchAgents-directory scan **cannot see** without pretending the data exists when macOS withholds it |
 | **Self-protection** | Aegis's own launchd agent removed, **its own plist present-but-malformed** (invalid XML that launchd will silently refuse on the next reboot — the monitor dies with no signal), its append-only log truncated, or its **trust store (baseline/allowlist) edited out-of-band** | A monitor an attacker can silently disable, blind, or feed a poisoned baseline — or that quietly rots itself into non-execution — is theater |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, Application Firewall, stealth mode, Remote Login, **+ XProtect definition age** | Surfaces weak settings (a first run typically finds a control the operator assumed was on) |
 
@@ -290,10 +290,11 @@ A security tool sees everything, so it must be trustworthy *by construction*:
   **only the sha256, never the file bytes**, and the scan/watch path makes **zero**
   network calls regardless — off by default, so the local-only guarantee stays
   literally true. No key ⇒ the command explains how to add one and does nothing.
-- ✅ **Login-Item / SMAppService coverage — SHIPPED** via `sfltool dumpbtm`
-  (unprivileged): a new Background Task Management item is diffed even when it
-  registers *without* a `~/Library/LaunchAgents` plist — the gap the directory
-  scan structurally couldn't close.
+- ✅ **Login-Item / SMAppService adapter — SHIPPED** via `sfltool dumpbtm`: when
+  Apple exposes the inventory, a new Background Task Management item is diffed
+  even without a `~/Library/LaunchAgents` plist. On macOS builds that require an
+  interactive admin authorization, Aegis records a DEGRADED sensor and escalates
+  repeated failures; it never converts denied inventory into an empty baseline.
 - ✅ **Notarization introspection — SHIPPED for `.app` bundles**, where the
   `spctl -a -t exec` verdict is authoritative (fresh unsigned/ad-hoc app → HIGH;
   signed-but-unnotarized → MEDIUM). Bare CLI Mach-Os are *not* assessed — modern
@@ -324,7 +325,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**206 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**208 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -344,7 +345,9 @@ The **layered core** pins privacy redaction before every persistence sink,
 idempotent/private SQLite initialization, one event per observation, stable
 signal occurrence counts, same-entity multi-layer correlation, incident lifecycle
 validation, bounded reminders, durable degraded sensor health, recovery, and the
-rule that an unavailable hardening probe is UNKNOWN rather than clean.
+rule that an unavailable hardening probe is UNKNOWN rather than clean. Legacy
+baselines are integrity-checked, migrated to hashed/redacted arguments, and
+re-watermarked without generating upgrade-only persistence changes.
 
 The **behavioral tier** (this release) is pinned against the 2025-26 stealer TTPs:
 a fake `osascript … hidden answer` password prompt → **CRITICAL**; `dscl -authonly`,
