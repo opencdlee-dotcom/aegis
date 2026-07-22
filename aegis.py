@@ -17,11 +17,12 @@ The scan/watch path is DETECT-ONLY and never destructive. Acting on a threat is
 a separate, opt-in RESPONSE tier that you invoke by hand on a reviewed finding —
 never automatically. It mirrors the industry ladder (SentinelOne Kill→Quarantine
 →Remediate→Rollback; Microsoft Defender's reversible-store + review-every-action
-doctrine): quarantine neutralizes and confines a file to a REVERSIBLE store,
-restore undoes it byte-for-byte (a false positive costs minutes, not data), and
+doctrine): quarantine atomically confines a file or valid app bundle to a
+REVERSIBLE store, restore reverses the native move without overwriting (a false
+positive costs minutes, not data), and
 destroy — the only irreversible verb — can act ONLY on an already-quarantined
 item (quarantine-first, never-delete-first). Plus kill (same-user process),
-sandbox (detonate a suspect binary in a deny-default Seatbelt jail), and
+sandbox (refuse host execution and require a disposable VM), and
 neutralize (ordered bootout→kill→quarantine kill-chain for launchd persistence).
 
 WHAT IT DOES (on an interval, via launchd)
@@ -73,31 +74,36 @@ WHAT IT DOES (on an interval, via launchd)
   instant Apple writes it; the tail is a wake source only — the rescan's
   windowed harvest still does the one authoritative parse/dedup/notify.
 
-DESIGN PRINCIPLE (from the alert-fatigue literature): *log everything, alert
-rarely, never repeat*. The first run establishes a SILENT baseline (no day-one
-alert storm - the KnockKnock/LuLu "trust what's already installed" rule).
-Afterwards only genuinely-new findings at >= HIGH severity raise a macOS
-notification, and each fingerprint fires at most once. Everything is written to
-a durable append-only log so nothing is missed if a notification is.
+DESIGN PRINCIPLE: many imperfect layers, one honest decision path. The first run
+establishes an UNVERIFIED silent baseline (no day-one storm and no clean claim).
+Afterwards new HIGH+ findings and high-confidence multi-layer chains become
+durable incidents with bounded reminders. Every observation and sensor result is
+written locally so an unavailable sensor can never masquerade as clean coverage.
 
-STATE  -> ~/.aegis/   (baseline.json, findings.jsonl, latest.md, seen.json,
-                       quarantine/ store + manifest, actions.jsonl audit, ...)
-USAGE  -> aegis.py [scan|report|status|baseline|allow <path>|vt <path|sha>|
+STATE  -> ~/.aegis/   (aegis.db, baseline.json, findings.jsonl, latest.md,
+                       quarantine transactions, actions.jsonl audit, ...)
+USAGE  -> aegis.py [scan|report|status|doctor|incidents|incident|baseline|
+                    allow <path>|vt <path|sha>|
                     canary|watch]
           aegis.py [quarantine <path>|quarantine-list|restore <id>|
                     destroy <id> --yes|kill <pid>|sandbox <path>|neutralize <plist>]
 """
 
 import json
+import errno
+import fcntl
 import os
 import plistlib
 import re
 import select
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import time
 import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------- #
@@ -114,12 +120,13 @@ SEEN = os.path.join(STATE_DIR, "seen.json")
 SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
+EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
 
 # --- Response tier (opt-in; never automatic) --------------------------------- #
-# The quarantine STORE: a confined, reversible holding area for neutralized
+# The quarantine STORE: a confined, reversible holding area for native
 # threat files. Mirrors the industry ladder (SentinelOne Kill→Quarantine→
 # Remediate, Defender's reversible store with restore metadata): quarantine
-# MOVES a file here and neutralizes it, `restore` reverses it byte-identically,
+# MOVES a file or valid app bundle here atomically, `restore` reverses the move,
 # `destroy` is the only irreversible step and can ONLY act on an already-
 # quarantined item (the "quarantine-first, never-delete-first" doctrine). Every
 # response action is appended to a durable action log.
@@ -139,14 +146,6 @@ ACTION_LOG = os.path.join(STATE_DIR, "actions.jsonl")
 # while still offering reputation when you deliberately ask for it.
 VT_KEY_FILE = os.path.join(STATE_DIR, "vt_key")
 VT_API_URL = "https://www.virustotal.com/api/v3/files/"
-
-# Neutralization key for the stored sample. This is deliberate OBFUSCATION, not
-# cryptography: a repeating-key XOR renders the quarantined bytes non-executable
-# (a double-click / accidental run can't launch it) and stops another on-host
-# scanner — or Aegis itself on the next pass — from re-flagging the store as live
-# malware (the classic AV "neutered sample" trick). XOR is symmetric, so `restore`
-# reverses it exactly. It is NOT a confidentiality control and is not claimed as one.
-_QUAR_XOR_KEY = b"AegisQuarantine\x17"  # 16 bytes
 
 # Absolute path of this script — never quarantine/kill/destroy Aegis itself.
 _SELF_PATH = os.path.abspath(__file__)
@@ -478,7 +477,11 @@ def now_iso():
 
 
 def ensure_state():
-    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
 
 
 def load_json(path, default):
@@ -489,18 +492,91 @@ def load_json(path, default):
         return default
 
 
+def _sync_fd(fd):
+    """Push a state mutation to stable storage as far as macOS permits."""
+    os.fsync(fd)
+    if sys.platform == "darwin":
+        try:
+            # F_FULLFSYNC is deliberately used by transactional response state:
+            # fsync alone may only reach a drive's volatile write cache on macOS.
+            fcntl.fcntl(fd, 51)
+        except OSError:
+            pass
+
+
+def _sync_dir(path):
+    try:
+        fd = os.open(path or ".", os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Some filesystems reject directory fsync. The file itself was still
+        # synced; callers that require same-volume response semantics fail closed.
+        pass
+
+
 def save_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    """Atomically and durably replace a JSON state file.
+
+    A unique temp prevents concurrent writers from sharing ``path.tmp``. The
+    replacement and parent directory are flushed so a successful return means
+    readers see complete old JSON or complete new JSON, never a torn document.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), time.time_ns())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            fd = -1
+            json.dump(obj, f, indent=2, sort_keys=True)
+            f.flush()
+            _sync_fd(f.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+        _sync_dir(parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+_TRUSTED_TOOLS = {
+    "chflags": "/usr/bin/chflags", "codesign": "/usr/bin/codesign",
+    "crontab": "/usr/bin/crontab", "csrutil": "/usr/bin/csrutil",
+    "defaults": "/usr/bin/defaults", "fdesetup": "/usr/bin/fdesetup",
+    "launchctl": "/bin/launchctl", "log": "/usr/bin/log",
+    "lsof": "/usr/sbin/lsof", "mdls": "/usr/bin/mdls",
+    "osascript": "/usr/bin/osascript", "plutil": "/usr/bin/plutil",
+    "profiles": "/usr/bin/profiles", "ps": "/bin/ps",
+    "sfltool": "/usr/bin/sfltool", "spctl": "/usr/sbin/spctl",
+    "sysctl": "/usr/sbin/sysctl", "xattr": "/usr/bin/xattr",
+}
+
+
+def _trusted_command(cmd):
+    normalized = list(cmd)
+    if normalized and not os.path.isabs(normalized[0]):
+        normalized[0] = _TRUSTED_TOOLS.get(normalized[0], normalized[0])
+    return normalized
 
 
 def run(cmd, timeout=15):
     """Run a command, return (stdout, stderr, rc). Never raises."""
     try:
+        safe_env = {
+            "HOME": HOME, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG": "C", "LC_ALL": "C",
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        }
         p = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+            _trusted_command(cmd), capture_output=True, text=True, timeout=timeout,
+            check=False, env=safe_env
         )
         return p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired:
@@ -551,9 +627,27 @@ def notify(title, message):
 
 def log_run(msg):
     try:
+        ensure_state()
+        _rotate_log(RUN_LOG)
         with open(RUN_LOG, "a") as f:
-            f.write("%s  %s\n" % (now_iso(), msg))
+            f.write("%s  %s\n" % (now_iso(), redact_sensitive(msg)))
+        os.chmod(RUN_LOG, 0o600)
     except Exception:
+        pass
+
+
+def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
+    """Bound local evidence files without silently discarding recent history."""
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return
+        for idx in range(generations, 0, -1):
+            src = path if idx == 1 else "%s.%d" % (path, idx - 1)
+            dst = "%s.%d" % (path, idx)
+            if os.path.exists(src):
+                os.replace(src, dst)
+        _sync_dir(os.path.dirname(path))
+    except OSError:
         pass
 
 
@@ -695,17 +789,537 @@ def suspicious_sig(trust):
 # --------------------------------------------------------------------------- #
 
 
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(password|passwd|token|api[_-]?key|secret|cookie)\b"
+    r"(\s*[:=]\s*)([^\s&;,]+)")
+_AUTH_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)?\s*)([^\s'\"]+)")
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:password|passwd|token|api[_-]?key|secret|cookie)=)([^&\s]+)")
+_URL_USERINFO_RE = re.compile(r"(https?://[^\s/@:]+:)([^\s/@]+)(@)", re.I)
+_TOKEN_SHAPE_RE = re.compile(
+    r"(?i)\b(?:sk-(?:live-)?[A-Za-z0-9_-]{12,}|gh[opusr]_[A-Za-z0-9]{20,}|"
+    r"AKIA[0-9A-Z]{16})\b")
+
+
+def redact_sensitive(value):
+    """Remove common credential shapes before data crosses a persistence edge."""
+    if value is None:
+        return value
+    text = str(value)
+    text = _AUTH_RE.sub(r"\1[REDACTED]", text)
+    text = _SECRET_ASSIGN_RE.sub(r"\1\2[REDACTED]", text)
+    text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[REDACTED]\3", text)
+    return _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
+
+
+def _redact_value(value):
+    if isinstance(value, str):
+        return redact_sensitive(value)
+    if isinstance(value, dict):
+        return {str(k): _redact_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_redact_value(v) for v in value]
+    return value
+
+
 def finding(severity, category, title, detail, fingerprint, **extra):
+    rule_id = extra.pop("rule_id", None)
+    slug = re.sub(r"[^a-z0-9]+", ".", title.lower()).strip(".")[:80]
     f = {
+        "schema_version": 1,
         "ts": now_iso(),
         "severity": severity,
         "category": category,
         "title": title,
-        "detail": detail,
+        "detail": redact_sensitive(detail),
         "fingerprint": fingerprint,
+        "rule_id": rule_id or "aegis.%s.%s" % (category, slug or "finding"),
+        "rule_version": 1,
     }
-    f.update(extra)
+    f.update(_redact_value(extra))
     return f
+
+
+# --------------------------------------------------------------------------- #
+# Durable event -> signal -> incident core (stdlib SQLite; one sink, no SIEM).
+# --------------------------------------------------------------------------- #
+
+_REMINDER_DELAYS = (3600, 86400, 259200)
+_ACTIVE_INCIDENT_STATES = ("OPEN", "ACK", "INVESTIGATING", "CONTAINED",
+                           "RECOVERING", "MONITORING")
+
+
+def _epoch(value=None):
+    if value is None:
+        return int(time.time())
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return int(time.time())
+
+
+def _event_connection():
+    ensure_state()
+    db = sqlite3.connect(EVENT_DB, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=10000")
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY,
+            fingerprint TEXT NOT NULL UNIQUE,
+            rule_id TEXT NOT NULL,
+            rule_version INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            title TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            attributes_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY,
+            scan_id TEXT,
+            occurred_at INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            signal_id INTEGER REFERENCES signals(id),
+            incident_id INTEGER REFERENCES incidents(id),
+            data_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_time ON events(observed_at);
+        CREATE INDEX IF NOT EXISTS idx_events_signal ON events(signal_id);
+        CREATE TABLE IF NOT EXISTS incidents (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            correlation_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            reminder_count INTEGER NOT NULL DEFAULT 0,
+            next_reminder_at INTEGER,
+            last_notified_at INTEGER,
+            resolution TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_incidents_active
+            ON incidents(status, next_reminder_at);
+        CREATE INDEX IF NOT EXISTS idx_incidents_key
+            ON incidents(correlation_key, status);
+        CREATE TABLE IF NOT EXISTS incident_events (
+            incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            PRIMARY KEY(incident_id, event_id)
+        );
+        CREATE TABLE IF NOT EXISTS sensor_status (
+            sensor_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            last_run_at INTEGER NOT NULL,
+            last_ok_at INTEGER,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            item_count INTEGER NOT NULL DEFAULT 0,
+            detail TEXT NOT NULL DEFAULT '',
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            episode_started_at INTEGER
+        );
+    """)
+    db.commit()
+    try:
+        os.chmod(EVENT_DB, 0o600)
+    except OSError:
+        pass
+    return db
+
+
+def init_event_store():
+    db = _event_connection()
+    db.close()
+
+
+def _event_attributes(f):
+    core = {"schema_version", "ts", "severity", "category", "title", "detail",
+            "fingerprint", "rule_id", "rule_version", "sensor_id"}
+    return _redact_value({k: v for k, v in f.items() if k not in core})
+
+
+def _entity(f):
+    for key in ("path", "program", "executable", "bundle", "pid", "label"):
+        if f.get(key) not in (None, ""):
+            return str(f[key])
+    return ""
+
+
+def _severity_max(a, b):
+    return a if SEV_ORDER.get(a, -1) >= SEV_ORDER.get(b, -1) else b
+
+
+def _upsert_incident(db, key, title, severity, kind, now, event_ids,
+                     initially_notified=False):
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    row = db.execute(
+        "SELECT * FROM incidents WHERE correlation_key=? AND status IN (%s) "
+        "ORDER BY id DESC LIMIT 1" % marks,
+        (key,) + _ACTIVE_INCIDENT_STATES).fetchone()
+    if row:
+        incident_id = row["id"]
+        new_sev = _severity_max(row["severity"], severity)
+        new_status = "OPEN" if (row["status"] == "ACK" and
+                                SEV_ORDER[new_sev] > SEV_ORDER[row["severity"]]) \
+            else row["status"]
+        db.execute("UPDATE incidents SET severity=?, status=?, last_seen=?, "
+                   "updated_at=? WHERE id=?",
+                   (new_sev, new_status, now, now, incident_id))
+    else:
+        last_notified = now if initially_notified else None
+        cur = db.execute(
+            "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
+            "created_at,first_seen,last_seen,updated_at,reminder_count,"
+            "next_reminder_at,last_notified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (kind, key, title, severity, "OPEN", now, now, now, now, 0,
+             now + _REMINDER_DELAYS[0], last_notified))
+        incident_id = cur.lastrowid
+    for event_id in event_ids:
+        db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
+                   "VALUES(?,?)", (incident_id, event_id))
+        db.execute("UPDATE events SET incident_id=? WHERE id=?",
+                   (incident_id, event_id))
+    return incident_id
+
+
+def _same_entity(a, b):
+    ea, eb = _entity(a), _entity(b)
+    if not ea or not eb:
+        return False
+    if os.path.isabs(ea) and os.path.isabs(eb):
+        return os.path.normcase(os.path.normpath(ea)) == \
+            os.path.normcase(os.path.normpath(eb))
+    return ea == eb
+
+
+def _apply_correlations(db, new_events, now, initially_notified=False,
+                        suppressed_categories=frozenset()):
+    """Run a deliberately tiny set of high-precision, versioned chain rules."""
+    rows = db.execute(
+        "SELECT id,observed_at,data_json FROM events "
+        "WHERE event_type='observation.finding' "
+        "AND observed_at>=?", (now - 1800,)).fetchall()
+    observations = [(row["id"], row["observed_at"],
+                     json.loads(row["data_json"])) for row in rows]
+    new_ids = {event_id for event_id, f in new_events
+               if f.get("category") not in suppressed_categories}
+    attached = set()
+
+    def correlate(base_key, title, left_pred, right_pred, window=900):
+        matches_by_entity = {}
+        for left_id, left_at, left in observations:
+            if not left_pred(left):
+                continue
+            for right_id, right_at, right in observations:
+                if left_id == right_id or not right_pred(right):
+                    continue
+                if abs(left_at - right_at) > window:
+                    continue
+                if not _same_entity(left, right):
+                    continue
+                if left_id in new_ids or right_id in new_ids:
+                    entity = _entity(left) or _entity(right)
+                    entity_key = hashlib.sha256(
+                        entity.encode("utf-8", "replace")).hexdigest()[:16]
+                    matches_by_entity.setdefault(entity_key, set()).update(
+                        (left_id, right_id))
+        for entity_key, matches in matches_by_entity.items():
+            key = "%s:%s" % (base_key, entity_key)
+            incident_id = _upsert_incident(
+                db, key, title, "CRITICAL", "correlation", now,
+                sorted(matches), initially_notified)
+            # A signal may have opened a standalone incident in an earlier scan.
+            # Once independent evidence promotes it into a chain, close those
+            # active leaf incidents so the operator sees one case, not duplicates.
+            marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+            event_marks = ",".join("?" for _ in matches)
+            db.execute(
+                "UPDATE incidents SET status='RESOLVED',resolution=?,updated_at=?,"
+                "next_reminder_at=NULL WHERE kind='signal' AND id<>? AND "
+                "status IN (%s) AND id IN (SELECT incident_id FROM incident_events "
+                "WHERE event_id IN (%s))" % (marks, event_marks),
+                ("promoted into incident %d" % incident_id, now, incident_id) +
+                _ACTIVE_INCIDENT_STATES + tuple(sorted(matches)))
+            attached.update(matches)
+
+    def has_marker(f, values):
+        markers = set(f.get("markers") or [])
+        text = (f.get("title", "") + " " + f.get("detail", "")).lower()
+        return bool(markers.intersection(values) or
+                    any(v.replace("-", " ") in text for v in values))
+
+    correlate(
+        "chain:clickfix", "Potential ClickFix / infostealer chain",
+        lambda f: f.get("category") in ("behavior", "shell-history") and
+        has_marker(f, {"fileless-fetch-exec", "password-phish",
+                       "quarantine-strip", "invisible-dmg"}),
+        lambda f: f.get("category") in ("persistence", "staging", "hot-dir"))
+    correlate(
+        "chain:persistence-execution", "Persistence followed by execution",
+        lambda f: f.get("category") == "persistence",
+        lambda f: f.get("category") in ("process", "behavior"))
+    correlate(
+        "chain:remote-access", "Remote-access persistence chain",
+        lambda f: f.get("category") == "persistence",
+        lambda f: f.get("category") == "net-listener")
+    correlate(
+        "chain:supply-chain", "Background-item execution chain",
+        lambda f: f.get("category") == "btm",
+        lambda f: f.get("category") in ("process", "hot-dir", "persistence"))
+
+    # Every uncorrelated HIGH+ signal still becomes one actionable incident.
+    for event_id, f in new_events:
+        if f.get("category") in suppressed_categories or event_id in attached \
+                or SEV_ORDER.get(f.get("severity"), -1) \
+                < SEV_ORDER["HIGH"]:
+            continue
+        _upsert_incident(db, "signal:" + f["fingerprint"], f["title"],
+                         f["severity"], "signal", now, [event_id],
+                         initially_notified)
+
+
+def _record_health(db, health, now):
+    for item in health:
+        sensor_id = str(item.get("sensor_id") or "unknown")
+        status = str(item.get("status") or "FAILED").upper()
+        detail = redact_sensitive(item.get("detail") or "")[:500]
+        prior = db.execute("SELECT * FROM sensor_status WHERE sensor_id=?",
+                           (sensor_id,)).fetchone()
+        failed = status != "OK"
+        failures = (prior["consecutive_failures"] if prior else 0) + 1 \
+            if failed else 0
+        episode = (prior["episode_started_at"] if prior else None)
+        if failed and episode is None:
+            episode = now
+        if not failed:
+            episode = None
+        db.execute("INSERT INTO sensor_status(sensor_id,status,last_run_at,last_ok_at,"
+                   "duration_ms,item_count,detail,consecutive_failures,episode_started_at)"
+                   " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(sensor_id) DO UPDATE SET "
+                   "status=excluded.status,last_run_at=excluded.last_run_at,"
+                   "last_ok_at=excluded.last_ok_at,duration_ms=excluded.duration_ms,"
+                   "item_count=excluded.item_count,detail=excluded.detail,"
+                   "consecutive_failures=excluded.consecutive_failures,"
+                   "episode_started_at=excluded.episode_started_at",
+                   (sensor_id, status, now, now if not failed else
+                    (prior["last_ok_at"] if prior else None),
+                    int(item.get("duration_ms") or 0),
+                    int(item.get("item_count") or 0), detail, failures, episode))
+        event_data = {"sensor_id": sensor_id, "status": status, "detail": detail,
+                      "consecutive_failures": failures}
+        cur = db.execute("INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                         "data_json) VALUES(?,?,?,?,?)",
+                         (now, now, sensor_id, "sensor.health",
+                          json.dumps(event_data, sort_keys=True)))
+        if failures >= 3:
+            _upsert_incident(db, "sensor:" + sensor_id,
+                             "Security coverage degraded: %s" % sensor_id,
+                             "HIGH", "sensor-health", now, [cur.lastrowid])
+        elif not failed:
+            db.execute("UPDATE incidents SET status='RESOLVED',resolution=?,"
+                       "updated_at=?,last_seen=?,next_reminder_at=NULL WHERE "
+                       "correlation_key=? AND status IN (%s)" %
+                       ",".join("?" for _ in _ACTIVE_INCIDENT_STATES),
+                       ("sensor recovered", now, now, "sensor:" + sensor_id) +
+                       _ACTIVE_INCIDENT_STATES)
+
+
+def record_security_state(findings, sensor_health=(), now=None,
+                          initially_notified=False,
+                          suppressed_categories=frozenset()):
+    now = _epoch(now)
+    db = _event_connection()
+    new_events = []
+    try:
+        with db:
+            for original in findings:
+                f = _redact_value(dict(original))
+                occurred = _epoch(f.get("occurred_at") or f.get("ts") or now)
+                attrs = _event_attributes(f)
+                db.execute(
+                    "INSERT INTO signals(fingerprint,rule_id,rule_version,category,"
+                    "severity,title,detail,first_seen,last_seen,occurrence_count,"
+                    "attributes_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT("
+                    "fingerprint) DO UPDATE SET last_seen=excluded.last_seen,"
+                    "severity=excluded.severity,title=excluded.title,detail=excluded.detail,"
+                    "occurrence_count=signals.occurrence_count+1,"
+                    "attributes_json=excluded.attributes_json",
+                    (f["fingerprint"], f.get("rule_id") or "aegis.legacy",
+                     int(f.get("rule_version") or 1), f["category"], f["severity"],
+                     f["title"], f["detail"], now, now, 1,
+                     json.dumps(attrs, sort_keys=True)))
+                signal_id = db.execute("SELECT id FROM signals WHERE fingerprint=?",
+                                       (f["fingerprint"],)).fetchone()[0]
+                cur = db.execute(
+                    "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                    "signal_id,data_json) VALUES(?,?,?,?,?,?)",
+                    (occurred, now, f.get("sensor_id") or f["category"],
+                     "observation.finding", signal_id,
+                     json.dumps(f, sort_keys=True)))
+                new_events.append((cur.lastrowid, f))
+            _record_health(db, sensor_health, now)
+            _apply_correlations(db, new_events, now, initially_notified,
+                                frozenset(suppressed_categories))
+            db.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON "
+                       "CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+        # Bound raw observations while retaining materialized signals/incidents.
+        with db:
+            db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
+                       "ORDER BY id DESC LIMIT -1 OFFSET 50000)")
+    finally:
+        db.close()
+    return {"events": len(new_events), "health": len(sensor_health)}
+
+
+def _dict_rows(rows):
+    return [dict(row) for row in rows]
+
+
+def list_incidents(active_only=True):
+    db = _event_connection()
+    try:
+        where, args = "", ()
+        if active_only:
+            marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+            where, args = "WHERE i.status IN (%s)" % marks, _ACTIVE_INCIDENT_STATES
+        rows = db.execute(
+            "SELECT i.*,count(ie.event_id) AS evidence_count FROM incidents i "
+            "LEFT JOIN incident_events ie ON ie.incident_id=i.id %s GROUP BY i.id "
+            "ORDER BY CASE i.severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 "
+            "ELSE 1 END DESC,i.updated_at DESC" % where, args).fetchall()
+        return _dict_rows(rows)
+    finally:
+        db.close()
+
+
+def incident_detail(incident_id):
+    db = _event_connection()
+    try:
+        row = db.execute("SELECT * FROM incidents WHERE id=?",
+                         (incident_id,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence"] = _dict_rows(db.execute(
+            "SELECT e.id,e.observed_at,e.source,e.event_type,e.data_json FROM events e "
+            "JOIN incident_events ie ON ie.event_id=e.id WHERE ie.incident_id=? "
+            "ORDER BY e.observed_at", (incident_id,)).fetchall())
+        return result
+    finally:
+        db.close()
+
+
+_INCIDENT_TRANSITIONS = {
+    "OPEN": {"ACK", "INVESTIGATING", "CONTAINED", "RESOLVED", "FALSE_POSITIVE"},
+    "ACK": {"INVESTIGATING", "CONTAINED", "RESOLVED", "FALSE_POSITIVE"},
+    "INVESTIGATING": {"CONTAINED", "RECOVERING", "MONITORING", "RESOLVED",
+                      "FALSE_POSITIVE"},
+    "CONTAINED": {"RECOVERING", "MONITORING", "RESOLVED"},
+    "RECOVERING": {"MONITORING", "RESOLVED"},
+    "MONITORING": {"INVESTIGATING", "RESOLVED"},
+    "RESOLVED": {"OPEN"},
+    "FALSE_POSITIVE": {"OPEN"},
+}
+
+
+def transition_incident(incident_id, new_status, now=None):
+    now = _epoch(now)
+    new_status = str(new_status).upper().replace("-", "_")
+    db = _event_connection()
+    try:
+        with db:
+            row = db.execute("SELECT * FROM incidents WHERE id=?",
+                             (incident_id,)).fetchone()
+            if not row or new_status not in _INCIDENT_TRANSITIONS.get(row["status"], set()):
+                return False
+            next_at = now + _REMINDER_DELAYS[0] if new_status == "OPEN" else None
+            resolution = new_status.lower() if new_status in \
+                ("RESOLVED", "FALSE_POSITIVE") else None
+            db.execute("UPDATE incidents SET status=?,updated_at=?,resolution=?,"
+                       "next_reminder_at=?,reminder_count=? WHERE id=?",
+                       (new_status, now, resolution, next_at,
+                        0 if new_status == "OPEN" else row["reminder_count"],
+                        incident_id))
+            db.execute("INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                       "incident_id,data_json) VALUES(?,?,?,?,?,?)",
+                       (now, now, "incident", "incident.lifecycle", incident_id,
+                        json.dumps({"from": row["status"], "to": new_status})))
+        return True
+    finally:
+        db.close()
+
+
+def claim_due_incident_reminders(now=None):
+    now = _epoch(now)
+    db = _event_connection()
+    claimed = []
+    try:
+        with db:
+            marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+            rows = db.execute(
+                "SELECT * FROM incidents WHERE status IN (%s) AND "
+                "next_reminder_at IS NOT NULL AND next_reminder_at<=? "
+                "ORDER BY severity DESC,next_reminder_at" % marks,
+                _ACTIVE_INCIDENT_STATES + (now,)).fetchall()
+            for row in rows:
+                count = row["reminder_count"] + 1
+                next_at = (row["created_at"] + _REMINDER_DELAYS[count]
+                           if count < len(_REMINDER_DELAYS) else None)
+                db.execute("UPDATE incidents SET reminder_count=?,last_notified_at=?,"
+                           "next_reminder_at=? WHERE id=?",
+                           (count, now, next_at, row["id"]))
+                claimed.append(dict(row))
+        return claimed
+    finally:
+        db.close()
+
+
+def get_sensor_health():
+    db = _event_connection()
+    try:
+        return _dict_rows(db.execute(
+            "SELECT * FROM sensor_status ORDER BY sensor_id").fetchall())
+    finally:
+        db.close()
+
+
+def _collect_sensor(sensor_id, fn, health, *args):
+    started = time.monotonic()
+    try:
+        result = fn(*args)
+        status = "DEGRADED" if result is None else "OK"
+        detail = "sensor returned no reliable snapshot" if result is None else ""
+        output = [] if result is None else result
+    except Exception as e:
+        status, detail, output = "FAILED", str(e), []
+    duration = int((time.monotonic() - started) * 1000)
+    health.append({"sensor_id": sensor_id, "status": status,
+                   "detail": redact_sensitive(detail), "duration_ms": duration,
+                   "item_count": len(output) if hasattr(output, "__len__") else 0})
+    if isinstance(output, list):
+        for f in output:
+            if isinstance(f, dict):
+                f.setdefault("sensor_id", sensor_id)
+    return output
 
 
 # --------------------------------------------------------------------------- #
@@ -739,6 +1353,7 @@ def snapshot_persistence():
                 continue
             path = os.path.join(d, name)
             rec = {"label": name[:-6], "program": None, "args": None,
+                   "args_sha256": None,
                    "sha256": None, "trust": "unknown", "run_at_load": False,
                    "authority": None, "env": None}
             try:
@@ -749,7 +1364,10 @@ def snapshot_persistence():
             prog, args = _plist_program(pl if isinstance(pl, dict) else {})
             rec["label"] = (pl.get("Label") if isinstance(pl, dict) else None) or rec["label"]
             rec["program"] = prog
-            rec["args"] = args
+            if args is not None:
+                raw_args = json.dumps(args, sort_keys=True, default=str)
+                rec["args_sha256"] = hashlib.sha256(raw_args.encode()).hexdigest()
+                rec["args"] = _redact_value(args)
             rec["run_at_load"] = bool(pl.get("RunAtLoad")) if isinstance(pl, dict) else False
             ev = pl.get("EnvironmentVariables") if isinstance(pl, dict) else None
             if isinstance(ev, dict):
@@ -939,7 +1557,8 @@ def check_persistence(baseline_snap, current_snap):
             prog_changed = (old.get("program") != rec.get("program")
                             or old.get("sha256") != rec.get("sha256"))
             env_changed = (old.get("env") or None) != (rec.get("env") or None)
-            args_changed = (old.get("args") or None) != (rec.get("args") or None)
+            args_changed = ((old.get("args_sha256") or old.get("args") or None) !=
+                            (rec.get("args_sha256") or rec.get("args") or None))
             if prog_changed or env_changed or args_changed:
                 what = "+".join(w for w, c in (
                     ("program/hash", prog_changed), ("env", env_changed),
@@ -948,7 +1567,8 @@ def check_persistence(baseline_snap, current_snap):
                 # alone is unchanged on an env-only mutation) so a real change
                 # re-alerts but a steady mutated state does not storm.
                 fp = hashlib.sha256(repr(
-                    (rec.get("sha256"), rec.get("env"), rec.get("args"))
+                    (rec.get("sha256"), rec.get("env"),
+                     rec.get("args_sha256") or rec.get("args"))
                 ).encode()).hexdigest()[:16]
                 # The mutated record's own risk drives severity (env-injection /
                 # adhoc-in-tmp escalate to CRITICAL), but a swapped program binary
@@ -984,7 +1604,8 @@ def check_cron():
         if lines:
             findings.append(finding(
                 "MEDIUM", "persistence", "User crontab entries present",
-                "%d active line(s): %s" % (len(lines), " | ".join(lines[:3])),
+                "%d active line(s); command digest %s" % (
+                    len(lines), hashlib.sha256(out.encode()).hexdigest()[:16]),
                 "cron:user:%s" % hashlib.sha256(out.encode()).hexdigest()[:16]))
     return findings
 
@@ -1143,12 +1764,13 @@ def check_behavior():
         if fp in seen:
             continue
         seen.add(fp)
-        snippet = argv if len(argv) <= 200 else argv[:197] + "..."
+        command_sha = hashlib.sha256(argv.encode()).hexdigest()
         findings.append(finding(
             top, "behavior", "Suspicious process behavior",
-            "%s [%s]: %s" % (base, names, snippet),
+            "%s triggered [%s]; command sha256=%s" %
+            (base, names, command_sha[:16]),
             fp, program=argv.split(None, 1)[0] if argv else "",
-            pid=pid, signals=names))
+            pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha))
     return findings
 
 
@@ -1281,16 +1903,17 @@ def check_shell_history():
                 continue
             top = max(signals, key=lambda s: SEV_ORDER[s[1]])[1]
             names = sorted(n for n, _ in signals)
-            snippet = cmd.strip()
-            snippet = snippet if len(snippet) <= 200 else snippet[:197] + "..."
+            command_sha = hashlib.sha256(cmd.strip().encode()).hexdigest()
             findings.append(finding(
                 top, "shell-history",
                 "Hostile command in shell history",
-                "%s [%s]: %s" % (os.path.basename(path), ", ".join(names), snippet),
+                "%s triggered [%s]; command sha256=%s" %
+                (os.path.basename(path), ", ".join(names), command_sha[:16]),
                 "shellhist:%s:%s" % (
                     os.path.basename(path),
-                    hashlib.sha256(cmd.strip().encode()).hexdigest()[:16]),
-                path=path, hostile=names))
+                    command_sha[:16]),
+                path=path, markers=names, hostile=names,
+                command_sha256=command_sha))
     return findings
 
 
@@ -1487,39 +2110,58 @@ def check_staging(max_age_days=3):
 def check_hardening():
     findings = []
 
-    out, _, _ = run(["csrutil", "status"])
-    if "enabled" not in out.lower():
+    def unknown(component, title, err):
+        findings.append(finding(
+            "MEDIUM", "coverage", "%s status is UNKNOWN" % title,
+            "%s probe unavailable or unrecognized: %s" %
+            (component, redact_sensitive(err or "empty output")),
+            "hardening:%s:unknown" % component))
+
+    out, err, rc = run(["csrutil", "status"])
+    if rc != 0 or ("enabled" not in out.lower() and "disabled" not in out.lower()):
+        unknown("sip", "System Integrity Protection", err or out)
+    elif "disabled" in out.lower():
         findings.append(finding(
             "CRITICAL", "hardening", "System Integrity Protection is OFF",
-            out.strip() or "csrutil status not 'enabled'", "hardening:sip:off"))
+            out.strip(), "hardening:sip:off"))
 
-    out, _, _ = run(["spctl", "--status"])
-    if "assessments enabled" not in out.lower():
+    out, err, rc = run(["spctl", "--status"])
+    if rc != 0 or "assessments" not in out.lower():
+        unknown("gatekeeper", "Gatekeeper", err or out)
+    elif "disabled" in out.lower():
         findings.append(finding(
             "HIGH", "hardening", "Gatekeeper assessments disabled",
-            out.strip() or "spctl --status not enabled", "hardening:gatekeeper:off"))
+            out.strip(), "hardening:gatekeeper:off"))
 
-    out, _, _ = run(["fdesetup", "status"])
-    if "filevault is on" not in out.lower():
+    out, err, rc = run(["fdesetup", "status"])
+    if rc != 0 or "filevault is" not in out.lower():
+        unknown("filevault", "FileVault", err or out)
+    elif "filevault is off" in out.lower():
         findings.append(finding(
             "MEDIUM", "hardening", "FileVault disk encryption is OFF",
-            out.strip() or "fdesetup reports not on", "hardening:filevault:off"))
+            out.strip(), "hardening:filevault:off"))
 
     fw = "/usr/libexec/ApplicationFirewall/socketfilterfw"
-    out, _, _ = run([fw, "--getglobalstate"])
-    if "state = 0" in out.lower() or "disabled" in out.lower():
+    out, err, rc = run([fw, "--getglobalstate"])
+    if rc != 0 or not out.strip():
+        unknown("firewall", "Application Firewall", err or out)
+    elif "state = 0" in out.lower() or "disabled" in out.lower():
         findings.append(finding(
             "MEDIUM", "hardening", "Application Firewall is OFF",
             out.strip(), "hardening:firewall:off"))
-    out, _, _ = run([fw, "--getstealthmode"])
-    if "off" in out.lower():
+    out, err, rc = run([fw, "--getstealthmode"])
+    if rc != 0 or not out.strip():
+        unknown("stealth", "Firewall stealth mode", err or out)
+    elif "off" in out.lower():
         findings.append(finding(
             "LOW", "hardening", "Firewall stealth mode is off",
             out.strip(), "hardening:stealth:off"))
 
     # Remote login (SSH) - loaded launchd label implies enabled.
-    lout, _, _ = run(["launchctl", "list"], timeout=8)
-    if "com.openssh.sshd" in lout:
+    lout, lerr, lrc = run(["launchctl", "list"], timeout=8)
+    if lrc != 0:
+        unknown("ssh", "Remote Login", lerr or lout)
+    elif "com.openssh.sshd" in lout:
         findings.append(finding(
             "MEDIUM", "hardening", "Remote Login (SSH) appears enabled",
             "com.openssh.sshd present in launchctl list",
@@ -1936,7 +2578,7 @@ def diff_btm(prior, cur):
                " team=%s" % rec["team"] if rec.get("team") else " (no Team ID)",
                " at %s" % path if path else ""),
             "btm:%s" % ident, identifier=ident, name=rec.get("name"),
-            team=rec.get("team"), url=url)
+            team=rec.get("team"), url=url, path=path)
 
     def changed_fn(ident, rec, old):
         # An in-place SMAppService hijack: the SAME identifier now backs a
@@ -1958,7 +2600,7 @@ def diff_btm(prior, cur):
                " now at %s" % path if path else ""),
             "btm:changed:%s:%s" % (ident, url or "?"),
             identifier=ident, name=rec.get("name"),
-            team=rec.get("team"), url=url)
+            team=rec.get("team"), url=url, path=path)
 
     return _diff_map(prior, cur, new_fn, changed_fn)
 
@@ -2196,7 +2838,7 @@ def check_canaries():
     return findings
 
 
-def _scan_surfaces(baseline, corrupt, first_run):
+def _scan_surfaces(baseline, corrupt, first_run, health=None):
     """Diff every extra surface; silently adopt any not yet in the baseline.
     Returns (findings, baseline). Persists the baseline when an EXISTING install
     gains a newly-watched surface (so the next scan can diff); on the true first
@@ -2209,10 +2851,19 @@ def _scan_surfaces(baseline, corrupt, first_run):
         baseline = {}
     dirty = False
     for key, snap_fn, diff_fn in SURFACES:
+        started = time.monotonic()
         try:
             cur = snap_fn()
-        except Exception:
+            status = "DEGRADED" if cur is None else "OK"
+            detail = "sensor returned no reliable snapshot" if cur is None else ""
+        except Exception as e:
             cur = None
+            status, detail = "FAILED", str(e)
+        if health is not None:
+            health.append({"sensor_id": "surface." + key, "status": status,
+                           "detail": redact_sensitive(detail),
+                           "duration_ms": int((time.monotonic() - started) * 1000),
+                           "item_count": len(cur) if hasattr(cur, "__len__") else 0})
         # A snapshot fn returns None when its backing command could not be read
         # this scan (e.g. sfltool/lsof timed out). That is a NON-ANSWER, not an
         # empty world: never adopt it as a baseline and never diff against it
@@ -2236,25 +2887,30 @@ def _scan_surfaces(baseline, corrupt, first_run):
 # --------------------------------------------------------------------------- #
 
 
-def gather_all(baseline_snap, current_snap):
+def gather_all(baseline_snap, current_snap, health=None):
+    health_sink = health if health is not None else []
     findings = []
-    findings += check_persistence(baseline_snap, current_snap)
-    findings += check_cron()
-    findings += check_processes()
-    findings += check_behavior()        # fileless-stealer argv tier
-    findings += check_xprotect()        # harvest Apple's XProtect Remediator
-    findings += check_shell_history()   # ClickFix terminal-paste residue
-    findings += check_hot_dirs()
-    findings += check_staging()         # /tmp loot-staging IOCs
-    findings += check_canaries()        # ransomware/bulk-tamper tripwire (opt-in)
-    findings += check_hardening()
-    findings += check_self_protection()
+    sensors = (
+        ("persistence.diff", check_persistence, (baseline_snap, current_snap)),
+        ("cron", check_cron, ()),
+        ("process", check_processes, ()),
+        ("behavior", check_behavior, ()),
+        ("xprotect", check_xprotect, ()),
+        ("shell-history", check_shell_history, ()),
+        ("hot-dir", check_hot_dirs, ()),
+        ("staging", check_staging, ()),
+        ("canary", check_canaries, ()),
+        ("hardening", check_hardening, ()),
+        ("self-protection", check_self_protection, ()),
+    )
+    for sensor_id, fn, args in sensors:
+        findings += _collect_sensor(sensor_id, fn, health_sink, *args)
     # Sort by severity desc, then category.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
     return findings
 
 
-def write_report(findings, first_run):
+def write_report(findings, first_run, incidents=None, sensor_health=None):
     counts = {}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
@@ -2271,6 +2927,23 @@ def write_report(findings, first_run):
                         if counts.get(s))
     lines.append("**Summary:** %s" % (summary or "no findings"))
     lines.append("")
+    degraded = [h for h in (sensor_health or []) if h.get("status") != "OK"]
+    if degraded:
+        lines.append("## Coverage health")
+        for h in degraded:
+            lines.append("- ? **%s: %s** — %s" %
+                         (h.get("sensor_id"), h.get("status"),
+                          h.get("detail") or "coverage unavailable"))
+        lines.append("")
+    if incidents:
+        lines.append("## Active incidents")
+        for incident in incidents:
+            lines.append("- %s **#%s %s** — %s (%s evidence event%s)" % (
+                SEV_ICON.get(incident.get("severity"), "?"), incident.get("id"),
+                incident.get("title"), incident.get("status"),
+                incident.get("evidence_count", 0),
+                "" if incident.get("evidence_count") == 1 else "s"))
+        lines.append("")
     if not findings:
         lines.append("_No findings._")
     else:
@@ -2312,6 +2985,7 @@ def emit(findings, first_run, adopt=frozenset()):
     seen = load_json(SEEN, {})
     allow = set(load_json(ALLOWLIST, []))
     new_high = []
+    _rotate_log(FINDINGS_LOG)
     with open(FINDINGS_LOG, "a") as log:
         for f in findings:
             fp = f["fingerprint"]
@@ -2360,20 +3034,42 @@ def load_baseline():
         return None, True
 
 
-def cmd_scan(quiet=False):
+@contextmanager
+def _scan_lock():
     ensure_state()
+    path = os.path.join(STATE_DIR, ".scan.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def cmd_scan(quiet=False):
+    # A watch-triggered scan and a manual/interval scan may overlap. One writer
+    # owns baseline/seen/sigcache/report state at a time; readers keep working.
+    with _scan_lock():
+        return _cmd_scan_locked(quiet)
+
+
+def _cmd_scan_locked(quiet=False):
+    ensure_state()
+    health = []
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
-    current = snapshot_persistence()
+    current = _collect_sensor("persistence.snapshot", snapshot_persistence,
+                              health)
 
     findings = gather_all(baseline.get("persistence") if baseline else None,
-                          current)
+                          current, health=health)
 
     # Extra baseline-diffed surfaces (shell rc, login hooks, config profiles,
     # extra persistence, browser extensions). Adopted silently on first sight,
     # diffed thereafter. `baseline` is returned possibly-mutated/persisted.
     surface_findings, baseline = _scan_surfaces(baseline, baseline_corrupt,
-                                                first_run)
+                                                first_run, health=health)
     findings += surface_findings
 
     if baseline_corrupt:
@@ -2385,6 +3081,12 @@ def cmd_scan(quiet=False):
             "re-evaluated as new. Run `aegis.py baseline` to re-establish a "
             "known-good baseline once you trust the current state." % BASELINE,
             "integrity:baseline:corrupt"))
+    elif baseline is not None and baseline.get("trust", "unverified") != "verified":
+        findings.append(finding(
+            "INFO", "trust", "Baseline is adopted but not reviewed",
+            "Existing state is being diffed to prevent alert storms, but it is not "
+            "asserted known-good. Review the machine, then run `aegis.py baseline` "
+            "to mark the current baseline verified.", "trust:baseline:unverified"))
 
     # Per-surface silent adoption on UPGRADE. shell-history is a LIVE (non-baseline)
     # surface, so an install that predates it must adopt whatever residue is already
@@ -2398,6 +3100,7 @@ def cmd_scan(quiet=False):
         # snapshot (_scan_surfaces adopted them into `baseline` in memory).
         baseline = baseline or {}
         baseline["created"] = baseline.get("created") or now_iso()
+        baseline["trust"] = "unverified"
         baseline["persistence"] = current
         baseline["shell_history_adopted"] = True
         save_json(BASELINE, baseline)
@@ -2410,8 +3113,30 @@ def cmd_scan(quiet=False):
     # after gather_all's sort.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
 
-    md = write_report(findings, first_run)
     new_high = emit(findings, first_run, adopt=adopt)
+    suppressed_categories = set(adopt)
+    if first_run:
+        suppressed_categories.update(("persistence", "shell-history"))
+    try:
+        record_security_state(
+            findings, sensor_health=health, initially_notified=bool(new_high),
+            suppressed_categories=suppressed_categories)
+        reminders = [] if new_high else claim_due_incident_reminders()
+        if reminders:
+            top = reminders[0]
+            extra = " (+%d more open)" % (len(reminders) - 1) \
+                if len(reminders) > 1 else ""
+            notify("Aegis incident reminder",
+                   "#%s %s%s" % (top["id"], top["title"], extra))
+        incidents = list_incidents()
+        persisted_health = get_sensor_health()
+    except Exception as e:
+        # The detector continues and its legacy evidence log remains available,
+        # but the failure is durable and visible rather than silently "clean".
+        log_run("event-store failure: %s" % e)
+        incidents, persisted_health = [], health
+    md = write_report(findings, first_run, incidents=incidents,
+                      sensor_health=persisted_health)
     flush_sigcache()
     record_selfstate()
     log_run("scan: %d findings, %d new-high, first_run=%s"
@@ -2422,10 +3147,15 @@ def cmd_scan(quiet=False):
     return 0
 
 
-def cmd_baseline():
+def cmd_baseline(trust="verified"):
+    with _scan_lock():
+        return _cmd_baseline_locked(trust)
+
+
+def _cmd_baseline_locked(trust="verified"):
     ensure_state()
     current = snapshot_persistence()
-    b = {"created": now_iso(), "persistence": current}
+    b = {"created": now_iso(), "persistence": current, "trust": trust}
     for key, snap_fn, _diff in SURFACES:
         try:
             snap = snap_fn()
@@ -2439,8 +3169,9 @@ def cmd_baseline():
     save_json(BASELINE, b)
     flush_sigcache()
     record_selfstate()
+    label = "reviewed/verified" if trust == "verified" else "adopted/unverified"
     print("Baseline reset: %d persistence item(s) + %d extra surface(s) recorded "
-          "as known-good." % (len(current), len(SURFACES)))
+          "as %s." % (len(current), len(SURFACES), label))
     return 0
 
 
@@ -2494,22 +3225,151 @@ def cmd_report():
     return 0
 
 
+def cmd_incidents(show_all=False):
+    incidents = list_incidents(active_only=not show_all)
+    if not incidents:
+        print("No %sincidents." % ("recorded " if show_all else "active "))
+        return 0
+    print("# Aegis incidents (%d)\n" % len(incidents))
+    for item in incidents:
+        print("  #%s  %-12s %-8s %s\n      %s · %s evidence event%s" % (
+            item["id"], item["status"], item["severity"], item["title"],
+            item["correlation_key"], item["evidence_count"],
+            "" if item["evidence_count"] == 1 else "s"))
+    print("\nDetails/actions: aegis.py incident <id> "
+          "[ack|investigate|contain|recover|monitor|resolve|false-positive|reopen]")
+    return 0
+
+
+_INCIDENT_ACTIONS = {
+    "ack": "ACK", "investigate": "INVESTIGATING", "contain": "CONTAINED",
+    "recover": "RECOVERING", "monitor": "MONITORING", "resolve": "RESOLVED",
+    "false-positive": "FALSE_POSITIVE", "reopen": "OPEN",
+}
+
+
+def cmd_incident(incident_id, action=None):
+    try:
+        incident_id = int(incident_id)
+    except (TypeError, ValueError):
+        print("usage: aegis.py incident <numeric-id> [action]")
+        return 1
+    if action:
+        new_status = _INCIDENT_ACTIONS.get(action.lower())
+        if not new_status:
+            print("unknown incident action: %s" % action)
+            return 1
+        if not transition_incident(incident_id, new_status):
+            current = incident_detail(incident_id)
+            print("refuse: invalid transition from %s to %s" %
+                  ((current or {}).get("status", "missing"), new_status))
+            return 1
+    item = incident_detail(incident_id)
+    if not item:
+        print("no such incident: %s" % incident_id)
+        return 1
+    print("# Incident #%s — %s\n\n  severity: %s\n  status:   %s\n  chain:    %s"
+          "\n  opened:   %s\n  updated:  %s\n\nEvidence:" % (
+              item["id"], item["title"], item["severity"], item["status"],
+              item["correlation_key"],
+              datetime.fromtimestamp(item["created_at"]).isoformat(),
+              datetime.fromtimestamp(item["updated_at"]).isoformat()))
+    for evidence in item.get("evidence", []):
+        try:
+            data = json.loads(evidence["data_json"])
+            summary = data.get("title") or data.get("status") or evidence["event_type"]
+        except Exception:
+            summary = evidence["event_type"]
+        print("  - %s · %s · %s" %
+              (evidence["observed_at"], evidence["source"], summary))
+    return 0
+
+
+def cmd_doctor():
+    """Report actual coverage and liveness; UNKNOWN is never printed as green."""
+    ensure_state()
+    init_event_store()
+    problems = []
+    print("# Aegis doctor - %s\n" % now_iso())
+    state_mode = os.stat(STATE_DIR).st_mode & 0o777
+    print("  %s state directory             mode %03o" %
+          ("✓" if state_mode == 0o700 else "?", state_mode))
+    if state_mode != 0o700:
+        problems.append("state permissions")
+    for path in (os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")):
+        try:
+            iterator = os.scandir(path)
+            try:
+                next(iterator, None)
+            finally:
+                iterator.close()
+            print("  ✓ %-27s readable" % path)
+        except OSError as e:
+            print("  ? %-27s unavailable: %s" % (path, e))
+            problems.append(path)
+    health = get_sensor_health()
+    if not health:
+        print("  ? sensors                     no completed scan recorded")
+        problems.append("no sensor health")
+    for item in health:
+        mark = "✓" if item["status"] == "OK" else "?"
+        print("  %s %-27s %-10s failures=%d %s" % (
+            mark, item["sensor_id"], item["status"],
+            item["consecutive_failures"], item["detail"] or ""))
+        if item["status"] != "OK":
+            problems.append(item["sensor_id"])
+    incidents = list_incidents()
+    print("\n  %s active incident%s" %
+          (len(incidents), "" if len(incidents) == 1 else "s"))
+    print("\nDoctor result: %s" % ("DEGRADED" if problems else "OK"))
+    return 1 if problems else 0
+
+
+def cmd_preflight():
+    """Installer-only capability check; performs no scan and blesses no state."""
+    ensure_state()
+    try:
+        init_event_store()
+        if not hasattr(select, "kqueue"):
+            raise RuntimeError("Python lacks macOS kqueue support")
+        if sys.version_info < (3, 9):
+            raise RuntimeError("Python 3.9 or newer is required")
+    except Exception as e:
+        print("Aegis preflight failed: %s" % e)
+        return 1
+    print("Aegis preflight OK: Python %s, kqueue, SQLite, private state" %
+          sys.version.split()[0])
+    return 0
+
+
+def cmd_mark_uninstalled():
+    """Installer lifecycle hook: intentional uninstall is not self-tampering."""
+    ensure_state()
+    state = load_json(SELFSTATE, {})
+    state["installed"] = False
+    state["uninstalled_at"] = now_iso()
+    save_json(SELFSTATE, state)
+    return 0
+
+
 def cmd_status():
     ensure_state()
     findings = check_hardening()
     print("# Aegis hardening posture - %s\n" % now_iso())
     checks = [
-        ("System Integrity Protection", "hardening:sip:off"),
-        ("Gatekeeper", "hardening:gatekeeper:off"),
-        ("FileVault", "hardening:filevault:off"),
-        ("Application Firewall", "hardening:firewall:off"),
-        ("Firewall stealth mode", "hardening:stealth:off"),
-        ("Remote Login (SSH) off", "hardening:ssh:on"),
+        ("System Integrity Protection", "hardening:sip:off", "hardening:sip:unknown"),
+        ("Gatekeeper", "hardening:gatekeeper:off", "hardening:gatekeeper:unknown"),
+        ("FileVault", "hardening:filevault:off", "hardening:filevault:unknown"),
+        ("Application Firewall", "hardening:firewall:off", "hardening:firewall:unknown"),
+        ("Firewall stealth mode", "hardening:stealth:off", "hardening:stealth:unknown"),
+        ("Remote Login (SSH) off", "hardening:ssh:on", "hardening:ssh:unknown"),
     ]
     bad = {f["fingerprint"]: f for f in findings}
-    for label, fp in checks:
+    for label, fp, unknown_fp in checks:
         if fp in bad:
             print("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
+        elif unknown_fp in bad:
+            print("  ? %-32s %s" % (label, bad[unknown_fp]["detail"]))
         else:
             print("  ✓ %-32s ok" % label)
 
@@ -2532,6 +3392,15 @@ def cmd_status():
         mark = "✓" if age <= XPROTECT_STALE_DAYS else "✗"
         print("  %s %-32s v%s, updated %.0f days ago"
               % (mark, "XProtect definitions", version or "?", age))
+    health = get_sensor_health()
+    if health:
+        print("\n# Sensor coverage")
+        for item in health:
+            mark = "✓" if item["status"] == "OK" else "?"
+            print("  %s %-32s %s%s" % (
+                mark, item["sensor_id"], item["status"],
+                (" — " + item["detail"]) if item["detail"] else ""))
+    print("\n# Incidents\n  %d active" % len(list_incidents()))
     return 0
 
 
@@ -2667,7 +3536,32 @@ def _watch_paths():
               + EXTRA_PERSIST_FILES):
         if os.path.isfile(f):
             paths.append(f)
-    return paths
+    # Directory vnode events reliably expose entry create/delete/rename, but an
+    # in-place write to an existing child can otherwise wait for reconciliation.
+    # Arm the already-present high-value objects directly as well.
+    for directory in PERSISTENCE_DIRS:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            child = os.path.join(directory, name)
+            if name.endswith(".plist") and os.path.isfile(child):
+                paths.append(child)
+    for directory in HOT_DIRS:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            app = os.path.join(directory, name)
+            if not name.lower().endswith(".app") or not os.path.isdir(app):
+                continue
+            paths.append(app)
+            executable = _bundle_executable(app)
+            if executable:
+                paths.append(executable)
+    return list(dict.fromkeys(paths))
 
 
 def _build_watch(extra_read_fds=()):
@@ -2730,10 +3624,13 @@ def _spawn_xprotect_stream():
     or None if `log` is unavailable — watch degrades to file events + the floor."""
     try:
         p = subprocess.Popen(
-            ["log", "stream", "--style", "ndjson", "--predicate",
-             'subsystem == "%s" AND category == "XPEvent.structured"'
-             % XPROTECT_SUBSYSTEM],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            _trusted_command(["log", "stream", "--style", "ndjson", "--predicate",
+                              'subsystem == "%s" AND category == "XPEvent.structured"'
+                              % XPROTECT_SUBSYSTEM]),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env={"HOME": HOME, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                 "LANG": "C", "LC_ALL": "C",
+                 "TMPDIR": os.environ.get("TMPDIR", "/tmp")})
         os.set_blocking(p.stdout.fileno(), False)
         return p
     except Exception:
@@ -2763,7 +3660,18 @@ def _stop_stream(proc):
         proc.terminate()
         proc.wait(timeout=5)
     except Exception:
-        pass
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    finally:
+        for pipe in (proc.stdout, proc.stderr, proc.stdin):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
 
 def cmd_watch(interval=600):
@@ -2821,11 +3729,11 @@ def cmd_watch(interval=600):
 # Remediate→Rollback ladder; Microsoft Defender's "every automated action must
 # be reviewable and reversible" playbook):
 #
-#   quarantine <path>  neutralize + confine a file to a reversible store
-#   restore <id>       un-quarantine: reverse the neutralization byte-for-byte
-#   destroy <id>       securely erase a quarantined item (IRREVERSIBLE; --yes)
+#   quarantine <path>  atomically confine a file/app in a reversible store
+#   restore <id>       reverse the native move without overwriting a destination
+#   destroy <id>       verified-delete a quarantined item (IRREVERSIBLE; --yes)
 #   kill <pid>         terminate a SAME-USER process (SIGTERM→SIGKILL)
-#   sandbox <path>     detonate a suspect binary in a deny-default Seatbelt jail
+#   sandbox <path>     refuse host execution; require a disposable VM
 #   neutralize <plist> ordered kill-chain for launchd-backed malware
 #
 # Hard safety rails (all destructive verbs): quarantine-first-never-delete-first
@@ -2837,25 +3745,405 @@ def cmd_watch(interval=600):
 # --------------------------------------------------------------------------- #
 
 
+_RESPONSE_FAILPOINT = None  # tests inject process-crash boundaries here
+
+
+def _response_checkpoint(stage):
+    if _RESPONSE_FAILPOINT is not None:
+        _RESPONSE_FAILPOINT(stage)
+
+
+def _response_lock_path():
+    return os.path.join(QUARANTINE_DIR, ".lock")
+
+
+def _response_trash_dir():
+    return os.path.join(QUARANTINE_DIR, ".trash")
+
+
+def _response_tombstone_dir():
+    return os.path.join(QUARANTINE_DIR, ".tombstones")
+
+
+def _quarantine_item(qid):
+    return os.path.join(QUARANTINE_DIR, qid)
+
+
+def _quarantine_txn(qid):
+    return os.path.join(_quarantine_item(qid), "txn.json")
+
+
+def _quarantine_sealed(qid):
+    return os.path.join(_quarantine_item(qid), "sealed")
+
+
+def _quarantine_payload(qid):
+    # No original extension and no .app suffix: Finder cannot launch this object.
+    return os.path.join(_quarantine_sealed(qid), "payload")
+
+
 def ensure_quarantine():
     ensure_state()
-    os.makedirs(QUARANTINE_DIR, exist_ok=True)
+    for path in (QUARANTINE_DIR, _response_trash_dir(),
+                 _response_tombstone_dir()):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
+@contextmanager
+def _response_lock():
+    ensure_quarantine()
+    fd = os.open(_response_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        os.chmod(QUARANTINE_DIR, 0o700)  # store is owner-only
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _strict_json(path):
+    with open(path, "r") as f:
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError("expected JSON object")
+    return value
+
+
+def _write_txn(txn):
+    txn["updated_at"] = now_iso()
+    save_json(_quarantine_txn(txn["id"]), txn)
+
+
+def _object_digest(path):
+    """Digest content, tree shape, symlink targets, and stat metadata.
+
+    The digest is independent of the root pathname, so it remains stable across
+    quarantine/restore renames. Internal symlinks are recorded, never followed.
+    """
+    if os.path.isfile(path) and not os.path.islink(path):
+        st = os.lstat(path)
+        return "file:%s:%o:%d:%d:%d" % (
+            sha256(path), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
+            st.st_mtime_ns)
+    if not os.path.isdir(path) or os.path.islink(path):
+        return None
+    h = hashlib.sha256()
+
+    def add_entry(full, rel):
+        st = os.lstat(full)
+        if stat.S_ISLNK(st.st_mode):
+            kind, content = "link", os.readlink(full)
+        elif stat.S_ISREG(st.st_mode):
+            kind, content = "file", sha256(full) or "unreadable"
+        elif stat.S_ISDIR(st.st_mode):
+            kind, content = "dir", ""
+        else:
+            kind, content = "other", ""
+        row = [rel, kind, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
+               st.st_nlink, st.st_size, st.st_mtime_ns,
+               getattr(st, "st_flags", 0), content]
+        h.update((json.dumps(row, separators=(",", ":")) + "\n").encode())
+
+    add_entry(path, ".")
+    for root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        dirs.sort()
+        files.sort()
+        for name in list(dirs):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, path)
+            add_entry(full, rel)
+            if os.path.islink(full):
+                dirs.remove(name)
+        for name in files:
+            full = os.path.join(root, name)
+            add_entry(full, os.path.relpath(full, path))
+    return "tree:" + h.hexdigest()
+
+
+def _capture_identity(path):
+    st = os.lstat(path)
+    return {
+        "dev": st.st_dev, "ino": st.st_ino,
+        "kind": "app" if stat.S_ISDIR(st.st_mode) else "file",
+        "nlink": st.st_nlink, "size": st.st_size,
+        "mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid,
+        "mtime_ns": st.st_mtime_ns, "atime_ns": st.st_atime_ns,
+        "flags": getattr(st, "st_flags", 0), "digest": _object_digest(path),
+    }
+
+
+def _identity_matches(path, identity):
+    try:
+        current = _capture_identity(path)
+    except (OSError, ValueError):
+        return False
+    return all(current.get(k) == identity.get(k)
+               for k in ("dev", "ino", "kind", "nlink", "digest"))
+
+
+def _valid_app_bundle(path):
+    if not path.lower().endswith(".app") or not os.path.isdir(path):
+        return False
+    info = os.path.join(path, "Contents", "Info.plist")
+    try:
+        with open(info, "rb") as f:
+            data = plistlib.load(f)
+        exe = data.get("CFBundleExecutable") if isinstance(data, dict) else None
     except Exception:
+        return False
+    if not isinstance(exe, str) or not exe or os.path.basename(exe) != exe:
+        return False
+    executable = os.path.join(path, "Contents", "MacOS", exe)
+    try:
+        mode = os.lstat(executable).st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) and not stat.S_ISLNK(mode)
+
+
+def _validate_app_tree(path):
+    """Reject bundle shapes whose live aliases would defeat containment."""
+    root = os.path.realpath(path)
+    for walk_root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        for name in list(dirs) + files:
+            item = os.path.join(walk_root, name)
+            st = os.lstat(item)
+            if stat.S_ISLNK(st.st_mode):
+                target = os.path.realpath(item)
+                try:
+                    inside = os.path.commonpath((root, target)) == root
+                except ValueError:
+                    inside = False
+                if not inside:
+                    return False, "external symlink: %s" % item
+            elif stat.S_ISREG(st.st_mode):
+                if st.st_nlink != 1:
+                    return False, "hard-linked file: %s" % item
+            elif not stat.S_ISDIR(st.st_mode):
+                return False, "special file: %s" % item
+    return True, ""
+
+
+def _rename_exclusive(src, dst):
+    """Atomic rename that fails rather than overwriting a raced destination."""
+    if sys.platform == "darwin":
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.renameatx_np
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                       ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        if fn(-2, os.fsencode(src), -2, os.fsencode(dst), 0x00000004) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err), dst)
+        return
+    # Development fallback. Production Aegis is macOS-only and always takes the
+    # renameatx_np path above.
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, "destination exists", dst)
+    os.rename(src, dst)
+
+
+def _sync_move(src, dst):
+    _sync_dir(os.path.dirname(src))
+    if os.path.dirname(src) != os.path.dirname(dst):
+        _sync_dir(os.path.dirname(dst))
+
+
+def _seal(qid):
+    try:
+        os.chmod(_quarantine_sealed(qid), 0o000)
+        _sync_dir(_quarantine_item(qid))
+    except OSError:
         pass
+
+
+def _unseal(qid):
+    os.chmod(_quarantine_sealed(qid), 0o700)
+
+
+def _manifest_record(txn):
+    identity = txn.get("identity") or {}
+    return {
+        "id": txn.get("id"), "orig_path": txn.get("original_path"),
+        "sha256": txn.get("sha256"), "size": identity.get("size"),
+        "mode": identity.get("mode"), "uid": identity.get("uid"),
+        "gid": identity.get("gid"), "detection": txn.get("detection"),
+        "ts": txn.get("created_at"), "kind": identity.get("kind"),
+        "phase": txn.get("phase"),
+    }
+
+
+def _iter_transactions():
+    ensure_quarantine()
+    for name in sorted(os.listdir(QUARANTINE_DIR)):
+        if name.startswith(".") or name == "manifest.json":
+            continue
+        path = os.path.join(QUARANTINE_DIR, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            yield name, _strict_json(os.path.join(path, "txn.json"))
+        except Exception as e:
+            yield name, {"id": name, "phase": "CORRUPT", "error": str(e)}
+
+
+def _rebuild_quarantine_manifest():
+    manifest = {}
+    for qid, txn in _iter_transactions():
+        if txn.get("phase") in ("QUARANTINED", "REVIEW_REQUIRED"):
+            manifest[qid] = _manifest_record(txn)
+    save_json(QUARANTINE_MANIFEST, manifest)
+    return manifest
+
+
+def _remove_object(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
+            for name in files:
+                try:
+                    item = os.path.join(root, name)
+                    if not os.path.islink(item):
+                        os.chmod(item, 0o600)
+                except OSError:
+                    pass
+            for name in dirs:
+                try:
+                    item = os.path.join(root, name)
+                    if not os.path.islink(item):
+                        os.chmod(item, 0o700)
+                except OSError:
+                    pass
+        os.chmod(path, 0o700)
+        shutil.rmtree(path)
+    else:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        os.remove(path)
+
+
+def _write_tombstone(txn, outcome):
+    tomb = dict(txn)
+    tomb["phase"] = outcome
+    tomb["completed_at"] = now_iso()
+    save_json(os.path.join(_response_tombstone_dir(),
+                           "%s.json" % txn["id"]), tomb)
+
+
+def _recover_quarantine_locked():
+    """Reconcile durable journals with filesystem reality; safe to repeat."""
+    for qid, txn in list(_iter_transactions()):
+        if txn.get("phase") == "CORRUPT":
+            continue
+        phase = txn.get("phase")
+        source = txn.get("original_path")
+        identity = txn.get("identity") or {}
+        sealed = _quarantine_sealed(qid)
+        payload = _quarantine_payload(qid)
+        if os.path.isdir(sealed):
+            try:
+                _unseal(qid)
+            except OSError:
+                pass
+        source_ok = bool(source and _identity_matches(source, identity))
+        payload_ok = _identity_matches(payload, identity)
+
+        if phase == "PREPARED":
+            if source_ok and not os.path.lexists(payload):
+                shutil.rmtree(_quarantine_item(qid), ignore_errors=True)
+                continue
+            if not os.path.lexists(source) and payload_ok:
+                txn["phase"] = "QUARANTINED"
+                txn["recovered_at"] = now_iso()
+                _write_txn(txn)
+            else:
+                txn["phase"] = "REVIEW_REQUIRED"
+                txn["recovery_error"] = "ambiguous PREPARED filesystem state"
+                _write_txn(txn)
+        elif phase == "RESTORE_PREPARED":
+            dest = txn.get("restore_path")
+            dest_ok = bool(dest and _identity_matches(dest, identity))
+            if payload_ok and not (dest and os.path.lexists(dest)):
+                txn["phase"] = "QUARANTINED"
+                _write_txn(txn)
+            elif dest_ok and not os.path.lexists(payload):
+                txn["phase"] = "RESTORED"
+                _write_txn(txn)
+            else:
+                txn["phase"] = "REVIEW_REQUIRED"
+                txn["recovery_error"] = "ambiguous restore filesystem state"
+                _write_txn(txn)
+        elif phase in ("DESTROY_PREPARED", "DESTROYING"):
+            trash = os.path.join(_response_trash_dir(), qid)
+            for candidate in (payload, trash):
+                if os.path.lexists(candidate):
+                    _remove_object(candidate)
+            txn["phase"] = "DESTROYED"
+            _write_txn(txn)
+
+        phase = txn.get("phase")
+        if phase == "QUARANTINED" and not txn.get("audit_terminal"):
+            if log_action("quarantine", txn.get("original_path"),
+                          "recovered-ok", id=qid,
+                          digest=identity.get("digest")):
+                txn["audit_terminal"] = True
+                _write_txn(txn)
+        elif phase == "RESTORED":
+            dest = txn.get("restore_path")
+            if dest and _identity_matches(dest, identity):
+                _write_tombstone(txn, "RESTORED")
+                if log_action("restore", txn.get("original_path"), "recovered-ok",
+                              id=qid, dest=dest):
+                    shutil.rmtree(_quarantine_item(qid), ignore_errors=True)
+                    continue
+        elif phase == "DESTROYED":
+            _write_tombstone(txn, "DESTROYED")
+            if log_action("destroy", txn.get("original_path"), "recovered-ok",
+                          id=qid):
+                shutil.rmtree(_quarantine_item(qid), ignore_errors=True)
+                continue
+        if txn.get("phase") in ("QUARANTINED", "REVIEW_REQUIRED") \
+                and os.path.isdir(sealed):
+            _seal(qid)
+    _rebuild_quarantine_manifest()
+
+
+def recover_quarantine():
+    with _response_lock():
+        _recover_quarantine_locked()
+    return 0
 
 
 def log_action(action, target, result, **extra):
-    """Durable, append-only audit of every response action (success OR refusal)."""
+    """Checked, durable audit append. False means the action must not proceed."""
     rec = {"ts": now_iso(), "action": action, "target": target, "result": result}
     rec.update(extra)
+    rec = _redact_value(rec)
+    data = (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8")
     try:
-        with open(ACTION_LOG, "a") as f:
-            f.write(json.dumps(rec) + "\n")
-    except Exception:
-        pass
-    log_run("%s %s -> %s" % (action, target, result))
+        ensure_state()
+        _rotate_log(ACTION_LOG)
+        fd = os.open(ACTION_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError("short action-log write")
+            _sync_fd(fd)
+        finally:
+            os.close(fd)
+        os.chmod(ACTION_LOG, 0o600)
+        _sync_dir(os.path.dirname(ACTION_LOG))
+        log_run("%s %s -> %s" % (action, target, result))
+        return True
+    except Exception as e:
+        log_run("AUDIT FAILURE %s %s -> %s (%s)" %
+                (action, target, result, e))
+        return False
 
 
 # Top-level paths whose removal/quarantine would be catastrophic — refuse even
@@ -2893,62 +4181,10 @@ def _is_protected_path(path):
     return False
 
 
-def _xor_copy(src, dst, key=_QUAR_XOR_KEY):
-    """Stream src -> dst applying a repeating-key XOR. Returns the sha256 of the
-    PLAINTEXT (pre-XOR) bytes so the caller can record it. Symmetric: calling it
-    again on the XORed file reverses the transform."""
-    h = hashlib.sha256()
-    klen = len(key)
-    i = 0
-    with open(src, "rb") as fi, open(dst, "wb") as fo:
-        while True:
-            chunk = fi.read(1 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-            out = bytes(b ^ key[(i + n) % klen] for n, b in enumerate(chunk))
-            fo.write(out)
-            i += len(chunk)
-    return h.hexdigest()
-
-
-def _xor_verify_plaintext_sha(quar_path, key=_QUAR_XOR_KEY):
-    """Stream the XORed store file back through XOR and return the sha256 of the
-    reconstructed plaintext — used to PROVE a quarantined item can be restored
-    byte-identically BEFORE we unlink the original (the never-lose-data invariant)."""
-    h = hashlib.sha256()
-    klen = len(key)
-    i = 0
-    with open(quar_path, "rb") as fi:
-        while True:
-            chunk = fi.read(1 << 20)
-            if not chunk:
-                break
-            plain = bytes(b ^ key[(i + n) % klen] for n, b in enumerate(chunk))
-            h.update(plain)
-            i += len(chunk)
-    return h.hexdigest()
-
-
-def _raw_quarantine_xattr(path):
-    """The raw com.apple.quarantine xattr value (or None), so restore can replay
-    the exact provenance the file carried. os.getxattr is absent on macOS
-    (stdlib), so we shell out to Apple's `xattr` like the rest of the tool."""
-    out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
-    return out.strip() if rc == 0 and out.strip() else None
-
-
 def cmd_quarantine(path, detection="manual"):
-    """Neutralize + confine a file to the reversible quarantine store.
-
-    Order of operations is chosen so the ORIGINAL is never lost if any step
-    fails: copy-with-neutralization into the store → verify the stored copy
-    reconstructs to the original hash → only THEN unlink the original. A failure
-    before the verify leaves the original exactly where it was."""
-    ensure_quarantine()
+    """Atomically confine a file or valid .app bundle in a durable transaction."""
     rp = os.path.realpath(path)
-
-    if not os.path.exists(rp):
+    if not os.path.lexists(path) or not os.path.exists(rp):
         print("refuse: %s does not exist" % path)
         log_action("quarantine", rp, "refused-missing")
         return 1
@@ -2958,80 +4194,97 @@ def cmd_quarantine(path, detection="manual"):
         print("refuse: %s is a symlink; pass the real target path" % path)
         log_action("quarantine", path, "refused-symlink")
         return 1
-    if os.path.isdir(rp):
-        print("refuse: %s is a directory; Aegis quarantines regular files only "
-              "(a Mach-O, plist, or staged archive), not trees" % rp)
+    is_app = os.path.isdir(rp) and _valid_app_bundle(rp)
+    if os.path.isdir(rp) and not is_app:
+        print("refuse: %s is a directory; only valid .app bundles can be "
+              "quarantined as a tree" % rp)
         log_action("quarantine", rp, "refused-directory")
         return 1
-    if not os.path.isfile(rp):
-        print("refuse: %s is not a regular file" % rp)
+    if not is_app and not os.path.isfile(rp):
+        print("refuse: %s is not a regular file or valid .app" % rp)
         log_action("quarantine", rp, "refused-not-regular")
         return 1
+    if is_app:
+        safe_tree, unsafe_reason = _validate_app_tree(rp)
+        if not safe_tree:
+            print("refuse: unsafe app bundle tree (%s)" % unsafe_reason)
+            log_action("quarantine", rp, "refused-unsafe-app-tree",
+                       reason=unsafe_reason)
+            return 1
     if _is_protected_path(rp):
         print("refuse: %s is a protected system/Aegis path and will not be "
               "quarantined" % rp)
         log_action("quarantine", rp, "refused-protected")
         return 1
 
-    try:
-        st = os.stat(rp)
-    except Exception as e:
-        print("refuse: cannot stat %s (%s)" % (rp, e))
+    identity = _capture_identity(rp)
+    if identity["kind"] == "file" and identity["nlink"] != 1:
+        print("refuse: %s has %d hard links; moving one name would not contain "
+              "the object" % (rp, identity["nlink"]))
+        log_action("quarantine", rp, "refused-hardlinks",
+                   nlink=identity["nlink"])
         return 1
-
-    orig_sha = sha256(rp)
-    qxattr = _raw_quarantine_xattr(rp)
-    qid = "%s-%s" % (datetime.now().strftime("%Y%m%dT%H%M%S"),
-                     (orig_sha or hashlib.sha256(rp.encode()).hexdigest())[:10])
-    item_dir = os.path.join(QUARANTINE_DIR, qid)
-    payload = os.path.join(item_dir, "payload.quar")
-    try:
-        os.makedirs(item_dir, exist_ok=False)
-        os.chmod(item_dir, 0o700)
-    except Exception as e:
-        print("error: could not create store entry (%s)" % e)
-        log_action("quarantine", rp, "error-store", detail=str(e))
+    ensure_quarantine()
+    if identity["dev"] != os.stat(QUARANTINE_DIR).st_dev:
+        print("refuse: %s is on a different filesystem; cross-volume copy/delete "
+              "is not crash-safe" % rp)
+        log_action("quarantine", rp, "refused-cross-volume")
         return 1
-
-    # 1) Neutralize-copy into the store and 2) prove it reconstructs.
-    try:
-        copied_sha = _xor_copy(rp, payload)
-        if copied_sha != orig_sha:
-            raise ValueError("read mismatch during copy")
-        if _xor_verify_plaintext_sha(payload) != orig_sha:
-            raise ValueError("store copy does not reconstruct to the original")
-        os.chmod(payload, 0o000)  # not readable/executable at rest
-    except Exception as e:
-        shutil.rmtree(item_dir, ignore_errors=True)
-        print("error: neutralization/verify failed, original left untouched (%s)" % e)
-        log_action("quarantine", rp, "error-verify", detail=str(e))
-        return 1
-
-    # 3) Only now remove the original — restore is provably possible.
-    try:
-        os.remove(rp)
-    except Exception as e:
-        shutil.rmtree(item_dir, ignore_errors=True)
-        print("error: could not remove original (%s); nothing quarantined "
-              "(check permissions; a system file may need sudo)" % e)
-        log_action("quarantine", rp, "error-remove", detail=str(e))
-        return 1
-
-    meta = {"id": qid, "orig_path": rp, "sha256": orig_sha, "size": st.st_size,
-            "mode": st.st_mode & 0o7777, "uid": st.st_uid, "gid": st.st_gid,
-            "quarantine_xattr": qxattr, "detection": detection, "ts": now_iso()}
-    save_json(os.path.join(item_dir, "meta.json"), meta)
-    manifest = load_json(QUARANTINE_MANIFEST, {})
-    manifest[qid] = meta
-    save_json(QUARANTINE_MANIFEST, manifest)
-    log_action("quarantine", rp, "ok", id=qid, sha256=orig_sha)
-    print("Quarantined: %s\n  id:      %s\n  store:   %s (neutralized, chmod 000)\n"
-          "  restore: aegis.py restore %s\n  destroy: aegis.py destroy %s --yes  "
-          "(irreversible)" % (rp, qid, payload, qid, qid))
+    token = identity["digest"].split(":")[1][:10]
+    qid = "%s-%s" % (datetime.now().strftime("%Y%m%dT%H%M%S%f"), token)
+    item_dir = _quarantine_item(qid)
+    payload = _quarantine_payload(qid)
+    txn = {
+        "schema": 1, "id": qid, "operation": "quarantine",
+        "phase": "PREPARED", "original_path": rp, "identity": identity,
+        "sha256": sha256(rp) if identity["kind"] == "file" else None,
+        "detection": detection, "created_at": now_iso(), "audit_terminal": False,
+    }
+    with _response_lock():
+        _recover_quarantine_locked()
+        os.makedirs(_quarantine_sealed(qid), mode=0o700, exist_ok=False)
+        _write_txn(txn)  # durable PREPARED always precedes the move
+        if not log_action("quarantine", rp, "prepared", id=qid,
+                          digest=identity["digest"]):
+            shutil.rmtree(item_dir, ignore_errors=True)
+            print("refuse: action audit is unavailable; source left untouched")
+            return 1
+        if not _identity_matches(rp, identity):
+            shutil.rmtree(item_dir, ignore_errors=True)
+            print("refuse: target changed after approval; source left untouched")
+            log_action("quarantine", rp, "refused-identity-changed", id=qid)
+            return 1
+        _rename_exclusive(rp, payload)
+        _sync_move(rp, payload)
+        _response_checkpoint("after-quarantine-rename")
+        if not _identity_matches(payload, identity):
+            txn["phase"] = "REVIEW_REQUIRED"
+            txn["recovery_error"] = "staged identity mismatch"
+            _write_txn(txn)
+            _seal(qid)
+            _rebuild_quarantine_manifest()
+            print("error: moved object failed identity verification; retained for review")
+            return 1
+        txn["phase"] = "QUARANTINED"
+        _write_txn(txn)
+        _seal(qid)
+        _rebuild_quarantine_manifest()
+        if not log_action("quarantine", rp, "ok", id=qid,
+                          digest=identity["digest"]):
+            print("error: object is contained, but terminal audit append failed; "
+                  "recovery will retry")
+            return 1
+        txn["audit_terminal"] = True
+        _write_txn(txn)
+    print("Quarantined: %s\n  id:      %s\n  store:   sealed native object "
+          "(metadata-preserving, same-volume transaction)\n  restore: aegis.py "
+          "restore %s\n  destroy: aegis.py destroy %s --yes (irreversible)"
+          % (rp, qid, qid, qid))
     return 0
 
 
 def cmd_quarantine_list():
+    recover_quarantine()
     manifest = load_json(QUARANTINE_MANIFEST, {})
     if not manifest:
         print("Quarantine store is empty.")
@@ -3048,94 +4301,146 @@ def cmd_quarantine_list():
 
 
 def cmd_restore(qid):
-    """Reverse a quarantine byte-for-byte: reconstruct the original, put it back
-    at its recorded path (or path+'.restored' if something now occupies it),
-    replay mode + quarantine xattr, and drop the store entry."""
-    ensure_quarantine()
-    manifest = load_json(QUARANTINE_MANIFEST, {})
-    m = manifest.get(qid)
-    if not m:
-        print("no such quarantine id: %s (see: aegis.py quarantine-list)" % qid)
-        return 1
-    payload = os.path.join(QUARANTINE_DIR, qid, "payload.quar")
-    if not os.path.exists(payload):
-        print("error: store payload for %s is missing; cannot restore" % qid)
-        log_action("restore", qid, "error-payload-missing")
-        return 1
-    dest = m["orig_path"]
-    if os.path.exists(dest):
-        dest = dest + ".restored"
-        print("note: %s now exists; restoring to %s" % (m["orig_path"], dest))
-    tmp = dest + ".aegis-restore.tmp"
-    try:
-        os.chmod(payload, 0o600)  # we chmod 000'd it at rest
-        _xor_copy(payload, tmp)  # XOR is symmetric → writes plaintext back out
-        # _xor_copy returns the sha of its INPUT (here the ciphertext), so verify
-        # against the sha of the reconstructed OUTPUT instead.
-        if sha256(tmp) != m.get("sha256"):
-            raise ValueError("recovered hash does not match recorded original")
-        os.replace(tmp, dest)
-        os.chmod(dest, m.get("mode", 0o644))
-    except Exception as e:
+    """Restore by exclusive native rename; never overwrite a raced occupant."""
+    with _response_lock():
+        _recover_quarantine_locked()
         try:
-            os.remove(tmp)
+            txn = _strict_json(_quarantine_txn(qid))
         except Exception:
-            pass
-        print("error: restore failed (%s); store entry left intact" % e)
-        log_action("restore", qid, "error", detail=str(e))
-        return 1
-    if m.get("quarantine_xattr"):
-        run(["xattr", "-w", "com.apple.quarantine", m["quarantine_xattr"], dest],
-            timeout=6)
-    shutil.rmtree(os.path.join(QUARANTINE_DIR, qid), ignore_errors=True)
-    manifest.pop(qid, None)
-    save_json(QUARANTINE_MANIFEST, manifest)
-    log_action("restore", m["orig_path"], "ok", id=qid, dest=dest)
-    print("Restored %s -> %s (verified byte-identical to the original)."
+            print("no such quarantine id: %s (see: aegis.py quarantine-list)" % qid)
+            return 1
+        if txn.get("phase") != "QUARANTINED":
+            print("refuse: %s is in phase %s, not safely restorable"
+                  % (qid, txn.get("phase")))
+            return 1
+        payload = _quarantine_payload(qid)
+        _unseal(qid)
+        if not _identity_matches(payload, txn["identity"]):
+            txn["phase"] = "REVIEW_REQUIRED"
+            txn["recovery_error"] = "payload identity mismatch before restore"
+            _write_txn(txn)
+            _seal(qid)
+            _rebuild_quarantine_manifest()
+            print("error: quarantine payload failed integrity verification")
+            return 1
+        dest = txn["original_path"]
+        if os.path.lexists(dest):
+            dest = "%s.restored.%s" % (dest, qid)
+            n = 1
+            while os.path.lexists(dest):
+                dest = "%s.restored.%s.%d" % (txn["original_path"], qid, n)
+                n += 1
+            print("note: %s now exists; restoring to %s"
+                  % (txn["original_path"], dest))
+        txn["operation"] = "restore"
+        txn["restore_path"] = dest
+        txn["phase"] = "RESTORE_PREPARED"
+        _write_txn(txn)
+        if not log_action("restore", txn["original_path"], "prepared",
+                          id=qid, dest=dest):
+            txn["phase"] = "QUARANTINED"
+            _write_txn(txn)
+            _seal(qid)
+            print("refuse: action audit is unavailable; item remains quarantined")
+            return 1
+        _response_checkpoint("after-restore-prepared")
+        try:
+            _rename_exclusive(payload, dest)
+        except OSError as e:
+            txn["phase"] = "QUARANTINED"
+            txn["restore_error"] = str(e)
+            _write_txn(txn)
+            _seal(qid)
+            print("error: restore destination became occupied; item remains "
+                  "quarantined")
+            return 1
+        _sync_move(payload, dest)
+        _response_checkpoint("after-restore-rename")
+        if not _identity_matches(dest, txn["identity"]):
+            txn["phase"] = "REVIEW_REQUIRED"
+            txn["recovery_error"] = "restored identity mismatch"
+            _write_txn(txn)
+            print("error: restored object failed identity verification")
+            return 1
+        txn["phase"] = "RESTORED"
+        _write_txn(txn)
+        _write_tombstone(txn, "RESTORED")
+        if not log_action("restore", txn["original_path"], "ok",
+                          id=qid, dest=dest):
+            print("error: object is restored, but terminal audit append failed; "
+                  "recovery will retry")
+            return 1
+        shutil.rmtree(_quarantine_item(qid), ignore_errors=True)
+        _rebuild_quarantine_manifest()
+    print("Restored %s -> %s (verified content and native metadata identity)."
           % (qid, dest))
     return 0
 
 
 def cmd_destroy(qid, confirmed=False):
-    """IRREVERSIBLE. Securely-ish erase a quarantined item from the store. This
-    is the only destructive verb, and by construction it can act ONLY on
-    something already quarantined — there is no 'delete a live path' command
-    (the industry's quarantine-first-never-delete-first invariant)."""
-    ensure_quarantine()
-    manifest = load_json(QUARANTINE_MANIFEST, {})
-    m = manifest.get(qid)
-    if not m:
-        print("no such quarantine id: %s" % qid)
-        return 1
-    if not confirmed:
-        print("REFUSING without confirmation. `destroy` is IRREVERSIBLE and the "
-              "item cannot be restored afterwards.\n  Item: %s (from %s)\n  "
-              "Re-run: aegis.py destroy %s --yes" % (qid, m.get("orig_path"), qid))
-        return 1
-    item_dir = os.path.join(QUARANTINE_DIR, qid)
-    payload = os.path.join(item_dir, "payload.quar")
-    try:
-        if os.path.exists(payload):
-            os.chmod(payload, 0o600)
-            size = os.path.getsize(payload)
-            with open(payload, "r+b") as f:  # single overwrite pass, then unlink
-                remaining = size
-                while remaining > 0:
-                    n = min(remaining, 1 << 20)
-                    f.write(os.urandom(n))
-                    remaining -= n
-                f.flush()
-                os.fsync(f.fileno())
-    except Exception as e:
-        print("warning: overwrite pass failed (%s); removing anyway" % e)
-    shutil.rmtree(item_dir, ignore_errors=True)
-    manifest.pop(qid, None)
-    save_json(QUARANTINE_MANIFEST, manifest)
-    log_action("destroy", m.get("orig_path"), "ok", id=qid, sha256=m.get("sha256"))
-    print("Destroyed %s (from %s). This cannot be undone.\n"
-          "Note: on an APFS/SSD volume a single overwrite is not a guaranteed "
-          "secure-erase (wear-levelling); FileVault is the real at-rest guarantee."
-          % (qid, m.get("orig_path")))
+    """IRREVERSIBLE verified deletion of an already-quarantined object."""
+    with _response_lock():
+        _recover_quarantine_locked()
+        try:
+            txn = _strict_json(_quarantine_txn(qid))
+        except Exception:
+            print("no such quarantine id: %s" % qid)
+            return 1
+        if txn.get("phase") != "QUARANTINED":
+            print("refuse: %s is in phase %s" % (qid, txn.get("phase")))
+            return 1
+        if not confirmed:
+            print("REFUSING without confirmation. `destroy` is IRREVERSIBLE and "
+                  "the item cannot be restored afterwards.\n  Item: %s (from %s)"
+                  "\n  Re-run: aegis.py destroy %s --yes"
+                  % (qid, txn.get("original_path"), qid))
+            log_action("destroy", txn.get("original_path"), "refused-confirmation",
+                       id=qid)
+            return 1
+        txn["operation"] = "destroy"
+        txn["phase"] = "DESTROY_PREPARED"
+        txn["approval"] = hashlib.sha256(
+            (qid + "\0" + txn["identity"]["digest"]).encode()).hexdigest()
+        _write_txn(txn)
+        if not log_action("destroy", txn.get("original_path"), "prepared",
+                          id=qid, approval=txn["approval"]):
+            txn["phase"] = "QUARANTINED"
+            _write_txn(txn)
+            _seal(qid)
+            print("refuse: action audit is unavailable; item remains quarantined")
+            return 1
+        _response_checkpoint("after-destroy-prepared")
+        _unseal(qid)
+        payload = _quarantine_payload(qid)
+        if not _identity_matches(payload, txn["identity"]):
+            txn["phase"] = "REVIEW_REQUIRED"
+            _write_txn(txn)
+            _seal(qid)
+            print("error: payload failed integrity verification; refusing destroy")
+            return 1
+        trash = os.path.join(_response_trash_dir(), qid)
+        _rename_exclusive(payload, trash)
+        _sync_move(payload, trash)
+        txn["phase"] = "DESTROYING"
+        _write_txn(txn)
+        _remove_object(trash)
+        _sync_dir(_response_trash_dir())
+        if os.path.lexists(trash):
+            print("error: verified deletion failed; recovery will retry")
+            return 1
+        txn["phase"] = "DESTROYED"
+        _write_txn(txn)
+        _write_tombstone(txn, "DESTROYED")
+        if not log_action("destroy", txn.get("original_path"), "ok", id=qid,
+                          approval=txn["approval"]):
+            print("error: deletion completed, but terminal audit append failed; "
+                  "recovery will retry")
+            return 1
+        shutil.rmtree(_quarantine_item(qid), ignore_errors=True)
+        _rebuild_quarantine_manifest()
+    print("Destroyed %s (from %s). Verified deletion completed; this cannot be "
+          "undone. APFS/SSD secure erasure is not claimed."
+          % (qid, txn.get("original_path")))
     return 0
 
 
@@ -3203,59 +4508,23 @@ def cmd_kill(pid):
     return 0 if gone else 1
 
 
-# Deny-default Seatbelt profile for detonating a suspect binary. Allows only
-# what a process needs to start and read its own image; denies network, all
-# writes, and the sensitive dirs. sandbox-exec/Seatbelt is deprecated by Apple
-# but fully functional (macOS 26 verified; Apple itself and shipping CLIs still
-# use .sb) — the only entitlement-free process-jail available to a userspace tool.
-_SANDBOX_PROFILE = """(version 1)
-(deny default)
-(allow process-fork)
-(allow process-exec)
-(allow file-read*)
-(allow sysctl-read)
-(allow mach-lookup)
-(deny network*)
-(deny file-write*)
-(deny file-read* (subpath "%s"))
-(deny file-read* (subpath "%s"))
-""" % (os.path.join(HOME, "Library", "Keychains"),
-       os.path.join(HOME, "Library", "Application Support"))
-
-
 def cmd_sandbox(path, extra_args=None):
-    """Detonate/inspect a suspect binary inside a deny-default Seatbelt jail:
-    no network, no filesystem writes, no keychain/App-Support reads. Lets you
-    watch what it *tries* to do without letting it phone home or steal data.
-    Honest caveat: this is a jail, not a VM — kernel bugs or a sandbox escape
-    could still bite; use a throwaway VM for true detonation."""
+    """Refuse host-side sample execution.
+
+    ``sandbox-exec`` is deprecated, its policy language is not a supported
+    third-party security boundary, and a useful process profile still exposes
+    host data and IPC. Aegis therefore performs static observation only; dynamic
+    analysis belongs in a disposable VM with no shared credentials or folders.
+    """
     rp = os.path.realpath(path)
     if not os.path.isfile(rp):
         print("refuse: %s is not a file" % rp)
         return 1
-    if not os.path.exists("/usr/bin/sandbox-exec"):
-        print("error: /usr/bin/sandbox-exec is not present on this macOS")
-        return 1
-    ensure_state()
-    prof = os.path.join(STATE_DIR, "sandbox.sb")
-    try:
-        with open(prof, "w") as f:
-            f.write(_SANDBOX_PROFILE)
-    except Exception as e:
-        print("error: could not write sandbox profile (%s)" % e)
-        return 1
-    cmd = ["/usr/bin/sandbox-exec", "-f", prof, rp] + list(extra_args or [])
-    print("Detonating in deny-default Seatbelt jail (no net, no writes):\n  %s\n"
-          "  (deprecated-but-functional sandbox-exec; not a VM substitute)\n---"
-          % " ".join(cmd))
-    log_action("sandbox", rp, "launched")
-    out, err, rc = run(cmd, timeout=30)
-    if out:
-        sys.stdout.write(out)
-    if err:
-        sys.stderr.write(err)
-    print("--- sandboxed process exited rc=%d" % rc)
-    return 0
+    log_action("sandbox", rp, "refused-host-execution")
+    print("refuse: Aegis will not execute a suspect sample on the host. Use static "
+          "inspection here, or a disposable VM with no shared folders, clipboard, "
+          "credentials, or production network for dynamic analysis.")
+    return 2
 
 
 def cmd_neutralize(plist_path):
@@ -3327,7 +4596,11 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
  DETECT (default; runs on a launchd interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
   report           print the latest report
-  status           print hardening posture + XProtect definition age (fast)
+  status           print hardening, XProtect, sensor coverage, and incidents
+  doctor           verify actual coverage/liveness (unknown is never green)
+  incidents [all]  list active incidents (or complete history)
+  incident <id> [ack|investigate|contain|recover|monitor|resolve|
+                 false-positive|reopen]
   baseline         reset the known-good persistence baseline to current state
   allow <path>     suppress future alerts for findings matching <path>
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
@@ -3339,12 +4612,12 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
                    floor. Production: bash install.sh watch
 
  RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
-  quarantine <path>      neutralize + confine a file to a reversible store
+  quarantine <path>      atomically confine a file or valid .app bundle
   quarantine-list        list the quarantine store (ids to restore/destroy)
-  restore <id>           un-quarantine byte-for-byte (undo a false positive)
-  destroy <id> --yes     securely erase a quarantined item (IRREVERSIBLE)
+  restore <id>           reverse the native move without overwriting
+  destroy <id> --yes     verified deletion from quarantine (IRREVERSIBLE)
   kill <pid>             terminate one of YOUR processes (SIGTERM->SIGKILL)
-  sandbox <path> [args]  detonate a suspect binary in a deny-default jail
+  sandbox <path> [args]  refuses host execution; use an isolated VM dynamically
   neutralize <plist>     kill-chain a launchd threat: bootout->kill->quarantine
 """
 
@@ -3357,8 +4630,20 @@ def main(argv):
         return cmd_report()
     if cmd == "status":
         return cmd_status()
+    if cmd == "doctor":
+        return cmd_doctor()
+    if cmd == "preflight":  # installer-only
+        return cmd_preflight()
+    if cmd == "mark-uninstalled":  # uninstaller-only
+        return cmd_mark_uninstalled()
+    if cmd == "incidents":
+        return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
+    if cmd == "incident" and len(argv) > 2:
+        return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None)
     if cmd == "baseline":
         return cmd_baseline()
+    if cmd == "baseline-unverified":  # installer-only: adopt, never bless
+        return cmd_baseline(trust="unverified")
     if cmd == "allow" and len(argv) > 2:
         return cmd_allow(argv[2])
     if cmd == "vt" and len(argv) > 2:

