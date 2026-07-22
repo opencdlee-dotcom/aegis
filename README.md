@@ -331,7 +331,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**216 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**218 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -349,7 +349,9 @@ punycode redirects to non-blocking addresses score HIGH; deliberate loopback
 blocks do not false-positive; unreadable hosts data degrades sensor health; the
 sensor is wired into every scan; and a same-size, same-mtime executable
 replacement is forced through strict `codesign` verification instead of reusing
-a stale trusted cache entry.
+a stale trusted cache entry. Two incident-lifecycle regressions additionally
+prove an exact reviewed false positive stays suppressed while accumulating
+evidence, but a resolved threat that recurs opens a fresh incident.
 
 The **response tier** pins files and valid `.app` bundles, native metadata-
 preserving round trips, durable crash recovery after the source rename, audit-

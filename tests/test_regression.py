@@ -2656,6 +2656,39 @@ class TestEventIncidentCore(Sandbox):
         self.assertEqual(aegis.incident_detail(incident["id"])["status"],
                          "RESOLVED")
 
+    def test_false_positive_suppresses_the_exact_recurring_signal(self):
+        f = aegis.finding("HIGH", "process", "Expected local tool", "adhoc",
+                          "process:/opt/local/tool:adhoc:stable-hash")
+        aegis.record_security_state([f], now=1_700_000_000)
+        incident = aegis.list_incidents()[0]
+        self.assertTrue(aegis.transition_incident(
+            incident["id"], "FALSE_POSITIVE", now=1_700_000_010))
+        aegis.record_security_state([f], now=1_700_000_020)
+        self.assertEqual(aegis.list_incidents(), [],
+                         "a reviewed exact fingerprint must stay suppressed")
+        rows = self._rows(
+            "SELECT id,status FROM incidents WHERE correlation_key=?",
+            ("signal:" + f["fingerprint"],))
+        self.assertEqual(rows, [(incident["id"], "FALSE_POSITIVE")])
+        evidence = self._rows(
+            "SELECT COUNT(*) FROM incident_events WHERE incident_id=?",
+            (incident["id"],))
+        self.assertEqual(evidence[0][0], 2,
+                         "recurrence remains attached as durable evidence")
+
+    def test_resolved_signal_recurrence_opens_a_new_incident(self):
+        f = aegis.finding("HIGH", "canary", "Canary changed", "changed",
+                          "canary:recurrence:1")
+        aegis.record_security_state([f], now=1_700_000_000)
+        first = aegis.list_incidents()[0]
+        self.assertTrue(aegis.transition_incident(
+            first["id"], "RESOLVED", now=1_700_000_010))
+        aegis.record_security_state([f], now=1_700_000_020)
+        active = aegis.list_incidents()
+        self.assertEqual(len(active), 1)
+        self.assertNotEqual(active[0]["id"], first["id"],
+                            "resolved threats must alert again if they recur")
+
     def test_open_incident_reminders_are_bounded(self):
         f = aegis.finding("HIGH", "canary", "Canary changed", "changed",
                           "canary:changed:2")

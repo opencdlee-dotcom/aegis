@@ -1005,14 +1005,28 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                    "updated_at=? WHERE id=?",
                    (new_sev, new_status, now, now, incident_id))
     else:
-        last_notified = now if initially_notified else None
-        cur = db.execute(
-            "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
-            "created_at,first_seen,last_seen,updated_at,reminder_count,"
-            "next_reminder_at,last_notified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-             now + _REMINDER_DELAYS[0], last_notified))
-        incident_id = cur.lastrowid
+        # FALSE_POSITIVE is a reviewed verdict on this exact correlation key.
+        # Keep later occurrences attached as evidence instead of opening a new
+        # incident every scan. Fingerprints include content hashes for mutable
+        # executables, so a changed object gets a different key and alerts again.
+        reviewed = db.execute(
+            "SELECT * FROM incidents WHERE correlation_key=? AND "
+            "status='FALSE_POSITIVE' ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+        if reviewed and SEV_ORDER.get(severity, -1) <= \
+                SEV_ORDER.get(reviewed["severity"], -1):
+            incident_id = reviewed["id"]
+            db.execute("UPDATE incidents SET last_seen=?,updated_at=? WHERE id=?",
+                       (now, now, incident_id))
+        else:
+            last_notified = now if initially_notified else None
+            cur = db.execute(
+                "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
+                "created_at,first_seen,last_seen,updated_at,reminder_count,"
+                "next_reminder_at,last_notified_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (kind, key, title, severity, "OPEN", now, now, now, now, 0,
+                 now + _REMINDER_DELAYS[0], last_notified))
+            incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
                    "VALUES(?,?)", (incident_id, event_id))

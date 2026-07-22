@@ -79,7 +79,10 @@ Allowed states are `OPEN`, `ACK`, `INVESTIGATING`, `CONTAINED`, `RECOVERING`,
 `MONITORING`, `RESOLVED`, and `FALSE_POSITIVE`. Transitions are validated so a
 closed incident cannot silently return to containment. An unresolved incident
 gets at most three reminders (about +1 hour, +24 hours, and +72 hours); afterward
-the durable open state is the reminder.
+the durable open state is the reminder. A reviewed `FALSE_POSITIVE` suppresses
+only the exact correlation key while retaining later occurrences as evidence;
+a changed content hash gets a new key. A `RESOLVED` threat that recurs opens a
+new incident instead of being silently ignored.
 
 ```text
 OPEN -> ACK -> INVESTIGATING -> CONTAINED -> RECOVERING -> MONITORING -> RESOLVED
