@@ -107,6 +107,7 @@ import subprocess
 import sys
 import time
 import hashlib
+import hmac
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -165,6 +166,46 @@ ACTION_LOG = os.path.join(STATE_DIR, "actions.jsonl")
 # while still offering reputation when you deliberately ask for it.
 VT_KEY_FILE = os.path.join(STATE_DIR, "vt_key")
 VT_API_URL = "https://www.virustotal.com/api/v3/files/"
+
+# --- Survivability: dead-man's switch + tamper-evidence ---------------------- #
+# A same-uid attacker can SIGKILL Aegis or `launchctl bootout` its agent and
+# blind every layer at once — silently (ATT&CK T1562.001). An unprivileged tool
+# cannot PREVENT this, so the design is tamper-EVIDENCE, not tamper-prevention:
+# the attacker may win locally, but must not win SILENTLY.
+#   * HEARTBEAT_FILE: written on every healthy scan (ALWAYS, no network). Its
+#     staleness is what an external watcher (or `aegis.py watchdog`) alarms on —
+#     absence of the ping is the alert (the 2026 "alert on missing telemetry"
+#     doctrine). A second launchd agent or cron calling `watchdog` is the
+#     unprivileged mutual-watchdog.
+#   * HEARTBEAT_URL (opt-in, BYO, off by default): if set, each healthy scan also
+#     POSTs a heartbeat + any HIGH+ alert out-of-band, so "silence" travels off
+#     the box the same session an attacker suppresses every LOCAL sink. Like `vt`
+#     this is the ONLY networked path and is off unless YOU configure it, so the
+#     scan/watch path stays local-only by default.
+#   * HMAC-chained state: the self-protection trust-store check upgrades from a
+#     plain hash to an hmac(key) so an attacker who edits baseline/allowlist AND
+#     recomputes the plain hash still cannot forge the watermark without the key.
+HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
+HMAC_KEY_FILE = os.path.join(STATE_DIR, "hmac.key")  # 0600, not beside the data
+AEGIS_CONFIG = os.path.join(STATE_DIR, "config.json")
+WATCHDOG_ALERT = os.path.join(STATE_DIR, "watchdog_alert")  # durable sentinel
+HEARTBEAT_STALE_SECS = 3 * 3600  # a scan every 10 min (watch) / hourly (interval)
+# Opt-in off-host egress endpoint: env wins (inject for one run), else config.json.
+HEARTBEAT_URL_ENV = "AEGIS_HEARTBEAT_URL"
+
+# XProtect Behavioral Service (Bastion) violation DB — root-only (0600 root:wheel,
+# UNIX perms not TCC). Apple records stealer-shape behavior here and never alerts;
+# the opt-in `sudo aegis bastion` tier surfaces it. Path per macOS 15/26.
+XPDB_PATH = "/var/protected/xprotect/db/XPdb"
+
+# AI-agent skill directories — a live 2026 AMOS distribution channel (malicious
+# OpenClaw/Claude "skills" that manipulate the agent into a fake password dialog,
+# Trend Micro 2026). Same shape as the IDE-extension surface: a new skill dir or a
+# changed SKILL.md is the signal. Symlinks resolve (the canonical skills tree is
+# often a symlink into a projects folder). Directly relevant to an agent-heavy box.
+AGENT_SKILL_ROOTS = [os.path.join(HOME, d) for d in (
+    ".claude/skills", ".claude/plugins", ".codex/skills", ".gemini/extensions",
+)]
 
 # Absolute path of this script — never quarantine/kill/destroy Aegis itself.
 _SELF_PATH = os.path.abspath(__file__)
@@ -248,7 +289,23 @@ EXTRA_PERSIST_FILES = ["/etc/crontab", "/etc/rc.common", "/etc/launchd.conf",
 # world-readable drop or a pam edit (644 root:wheel — readable) is still caught.
 EXTRA_PERSIST_DIRS = ["/etc/periodic", "/etc/emond.d/rules",
                       "/Library/StartupItems", "/System/Library/StartupItems",
-                      "/etc/pam.d", "/etc/sudoers.d", "/etc/ssh/sshd_config.d"]
+                      "/etc/pam.d", "/etc/sudoers.d", "/etc/ssh/sshd_config.d",
+                      # Residual ASEP surfaces from KnockKnock's 60+ categories,
+                      # walked by the same content-hash+diff machinery: a NEW
+                      # authorization plugin, Spotlight importer (.mdimporter),
+                      # QuickLook generator, scripting addition (OSAX), or folder
+                      # action bundle is a rarely-legit persistence install. Only
+                      # the world-readable ones hash; existing plugins are
+                      # baselined silently, so only a net-new one alerts.
+                      "/Library/Security/SecurityAgentPlugins",
+                      "/Library/Spotlight",
+                      os.path.join(HOME, "Library", "Spotlight"),
+                      "/Library/QuickLook",
+                      os.path.join(HOME, "Library", "QuickLook"),
+                      "/Library/ScriptingAdditions",
+                      os.path.join(HOME, "Library", "ScriptingAdditions"),
+                      os.path.join(HOME, "Library", "Workflows",
+                                   "Applications", "Folder Actions")]
 
 # Chromium-family + Firefox extension roots (in the user's own home — no special
 # privilege). A newly-appearing extension ID is the signal; we diff the inventory.
@@ -461,6 +518,26 @@ WALLET_APP_BINS = [
 LSOF_LISTEN_CMD = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]
 _LISTENER_NET_UTILS = frozenset(("nc", "ncat", "socat"))
 
+# --- Outbound connections (exfil-in-flight) ---------------------------------- #
+# The listener surface catches the bind-shell shape; it is structurally blind to
+# EXFIL, which is an OUTBOUND connection. `netstat -anv` attributes every socket
+# to a `<proc>:<pid>` column WITHOUT root (verified on macOS 26) — including
+# established outbound connections. We can't baseline-diff outbound (a browser
+# opens hundreds), so this is a LIVE check that flags only SUSPICIOUS egress: an
+# unsigned/ad-hoc binary in a user-writable path talking to the network, or a
+# fileless-stealer interpreter/util (osascript/curl/nc/python/nohup) connecting
+# outbound to a non-loopback host — especially a raw IP (AMOS C2 is bare-IP).
+NETSTAT_CMD = ["netstat", "-anv", "-p", "tcp"]
+
+# --- Auth sessions (remote login / screen sharing) --------------------------- #
+# A canonical EDR sensor domain Aegis lacked. A personal Mac rarely has an ACTIVE
+# remote login; `who` shows a remote host in parentheses for ssh/screen-sharing
+# sessions. We baseline-diff the set of REMOTE sessions (local ttys/console are
+# ignored — they churn every terminal), so a new ssh/screen-sharing origin is the
+# signal. Complements the ~/.ssh/authorized_keys persistence check (that catches
+# the implant; this catches the live session it enables).
+WHO_CMD = ["who"]
+
 # --- Known-vendor label impersonation (generalizes the com.apple.* check) ---- #
 # A persistence LABEL claiming a well-known vendor whose backing program isn't
 # signed by that vendor's Team ID is impersonating trusted software. ClickFix
@@ -575,6 +652,8 @@ _TRUSTED_TOOLS = {
     "profiles": "/usr/bin/profiles", "ps": "/bin/ps",
     "sfltool": "/usr/bin/sfltool", "spctl": "/usr/sbin/spctl",
     "sysctl": "/usr/sbin/sysctl", "xattr": "/usr/bin/xattr",
+    "netstat": "/usr/sbin/netstat", "last": "/usr/bin/last",
+    "who": "/usr/bin/who",
 }
 
 
@@ -844,13 +923,27 @@ def _redact_value(value):
     return value
 
 
+CONFIDENCE_ORDER = {"high": 2, "medium": 1, "low": 0}
+
+
 def finding(severity, category, title, detail, fingerprint, **extra):
     rule_id = extra.pop("rule_id", None)
+    # Confidence is a SEPARATE axis from severity (Secureworks/Vectra/Sigma
+    # two-axis model): severity = impact if real, confidence = how sure we are
+    # this specific hit is a true positive (rule specificity × baseline rarity).
+    # Kept as its own field so tuning one never silently moves the other, and so
+    # the routing gate can demote a high-impact-but-noisy hit to digest without
+    # lowering its recorded severity. Default 'medium'; only an EXPLICIT 'low'
+    # ever routes below the notify floor, so existing callers are unaffected.
+    confidence = extra.pop("confidence", "medium")
+    if confidence not in CONFIDENCE_ORDER:
+        confidence = "medium"
     slug = re.sub(r"[^a-z0-9]+", ".", title.lower()).strip(".")[:80]
     f = {
         "schema_version": 1,
         "ts": now_iso(),
         "severity": severity,
+        "confidence": confidence,
         "category": category,
         "title": title,
         "detail": redact_sensitive(detail),
@@ -1045,6 +1138,62 @@ def _same_entity(a, b):
     return ea == eb
 
 
+# Per-entity risk accumulation (Elastic building-block → entity-risk → higher-
+# order pattern): weak signals that never notify alone should escalate when they
+# PILE UP on one entity. Weight = severity × confidence; an entity that crosses
+# the threshold from enough DISTINCT signals opens one 'risk' incident.
+_RISK_SEV_WEIGHT = {"CRITICAL": 4.0, "HIGH": 3.0, "MEDIUM": 2.0, "LOW": 1.0,
+                    "INFO": 0.0}
+_RISK_CONF_WEIGHT = {"high": 1.0, "medium": 0.7, "low": 0.4}
+RISK_WINDOW = 1800       # look-back seconds (matches the correlation window)
+RISK_THRESHOLD = 4.0     # ~three medium-confidence MEDIUMs on one entity
+RISK_MIN_SIGNALS = 3     # never escalate a single loud finding this way
+
+
+def _accumulate_risk(db, now, new_ids):
+    """Open one 'risk' incident per entity whose recent findings sum past
+    RISK_THRESHOLD from ≥ RISK_MIN_SIGNALS DISTINCT signals, provided at least one
+    is new this scan. Lets three MEDIUMs on one binary escalate where one alone
+    stays below the notify floor — the middle tier between raw signals and the
+    hand-written chain rules. No schema change; reuses the incident store."""
+    rows = db.execute(
+        "SELECT id, observed_at, data_json FROM events "
+        "WHERE event_type='observation.finding' AND observed_at>=?",
+        (now - RISK_WINDOW,)).fetchall()
+    by_entity = {}
+    for row in rows:
+        try:
+            f = json.loads(row["data_json"])
+        except Exception:
+            continue
+        entity = _entity(f)
+        if not entity:
+            continue
+        w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
+             * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7))
+        if w <= 0:
+            continue
+        ek = hashlib.sha256(entity.encode("utf-8", "replace")).hexdigest()[:16]
+        b = by_entity.setdefault(ek, {"weight": 0.0, "fps": set(), "ids": set(),
+                                      "entity": entity, "new": False})
+        fp = f.get("fingerprint")
+        if fp in b["fps"]:
+            continue  # count each distinct signal once, not once per rescan
+        b["fps"].add(fp)
+        b["weight"] += w
+        b["ids"].add(row["id"])
+        if row["id"] in new_ids:
+            b["new"] = True
+    for ek, b in by_entity.items():
+        if b["new"] and len(b["fps"]) >= RISK_MIN_SIGNALS \
+                and b["weight"] >= RISK_THRESHOLD:
+            _upsert_incident(
+                db, "risk:%s" % ek,
+                "Accumulated risk on %s (%d signals, score %.1f)"
+                % (b["entity"][:80], len(b["fps"]), b["weight"]),
+                "HIGH", "risk", now, sorted(b["ids"]))
+
+
 def _apply_correlations(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset()):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
@@ -1119,6 +1268,9 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         "chain:supply-chain", "Background-item execution chain",
         lambda f: f.get("category") == "btm",
         lambda f: f.get("category") in ("process", "hot-dir", "persistence"))
+
+    # Middle tier: pile-up of weak signals on one entity → one 'risk' incident.
+    _accumulate_risk(db, now, new_ids)
 
     # Every uncorrelated HIGH+ signal still becomes one actionable incident.
     for event_id, f in new_events:
@@ -2067,7 +2219,17 @@ def check_hot_dirs(max_age_days=14):
                 # cutoff decided inside — bundle freshness is max(root, exe).
                 findings.extend(_check_hot_app(path, st, cutoff))
                 continue
-            if st.st_mtime < cutoff:
+            # Timestomp (T1070.006): a payload may backdate its mtime to age out
+            # of the hot window. ctime/btime can't be moved from userland, so a
+            # file whose mtime is old BUT whose ctime/btime is recent AND whose
+            # timestamps are internally inconsistent is a backdated fresh drop —
+            # do NOT let the mtime cutoff skip it.
+            ts_reason = timestomp_signal(path, st)
+            btime = getattr(st, "st_birthtime", None)
+            backdated_fresh = (ts_reason is not None
+                               and (st.st_ctime >= cutoff
+                                    or (btime is not None and btime >= cutoff)))
+            if st.st_mtime < cutoff and not backdated_fresh:
                 continue
             if not os.path.isfile(path):
                 continue
@@ -2079,15 +2241,18 @@ def check_hot_dirs(max_age_days=14):
                 quar, agent = quarantine_origin(path)
                 prov = ("via %s" % agent if agent else
                         ("quarantined" if quar else "NO quarantine flag — side-loaded (bypassed Gatekeeper)"))
+                ts_note = "; TIMESTOMP: %s" % ts_reason if ts_reason else ""
                 findings.append(finding(
                     "HIGH", "hot-dir", "Unsigned executable in watched folder",
-                    "%s [%s], modified %s, %s" % (
+                    "%s [%s], modified %s, %s%s" % (
                         path, sig["trust"],
                         datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
-                        prov),
+                        prov, ts_note),
                     "hotdir:%s:%s:%s" % (path, sig["trust"], sha),
                     path=path, trust=sig["trust"], sha256=sha,
-                    quarantined=quar, download_agent=agent))
+                    quarantined=quar, download_agent=agent,
+                    timestomp=ts_reason,
+                    markers=(["timestomp"] if ts_reason else None)))
     return findings
 
 
@@ -2803,6 +2968,436 @@ def diff_listeners(prior, cur):
     return _diff_map(prior, cur, new_fn)
 
 
+# --- Outbound connections (exfil-in-flight) ----------------------------------
+# The attribution token `<proc>:<pid>` sits after the state + numeric byte
+# columns, right before the 4–8-hex flags column. proc may contain spaces and is
+# truncated ('Google Chrome He'), so we anchor on the segment AFTER 'ESTABLISHED'
+# and take the first letter-led run before ':<pid>' (a numeric address never
+# starts with a letter, so this can't grab a column).
+_NETSTAT_PROC_RE = re.compile(r"([A-Za-z][\w .()\-/]*?):(\d+)\s+[0-9a-f]{4,}\b")
+
+
+def _parse_netstat_established(text):
+    """[(proc, pid, remote_ip, remote_port)] for ESTABLISHED **outbound** TCP from
+    `netstat -anv`. The remote address is the 5th field in dotted IP.port form.
+    Loopback remotes are dropped (not egress). Never raises on a malformed row."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 6 or not parts[0].startswith("tcp"):
+            continue
+        if "ESTABLISHED" not in parts:
+            continue
+        remote = parts[4]
+        rip, _, rport = remote.rpartition(".")
+        if not rip or not rport.isdigit():
+            continue
+        if rip.startswith(("127.", "::1", "fe80:")) or rip in ("localhost", "*"):
+            continue
+        rhs = line.split("ESTABLISHED", 1)[1]
+        m = _NETSTAT_PROC_RE.search(rhs)
+        proc = m.group(1).strip() if m else "?"
+        pid = m.group(2) if m else None
+        rows.append((proc, pid, rip, rport))
+    return rows
+
+
+def _outbound_finding(path, rip, rport):
+    """Score one outbound connection. A finding only for an unsigned/ad-hoc/broken
+    binary in a user-writable path (the rogue-payload-phoning-home shape); None
+    for a signed or system-path process (a browser/updater talking out is normal).
+    MEDIUM/medium-confidence: logged + fed to correlation, below the notify floor
+    (ad-hoc dev binaries talk to the network routinely — must not page alone)."""
+    if not (path and path.startswith("/")):
+        return None
+    trust = classify_signature(path)["trust"]
+    if not (suspicious_sig(trust) and is_risky_location(path)):
+        return None
+    return finding(
+        "MEDIUM", "net-outbound", "Unsigned binary connected outbound",
+        "%s [%s] in a user-writable path is connected to %s:%s — an "
+        "ad-hoc/unsigned binary holding an outbound socket is a payload-"
+        "phoning-home / exfil shape. Recorded for correlation."
+        % (path, trust, rip, rport),
+        "outbound:%s:%s:%s" % (path, rip, rport), path=path, program=path,
+        remote=rip, port=rport, trust=trust, confidence="medium",
+        markers=["outbound-exfil"])
+
+
+def check_outbound():
+    """Record the exfil shape the listener surface is structurally blind to: an
+    unsigned/ad-hoc/broken binary in a user-writable path holding an ESTABLISHED
+    outbound connection. We can't baseline-diff outbound (a browser opens
+    hundreds) and `netstat -n` shows only numeric peers, so this scores live via
+    _outbound_finding. Best-effort: a netstat non-answer yields no findings."""
+    out, _, rc = run(NETSTAT_CMD, timeout=15)
+    if rc in (124, 127) or not out:
+        return []
+    findings = []
+    seen = set()
+    for _proc, pid, rip, rport in _parse_netstat_established(out):
+        path = None
+        if pid:
+            pout, _, prc = run(["ps", "-o", "comm=", "-p", pid], timeout=6)
+            if prc == 0 and pout.strip():
+                path = pout.strip()
+        if not (path and path.startswith("/")):
+            continue
+        key = "%s:%s:%s" % (path, rip, rport)
+        if key in seen:
+            continue
+        seen.add(key)
+        f = _outbound_finding(path, rip, rport)
+        if f:
+            findings.append(f)
+    return findings
+
+
+# --- Unified-log security harvest (Gatekeeper / syspolicy denials) ------------
+_SYSPOLICY_DENY_RE = re.compile(
+    r"\b(?:denied|blocked|rejected|will not be permitted|gke.*deny)\b", re.I)
+
+
+def _parse_syspolicy_denials(ndjson_text):
+    """[(message, timestamp)] of Gatekeeper/syspolicy DENIAL events from
+    `log show --style ndjson` output. A denial means something tried to run and
+    was blocked — high-signal, low-volume. Pure/fixture-testable; tolerant of
+    non-object records and non-JSON lines (never raises)."""
+    hits = []
+    for line in (ndjson_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("eventMessage") or ""
+        if not isinstance(msg, str) or not _SYSPOLICY_DENY_RE.search(msg):
+            continue
+        hits.append((msg.strip(), ev.get("timestamp") or ""))
+    return hits
+
+
+def check_security_log(window_hours=None):
+    """Harvest Gatekeeper/syspolicy DENIAL events from the unified log the same
+    unprivileged `log show` way check_xprotect does — a new security domain for
+    ~free. Kept at MEDIUM/low-confidence (log+correlation tier, below the notify
+    floor): the live message format varies by OS build and can't be verified
+    against a real denial in the field here, so it enriches without risking a
+    noisy page. On any log-read failure it degrades to empty (never a storm)."""
+    if window_hours is None:
+        window_hours = 6
+    win = "%dh" % max(1, min(int(window_hours), 48))
+    out, _, rc = run(["log", "show", "--last", win, "--style", "ndjson",
+                      "--predicate", 'subsystem == "com.apple.syspolicy"'],
+                     timeout=45)
+    if rc != 0 or not out:
+        return []
+    findings = []
+    for msg, ts in _parse_syspolicy_denials(out):
+        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]
+        findings.append(finding(
+            "MEDIUM", "gatekeeper", "Gatekeeper/syspolicy blocked a launch",
+            "syspolicy denied/blocked an item at %s: %s — something the OS did "
+            "not trust tried to run; verify it was expected." % (ts, msg[:240]),
+            "gatekeeper:deny:%s" % digest, confidence="low",
+            markers=["gatekeeper-deny"]))
+    return findings
+
+
+# --- Auth sessions (remote login / screen sharing) ---------------------------
+def _parse_who_remote(text):
+    """{user@host:tty: host} for REMOTE sessions only — a parenthesized origin at
+    the end of a `who` line marks ssh / screen-sharing. Local console/ttys carry
+    no host and are ignored (they churn on every terminal window)."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = re.search(r"\(([^)]+)\)\s*$", line)
+        if not m:
+            continue
+        host = m.group(1).strip()
+        if not host or host in ("localhost", ":0", ":0.0"):
+            continue
+        parts = line.split()
+        user = parts[0] if parts else "?"
+        tty = parts[1] if len(parts) > 1 else "?"
+        out["%s@%s:%s" % (user, host, tty)] = host
+    return out
+
+
+def snapshot_auth_sessions():
+    """{session_key: origin_host} of active REMOTE login sessions, or None if
+    `who` could not be read (a non-answer, not 'no sessions' — never adopt/diff a
+    false-empty)."""
+    out, _, rc = run(WHO_CMD, timeout=8)
+    if rc in (124, 127):
+        return None
+    return _parse_who_remote(out)
+
+
+def diff_auth_sessions(prior, cur):
+    def new_fn(key, host):
+        return finding(
+            "HIGH", "auth-session", "New remote login session",
+            "%s — a remote (ssh / screen-sharing) session appeared from %s. A "
+            "personal Mac rarely has an active remote login; verify this is you "
+            "(and that Remote Login / Screen Sharing being on is intended)."
+            % (key, host), "auth-session:%s" % key, session=key, origin=host,
+            confidence="medium", markers=["remote-access"])
+    return _diff_map(prior, cur, new_fn)
+
+
+# --- AI-agent skill directories (2026 AMOS supply-chain channel) --------------
+def _skill_signature(skill_dir):
+    """A stable content signature for an agent-skill dir: the hash of its
+    instruction file (SKILL.md — what an OpenClaw/Claude-skill attack weaponizes
+    to drive a fake password dialog) plus the sorted names of any executable /
+    script payloads it ships alongside. Cheap; None-safe."""
+    parts = []
+    for cand in ("SKILL.md", "skill.md", "manifest.json", "plugin.json",
+                 "AGENTS.md"):
+        p = os.path.join(skill_dir, cand)
+        if os.path.isfile(p):
+            h = sha256(p)
+            if h:
+                parts.append("%s=%s" % (cand, h))
+    execs = []
+    try:
+        for name in sorted(os.listdir(skill_dir)):
+            fp = os.path.join(skill_dir, name)
+            if os.path.isfile(fp) and (
+                    os.access(fp, os.X_OK) or
+                    name.endswith((".sh", ".py", ".js", ".rb", ".pl", ".command"))):
+                execs.append(name)
+    except Exception:
+        pass
+    if execs:
+        parts.append("exec=" + ",".join(execs))
+    return "|".join(parts) or "empty"
+
+
+def snapshot_agent_skills():
+    """{root/skill: signature} for every installed AI-agent skill. Resolves
+    symlinked roots (the canonical skills tree is often a symlink into a projects
+    folder)."""
+    snap = {}
+    for root in AGENT_SKILL_ROOTS:
+        try:
+            names = sorted(os.listdir(root))
+        except Exception:
+            continue
+        label = os.path.basename(root.rstrip("/")) or root
+        for name in names:
+            if name.startswith("."):
+                continue
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            snap["%s/%s" % (label, name)] = _skill_signature(d)
+    return snap
+
+
+def diff_agent_skills(prior, cur):
+    # Both tiers stay BELOW the notify floor (MEDIUM): the owner authors skills,
+    # so changes are routine — we want a durable record + a correlation input (a
+    # new/changed skill that is followed by an osascript password-phish becomes a
+    # correlated incident), not an interrupt. 'changed' is low-confidence because
+    # a skills author edits constantly; 'new' is medium (a skill you did not add).
+    def new_fn(key, sig):
+        return finding(
+            "MEDIUM", "agent-skill", "New AI-agent skill installed",
+            "%s appeared — AI-agent skills run with your full privileges and are "
+            "a live 2026 stealer channel (a malicious SKILL.md can drive a fake "
+            "password dialog). Verify you installed it." % key,
+            "agent-skill:new:%s" % key, skill=key, confidence="medium",
+            markers=["agent-skill"])
+
+    def changed_fn(key, sig, old):
+        return finding(
+            "MEDIUM", "agent-skill", "AI-agent skill changed",
+            "%s was modified — its SKILL.md or a shipped script changed. Routine "
+            "when you author skills; a change you did not make is a supply-chain "
+            "hijack." % key,
+            "agent-skill:changed:%s:%s"
+            % (key, hashlib.sha256(sig.encode()).hexdigest()[:12]),
+            skill=key, confidence="low", markers=["agent-skill"])
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Timestomp detection (T1070.006) -----------------------------------------
+def timestomp_signal(path, st=None):
+    """A reason string if a file's timestamps look tampered, else None. `touch`/
+    `SetFile` move mtime/atime but CANNOT move ctime (inode-change time) or btime
+    (birth time) from unprivileged userland — so an mtime that predates ctime by
+    a wide margin, or an mtime far older than btime, is a strong backdating
+    signal (a dropped payload made to look old to age out of a hot-dir window).
+    Pass an existing os.stat result to avoid a redundant stat in a scan loop."""
+    if st is None:
+        try:
+            st = os.stat(path)
+        except Exception:
+            return None
+    mtime = st.st_mtime
+    ctime = st.st_ctime
+    btime = getattr(st, "st_birthtime", None)
+    # mtime well BEFORE ctime: the content was 'last modified' before the inode
+    # itself changed — impossible without backdating. 1h slop absorbs normal skew.
+    if mtime < ctime - 3600:
+        return ("mtime (%s) predates ctime (%s) by >1h — backdated timestamp"
+                % (_fmt_epoch(mtime), _fmt_epoch(ctime)))
+    if btime and mtime < btime - 3600:
+        return ("mtime (%s) predates the file's birth time (%s) — backdated"
+                % (_fmt_epoch(mtime), _fmt_epoch(btime)))
+    return None
+
+
+def _fmt_epoch(e):
+    try:
+        return datetime.fromtimestamp(e, timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    except Exception:
+        return str(int(e))
+
+
+# --- Survivability: HMAC-watermarked tamper-evidence -------------------------
+def _hmac_key():
+    """Load (or lazily create, 0600) the HMAC key that watermarks trust-store
+    state. Kept in its OWN file, not beside the data: an attacker who edits
+    baseline.json and recomputes a plain sha256 (what most tooling does) still
+    can't forge the MAC without also reading the key — a second, observable step.
+    (A same-uid attacker who DOES read the key can still forge; no unprivileged
+    tool can close that. This raises the bar from trivial to deliberate.)"""
+    try:
+        with open(HMAC_KEY_FILE, "rb") as f:
+            k = f.read()
+        if len(k) >= 16:
+            return k
+    except Exception:
+        pass
+    k = os.urandom(32)
+    try:
+        fd = os.open(HMAC_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(k)
+    except FileExistsError:
+        try:
+            with open(HMAC_KEY_FILE, "rb") as f:
+                return f.read()
+        except Exception:
+            return k
+    except Exception:
+        pass
+    return k
+
+
+def _hmac_file(path):
+    """HMAC-SHA256 of a file's bytes under the local key, or None if unreadable."""
+    try:
+        h = hmac.new(_hmac_key(), digestmod=hashlib.sha256)
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+# --- Survivability: dead-man's-switch heartbeat ------------------------------
+def _aegis_config():
+    return load_json(AEGIS_CONFIG, {})
+
+
+def _heartbeat_url():
+    u = os.environ.get(HEARTBEAT_URL_ENV, "").strip()
+    if u:
+        return u
+    u = _aegis_config().get("heartbeat_url")
+    return u.strip() if isinstance(u, str) and u.strip() else None
+
+
+def read_heartbeat():
+    return load_json(HEARTBEAT_FILE, {})
+
+
+def _post_heartbeat(url, beat):
+    """Best-effort OUT-OF-BAND beat POST. Lazy-imports urllib so the default
+    (no URL) scan path never even loads networking — the same local-only-by-
+    construction guarantee as `vt`. Redacts before sending. Never raises."""
+    try:
+        import urllib.request
+        body = redact_sensitive(json.dumps(beat, sort_keys=True)).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "aegis"})
+        with urllib.request.urlopen(req, timeout=8):
+            pass
+        return True
+    except Exception as e:
+        log_run("heartbeat post failed: %s" % e)
+        return False
+
+
+def write_heartbeat(status="ok", alerts=0, top_alert=None):
+    """Record a liveness beat on every healthy scan (ALWAYS — no network). An
+    external watcher, a peer launchd agent, or `aegis.py watchdog` treats a STALE
+    beat as the alarm: absence of the beat is the one signal a same-uid attacker
+    who SIGKILLs or boots-out Aegis cannot suppress off-box. If (and ONLY if) an
+    off-host URL is configured, ALSO POST the beat + top alert out-of-band so
+    'silence' leaves the box the same run every LOCAL sink is being suppressed.
+    Off by default → the scan/watch path stays local-only."""
+    beat = {"ts": now_iso(), "epoch": int(time.time()), "pid": os.getpid(),
+            "status": status, "alerts": int(alerts),
+            "top_alert": redact_sensitive((top_alert or ""))[:200]}
+    try:
+        save_json(HEARTBEAT_FILE, beat)
+    except Exception:
+        pass
+    url = _heartbeat_url()
+    if url:
+        _post_heartbeat(url, beat)
+    return beat
+
+
+# --- Opt-in privileged tier: XProtect Behavioral (Bastion) DB ----------------
+def _parse_xpdb(db_path):
+    """Return [(rule, process, item, ts)] of XProtect Behavioral Service (Bastion)
+    violations from the root-only XPdb SQLite store. Apple RECORDS stealer-shape
+    behavior here (a process touching browser data / Messages / keychain) but
+    never alerts on it — so surfacing rows is free high-signal coverage. Read
+    defensively across schema variants; never raises."""
+    rows = []
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=8)
+    except Exception:
+        return rows
+    try:
+        con.row_factory = sqlite3.Row
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        target = next((t for t in tables
+                       if "violation" in t.lower() or "event" in t.lower()
+                       or "bastion" in t.lower()), tables[0] if tables else None)
+        if not target:
+            return rows
+        for r in con.execute("SELECT * FROM \"%s\" LIMIT 2000" % target).fetchall():
+            d = {k: r[k] for k in r.keys()}
+            rule = str(d.get("rule") or d.get("rule_id") or d.get("policy") or "?")
+            proc = str(d.get("process") or d.get("responsible") or
+                       d.get("path") or d.get("initiating_process") or "?")
+            item = str(d.get("target") or d.get("resource") or
+                       d.get("file") or "")
+            ts = str(d.get("timestamp") or d.get("time") or d.get("date") or "")
+            rows.append((rule, proc, item, ts))
+    except Exception:
+        pass
+    finally:
+        con.close()
+    return rows
+
+
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
 SURFACES = [
     ("shellrc", snapshot_shellrc, diff_shellrc),
@@ -2814,6 +3409,8 @@ SURFACES = [
     ("wallet", snapshot_wallet, diff_wallet),
     ("listeners", snapshot_listeners, diff_listeners),
     ("btm", snapshot_btm, diff_btm),
+    ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+    ("agent_skills", snapshot_agent_skills, diff_agent_skills),
 ]
 
 
@@ -2873,18 +3470,26 @@ def check_self_protection():
     # allowlist.json live in ~/.aegis, writable by the SAME uid as the dominant
     # same-user stealer class. An attacker who poisons the baseline (blesses its
     # own persistence) or pre-inserts an allowlist entry makes Aegis diff against
-    # corrupted ground truth. We record each file's hash right after WE write it;
-    # a mismatch at the next scan means it changed by a hand that wasn't ours.
+    # corrupted ground truth. We record each file's HMAC (keyed watermark) right
+    # after WE write it; a mismatch at the next scan means it changed by a hand
+    # that wasn't ours — and, unlike a plain sha, an attacker who recomputes the
+    # hash of an edited file still can't forge the MAC without also reading the
+    # key file. Falls back to the legacy sha watermark for installs upgraded
+    # before a MAC was recorded (the next record_selfstate writes the MAC).
     for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
-        recorded = st.get("%s_sha" % name)
-        cur_sha = sha256(path) if os.path.exists(path) else None
+        recorded_mac = st.get("%s_mac" % name)
+        recorded = recorded_mac or st.get("%s_sha" % name)
+        exists = os.path.exists(path)
+        cur_watermark = (_hmac_file(path) if recorded_mac else sha256(path)) \
+            if exists else None
+        cur_sha = sha256(path) if exists else None
         # `recorded` is only set once record_selfstate saw the file exist, so a
-        # truthy `recorded` means it existed. cur_sha is None => the file is now
-        # gone (deletion — the more dangerous tamper: it forces the next scan onto
-        # the first_run path, silently re-baselining current persistence as
-        # known-good). A differing hash => modification. Both are tampering.
-        if recorded and cur_sha != recorded:
-            if cur_sha is None:
+        # truthy `recorded` means it existed. cur_watermark is None => the file is
+        # now gone (deletion — the more dangerous tamper: it forces the next scan
+        # onto the first_run path, silently re-baselining current persistence as
+        # known-good). A differing watermark => modification. Both are tampering.
+        if recorded and cur_watermark != recorded:
+            if cur_watermark is None:
                 detail = ("%s was DELETED out-of-band — Aegis recorded its "
                           "integrity hash but the file is now gone. A missing "
                           "trust store forces the next scan to silently "
@@ -2913,9 +3518,14 @@ def record_selfstate():
         st["findings_size"] = os.path.getsize(FINDINGS_LOG)
     except Exception:
         st["findings_size"] = 0
-    # Record trust-store hashes so the NEXT scan can detect out-of-band edits.
+    # Record trust-store watermarks so the NEXT scan can detect out-of-band
+    # edits: the keyed HMAC is the primary tamper watermark (an attacker can't
+    # forge it without the key), and the plain sha is retained because
+    # _migrate_baseline uses `baseline_sha` as its own out-of-band-edit guard.
     for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
-        st["%s_sha" % name] = sha256(path) if os.path.exists(path) else None
+        present = os.path.exists(path)
+        st["%s_sha" % name] = sha256(path) if present else None
+        st["%s_mac" % name] = _hmac_file(path) if present else None
     save_json(SELFSTATE, st)
 
 
@@ -3016,6 +3626,8 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("hot-dir", check_hot_dirs, ()),
         ("staging", check_staging, ()),
         ("canary", check_canaries, ()),
+        ("outbound", check_outbound, ()),
+        ("security-log", check_security_log, ()),
         ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
         ("self-protection", check_self_protection, ()),
@@ -3125,7 +3737,15 @@ def emit(findings, first_run, adopt=frozenset()):
             suppressed = (
                 (first_run and f["category"] in ("persistence", "shell-history"))
                 or f["category"] in adopt)
-            if not suppressed and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
+            # Two-axis routing gate: notify only when severity clears the floor
+            # AND confidence is not 'low'. A high-impact-but-noisy hit (explicit
+            # confidence='low') is still logged/correlated but routed to the
+            # digest tier instead of interrupting — the anti-fatigue rule that
+            # keeps the tool trusted. Default 'medium' keeps every existing
+            # finding's notify behavior byte-identical.
+            low_conf = CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0
+            if not suppressed and not low_conf \
+                    and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
                 new_high.append(f)
     save_json(SEEN, _cap_seen(seen))
 
@@ -3298,6 +3918,12 @@ def _cmd_scan_locked(quiet=False):
                       sensor_health=persisted_health)
     flush_sigcache()
     record_selfstate()
+    # Dead-man's-switch beat: a completed scan is proof of life. Its ABSENCE is
+    # what an external watcher / peer agent / `aegis.py watchdog` alarms on — the
+    # one signal a same-uid attacker who kills or boots-out Aegis can't suppress
+    # off-box. POSTs out-of-band only if a URL is configured (else local-only).
+    write_heartbeat(status="ok", alerts=len(new_high),
+                    top_alert=new_high[0]["title"] if new_high else None)
     log_run("scan: %d findings, %d new-high, first_run=%s"
             % (len(findings), len(new_high), first_run))
 
@@ -3561,7 +4187,50 @@ def cmd_status():
                 mark, item["sensor_id"], item["status"],
                 (" — " + item["detail"]) if item["detail"] else ""))
     print("\n# Incidents\n  %d active" % len(list_incidents()))
+
+    # Survivability (dead-man's switch) + capability posture.
+    print("\n# Survivability")
+    beat = read_heartbeat()
+    if beat.get("epoch"):
+        age = int(time.time()) - int(beat["epoch"])
+        mark = "✓" if age <= HEARTBEAT_STALE_SECS else "✗"
+        print("  %s %-32s last beat %d min ago (pid %s)"
+              % (mark, "Heartbeat", age // 60, beat.get("pid", "?")))
+    else:
+        print("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
+    print("  %s %-32s %s" % (
+        "✓" if _heartbeat_url() else "·", "Off-host heartbeat",
+        "configured (out-of-band alerting on)" if _heartbeat_url()
+        else "off (local-only; set AEGIS_HEARTBEAT_URL to enable)"))
+    if os.path.exists(WATCHDOG_ALERT):
+        try:
+            with open(WATCHDOG_ALERT) as f:
+                last = f.read().strip().splitlines()[-1]
+        except Exception:
+            last = "(unreadable)"
+        print("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
+    fda = _has_full_disk_access()
+    print("  %s %-32s %s" % (
+        "✓" if fda else "·", "Full Disk Access",
+        "granted (Downloads/Desktop/Bastion in scope)" if fda
+        else "not granted (Downloads/Desktop scan degraded; grant to python3)"))
     return 0
+
+
+def _has_full_disk_access():
+    """Silent FDA self-test: opening the per-user TCC.db does NOT raise a TCC
+    prompt, so a successful read means this process holds Full Disk Access.
+    Probed from whatever context calls it — note a launchd agent's grant differs
+    from an interactive shell's, so `status` (interactive) and the agent may
+    disagree; that is real, not a bug."""
+    tcc = os.path.join(HOME, "Library", "Application Support",
+                       "com.apple.TCC", "TCC.db")
+    try:
+        with open(tcc, "rb") as f:
+            f.read(16)
+        return True
+    except Exception:
+        return False
 
 
 def _vt_api_key():
@@ -4751,6 +5420,82 @@ def cmd_neutralize(plist_path):
     return 0 if rc_plist == 0 else 1
 
 
+def cmd_watchdog():
+    """Dead-man's-switch check: is the monitor still beating? Meant to be run by
+    a SECOND launchd agent or cron (the unprivileged mutual-watchdog), or by an
+    external monitor. Exits non-zero and raises a DURABLE alert (notification +
+    a sentinel the next interactive session sees) when the last heartbeat is
+    missing-though-armed or older than the tolerance — precisely the state a
+    killed / booted-out / frozen Aegis leaves behind. Idempotent: clears the
+    sentinel once the beat is healthy again."""
+    ensure_state()
+    beat = read_heartbeat()
+    armed = bool(beat) or os.path.exists(BASELINE)  # a fresh install isn't "dead"
+    now = int(time.time())
+    last = int(beat.get("epoch") or 0)
+    age = now - last if last else None
+    stale = armed and (age is None or age > HEARTBEAT_STALE_SECS)
+    if stale:
+        human = ("no heartbeat on record" if age is None
+                 else "last beat %d min ago (> %d min tolerance)"
+                 % (age // 60, HEARTBEAT_STALE_SECS // 60))
+        msg = ("Aegis watchdog: the monitor is NOT beating — %s. It may have been "
+               "killed, unloaded (launchctl bootout), frozen, or the Mac was "
+               "asleep. Verify the agent is running (`launchctl list | grep "
+               "aegis`) and re-run install.sh if needed." % human)
+        try:
+            with open(WATCHDOG_ALERT, "w") as f:
+                f.write("%s  %s\n" % (now_iso(), msg))
+            os.chmod(WATCHDOG_ALERT, 0o600)
+        except Exception:
+            pass
+        notify("Aegis watchdog: monitor not beating", human)
+        log_run("watchdog: STALE (%s)" % human)
+        print(msg)
+        return 1
+    # Healthy — clear any stale sentinel from a prior firing.
+    try:
+        if os.path.exists(WATCHDOG_ALERT):
+            os.remove(WATCHDOG_ALERT)
+    except Exception:
+        pass
+    print("Aegis watchdog: OK — last heartbeat %d min ago (pid %s)."
+          % ((age or 0) // 60, beat.get("pid", "?")))
+    return 0
+
+
+def cmd_bastion():
+    """OPT-IN privileged tier: surface Apple's XProtect Behavioral Service
+    (Bastion) violations. Apple records stealer-shape behavior (a process
+    touching browser data / Messages / the keychain) to a root-only SQLite DB and
+    NEVER alerts the user on it — so this is free high-signal coverage no
+    unprivileged layer can reach. Needs `sudo` (the DB is 0600 root); read-only.
+    Prints how to run it and exits 2 when the DB can't be read, so the default
+    unprivileged scan path is unaffected."""
+    ensure_state()
+    if not os.path.exists(XPDB_PATH):
+        print("XProtect Behavioral (Bastion) DB not present at %s — this macOS "
+              "build may not ship it, or it has no records yet." % XPDB_PATH)
+        return 2
+    if not os.access(XPDB_PATH, os.R_OK):
+        print("Bastion DB is root-only (0600). Re-run with elevation:\n"
+              "    sudo %s bastion" % _SELF_PATH)
+        return 2
+    rows = _parse_xpdb(XPDB_PATH)
+    if not rows:
+        print("Bastion DB read OK — no behavioral violations recorded.")
+        return 0
+    print("# XProtect Behavioral (Bastion) violations — %d recorded\n" % len(rows))
+    for rule, proc, item, ts in rows[:200]:
+        print("  🟥 %s  rule=%s  process=%s%s"
+              % (ts or "?", rule, proc, ("  target=%s" % item) if item else ""))
+    print("\nApple records these but does not alert on them. A process touching "
+          "browser/keychain/Messages data it shouldn't is a stealer signature — "
+          "investigate any you don't recognize.")
+    log_run("bastion: surfaced %d XPdb rows" % len(rows))
+    return 0
+
+
 HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
 
  DETECT (default; runs on a launchd interval, never destructive)
@@ -4770,6 +5515,11 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
   watch [secs]     event-driven monitor: kqueue rescan seconds after a watched
                    path changes + a full scan every [secs] (default 600) as a
                    floor. Production: bash install.sh watch
+  watchdog         dead-man's switch: exit non-zero + alert if the monitor has
+                   stopped beating (run from a 2nd launchd agent/cron as a
+                   mutual-watchdog, or externally)
+  bastion          OPT-IN, needs sudo: surface Apple's XProtect Behavioral
+                   (Bastion) violations Apple records but never alerts on
 
  RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
   quarantine <path>      atomically confine a file or valid .app bundle
@@ -4812,6 +5562,10 @@ def main(argv):
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
+    if cmd == "watchdog":
+        return cmd_watchdog()
+    if cmd == "bastion":
+        return cmd_bastion()
     # --- response tier (opt-in) ---
     if cmd == "quarantine" and len(argv) > 2:
         return cmd_quarantine(argv[2])

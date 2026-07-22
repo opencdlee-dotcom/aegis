@@ -86,6 +86,11 @@ python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends on
                                #   the hash, never the file; scan stays local-only)
 python3 aegis.py canary        # plant ransomware canary/honeypot files (opt-in)
 python3 aegis.py canary remove # ...and remove them
+python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
+                               #   monitor has stopped beating (run from a 2nd
+                               #   launchd agent/cron as a mutual-watchdog)
+python3 aegis.py bastion       # OPT-IN, needs sudo: surface Apple's XProtect
+                               #   Behavioral (Bastion) violations it never alerts on
 
 # RESPONSE TIER — opt-in, run by hand on a reviewed finding (never automatic):
 python3 aegis.py quarantine PATH     # atomically confine a file or valid .app bundle

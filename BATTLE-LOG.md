@@ -1,3 +1,35 @@
+# Aegis — Roadmap build (2026-07-22, `/doit`: 10 research-derived layers)
+
+Implemented the prioritized roadmap from the deep-research + 7-lens STORM
+synthesis (see the Swiss-cheese blueprint). Each new detector is pinned by a
+fail-before/pass-after regression test in `tests/test_roadmap.py`; the full suite
+is **246 tests** (218 prior, untouched, + 28 new) + `selftest` green, and a live
+end-to-end scan in a throwaway `$HOME` ran clean twice (rc 0, heartbeat +
+watchdog working, no alert storm, no exceptions).
+
+| # | Layer added | Shape | Tier |
+|---|-------------|-------|------|
+| 1 | **Dead-man's switch** | `write_heartbeat` on every healthy scan (always, no network) + `aegis.py watchdog` peer/cron check that alarms on a stale/absent beat with a durable sentinel; **opt-in** off-host POST (`AEGIS_HEARTBEAT_URL`, BYO) for out-of-band egress. Closes the one hole no other layer covers — a same-uid SIGKILL/bootout can't suppress the beat off-box. | survivability |
+| 2 | **Confidence axis + risk accumulator** | `finding()` gains a `confidence` field (separate from severity); the notify gate demotes explicit low-confidence HIGHs to digest; a per-entity decaying risk accumulator opens one `risk` incident when ≥3 distinct signals pile up on one entity (Elastic building-block→entity-risk pattern). | scoring |
+| 3 | **Gatekeeper/syspolicy harvest** | Unified-log `syspolicy` denial harvest (same unprivileged `log show` path as XProtect), MEDIUM/low-confidence — log+correlation tier (live format unverifiable in the field → below the notify floor). | detection |
+| 4 | **Outbound exfil** | `netstat -anv` process-attributed outbound diff: an unsigned/ad-hoc binary in a user-writable path holding an ESTABLISHED socket → MEDIUM (feeds correlation; ad-hoc dev binaries talk out routinely, so it must not page alone). | detection |
+| 5 | **HMAC trust-store watermark** | Baseline/allowlist tamper-evidence upgraded from a plain sha to a keyed HMAC — an attacker who edits state AND recomputes the sha still can't forge the MAC without the key file (a second, observable step). | survivability |
+| 6 | **Agent-skill sensor** | New SURFACE over `~/.claude/skills` (+codex/gemini): a new/changed skill dir (SKILL.md hash + shipped-exec names) — a live 2026 AMOS channel. Both tiers below the notify floor (a skills author edits constantly) → durable record + correlation input. | detection |
+| 7 | **Auth-session sensor** | New SURFACE: baseline-diffs active REMOTE (`who` parenthesized-origin) sessions → a new ssh/screen-sharing login is HIGH. Complements the `authorized_keys` persistence check. | detection |
+| 8 | **Timestomp** | Hot-dir drops compare ctime/btime vs mtime; a backdated mtime that would age a payload out of the hot window no longer skips it (ctime/btime can't be moved from userland). | detection |
+| 9 | **Residual ASEP persistence** | Authorization plugins, Spotlight importers, QuickLook generators, scripting additions, and folder actions added to the content-hash+diff machinery (KnockKnock residual categories). *(A standalone dylib-hijack Mach-O scanner is deferred — an FP-prone parser would violate the no-regression bar; noted as the remaining #9 residual.)* | detection |
+| 10 | **Bastion/XPdb opt-in tier** | `sudo aegis.py bastion` surfaces XProtect Behavioral Service violations Apple records to a root-only SQLite DB but never alerts on — free high-signal coverage no unprivileged layer can reach. | privileged (opt-in) |
+
+**Design guardrails honored:** the scan/watch path stays local-only by default
+(heartbeat POST and the sudo/Bastion tier are both opt-in, mirroring `vt`); new
+noisy-on-a-dev-box surfaces (outbound, agent-skill-changed, syspolicy) sit at
+MEDIUM/low-confidence so they enrich correlation without paging; every new
+state path is sandboxed in the test harness (no real `~/.aegis` writes — the
+P3-3 invariant); and the confidence gate is non-regressive (nothing pre-existing
+is marked low, so every prior notification is byte-identical).
+
+---
+
 # Aegis — Deployment finding (2026-07-16, post-pass-3 — first live `watch` enablement)
 
 Found while switching the live agent from hourly to event-driven watch mode and

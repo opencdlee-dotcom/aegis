@@ -53,6 +53,18 @@ class Sandbox(unittest.TestCase):
             "EVENT_DB": os.path.join(self.state, "aegis.db"),
             "SELFSTATE": os.path.join(self.state, "selfstate.json"),
             "SELF_PLIST": os.path.join(self.state, "com.charlie.aegis.plist"),
+            # Survivability + new-surface state: sandbox every path a scan may
+            # write (heartbeat, hmac key, config, watchdog sentinel) so tests
+            # NEVER touch real ~/.aegis, and stub the new host-reading commands
+            # so scan-level tests stay deterministic and offline.
+            "HEARTBEAT_FILE": os.path.join(self.state, "heartbeat.json"),
+            "HMAC_KEY_FILE": os.path.join(self.state, "hmac.key"),
+            "AEGIS_CONFIG": os.path.join(self.state, "config.json"),
+            "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
+            "AGENT_SKILL_ROOTS": [],
+            "NETSTAT_CMD": ["/usr/bin/true"],  # rc 0, empty → no outbound findings
+            "WHO_CMD": ["/usr/bin/true"],       # rc 0, empty → no remote sessions
+            "XPDB_PATH": os.path.join(self.state, "XPdb-absent"),
             "PERSISTENCE_DIRS": [self.pers],
             "HOT_DIRS": [self.hot],
             # New baseline-diffed surfaces read real machine state (shell rc,
@@ -103,7 +115,8 @@ class Sandbox(unittest.TestCase):
         # on a dev host (what's running / installed varies). Stub them to empty for
         # cmd_scan-level tests — dedicated tests pull the real function from
         # self._saved[...] or call the pure helpers (_argv_signals) directly.
-        for fn in ("check_processes", "check_behavior", "check_xprotect"):
+        for fn in ("check_processes", "check_behavior", "check_xprotect",
+                   "check_security_log"):
             self._saved[fn] = getattr(aegis, fn)
             setattr(aegis, fn, (lambda *a, **k: []))
 
