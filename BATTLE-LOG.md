@@ -1,3 +1,68 @@
+# Aegis — Battle-test pass 2 (2026-07-22, `/battle-test`: siege tier, the 10 new layers)
+
+Adversarial hardening of the 790-line `feat/defense-in-depth-layers` commit. Tier
+**siege** (irreversible response tier: `quarantine`/`destroy`/`kill`). Discipline
+`/fable-mode`; hunting fanned out to 3 oracle-disciplined adversarial agents
+(parsers · detection/severity/diff · integrity/egress) plus a main-thread
+security + side-effect-safety lens. Every oracle derived from README/ARCHITECTURE
+intent, never from the code under test; every finding reproduced against the real
+functions with captured output before it counted.
+
+**Result:** 6 genuine improvements implemented + 1 documentation-honesty pass,
+each pinned by a fail-before/pass-after regression test. Suite **257** (246 prior
++ 11 new) + `selftest` green; test isolation proven leak-free (function-attribute
+completeness scan); heartbeat-egress guard self-test confirms the scan path is
+**inert by default** (0 POSTs, opt-in gate fires only when a URL is set).
+
+## Findings (fixed)
+
+| # | Sev | Where | Defect (vs stated intent) | Evidence | Fix |
+|---|-----|-------|---------------------------|----------|-----|
+| P2-1 | **HIGH** | `tests` (`Sandbox.setUp`) | The suite shipped **red on HEAD**: `check_hardening` was the only host-reading sensor `setUp` did not stub/restore, so ~5 `cmd_scan` tests hand-stubbed `aegis.check_hardening = lambda: []` and never restored it → it **leaked globally and neutered the very test guarding `check_hardening`** (masking any real regression in that sensor). | `pytest tests/` failed 1/246; passes alone; a per-test probe showed `check_hardening` → `[]` for the rest of the suite after `TestShellRc`. | Added `check_hardening` to `setUp`'s stub/restore tuple; guard test pulls the real fn from `self._saved` (the codebase's own pattern). A completeness scan now confirms **zero** `aegis.*` function leaks. |
+| P2-2 (C1) | **HIGH** | `cmd_watchdog` | Dead-man's switch reads a **dead** installed monitor as **alive**: `armed = bool(beat) or exists(BASELINE)` — both anchors live inside `~/.aegis`, so a same-uid `rm -rf ~/.aegis` (the exact threat model) makes a killed monitor return `rc 0 / OK`. Contradicts its own docstring ("alerts when the monitor stopped beating"). | Repro: plist installed + `~/.aegis` wiped → `rc 0` (should ALARM). | Anchor `armed` also on `SELF_PLIST` (lives OUTSIDE `~/.aegis`) and `SELFSTATE.installed`; a genuinely uninstalled box still stays quiet. |
+| P2-3 (A1/B1) | **HIGH** | `_skill_signature` | Shipped agent-skill script payloads were signed **by name only**, so a supply-chain hijack that swaps a script's **body** under the same filename (the most direct attack the surface exists to catch) produced an identical signature → `diff_agent_skills` fired nothing. F4-class. **Independently found by 2 hunters.** | Repro: `run.py` body swapped benign→`curl\|bash`, sig unchanged. | Content-hash each payload (`name@sha16`); broadened payload extensions (`.scpt/.applescript/.zsh/.mjs/…`). Body swap + no-exec interpreter drop now change the signature. |
+| P2-4 (B2) | **MEDIUM** | `_scan_surfaces` | `auth_sessions` was silently adopted on first sight like installed-residue, so an **active remote login present at install/upgrade time** was blessed as known-good and never alerted — violating the README's "live-threat surfaces are never first-run-suppressed" rule. | Repro: live `root@203.0.113.9` session at first-run → `[]` findings, adopted into baseline. | `_NEVER_ADOPT_LIVE = {"auth_sessions"}`: diff against empty on first sight so a live session alerts HIGH immediately; residue surfaces stay first-run-silent (proven by test). |
+| P2-5 (A2) | **MEDIUM** | `_parse_who_remote` | The loopback drop-list held only symbolic forms, so a **loopback ssh session** (`ssh localhost`, VS Code Remote-SSH, git-over-ssh — routine for devs), which `who` records as numeric `127.0.0.1`/`::1`, fired a **HIGH page** on the only auto-paging remote surface. | Repro: `(127.0.0.1)`/`(::1)` → remote-session dict → HIGH. | Added `127.0.0.1`, `::1`, `::ffff:127.0.0.1` to the drop-list; real remotes still detected. |
+| P2-6 (A4) | **LOW** | `_parse_netstat_established` | An IPv4-mapped-IPv6 loopback peer `::ffff:127.0.0.1` wasn't recognized as loopback → counted as egress. | Repro: mapped-loopback row kept as outbound. | Added `::ffff:127.` to the loopback prefix drop. |
+| P2-7 (C3) | doc/comment | README + 2 code comments | **Trust-model contract was false:** README stated "the **only** command that touches the network is `aegis.py vt` … the background scanner … never even imports the networking module," yet the opt-in heartbeat POSTs on the scan path — and the `AEGIS_HEARTBEAT_URL`/`heartbeat_url` knob was **undocumented** (0 hits in README/ARCHITECTURE). Two in-code comments also overstated guarantees (HMAC "can't forge without the key"; agent-skill "auto-correlates" with a later phish — not wired). | `grep heartbeat README ARCHITECTURE` → none; guard self-test showed the scan-path POST. | Softened the README claim to accurately carve out the opt-in, off-by-default, redacted heartbeat egress + documented the knob; corrected both comments to the honest same-uid framing. |
+
+## Verified robust (stated explicitly — not everything hunted was broken)
+
+- **Heartbeat egress is opt-in & inert by default** — 2 sandboxed scans with no URL → **0 POSTs**; gate fires only when a URL is set; wire body is `{ts,epoch,pid,status,alerts,top_alert}`, double-redacted. Local-only-by-construction holds.
+- **No injection sinks** in the new layers — no `eval`/`exec`/`shell=True`/`os.system`/`pickle`; all shells route through the hardened `run()` (list-form, fixed PATH/env, timeouts); `urllib` lazy-imported; `sqlite3` opens `mode=ro`. (`watchdog` binary absent → inline security review, logged.)
+- **All 5 new parsers survive a malformed-input crash sweep** (empty/None/truncated/non-JSON/non-dict/binary) with zero exceptions.
+- `_parse_xpdb`, `_outbound_finding`/`check_outbound` (below-notify by documented intent), `check_security_log`, `timestomp_signal`, `_accumulate_risk`, `cmd_bastion`/`_has_full_disk_access` — no genuine defect found.
+
+## Deferred (documented residual, not fixed)
+
+- **A3 — `_parse_syspolicy_denials` deny-regex narrower than the denial vocabulary** (misses `deny` verdict-token, `Blocking`, `not allowed`). PLAUSIBLE, but the real macOS wording could not be verified in-field (no live denial in the sampled window) and the surface is below the notify floor by design. Changing an unverified security detector's regex was declined per the verify-before-claim rule; left as residual.
+- **C2 — HMAC trust-store gate is same-uid-forgeable** (drop `<name>_mac` from the same-uid-writable `SELFSTATE` → sha-downgrade; or delete `SELFSTATE` → re-bless). Architecturally bounded by the same-uid model the tool already concedes; the honest remediation (correct the overclaiming comment) is a comment-only change that does not clear the genuine-improvement bar alone, so it rode along in P2-7. Real closure needs an off-box/non-attacker-writable anchor.
+- **Agent-skill → correlation chain is not wired** (findings carry no entity → never enter `_accumulate_risk`; `agent-skill` in no `correlate()` rule). Bounded impact (the phish still fires CRITICAL alone); the overstated docstring was corrected in P2-7.
+
+## Side-effect safety / collateral disclosure
+
+- The loop stayed inert **except** for one incident: a hunter subagent's isolation
+  harness wrote the live `~/.aegis/baseline.json` (the `_scan_surfaces` upgrade
+  branch persists), the installed file-watcher then ran a real scan, corrupted the
+  baseline (persistence emptied, a synthetic `root@203.0.113.9` session blessed),
+  and opened spurious HIGH incidents. Verified read-only: the fake session is not
+  in live `who` (no real intrusion). Recovery (`aegis.py baseline` + resolve the
+  spurious incidents) is handed to the operator, **not** auto-run — `baseline`
+  asserts current state as trusted. Lesson pinned: a subagent hunting an installed,
+  file-watched tool MUST redirect every state path (incl. any upgrade-persist
+  branch) before calling a scan-adjacent function.
+
+## Stop-gate (why the loop ended)
+
+One full round across all lenses; oracles mutation-checked; parsers crash-swept;
+integrity/egress guard self-tested; every genuine finding fixed + regression-pinned
+and re-verified green (257 + selftest); a completeness critic (function-leak scan)
+came back clean. New surface saturated by 3 independent hunters + main-thread
+review with only architecturally-bounded residuals remaining. Well under the
+siege 6-round cap.
+
+---
+
 # Aegis — Roadmap build (2026-07-22, `/doit`: 10 research-derived layers)
 
 Implemented the prioritized roadmap from the deep-research + 7-lens STORM

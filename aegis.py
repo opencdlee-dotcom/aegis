@@ -2992,7 +2992,8 @@ def _parse_netstat_established(text):
         rip, _, rport = remote.rpartition(".")
         if not rip or not rport.isdigit():
             continue
-        if rip.startswith(("127.", "::1", "fe80:")) or rip in ("localhost", "*"):
+        if rip.startswith(("127.", "::1", "::ffff:127.", "fe80:")) \
+                or rip in ("localhost", "*"):
             continue
         rhs = line.split("ESTABLISHED", 1)[1]
         m = _NETSTAT_PROC_RE.search(rhs)
@@ -3119,7 +3120,13 @@ def _parse_who_remote(text):
         if not m:
             continue
         host = m.group(1).strip()
-        if not host or host in ("localhost", ":0", ":0.0"):
+        # Drop loopback-equivalent origins in BOTH symbolic and numeric form:
+        # macOS `who` records a loopback ssh peer (ssh localhost, VS Code
+        # Remote-SSH to localhost, git-over-ssh loopback — routine for devs) as
+        # the numeric 127.0.0.1 / ::1, which sshd does not reverse-resolve. Left
+        # in, those fire a HIGH page on this surface's only auto-paging path.
+        if not host or host in ("localhost", "127.0.0.1", "::1",
+                                "::ffff:127.0.0.1", ":0", ":0.0"):
             continue
         parts = line.split()
         user = parts[0] if parts else "?"
@@ -3151,11 +3158,18 @@ def diff_auth_sessions(prior, cur):
 
 
 # --- AI-agent skill directories (2026 AMOS supply-chain channel) --------------
+_SKILL_SCRIPT_EXT = (".sh", ".py", ".js", ".mjs", ".rb", ".pl", ".command",
+                     ".scpt", ".applescript", ".osascript", ".zsh", ".bash")
+
+
 def _skill_signature(skill_dir):
     """A stable content signature for an agent-skill dir: the hash of its
     instruction file (SKILL.md — what an OpenClaw/Claude-skill attack weaponizes
-    to drive a fake password dialog) plus the sorted names of any executable /
-    script payloads it ships alongside. Cheap; None-safe."""
+    to drive a fake password dialog) plus a CONTENT hash of every executable /
+    script payload it ships alongside. Payloads are hashed by BODY, not name: the
+    most direct supply-chain hijack swaps a shipped script's contents under the
+    same filename (F4-class), which a names-only signature could never see. Cheap;
+    None-safe."""
     parts = []
     for cand in ("SKILL.md", "skill.md", "manifest.json", "plugin.json",
                  "AGENTS.md"):
@@ -3169,9 +3183,9 @@ def _skill_signature(skill_dir):
         for name in sorted(os.listdir(skill_dir)):
             fp = os.path.join(skill_dir, name)
             if os.path.isfile(fp) and (
-                    os.access(fp, os.X_OK) or
-                    name.endswith((".sh", ".py", ".js", ".rb", ".pl", ".command"))):
-                execs.append(name)
+                    os.access(fp, os.X_OK) or name.endswith(_SKILL_SCRIPT_EXT)):
+                h = sha256(fp)
+                execs.append("%s@%s" % (name, h[:16]) if h else name)
     except Exception:
         pass
     if execs:
@@ -3202,10 +3216,13 @@ def snapshot_agent_skills():
 
 def diff_agent_skills(prior, cur):
     # Both tiers stay BELOW the notify floor (MEDIUM): the owner authors skills,
-    # so changes are routine — we want a durable record + a correlation input (a
-    # new/changed skill that is followed by an osascript password-phish becomes a
-    # correlated incident), not an interrupt. 'changed' is low-confidence because
-    # a skills author edits constantly; 'new' is medium (a skill you did not add).
+    # so changes are routine — we want a durable RECORD, not an interrupt.
+    # 'changed' is low-confidence because a skills author edits constantly; 'new'
+    # is medium (a skill you did not add). NOTE: these findings carry only
+    # skill=key (no path/program entity), so they do not currently feed
+    # _accumulate_risk, and 'agent-skill' is in no correlate() rule — the
+    # durable record is real, but the "auto-correlates with a later osascript
+    # phish" chain is not yet wired. The phish itself still fires CRITICAL alone.
     def new_fn(key, sig):
         return finding(
             "MEDIUM", "agent-skill", "New AI-agent skill installed",
@@ -3413,6 +3430,12 @@ SURFACES = [
     ("agent_skills", snapshot_agent_skills, diff_agent_skills),
 ]
 
+# Surfaces whose first-sight items are LIVE risks, not installed-residue: they
+# must NOT be silently adopted on the very first scan (see _scan_surfaces). An
+# active remote login present at install/upgrade time is a current-access threat
+# the README's live-vs-residue rule says the user must hear about immediately.
+_NEVER_ADOPT_LIVE = {"auth_sessions"}
+
 
 # --------------------------------------------------------------------------- #
 # Check 5: self-protection (a monitor an attacker can silently disable or blind
@@ -3472,10 +3495,17 @@ def check_self_protection():
     # own persistence) or pre-inserts an allowlist entry makes Aegis diff against
     # corrupted ground truth. We record each file's HMAC (keyed watermark) right
     # after WE write it; a mismatch at the next scan means it changed by a hand
-    # that wasn't ours — and, unlike a plain sha, an attacker who recomputes the
-    # hash of an edited file still can't forge the MAC without also reading the
-    # key file. Falls back to the legacy sha watermark for installs upgraded
-    # before a MAC was recorded (the next record_selfstate writes the MAC).
+    # that wasn't ours. The keyed MAC raises the bar over a plain sha: naive
+    # tooling that just recomputes sha256(edited-file) is caught. It is NOT a
+    # same-uid barrier, though — the recorded watermarks live in SELFSTATE, which
+    # a same-uid attacker can also rewrite: dropping the `<name>_mac` field
+    # downgrades this check to the sha path (which the attacker then controls),
+    # and deleting
+    # SELFSTATE forces a clean re-record. That is the same same-uid limit the
+    # _hmac_key docstring states plainly; closing it needs an off-box or
+    # non-attacker-writable anchor (a configured heartbeat URL is one). Falls back
+    # to the legacy sha watermark for installs upgraded before a MAC was recorded
+    # (the next record_selfstate writes the MAC).
     for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
         recorded_mac = st.get("%s_mac" % name)
         recorded = recorded_mac or st.get("%s_sha" % name)
@@ -3599,7 +3629,16 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             continue
         prior = baseline.get(key)
         if prior is None:
-            baseline[key] = cur  # first sighting → adopt silently
+            # First sighting → adopt silently (the KnockKnock "trust what's
+            # already installed" rule) EXCEPT for live-threat surfaces: an active
+            # remote login is a CURRENT-ACCESS risk, not residue, so per the
+            # README's live-vs-residue principle it must alert even on the very
+            # first scan (an intruder logged in at install/upgrade time must not
+            # be blessed as known-good). Diff against empty to surface it, then
+            # record so it does not re-alert next scan.
+            if key in _NEVER_ADOPT_LIVE:
+                findings += diff_fn({}, cur)
+            baseline[key] = cur
             dirty = True
         else:
             findings += diff_fn(prior, cur)
@@ -5430,7 +5469,15 @@ def cmd_watchdog():
     sentinel once the beat is healthy again."""
     ensure_state()
     beat = read_heartbeat()
-    armed = bool(beat) or os.path.exists(BASELINE)  # a fresh install isn't "dead"
+    # "Armed" must survive an attacker WIPING ~/.aegis: anchor on the launchd
+    # plist (which lives OUTSIDE ~/.aegis) and the recorded install marker, not
+    # only on the two deletable state files. Otherwise `rm -rf ~/.aegis` on an
+    # installed Mac makes a DEAD monitor read as a never-installed one and the
+    # watchdog returns OK — the exact same-uid suppression the dead-man's switch
+    # exists to catch. A genuinely fresh, uninstalled box has no plist and no
+    # state, so it is correctly "not armed" (no false alarm before install).
+    armed = (bool(beat) or os.path.exists(BASELINE) or os.path.exists(SELF_PLIST)
+             or bool(load_json(SELFSTATE, {}).get("installed")))
     now = int(time.time())
     last = int(beat.get("epoch") or 0)
     age = now - last if last else None

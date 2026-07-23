@@ -88,7 +88,11 @@ python3 aegis.py canary        # plant ransomware canary/honeypot files (opt-in)
 python3 aegis.py canary remove # ...and remove them
 python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
                                #   monitor has stopped beating (run from a 2nd
-                               #   launchd agent/cron as a mutual-watchdog)
+                               #   launchd agent/cron as a mutual-watchdog). Every
+                               #   healthy scan writes a LOCAL beat; set
+                               #   AEGIS_HEARTBEAT_URL (or heartbeat_url in
+                               #   ~/.aegis/config.json) to ALSO POST a small
+                               #   redacted beat off-box — OPT-IN, off by default
 python3 aegis.py bastion       # OPT-IN, needs sudo: surface Apple's XProtect
                                #   Behavioral (Bastion) violations it never alerts on
 
@@ -256,11 +260,16 @@ Not defensible, and not claimed: *"blocks malware."*
 ## Trust model (a monitor is itself a privileged surveillance surface)
 
 A security tool sees everything, so it must be trustworthy *by construction*:
-- **Local-only on the scan/watch path** — the automatic monitor never phones home;
-  no telemetry, no cloud. The **only** command that touches the network is
-  `aegis.py vt`, which you run **by hand**, only with a key you supply, and which
-  sends **only a hash, never a file** — the background scanner never invokes it and
-  never even imports the networking module.
+- **Local-only on the scan/watch path *by default*** — out of the box the
+  automatic monitor never phones home; no telemetry, no cloud. The only
+  network-touching feature you run **by hand** is `aegis.py vt` (VirusTotal
+  reputation), which needs a key you supply and sends **only a hash, never a
+  file**; with no key the scanner never even imports the networking module.
+  The **one** background egress that exists is **off unless you deliberately
+  turn it on**: the dead-man's-switch heartbeat (below) POSTs a small redacted
+  liveness beat *only* if you set `AEGIS_HEARTBEAT_URL` or a `heartbeat_url` in
+  `~/.aegis/config.json`. Unset (the default) → zero network calls on the scan
+  path, and `urllib` is lazy-imported so it isn't even loaded.
 - **Stdlib-only** — no pip packages = no supply-chain surface to audit.
 - **Readable** — one stdlib-only program you can audit end to end; it invokes
   trusted system tools by absolute path with a fixed system `PATH` (`codesign`,
