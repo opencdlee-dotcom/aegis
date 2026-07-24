@@ -1,3 +1,71 @@
+# Aegis — Battle-Test pass 3 (2026-07-23): correlation firmlink canonicalization
+
+`/battle-test` on the freshest surface — the 13 research-derived correlation /
+lineage / triage layers landed earlier the same day, which had verification but
+no adversarial loop. **Tier: siege** (the response tier can quarantine / neutralize /
+destroy — irreversible side effects — so the top tier applies), but no live side
+effect was exercised: the whole hunt ran through the in-process event store on a
+throwaway `EVENT_DB`, never touching real `~/.aegis`. Framing held throughout:
+*surface failures honestly; captured stdout + exit code is the only evidence.*
+Every oracle was derived from the README / docstring intent (the documented
+lineage & chain guarantees), never from the code under test, and the new
+regression test is mutation-validated (neutering the canonicalizer re-breaks the
+join — proven by `test_lineage_firmlink_canon_is_discriminating`).
+
+## Outcome
+
+**1 genuine defect fixed** (HIGH — a detection false-negative in the correlation /
+lineage / risk-accumulation engine), pinned by **4 new regression tests** (one a
+mutation discriminator). Test state after the pass: `selftest.py` 7/7,
+`tests/` **306 passed** (302 prior, untouched, + 4 new), 4 subtests. No live
+notification, launchd load, quarantine action, or write outside a throwaway DB
+ever fired.
+
+## The finding (fixed)
+
+| Sev | Where | Defect (vs stated intent) | Evidence | Fix |
+|-----|-------|---------------------------|----------|-----|
+| **HIGH** | `_same_entity` / `_lineage_path` / `_accumulate_risk` / `correlate` entity-key | The correlation, durable-lineage, and risk-accumulation layers join entities by **path string** using `os.path.normpath` — which does **not** collapse the macOS root firmlinks (`/tmp`→`/private/tmp`, `/var`→`/private/var`, `/etc`→`/private/etc`). So a dropper's payload recorded as `/tmp/evil` and its later execution/persistence seen as `/private/tmp/evil` — **the same on-disk object** — were treated as two different entities. Result: the CRITICAL "dropped object later executed or persisted" lineage chain and the persistence→execution chain **silently failed to fire**, degrading to two independent HIGHs — and `/tmp` is the #1 macOS malware staging location, so this was the common case, not a corner case. This is exactly the F6 bug class (`/var` vs `/private/var`, fixed in pass 1 for `is_risky_location`) reintroduced in the newer join keys. | Probe (captured stdout): control with identical forms → CRITICAL chain opens; persistence(`/private/tmp/evil`) + process(`/tmp/evil`) → **no chain** (two standalone HIGHs); lineage drop/activation across the firmlink → **no CRITICAL chain** (both directions); `_same_entity('/tmp/x','/private/tmp/x')` → `False`. | Added `_canon_entity_path()` — a pure string map (no filesystem I/O) that normalizes an entity toward the real `/private` form, unifying exactly the three firmlinks and **never** over-collapsing a lookalike (`/tmpfoo`) or two distinct paths. Applied at all four join/group sites. Post-fix the same probe shows every chain opens. |
+
+## Round 2 (dry — no new genuine findings)
+
+- **Response tier** (`cmd_quarantine`/`restore`/`destroy`/`neutralize` + recovery):
+  already exhaustively hardened across two prior passes — transaction phases,
+  content+metadata digests, identity re-verification, protected-path refusal,
+  hard-link / cross-volume / symlink refusal, crash-safe recovery. Nothing new.
+- **Triage state machine** (`transition_incident` / dismissals): correct —
+  reopening an incident deletes its dismissal rows so the per-sensor precision
+  feedback is retracted, matching the documented behavior.
+- **Security lens** (inline; `watchdog` binary not installed): **zero** dangerous
+  sinks — no `eval`/`exec`/`os.system`/`shell=True`/`pickle`/`yaml.load`; the
+  `run()` helper never invokes a shell.
+- **Sensors** (supply-chain, behavior/argv, typosquat, web-protection, staging):
+  reviewed against README intent; `_edit_distance_le1`, hosts parsing, and the
+  narrow supply-chain FP discipline are sound.
+
+## Stop-gate (why the loop ended)
+
+Composite gate met: the one oracle is mutation-validated · the correlation /
+lineage / risk join surfaces were saturated by direct adversarial probes and now
+pass · one dry round after the fix (full suite 306/306 + selftest 7/7 green, and
+the original failing probe now green) · far under the siege 6-round cap.
+
+## Residual risk / notes
+
+- Any `path_lineage` rows written by a *pre-fix* build under the old `/tmp` form
+  will not join a post-fix `/private/tmp` activation. This self-heals: the
+  hot-dir / staging sensors re-emit a still-present drop each scan (re-inserting
+  under the canonical key), and any stale row ages out via the 180-day retention.
+  No migration was added — the naive-correct path is strictly better than the
+  buggy state and needs no operator action.
+- `_canon_entity_path` covers the three macOS root firmlinks only, not arbitrary
+  user symlinks (which would need `realpath` + filesystem I/O on the correlation
+  path). The join layer only needs the well-known system duality the codebase
+  already documents; resolving attacker-controlled symlinks is out of scope (an
+  attacker who controls a symlink in the path already has code execution).
+
+---
+
 # Aegis — Research build (2026-07-23, `/deep-research` + `/storm-research`: 13 layers)
 
 Implemented the full prioritized output of a second research pass: a 6-perspective

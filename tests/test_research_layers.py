@@ -303,7 +303,60 @@ class TestPathLineage(Sandbox):
 
     def test_relative_entities_are_ignored(self):
         self.assertIsNone(aegis._lineage_path({"path": "not-absolute"}))
-        self.assertEqual(aegis._lineage_path({"path": "/tmp/./x"}), "/tmp/x")
+        # /tmp is a macOS firmlink to /private/tmp; the lineage key canonicalizes
+        # to the real form so a drop and its later execution join across aliases.
+        self.assertEqual(aegis._lineage_path({"path": "/tmp/./x"}),
+                         "/private/tmp/x")
+
+    def test_lineage_joins_across_tmp_private_tmp_firmlink(self):
+        # A dropper writes the payload at /tmp/eve (the alias form a hot-dir or
+        # staging sensor reports); a launchd job later runs it as the canonical
+        # /private/tmp/eve. These are the SAME on-disk object — the CRITICAL
+        # lineage chain must fire regardless of which alias each sensor used.
+        # /tmp is the #1 macOS malware staging location, so this is the common
+        # case. Pre-fix (normpath-only keys) this silently produced two
+        # standalone HIGHs and no chain.
+        for drop_form, act_form in (("/tmp/eve", "/private/tmp/eve"),
+                                    ("/private/tmp/eve", "/tmp/eve")):
+            with self.subTest(drop=drop_form, act=act_form):
+                self._reset_event_db()
+                aegis.record_security_state([aegis.finding(
+                    "HIGH", "hot-dir", "drop", "d", "fp-x", path=drop_form)],
+                    now=1000)
+                aegis.record_security_state([aegis.finding(
+                    "MEDIUM", "persistence", "p", "d", "fp-y", path=act_form)],
+                    now=1000 + 3 * 86400)
+                chains = [i for i in aegis.list_incidents()
+                          if i["correlation_key"].startswith("chain:lineage")]
+                self.assertTrue(chains, "%s -> %s must chain" % (drop_form, act_form))
+                self.assertEqual(chains[0]["severity"], "CRITICAL")
+
+    def test_lineage_firmlink_canon_is_discriminating(self):
+        # Mutation guard: neutering the canonicalizer to identity must break the
+        # cross-form join above — proving the test depends on the mechanism and
+        # is not a tautology.
+        saved = aegis._canon_entity_path
+        aegis._canon_entity_path = lambda v: os.path.normpath(v) if v else v
+        try:
+            self._reset_event_db()
+            aegis.record_security_state([aegis.finding(
+                "HIGH", "hot-dir", "drop", "d", "fp-x", path="/tmp/eve")],
+                now=1000)
+            aegis.record_security_state([aegis.finding(
+                "MEDIUM", "persistence", "p", "d", "fp-y", path="/private/tmp/eve")],
+                now=1000 + 3 * 86400)
+            chains = [i for i in aegis.list_incidents()
+                      if i["correlation_key"].startswith("chain:lineage")]
+            self.assertEqual(chains, [])  # no join without canonicalization
+        finally:
+            aegis._canon_entity_path = saved
+
+    def _reset_event_db(self):
+        try:
+            os.remove(aegis.EVENT_DB)
+        except OSError:
+            pass
+        aegis.init_event_store()
 
 
 # --------------------------------------------------------------------------- #
@@ -342,6 +395,32 @@ class TestCorrelationQuality(Sandbox):
         risk = [i for i in aegis.list_incidents()
                 if i["title"].startswith("Accumulated risk")]
         self.assertEqual(risk, [])
+
+    def test_chain_joins_across_tmp_private_tmp_firmlink(self):
+        # persistence(/private/tmp/evil) + execution(/tmp/evil) are the same file
+        # via the macOS firmlink; the persistence->execution CRITICAL chain must
+        # fire. Pre-fix these were two standalone HIGHs, never one CRITICAL case.
+        aegis.record_security_state([
+            aegis.finding("HIGH", "persistence", "New persistence item", "d",
+                          "cf-1", program="/private/tmp/evil", label="com.evil"),
+            aegis.finding("HIGH", "process", "Suspicious running process", "d",
+                          "cf-2", path="/tmp/evil"),
+        ])
+        chains = [i for i in aegis.list_incidents()
+                  if i["correlation_key"].startswith("chain:persistence-execution")]
+        self.assertTrue(chains, "persistence + execution on one file must chain")
+        self.assertEqual(chains[0]["severity"], "CRITICAL")
+
+    def test_same_entity_unifies_firmlink_forms(self):
+        self.assertTrue(aegis._same_entity({"path": "/tmp/x"},
+                                           {"path": "/private/tmp/x"}))
+        self.assertTrue(aegis._same_entity({"program": "/var/f/y"},
+                                           {"path": "/private/var/f/y"}))
+        # ...but never over-collapses a lookalike prefix or distinct paths.
+        self.assertFalse(aegis._same_entity({"path": "/tmpfoo/x"},
+                                            {"path": "/private/tmpfoo/x"}))
+        self.assertFalse(aegis._same_entity({"path": "/Users/a"},
+                                            {"path": "/Users/b"}))
 
     def test_credential_capture_plus_persistence_chains(self):
         entity = "/Users/Shared/stealer"

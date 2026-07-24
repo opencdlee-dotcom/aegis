@@ -1315,13 +1315,39 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
     return incident_id
 
 
+# macOS root firmlinks: /tmp, /var, /etc are symlinks to /private/{tmp,var,etc},
+# so the SAME on-disk object appears under either string form. Correlation,
+# lineage, and risk-accumulation join entities by their PATH STRING, so without
+# canonicalizing here a drop recorded as `/tmp/x` never joins an execution seen
+# as `/private/tmp/x` (or vice versa) — and `/tmp` is the #1 malware staging
+# location, so this is the common case, not a corner case. Same equivalence the
+# codebase already encodes for is_risky_location (RISKY_PREFIXES lists both
+# forms); this is that fix carried into the join keys. Pure string map — no
+# filesystem I/O — and it only unifies the three real firmlinks (never
+# over-collapses e.g. /tmpfoo or two distinct /Users paths).
+_MACOS_FIRMLINKS = ("/tmp", "/var", "/etc")
+
+
+def _canon_entity_path(value):
+    """Normalize an entity string toward macOS's real (/private) path form so
+    the same object joins regardless of which firmlink alias a sensor reported.
+    Non-path entities (a pid, a launchd label) pass through unchanged."""
+    if not value:
+        return value
+    p = os.path.normpath(value)
+    for fl in _MACOS_FIRMLINKS:
+        if p == fl or p.startswith(fl + "/"):
+            return "/private" + p
+    return p
+
+
 def _same_entity(a, b):
     ea, eb = _entity(a), _entity(b)
     if not ea or not eb:
         return False
     if os.path.isabs(ea) and os.path.isabs(eb):
-        return os.path.normcase(os.path.normpath(ea)) == \
-            os.path.normcase(os.path.normpath(eb))
+        return os.path.normcase(_canon_entity_path(ea)) == \
+            os.path.normcase(_canon_entity_path(eb))
     return ea == eb
 
 
@@ -1408,6 +1434,7 @@ def _accumulate_risk(db, now, new_ids):
         entity = _entity(f)
         if not entity:
             continue
+        entity = _canon_entity_path(entity)
         category = f.get("category") or ""
         w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
              * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7)
@@ -1475,7 +1502,7 @@ def _lineage_path(f):
     entity = _entity(f)
     if not entity or not os.path.isabs(entity):
         return None
-    return os.path.normcase(os.path.normpath(entity))
+    return os.path.normcase(_canon_entity_path(entity))
 
 
 def _apply_path_lineage(db, new_events, now, initially_notified=False,
@@ -1559,7 +1586,7 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
                 if not _same_entity(left, right):
                     continue
                 if left_id in new_ids or right_id in new_ids:
-                    entity = _entity(left) or _entity(right)
+                    entity = _canon_entity_path(_entity(left) or _entity(right))
                     entity_key = hashlib.sha256(
                         entity.encode("utf-8", "replace")).hexdigest()[:16]
                     matches_by_entity.setdefault(entity_key, set()).update(
