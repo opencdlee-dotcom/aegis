@@ -1,3 +1,67 @@
+# Aegis — Battle-Test pass 5 (2026-07-24): fileless-pipeline EVASION closure
+
+`/battle-test` (no arg → target = repo). **Tier: siege** (the response tier can
+`quarantine`/`neutralize`/`destroy`). Framing held from the start: *surface a real
+gap or report "already robust" — never fabricate.* Every oracle was derived from
+README/ARCHITECTURE **intent** and the suite's own codified severity contract
+(`test_fileless_fetch_exec_combo_is_high`: `curl … | bash` = **HIGH**); captured
+stdout + a runnable probe were the only evidence. Unlike pass 4, this pass found
+**2 genuine, proven root-cause gaps in detection efficacy** → fixed via surgical
+regex change + 8 pinned regression tests → **shipped**.
+
+## The question this pass answered
+
+The operator asked the load-bearing question directly: *"is this actually
+protection?"* So the hunt targeted **detection efficacy** (does a check fire on the
+real TTP, and can a source-reading attacker trivially evade it?), not just code
+correctness. A Breaker probe called the **real** `_argv_signals` / `_hostile_content`
+functions with crafted argv — 4 positive controls (canonical `curl|bash`, osascript
+phish, `/dev/tcp` reverse shell, keychain-db copy) **all fired correctly** (the
+detections are real), then evasion variants were tried.
+
+## What was attacked — captured-output evidence
+
+| Lens | Finding | Result |
+|------|---------|--------|
+| **Behavioral argv scorer — evasion (Breaker probe, runnable repro)** | **Gap A:** the `pipe-to-shell`/`pipe-to-interpreter` idioms matched only a bare or `/bin/`-prefixed interpreter, so `curl … \| env bash`, `\| /usr/bin/env bash`, `\| /opt/homebrew/bin/bash`, `\| env sh` — the **identical** fileless pipeline the suite pins as HIGH — dropped to a **silent MEDIUM** with a 4-char change any reader of this open-source regex can apply. **Gap B:** interpreter-**native** fetch (python `urllib`/`http.client`/`requests`, ruby `open-uri`/`Net::HTTP`, perl `LWP`, node `require('https')`) + `exec()` produced **no signal at all**, despite python being a watched interpreter and fileless-interpreter payloads being the tier's *stated purpose*. | **Both fixed.** `_PIPE_LAUNCH` now lets the pipe idioms step over an `env` launcher (with flags/`VAR=val`) or an absolute path; new `interp-fetch` (FETCH idiom) + `exec-eval` (PIPE-EXEC idiom) reuse the existing fetch+exec→HIGH combination, so interpreter-native download-and-exec fires HIGH exactly like `curl\|bash`. |
+| **FP discipline (the fix must not over-fire)** | The fix's risk is a false-positive storm on benign interpreter use. | **Clean.** Full suite **318/318** (was 310 + 8 new). FP guards preserved: perl/sed quoted-alternation `s{(rm\|node)}` still not a pipe; lone `curl` (no exec) stays MEDIUM; download-**to-disk** via urllib (no in-command exec) stays MEDIUM (a file-drop caught by the hot-dir/path-lineage surface); local decode+exec with no network stays MEDIUM. `exec-eval`'s `\s*\(` never matches shell `exec bash` or `eval "$(…)"`. |
+| **Live end-to-end scan** (sandboxed `$HOME`, detect-only, real host data) | Does the whole plumbing run, and does the new idiom behave in the wild? | **Clean (exit 0).** Coherent report; real state classified correctly (docker/MS/Zoom helpers = developer-id LOW, adhoc node/Hermes = HIGH process). A real `perl` process matched the new `exec-eval` at **MEDIUM — did NOT notify and did NOT open an incident** (the 4 incidents are pre-existing adhoc-binary findings). The FP discipline holds live: the new corroborator logs but never alerts alone. `btm` honestly reported DEGRADED. |
+| **Siege §Side-effect-safety (structural)** | Confirm the fix touched no response path and the detect-only invariant still holds. | **Solid.** Response sinks (`kill`/`quarantine`/`destroy`/`_remove_object`) reachable **only** from `main()` argv dispatch + `cmd_neutralize`'s own chain — no `check_*`/scan path reaches them. `_is_protected_path` still refuses SIP/system/HOME+ancestor/Aegis-own/symlink. This pass changed **only** pattern regexes + two idiom sets; no response code touched. |
+
+## End-state checklist (each box backed by captured output)
+
+- ▢→✅ **bugs/logic errors found → fixed:** Gaps A & B, both root-cause, both fixed in the shared `_HOSTILE_CONTENT_RES` table (propagates to behavioral + shell-history + shell-rc + launchd-arg surfaces at once).
+- ✅ **edge cases found → regression-pinned:** 8 new tests in `TestFilelessEvasionClosure` (3 pinned the gaps and **failed against pre-fix code**, verified; 5 pin the intentional boundaries + FP guards).
+- ✅ **no unimplemented files/stubs remain:** completeness pre-flight clean (0 TODO/FIXME/NotImplementedError/`...`).
+- ✅ **security lens run:** inline (watchdog binary absent) — no new sinks; change is regex-only, response tier untouched and re-verified detect-only.
+- ⚠️ **`/spar` not separately invoked:** the Breaker's runnable-repro duty was discharged inline by the `probe_behavior.py` probe against the real functions (4 passing positive controls = the mutation-validation that the oracle isn't a tautology). Noted honestly rather than claimed.
+- ✅ **verified:** new tests fail→pass; full suite **318/318**; `selftest.py` **7/7**; live scan exit 0 with correct MEDIUM-not-notify behavior for the new idiom.
+
+## Stop-gate (why the loop ended)
+
+Two genuine improvements found, proven with a runnable repro, fixed, and pinned;
+the fix is surgical (one shared table + two frozensets, +92/−4 lines) and the full
+suite is green with **zero FP regression** confirmed both in-suite and on a live
+scan. The highest-yield remaining surfaces (response-tier safety, the structural
+Team-ID/typosquat/provenance checks) were spot-checked and are sound by design —
+hard-to-vary invariants, not string patterns. Right-sized: further rounds on a
+mature 5-pass tool have declining marginal yield.
+
+## Residual risk / notes
+
+- **Gap B is scoped to the fetch+exec _combination_** (mirroring the curl rule):
+  interpreter-native fetch **alone** or `exec()` **alone** stays MEDIUM (won't
+  notify), to keep pip/package-manager fetches and benign `perl -e 'eval(...)'`
+  below the notify floor. A payload that fetches and execs across **two separate
+  processes** is caught by the path-lineage correlation, not this single-argv
+  scorer — by design.
+- The new `interp-fetch` token list is pattern-based (the same open-source-readable
+  limitation the README already owns); it raises the evasion cost (an attacker must
+  now avoid `env`, absolute paths, curl/wget/nscurl/fetch, AND the common native
+  HTTP-client tokens) without claiming to be exhaustive.
+
+---
+
 # Aegis — Battle-Test pass 4 (2026-07-23): dry re-siege — nothing genuine to fix
 
 `/battle-test` (no arg → target = repo). **Tier: siege** (the response tier can

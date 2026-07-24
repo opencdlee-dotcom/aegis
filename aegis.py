@@ -332,17 +332,40 @@ IDE_EXT_ROOTS = [os.path.join(HOME, d) for d in (
 SELF_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.charlie.aegis.plist")
 SELFSTATE = os.path.join(STATE_DIR, "selfstate.json")
 
+# Optional launcher between a pipe and the interpreter it feeds. A source-reading
+# attacker evades a bare `| bash` matcher by fronting the interpreter with `env`
+# (`| env bash`, `| /usr/bin/env bash`, `| env FOO=1 bash`) or a non-/bin absolute
+# path (`| /opt/homebrew/bin/bash`) — the identical fileless pipeline. The path
+# prefix is absolute-only (`/\S*/`) so it can't match relative junk like
+# `grep foo/sh`; the perl/sed alternation FP guard is preserved by the interpreter
+# patterns' own trailing boundary (`\b` / `(?=\s|$)`), unaffected by this prefix.
+_PIPE_LAUNCH = r"(?:(?:/\S*/)?env\s+(?:-\S+\s+|[\w.]+=\S*\s+)*)?(?:/\S*/)?"
+
 # High-signal hostile shell/command patterns, shared by argument inspection
 # (launchd/cron) and file-content scanning (shell rc). Each is a "download-and-
 # run", "reverse shell", or "obfuscated-decode-and-exec" idiom — the live tail of
 # a 2025-era ClickFix / AMOS infection chain.
 _HOSTILE_CONTENT_RES = [
     (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]*\bhttps?://", re.I), "network-fetch"),
-    (re.compile(r"\|\s*(?:/bin/)?(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
+    (re.compile(r"\|\s*" + _PIPE_LAUNCH + r"(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
     # Require a real command boundary after the interpreter (space/EOL) so a `|`
     # INSIDE a quoted regex alternation — e.g. perl/sed `s{(a|node|b)}` — is not
     # mistaken for a shell pipe into `node`. A genuine pipe reads `… | osascript`.
-    (re.compile(r"\|\s*(?:/usr/bin/)?(?:osascript|python[0-9.]*|perl|ruby|node|php)(?=\s|$)", re.I), "pipe-to-interpreter"),
+    (re.compile(r"\|\s*" + _PIPE_LAUNCH + r"(?:osascript|python[0-9.]*|perl|ruby|node|php)(?=\s|$)", re.I), "pipe-to-interpreter"),
+    # Interpreter-NATIVE HTTP fetch (python urllib/http.client/requests, ruby
+    # open-uri/Net::HTTP, perl LWP/HTTP::Tiny, node require('https')/http.get) —
+    # the fetch half of a fileless download+exec that never shells out to curl.
+    # A FETCH idiom (MEDIUM alone); HIGH only combined with an exec sink, exactly
+    # like curl. Keeps pip/package-manager fetches (no exec) below the notify floor.
+    (re.compile(r"\b(?:urllib\.request|urllib\.urlopen|urlopen|urlretrieve|"
+                r"http\.client|httplib|requests\.(?:get|post)|open-uri|Net::HTTP|"
+                r"URI\.open|HTTP::Tiny|LWP::|require\(\s*['\"]https?['\"]|"
+                r"https?\.get\()", re.I), "interp-fetch"),
+    # exec()/eval() of a string — the exec sink an interpreter one-liner uses to
+    # run fetched/decoded bytes in memory. `\s*\(` requires the call form, so it
+    # never fires on shell `exec bash` (no paren) or `eval "$(…)"` (a quote, not
+    # a paren, follows). An exec idiom (MEDIUM alone); HIGH only with a fetch.
+    (re.compile(r"\b(?:exec|eval)\s*\(", re.I), "exec-eval"),
     (re.compile(r"\bbase64\b\s+(?:--?d(?:ecode)?|-D)\b", re.I), "base64-decode"),
     (re.compile(r"\beval\b[^\n]*\$\(", re.I), "eval-subshell"),
     (re.compile(r"/dev/tcp/", re.I), "bash-reverse-shell"),
@@ -2456,8 +2479,8 @@ def check_processes():
 # low-FP (the moderator's 'alert rarely' + Bitdefender-ATC threshold lesson).
 _PIPE_EXEC_IDIOMS = frozenset((
     "pipe-to-shell", "pipe-to-interpreter", "osascript-shell", "base64-decode",
-    "python-oneliner", "eval-subshell"))
-_FETCH_IDIOMS = frozenset(("network-fetch", "raw-ip-fetch"))
+    "python-oneliner", "eval-subshell", "exec-eval"))
+_FETCH_IDIOMS = frozenset(("network-fetch", "raw-ip-fetch", "interp-fetch"))
 
 
 def _argv_signals(argv):
