@@ -2212,6 +2212,42 @@ def _persistence_severity(rec):
     return "LOW"
 
 
+def _persistence_change_detail(label, old, rec,
+                               prog_changed, env_changed, args_changed):
+    """Human-readable before->after for the fields that actually mutated. The
+    old message always printed the PROGRAM path on both sides, so an args- or
+    env-only change rendered as the nonsensical 'args changed (X -> X)' with an
+    identical program — uninterpretable, and the exact confusion that made a
+    real (but benign) self-plist change look like garbage. Render each changed
+    field's true old->new instead. Values are already redacted at snapshot;
+    finding() redacts the detail once more."""
+    def _args_str(v):
+        a = v.get("args")
+        if not a:
+            return "(none)"
+        if isinstance(a, (list, tuple)):
+            return " ".join(str(x) for x in a)
+        return str(a)
+
+    def _env_str(v):
+        e = v.get("env")
+        return json.dumps(e, sort_keys=True) if e else "(none)"
+
+    parts = []
+    if prog_changed:
+        op, np = old.get("program"), rec.get("program")
+        if op != np:
+            parts.append("program %s -> %s" % (op, np))
+        else:  # same path, different bytes — a swapped binary
+            parts.append("program bytes %s -> %s" % (
+                (old.get("sha256") or "?")[:12], (rec.get("sha256") or "?")[:12]))
+    if args_changed:
+        parts.append("args [%s] -> [%s]" % (_args_str(old), _args_str(rec)))
+    if env_changed:
+        parts.append("env %s -> %s" % (_env_str(old), _env_str(rec)))
+    return "%s: %s" % (label, "; ".join(parts))
+
+
 def check_persistence(baseline_snap, current_snap):
     findings = []
     base = baseline_snap or {}
@@ -2239,9 +2275,6 @@ def check_persistence(baseline_snap, current_snap):
             args_changed = ((old.get("args_sha256") or old.get("args") or None) !=
                             (rec.get("args_sha256") or rec.get("args") or None))
             if prog_changed or env_changed or args_changed:
-                what = "+".join(w for w, c in (
-                    ("program/hash", prog_changed), ("env", env_changed),
-                    ("args", args_changed)) if c)
                 # Fold the current sha256/env/args into the fingerprint (sha256
                 # alone is unchanged on an env-only mutation) so a real change
                 # re-alerts but a steady mutated state does not storm.
@@ -2260,9 +2293,9 @@ def check_persistence(baseline_snap, current_snap):
                 findings.append(finding(
                     sev, "persistence",
                     "Persistence item CHANGED",
-                    "%s: %s changed (%s -> %s)" % (
-                        rec["label"], what, old.get("program"),
-                        rec.get("program")),
+                    _persistence_change_detail(
+                        rec["label"], old, rec,
+                        prog_changed, env_changed, args_changed),
                     "persistence:changed:%s:%s" % (path, fp),
                     path=path, program=rec.get("program"), trust=rec.get("trust")))
     for path, old in base.items():

@@ -2990,5 +2990,56 @@ class TestAuthSessionLiveNotAdoptedFirstRun(Sandbox):
         self.assertEqual(findings, [], "residue surfaces stay first-run-silent")
 
 
+class TestPersistenceChangeDetail(Sandbox):
+    """A CHANGED persistence finding must name the field that actually mutated.
+    The old message printed the PROGRAM path on both sides, so an args- or
+    env-only change read as 'args changed (X -> X)' with an identical program —
+    uninterpretable (the real com.charlie.aegis watch->scan change looked like
+    garbage)."""
+
+    def _changed(self, old, rec):
+        fs = aegis.check_persistence({"/x.plist": old}, {"/x.plist": rec})
+        got = [f for f in fs if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(got), 1, got)
+        return got[0]["detail"]
+
+    def _base(self, **kw):
+        rec = {"label": "com.charlie.aegis", "program": "/usr/bin/python3",
+               "sha256": "0f534e4b", "trust": "apple", "run_at_load": True,
+               "args": ["/usr/bin/python3", "/x/aegis.py", "watch", "600"],
+               "args_sha256": "AAA", "env": None}
+        rec.update(kw)
+        return rec
+
+    def test_args_only_change_shows_both_arg_lists_not_program(self):
+        detail = self._changed(
+            self._base(),
+            self._base(args=["/usr/bin/python3", "/x/aegis.py", "scan"],
+                       args_sha256="BBB"))
+        self.assertIn("watch 600", detail)
+        self.assertIn("scan", detail)
+        # The regression: identical program must NOT be rendered as the change.
+        self.assertNotIn("/usr/bin/python3 -> /usr/bin/python3", detail)
+
+    def test_program_path_change_shows_old_and_new_path(self):
+        detail = self._changed(
+            self._base(),
+            self._base(program="/tmp/evil", sha256="dead", trust="adhoc"))
+        self.assertIn("program /usr/bin/python3 -> /tmp/evil", detail)
+
+    def test_program_bytes_change_shows_hash_delta_when_path_same(self):
+        detail = self._changed(self._base(), self._base(sha256="beef1234feed99"))
+        self.assertIn("program bytes", detail)
+        self.assertIn("0f534e4b", detail)
+        self.assertIn("beef1234feed", detail)
+
+    def test_env_injection_change_is_named(self):
+        detail = self._changed(
+            self._base(),
+            self._base(env={"DYLD_INSERT_LIBRARIES": "/tmp/x.dylib"}))
+        self.assertIn("env", detail)
+        self.assertIn("DYLD_INSERT_LIBRARIES", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
