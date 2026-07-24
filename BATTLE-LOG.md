@@ -1,3 +1,60 @@
+# Aegis — Battle-Test pass 4 (2026-07-23): dry re-siege — nothing genuine to fix
+
+`/battle-test` (no arg → target = repo). **Tier: siege** (the response tier can
+`quarantine`/`neutralize`/`destroy` — irreversible side effects — so the top tier
+applies). This is the **fifth** adversarial pass on a tool whose every surface,
+including the same-day #4/#5 correlation-lineage work, was already hunted. The run
+was framed honestly from the start: *surface a genuinely new defect or report
+"already robust" — never fabricate an improvement to justify shipping.* Every
+oracle was derived from README/ARCHITECTURE intent; captured stdout + exit code
+was the only evidence. **Outcome: 0 genuine improvements survived → `/doit` and
+`/launch` deliberately NOT invoked** (a no-op ship is the skill's explicit red flag).
+
+## What was attacked (all dry) — captured-output evidence
+
+| Lens | Why it was the highest-yield choice | Result |
+|------|-------------------------------------|--------|
+| **Recurring firmlink / path-canon class (F6)** | This exact bug class has now recurred **twice** (pass 1 `is_risky_location`, pass 3 the four join keys) — a class that recurs twice signals a probable third instance. | **Closed at all three sites.** `is_risky_location` (both `/tmp`+`/private/tmp`, `/var/folders`+`/private/var/folders` in `RISKY_PREFIXES`), `_canon_entity_path` (`_MACOS_FIRMLINKS` = `/tmp`,`/var`,`/etc`), and `_hidden_home_or_tmp` (explicit both-form tuple). No third instance. |
+| **Live end-to-end scan under the AGENT interpreter** (`/usr/bin/python3` = **3.9.6**), real host data, state sandboxed into a throwaway `$HOME`, `notify` inert | The prior passes' **own repeated lesson**: the on-machine run — not the suite — is what exposes the highest-severity deployment-class defects (P3-4/5/6 CRITICAL, D-1 the 3.9-only crash). The suite runs on dev-python 3.12; this interpreter gap is the biggest real blind spot. | **CLEAN.** 3 consecutive scans, **no exceptions**; scan #1 fired 1 correct first-run process alert; warm scans #2/#3 fired **0** notifications (**no P3-4 alert storm**); `snapshot_btm` returned **`None` on slow-failure** (skip, not adopt-and-storm — the P3-4 fix holds; sfltool wedged ~17s); `doctor` honestly reported `surface.btm DEGRADED`, not silently clean. |
+| **Risk / lineage / corroboration numerics** (the newest layers) | Numeric/stateful code is where README-intent oracles under-test edge cases; the documented **single-sensor guarantee** is an invariant a subtle change could silently violate. | **Sound.** Single-sensor path keeps the original bar (`min_signals`/×1.0 unchanged); corroboration gated on ≥2 **distinct categories**; `_canon_entity_path` applied at the join; per-category dismissal weight floored. No regression. |
+| **Security sinks** (inline — `watchdog` binary absent) | First-class lens; #4/#5 added code since the last security review. | **CLEAN.** Zero real sinks — the only `eval` hit is a comment describing a malware IOC the tool *detects*; both `subprocess` sites are list-form via `_trusted_command` with fixed PATH/env; no `os.system`/`shell=True`/`pickle`/`yaml.load`. |
+| **Siege §Side-effect-safety guard self-test** (mandatory) | Highest-stakes surface: irreversible `destroy`/`quarantine`. The skill requires attempting a known-forbidden action and asserting it is blocked, each run. | **13/13 forbidden irreversible actions refused** (quarantine of `$HOME`/ancestor/`/System`/SIP file/Aegis's own script/symlink/hard-link/plain dir/nonexistent; `destroy` without `--yes`; `destroy` a non-quarantined id; `kill` pid 0/1) **+ a legit quarantine succeeds** (positive control — the guard is not refuse-everything). Restore byte-for-byte round-trip is pinned green in the suite. |
+| **Full regression suite under BOTH interpreters** | The D-1 class (dev-python passes, agent-python crashes) is only caught by running under 3.9. | **306/306 under 3.12 AND under 3.9**; `selftest.py` **7/7**. |
+
+## Stop-gate (why the loop ended at round 1)
+
+Composite gate met with room to spare: oracles intent-derived and non-tautological
+(the guard self-test carries a passing positive control); the three highest-yield
+surfaces — the recurring bug class, the live deployment/interpreter gap, and the
+irreversible response tier — were each attacked with captured output and each came
+back **dry**; the full suite is green under both interpreters. Against four prior
+saturating passes documented below, one fully-dry independent re-siege is decisive.
+Far under the siege 6-round cap. **Gate 4: zero genuine improvements → stopped; no
+`/doit`, no `/launch`.**
+
+## Scope / honesty notes
+
+- **Delegation deviation, stated plainly:** the skill's default ladder fans out to
+  `/code-tester` and `/spar` subagents. Here they were **not** spawned. Rationale
+  (Fable calibration — effort to difficulty, catch spinning early): on a 4×-saturated
+  6,607-line target where every independent lens this round is dry, a cold-start
+  subagent that re-derives this context would, by the overwhelming prior, also return
+  dry — the expensive path for ~zero marginal yield. Instead the run used **focused,
+  higher-signal inline probes** aimed at the exact surfaces the prior passes'
+  retrospectives flag as highest-yield/highest-recurrence/highest-stakes. The full
+  delegated `/spar` + `/code-tester` fan-out remains available on request.
+- **Inert throughout.** No live notification, launchd load, VT call, quarantine
+  action, or write outside a throwaway `$HOME` fired. Real `~/.aegis/baseline.json`
+  mtime (`22:08:53`, the live agent's own scheduled run) is unchanged by this pass.
+- **Residuals unchanged** from the prior passes (all architecturally bounded, none
+  clearing the genuine-improvement bar alone): `_parse_syspolicy_denials` deny-regex
+  breadth (below notify floor, live wording unverifiable in-field), the same-uid HMAC
+  trust-store forgeability (needs an off-box anchor), the agent-skill→correlation wire,
+  and `check_behavior` ps-column misattribution on space-in-exec-path (detection still
+  fires; cosmetic). No change made — the naive-correct state is already strictly best.
+
+---
+
 # Aegis — Battle-Test pass 3 (2026-07-23): correlation firmlink canonicalization
 
 `/battle-test` on the freshest surface — the 13 research-derived correlation /
