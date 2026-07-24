@@ -1,3 +1,78 @@
+# Aegis — Research build (2026-07-23, `/deep-research` + `/storm-research`: 13 layers)
+
+Implemented the full prioritized output of a second research pass: a 6-perspective
+STORM run (90 raw claims; 24 adversarially confirmed before the account's weekly
+model limit stopped the verify stage) plus a deep-research fan-out (107 claims
+across 22 sources). Both pipelines' *upstream* research completed; only their
+verify/synthesis stages were cut off, so synthesis was done in-session against the
+live code — every candidate was cross-checked against the actual sensor table and
+regex tables first, which filtered out ~10 proposals aegis already implements
+(`dscl -authonly`, `tccutil reset`, quarantine-strip, `hdiutil -nobrowse`,
+keychain-db access, `curl -F` exfil, staging IOCs, XProtect harvest, watchdog).
+
+Suite: **302 tests** (257 prior, untouched, + 45 new in
+`tests/test_research_layers.py`) + `selftest` green. Live end-to-end scan in a
+throwaway `$HOME` ran clean twice (rc 0, no exceptions, new sensor health OK).
+
+| # | Layer added | Shape | Tier |
+|---|-------------|-------|------|
+| 1 | **Developer supply chain** | New 15th sensor: npm lifecycle hooks (`preinstall`/`postinstall`/…) scored for decode-and-exec, incl. the JS-native loader (`node -e "eval(Buffer.from(…,'base64'))"`, `atob`, `require('https')`) invisible to shell-oriented patterns; plus documented dropper dotfiles at `$HOME` root (DPRK `.npc`/`.myvars`/`.pyp`, AMOS `.agent`/`.helper`/`.mainhelper`). Bare fetches deliberately never fire. | detection |
+| 2 | **GUI-kill coercion** | ClickLock's password-coercion primitive: killing Activity Monitor / SystemUIServer / NotificationCenter / Console → HIGH; the tight-loop variant → CRITICAL short-circuit. Plain `killall Dock` stays silent. | detection |
+| 3 | **Daemon name masquerade** | Edit-distance-1 process-name typosquat of an Apple daemon (`SystemUIServerl`) in a user-writable path → HIGH, regardless of signature. | detection |
+| 4 | **applescript:// delivery** | The Script-Editor URL scheme that executes outside any shell — evading both shell history and Apple's Tahoe 26.4 Terminal-paste warning. | detection |
+| 5 | **Download provenance** | `QuarantineEventsV2` + Chrome-family `downloads` table (both no-FDA) resolve a drop's origin URL and agent. Enriches hot-dir findings AND grades them: a trusted origin demotes to digest. Only ever lowers confidence, never severity — provenance is attacker-supplyable. | attribution |
+| 6 | **Durable path lineage** | A suspicious drop is remembered by normalized path indefinitely (6-month retention); any later execution/persistence of that path opens a CRITICAL chain. Fixes the entity-hop (dropper exits, launchd runs it at next login) and the re-signing case that defeats hash-keyed joins. | correlation |
+| 7 | **Credential-capture chain** | Password phish / `dscl -authonly` / keychain access / GUI-kill + persistence-or-exfil on one entity → CRITICAL chain instead of two independent HIGHs. | correlation |
+| 8 | **Corroboration scoring** | Cross-sensor agreement multiplies the risk score against a *constant* threshold (Splunk RBA's explicit tuning guidance) and needs fewer signals. The documented single-sensor guarantee is preserved — verified by a test. | correlation |
+| 9 | **Wrapper-LOLBin unwrapping** | `caffeinate -i ~/.payload`, `nohup`, `setsid`, `sudo -u` fronting a payload: the wrapper is stripped so the *target* is scored, not the Apple-signed launcher. Value-taking flags (`-t 3600`) are skipped correctly. | detection |
+| 10 | **Typed dismissals** | `false-positive` (rule is wrong) vs `benign-positive` (real but authorized) recorded separately into a `dismissals` table feeding different tuning queues; reopening retracts the dismissal. | triage |
+| 11 | **Per-sensor precision** | A chronically-dismissed category is down-weighted in risk accumulation toward a floor (never zero, so it can still corroborate), gated on a minimum sample so one dismissal cannot mute a sensor. | triage |
+| 12 | **Known benign causes** | Each incident card prints the documented benign causes for the sensors that fired — triage becomes a lookup, not an investigation. | triage |
+| 13 | **`replay` backtest** | Re-runs current correlation logic over recorded history in a throwaway in-memory DB built from the same schema constant. Strictly read-only — proven by test that durable state is unchanged. | detection-as-code |
+
+## Found and fixed during verification (not shipped broken)
+
+- **Typosquat false-positive cannon.** Against a live 537-process table, short
+  daemon names collide at edit-distance 1 with ordinary binaries: `/usr/bin/log`
+  ↔ `logd`, `finger` ↔ `finder`, `doc` ↔ `dock`. They did not alert only because
+  those paths are trusted — but any such binary in a user-writable path would
+  have fired a false HIGH. Fixed by comparing only names ≥7 chars; the dropped
+  short names lose nothing (an unsigned short-named binary in a user-writable
+  path is already caught by the signature check, and `com.finder.*` label
+  impersonation is the persistence sensor's Team-ID job). Pinned by test.
+- **New sensor read the live host in tests.** `check_supply_chain` walked the
+  real `$HOME`, breaking the suite's "never reads the live host" invariant and
+  slowing every scan-level test. Fixed by making `SUPPLY_CHAIN_ROOTS` an
+  overridable module global (matching `STAGING_DIRS`/`HOT_DIRS`) and pinning it
+  in the shared `Sandbox`.
+- **Three `xattr` subprocesses per file.** The provenance work initially spawned
+  `xattr` three times per hot-dir candidate; consolidated to one read via
+  `_quarantine_fields()`.
+- **`urllib` on the scan path.** The first provenance draft used
+  `urllib.request.pathname2url`, which would have loaded the networking module
+  and broken the local-only guarantee's "urllib isn't even imported" claim.
+  Replaced with hand-rolled URI escaping and a host regex.
+
+## Design guardrails honored
+
+Local-only and stdlib-only unchanged (the two new data sources are the user's own
+SQLite files, opened read-only/immutable so a live browser DB is never locked);
+no new privileged parser; the supply-chain sensor is bounded by depth, directory,
+manifest, and wall-clock caps and degrades via the normal sensor-health path.
+**No detection regressed:** the one behavior change that would have revoked a
+documented guarantee (single-sensor risk accumulation) was deliberately reworked
+into an additive one after the existing test caught it.
+
+## Measured
+
+- Supply-chain sensor on the real home: **0.72 s**, 3,298 manifests reachable,
+  369 scored within the 30-day window, **0 false positives**.
+- New argv rules against the live process table: **0** hits.
+- Typosquat rule after tightening: 1 name-match on 537 live processes, correctly
+  gated to no alert by `is_risky_location`.
+
+---
+
 # Aegis — Battle-test pass 2 (2026-07-22, `/battle-test`: siege tier, the 10 new layers)
 
 Adversarial hardening of the 790-line `feat/defense-in-depth-layers` commit. Tier

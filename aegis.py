@@ -353,6 +353,18 @@ _HOSTILE_CONTENT_RES = [
     (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]*/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
     (re.compile(r"display\s+dialog.*hidden\s+answer", re.I | re.S), "osascript-password-phish"),
     (re.compile(r"\bsecurity\b[^\n]*\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I), "keychain-dump"),
+    # ClickLock (Group-IB, 2026) coerces a password by killing the very apps a
+    # user would open to notice/stop it — Activity Monitor, the menu-bar
+    # (SystemUIServer), NotificationCenter (suppresses Gatekeeper warnings),
+    # Console. A user practically never scripts killing THESE, so it is a high-
+    # signal anti-analysis/coercion tell even outside the tight-loop shape.
+    (re.compile(r"\b(?:killall|pkill)\b[^\n]*\b(?:Activity[ _]?Monitor|"
+                r"SystemUIServer|NotificationCenter|Console|coreauthd)\b", re.I),
+     "gui-kill-coercion"),
+    # applescript:// URL scheme launches Script Editor pre-loaded with the
+    # payload — executing OUTSIDE any shell, so it dodges shell history AND
+    # Apple's Tahoe 26.4 Terminal-paste warning (Jamf/Netskope, 2026 ClickFix).
+    (re.compile(r"\bapplescript://", re.I), "applescript-url-scheme"),
 ]
 
 # launchd EnvironmentVariables keys that inject code into other processes.
@@ -405,7 +417,23 @@ _HOSTILE_ARGV_RES = [
      "curl-insecure-pipe", "HIGH"),
     # Fileless staging: nohup curl pulling a payload run in memory.
     (re.compile(r"\bnohup\b[^\n]*\bcurl\b", re.I), "nohup-curl-fileless", "HIGH"),
+    # ClickLock (2026) password-coercion / anti-analysis: killing Activity
+    # Monitor / SystemUIServer / NotificationCenter / Console. HIGH alone; the
+    # tight-loop variant escalates to CRITICAL in _argv_signals (below).
+    (re.compile(r"\b(?:killall|pkill)\b[^\n]*\b(?:Activity[ _]?Monitor|"
+                r"SystemUIServer|NotificationCenter|Console|coreauthd)\b", re.I),
+     "gui-kill-coercion", "HIGH"),
+    # applescript:// URL-scheme execution (shell-history- and Terminal-warning-
+    # evading Script Editor payload delivery).
+    (re.compile(r"\bapplescript://", re.I), "applescript-url-scheme", "HIGH"),
 ]
+
+# A tight loop wrapped around a GUI-kill: the ClickLock coercion primitive (kill
+# Activity Monitor / Dock / Terminal every ~0.2s for hours until a password is
+# typed). "No legitimate use case" (Group-IB), so the loop+kill COMBINATION is a
+# short-circuit CRITICAL — it must not have to wait for risk accumulation.
+_KILL_LOOP_RE = re.compile(
+    r"\b(?:while|until|repeat|for)\b.{0,80}?\b(?:killall|pkill)\b", re.I | re.S)
 
 # Anti-VM / sandbox / geo gates run BEFORE the payload — an early-warning signal
 # on a real victim endpoint (where the malware WILL proceed). Lower severity
@@ -424,6 +452,9 @@ _ARGV_WATCH_BINS = frozenset((
     "python3", "perl", "ruby", "php", "node", "curl", "wget", "nscurl",
     "xattr", "hdiutil", "tccutil", "dscl", "security", "nohup", "sysctl",
     "system_profiler", "ioreg", "sqlite3", "ditto", "zip",
+    # process-kill utilities: the ClickLock GUI-kill coercion vehicle. Scored
+    # only when argv names a GUI-critical target (see gui-kill-coercion).
+    "killall", "pkill",
     # file-move/copy/archive utilities: harmless alone, but the vehicle a
     # stealer uses to exfil a sensitive file (e.g. `cp login.keychain-db`).
     # Adding them only means their argv gets SCORED — _argv_signals still
@@ -749,6 +780,19 @@ def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
         pass
 
 
+def _quarantine_fields(path):
+    """One `xattr` read of com.apple.quarantine → (present, agent, event_uuid).
+    Single-call so the hot-dir sweep does not spawn three subprocesses per file.
+    Value layout: flags;hex-timestamp;AgentName;event-UUID."""
+    out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
+    if rc != 0 or not out.strip():
+        return (False, None, None)
+    fields = out.strip().split(";")
+    agent = fields[2].strip() if len(fields) >= 3 and fields[2].strip() else None
+    uuid = fields[3].strip() if len(fields) >= 4 and fields[3].strip() else None
+    return (True, agent, uuid)
+
+
 def quarantine_origin(path):
     """Provenance from the com.apple.quarantine xattr, via Apple's `xattr` CLI
     (Python's os.getxattr is Linux-only — verified absent on macOS). Returns
@@ -757,13 +801,131 @@ def quarantine_origin(path):
     ABSENCE on a freshly-dropped executable is itself a signal — it means the
     file arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
     the exact side-load path AMOS/DMG-lure chains use."""
-    out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
-    if rc != 0 or not out.strip():
-        return (False, None)
-    # value: flags;hex-timestamp;AgentName;UUID
-    fields = out.strip().split(";")
-    agent = fields[2].strip() if len(fields) >= 3 and fields[2].strip() else None
-    return (True, agent)
+    present, agent, _uuid = _quarantine_fields(path)
+    return (present, agent)
+
+
+# The central download-provenance store — LSQuarantineEvent rows in the user's
+# OWN preferences (no admin, no Full Disk Access; readable by stdlib sqlite3).
+# Keyed by the event-UUID that the per-file quarantine xattr's 4th field carries,
+# it maps a downloaded file back to the ORIGIN URL and the downloading agent.
+_QUARANTINE_EVENTS_DB = os.path.join(
+    HOME, "Library", "Preferences",
+    "com.apple.LaunchServices.QuarantineEventsV2")
+
+# Chrome-family History DBs are same-user-readable and NOT TCC-protected (unlike
+# Safari): their `downloads` table (target_path, tab_url) is a second FDA-free
+# origin source, useful when the QuarantineEventsV2 row was pruned or the file
+# carries no quarantine xattr (curl/AirDrop side-load).
+_CHROME_HISTORY_DBS = [os.path.join(HOME, p) for p in (
+    "Library/Application Support/Google/Chrome/Default/History",
+    "Library/Application Support/BraveSoftware/Brave-Browser/Default/History",
+    "Library/Application Support/Microsoft Edge/Default/History",
+    "Library/Application Support/Chromium/Default/History",
+    "Library/Application Support/Vivaldi/Default/History",
+)]
+
+# Origin hosts we trust enough to DOWN-grade (never to suppress) a fresh-unsigned
+# hot-dir drop: a binary a developer knowingly pulled from these is far likelier
+# a legit tool than a ClickFix payload. Conservative allowlist — provenance only
+# lowers confidence to route-to-digest, it never closes the finding.
+_TRUSTED_ORIGIN_HOSTS = frozenset((
+    "github.com", "objects.githubusercontent.com", "codeload.github.com",
+    "raw.githubusercontent.com", "github-releases.githubusercontent.com",
+    "apple.com", "developer.apple.com", "brew.sh", "formulae.brew.sh",
+    "python.org", "nodejs.org", "npmjs.com", "registry.npmjs.org",
+    "pypi.org", "files.pythonhosted.org", "docker.com", "jetbrains.com",
+    "code.visualstudio.com", "gitlab.com", "sourceforge.net",
+))
+
+
+def _sqlite_uri_path(path):
+    """Percent-encode the characters SQLite treats specially in a URI filename.
+    Deliberately hand-rolled rather than urllib.request.pathname2url: importing
+    urllib.request would load the networking module on the scan path, which the
+    local-only guarantee says never happens (urllib stays lazy-imported for vt)."""
+    return path.replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+
+
+def _sqlite_readonly(path):
+    """Open a possibly-live SQLite DB read-only and immutably, so reading another
+    process's browser/prefs DB never locks it or is blocked by a WAL lock. Returns
+    a connection or None; the caller must close. immutable=1 is safe here because
+    we only ever SELECT and tolerate a slightly stale snapshot."""
+    if not os.path.exists(path):
+        return None
+    try:
+        uri = "file:%s?immutable=1&mode=ro" % _sqlite_uri_path(path)
+        return sqlite3.connect(uri, uri=True, timeout=2)
+    except Exception:
+        return None
+
+
+# Host of a URL, without importing urllib (see _sqlite_uri_path). Tolerates
+# userinfo (user:pass@host), a port, and a missing path.
+_URL_HOST_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://(?:[^/@\s]*@)?([^/:?#\s]+)", re.I)
+
+
+def _origin_host(url):
+    m = _URL_HOST_RE.match(url or "")
+    return m.group(1).lower().rstrip(".").lstrip(".") if m else None
+
+
+def _origin_from_quarantine_db(uuid):
+    if not uuid:
+        return None
+    db = _sqlite_readonly(_QUARANTINE_EVENTS_DB)
+    if db is None:
+        return None
+    try:
+        row = db.execute(
+            "SELECT LSQuarantineDataURLString, LSQuarantineOriginURLString "
+            "FROM LSQuarantineEvent WHERE LSQuarantineEventIdentifier=?",
+            (uuid,)).fetchone()
+        if row:
+            return row[0] or row[1] or None
+    except Exception:
+        return None
+    finally:
+        db.close()
+    return None
+
+
+def _origin_from_chrome_history(path):
+    """Look up a downloaded file's source tab_url in any Chrome-family History
+    DB by exact target_path. Read-only/immutable; bounded to the newest match."""
+    for hist in _CHROME_HISTORY_DBS:
+        db = _sqlite_readonly(hist)
+        if db is None:
+            continue
+        try:
+            row = db.execute(
+                "SELECT tab_url FROM downloads WHERE target_path=? "
+                "ORDER BY start_time DESC LIMIT 1", (path,)).fetchone()
+            if row and row[0]:
+                return row[0]
+        except Exception:
+            pass
+        finally:
+            db.close()
+    return None
+
+
+def download_provenance(path):
+    """Best-effort origin attribution for a dropped file, entirely inside the
+    unprivileged/no-FDA envelope. Returns (present, agent, origin_url, trusted):
+      present        — file carries a Gatekeeper quarantine flag
+      agent          — downloading app from the quarantine xattr (curl/Chrome/…)
+      origin_url     — source URL from QuarantineEventsV2 or Chrome `downloads`
+      trusted        — True iff origin_url's host is on _TRUSTED_ORIGIN_HOSTS
+    Used to enrich AND grade hot-dir findings: a benign trusted origin downgrades
+    confidence (route-to-digest), a raw-IP/absent origin keeps it loud."""
+    present, agent, uuid = _quarantine_fields(path)
+    origin = _origin_from_quarantine_db(uuid) or _origin_from_chrome_history(path)
+    host = _origin_host(origin) if origin else None
+    trusted = bool(host and any(host == d or host.endswith("." + d)
+                                for d in _TRUSTED_ORIGIN_HOSTS))
+    return (present, agent, origin, trusted)
 
 
 def _hostile_content(text):
@@ -975,15 +1137,10 @@ def _epoch(value=None):
         return int(time.time())
 
 
-def _event_connection():
-    ensure_state()
-    db = sqlite3.connect(EVENT_DB, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=10000")
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=FULL")
-    db.executescript("""
+# One definition of the event-store schema, shared by the durable store and the
+# throwaway in-memory database `replay` builds — so a backtest can never drift
+# from the real store's shape.
+_EVENT_SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );
@@ -1039,6 +1196,25 @@ def _event_connection():
             event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
             PRIMARY KEY(incident_id, event_id)
         );
+        CREATE TABLE IF NOT EXISTS path_lineage (
+            path TEXT PRIMARY KEY,
+            first_event_id INTEGER,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_lineage_seen ON path_lineage(last_seen);
+        CREATE TABLE IF NOT EXISTS dismissals (
+            id INTEGER PRIMARY KEY,
+            incident_id INTEGER,
+            correlation_key TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            dismissed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dismissals_cat
+            ON dismissals(category, dismissed_at);
         CREATE TABLE IF NOT EXISTS sensor_status (
             sensor_id TEXT PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1050,7 +1226,18 @@ def _event_connection():
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             episode_started_at INTEGER
         );
-    """)
+"""
+
+
+def _event_connection():
+    ensure_state()
+    db = sqlite3.connect(EVENT_DB, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=10000")
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.executescript(_EVENT_SCHEMA_SQL)
     db.commit()
     try:
         os.chmod(EVENT_DB, 0o600)
@@ -1148,18 +1335,70 @@ _RISK_CONF_WEIGHT = {"high": 1.0, "medium": 0.7, "low": 0.4}
 RISK_WINDOW = 1800       # look-back seconds (matches the correlation window)
 RISK_THRESHOLD = 4.0     # ~three medium-confidence MEDIUMs on one entity
 RISK_MIN_SIGNALS = 3     # never escalate a single loud finding this way
+# Splunk RBA's lesson is that CORROBORATION ACROSS SOURCES is the high-precision
+# signal — its canonical rule demands distinct tactics from distinct sources.
+# Applied here as a LOWER bar for diverse evidence rather than a higher bar for
+# single-sensor evidence: two distinct sensors agreeing on one entity is stronger
+# than three findings from one sensor, so it escalates a signal sooner. The
+# single-sensor path keeps its original threshold — occurrences are already
+# deduplicated by fingerprint, so three findings there are three DISTINCT
+# signals, not one chatty detector repeating, and demoting it would revoke a
+# documented capability rather than add precision.
+RISK_MIN_SIGNALS_MULTI_SENSOR = 2
+# Splunk's tuning guidance is explicit: keep the THRESHOLD constant and tune the
+# SCORES around it. So corroboration is expressed as a score multiplier rather
+# than a second threshold — two sensors independently implicating one entity is
+# stronger evidence than the same count from one sensor.
+RISK_CORROBORATION_BONUS = 1.5
+# Per-sensor precision feedback (the detection-engineering loop): a category the
+# operator keeps dismissing is, empirically, low-precision — so its contribution
+# to accumulation decays. It never reaches zero: a down-weighted sensor must
+# still be able to participate in a chain, it just stops driving escalation by
+# itself. Requires a minimum sample so one dismissal cannot mute a sensor.
+_PRECISION_MIN_SAMPLE = 4
+_PRECISION_FLOOR = 0.25
+
+
+def _category_dismissal_weights(db, now, window=90 * 86400):
+    """{category: multiplier} from the operator's own dismissal history. A
+    category dismissed as benign/false-positive most of the time is down-weighted
+    toward _PRECISION_FLOOR; anything with too small a sample stays at 1.0."""
+    weights = {}
+    try:
+        rows = db.execute(
+            "SELECT category, COUNT(*) AS n FROM dismissals "
+            "WHERE dismissed_at>=? AND category<>'' GROUP BY category",
+            (now - window,)).fetchall()
+    except Exception:
+        return weights
+    for row in rows:
+        dismissed = int(row["n"])
+        if dismissed < _PRECISION_MIN_SAMPLE:
+            continue
+        opened = db.execute(
+            "SELECT COUNT(*) FROM incidents i JOIN incident_events ie "
+            "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
+            "WHERE i.created_at>=? AND json_extract(e.data_json,'$.category')=?",
+            (now - window, row["category"])).fetchone()[0]
+        total = max(opened, dismissed)
+        precision = max(0.0, (total - dismissed) / float(total)) if total else 1.0
+        weights[row["category"]] = max(_PRECISION_FLOOR, precision)
+    return weights
 
 
 def _accumulate_risk(db, now, new_ids):
     """Open one 'risk' incident per entity whose recent findings sum past
-    RISK_THRESHOLD from ≥ RISK_MIN_SIGNALS DISTINCT signals, provided at least one
-    is new this scan. Lets three MEDIUMs on one binary escalate where one alone
+    RISK_THRESHOLD from ≥ RISK_MIN_SIGNALS DISTINCT signals spanning at least
+    provided at least one is new this scan. Cross-sensor corroboration both needs
+    fewer signals and scores higher (RISK_CORROBORATION_BONUS) against the same
+    constant threshold. Lets three MEDIUMs on one binary escalate where one alone
     stays below the notify floor — the middle tier between raw signals and the
     hand-written chain rules. No schema change; reuses the incident store."""
     rows = db.execute(
         "SELECT id, observed_at, data_json FROM events "
         "WHERE event_type='observation.finding' AND observed_at>=?",
         (now - RISK_WINDOW,)).fetchall()
+    demote = _category_dismissal_weights(db, now)
     by_entity = {}
     for row in rows:
         try:
@@ -1169,29 +1408,129 @@ def _accumulate_risk(db, now, new_ids):
         entity = _entity(f)
         if not entity:
             continue
+        category = f.get("category") or ""
         w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
-             * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7))
+             * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7)
+             * demote.get(category, 1.0))
         if w <= 0:
             continue
         ek = hashlib.sha256(entity.encode("utf-8", "replace")).hexdigest()[:16]
         b = by_entity.setdefault(ek, {"weight": 0.0, "fps": set(), "ids": set(),
-                                      "entity": entity, "new": False})
+                                      "cats": set(), "entity": entity,
+                                      "new": False})
         fp = f.get("fingerprint")
         if fp in b["fps"]:
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
         b["weight"] += w
         b["ids"].add(row["id"])
+        b["cats"].add(category)
         if row["id"] in new_ids:
             b["new"] = True
     for ek, b in by_entity.items():
-        if b["new"] and len(b["fps"]) >= RISK_MIN_SIGNALS \
-                and b["weight"] >= RISK_THRESHOLD:
+        # Corroboration across sensors is the higher-precision evidence: it needs
+        # fewer signals AND scores higher against the same constant threshold.
+        # One sensor keeps the original bar, so no existing detection regresses.
+        multi = len(b["cats"]) >= 2
+        min_signals = RISK_MIN_SIGNALS_MULTI_SENSOR if multi else RISK_MIN_SIGNALS
+        score = b["weight"] * (RISK_CORROBORATION_BONUS if multi else 1.0)
+        if b["new"] and len(b["fps"]) >= min_signals \
+                and score >= RISK_THRESHOLD:
             _upsert_incident(
                 db, "risk:%s" % ek,
-                "Accumulated risk on %s (%d signals, score %.1f)"
-                % (b["entity"][:80], len(b["fps"]), b["weight"]),
+                "Accumulated risk on %s (%d signals across %d sensor%s, score %.1f)"
+                % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
+                   "" if len(b["cats"]) == 1 else "s", score),
                 "HIGH", "risk", now, sorted(b["ids"]))
+
+
+# --------------------------------------------------------------------------- #
+# Durable PATH LINEAGE — the fix for entity-hopping and slow-burn persistence.
+#
+# The time-boxed same-entity chains below cannot see the dominant 2025-26 shape:
+# a dropper writes a payload at path P and EXITS, then a SEPARATE launchd job
+# executes P at the next login — hours or days later, from a different process,
+# often after the binary was re-signed (so a content hash no longer matches).
+# A longer window is the wrong fix (it would only widen the noise). Instead we
+# durably remember "a suspicious object appeared at P" and raise the chain the
+# moment ANYTHING later executes or persists P, however much later that is.
+#
+# Keyed on the normalized PATH — not pid, not content hash — because the path is
+# the one identifier that must survive between the drop and the execution for the
+# attack to work at all (CrashStealer re-signs between stages, changing hashes).
+# --------------------------------------------------------------------------- #
+
+# Categories whose finding means "a suspicious object was placed at this path".
+_LINEAGE_DROP_CATEGORIES = frozenset(("hot-dir", "staging", "supply-chain"))
+# Categories whose finding means "this path is now being executed / persisted".
+_LINEAGE_ACTIVATION_CATEGORIES = frozenset(
+    ("persistence", "process", "behavior", "btm", "net-listener"))
+_LINEAGE_RETENTION = 180 * 86400     # forget a drop after ~6 months
+
+
+def _lineage_path(f):
+    """The absolute filesystem path a finding is about, normalized, or None.
+    Only absolute paths participate: a pid or a bare label cannot be joined
+    across time the way a path can."""
+    entity = _entity(f)
+    if not entity or not os.path.isabs(entity):
+        return None
+    return os.path.normcase(os.path.normpath(entity))
+
+
+def _apply_path_lineage(db, new_events, now, initially_notified=False,
+                        suppressed_categories=frozenset()):
+    """Record suspicious drops durably, and raise a CRITICAL chain when a
+    remembered path is later executed or persisted. Returns the set of event ids
+    attached to a lineage incident."""
+    attached = set()
+    db.execute("DELETE FROM path_lineage WHERE last_seen < ?",
+               (now - _LINEAGE_RETENTION,))
+    for event_id, f in new_events:
+        category = f.get("category")
+        if category in suppressed_categories:
+            continue
+        path = _lineage_path(f)
+        if not path:
+            continue
+        if category in _LINEAGE_DROP_CATEGORIES:
+            db.execute(
+                "INSERT INTO path_lineage(path,first_event_id,first_seen,"
+                "last_seen,category,detail) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(path) DO UPDATE SET last_seen=excluded.last_seen",
+                (path, event_id, now, now, category,
+                 redact_sensitive(str(f.get("title") or ""))[:200]))
+    # Second pass: activations join against everything remembered (including a
+    # drop recorded moments ago in the loop above — same-scan chains are real).
+    for event_id, f in new_events:
+        category = f.get("category")
+        if category in suppressed_categories \
+                or category not in _LINEAGE_ACTIVATION_CATEGORIES:
+            continue
+        path = _lineage_path(f)
+        if not path:
+            continue
+        row = db.execute(
+            "SELECT first_event_id, first_seen, category, detail "
+            "FROM path_lineage WHERE path=?", (path,)).fetchone()
+        if not row or row["first_event_id"] is None \
+                or row["first_event_id"] == event_id:
+            continue
+        evidence = sorted({row["first_event_id"], event_id})
+        age_h = max(0, (now - int(row["first_seen"]))) / 3600.0
+        incident_id = _upsert_incident(
+            db, "chain:lineage:%s" % hashlib.sha256(
+                path.encode("utf-8", "replace")).hexdigest()[:16],
+            "Dropped object later executed or persisted (%s -> %s)"
+            % (row["category"], category),
+            "CRITICAL", "correlation", now, evidence, initially_notified)
+        db.execute(
+            "UPDATE incidents SET title=? WHERE id=?",
+            ("Dropped object later executed or persisted: %s (%s -> %s, %.1fh "
+             "apart)" % (path[:120], row["category"], category, age_h),
+             incident_id))
+        attached.update(evidence)
+    return attached
 
 
 def _apply_correlations(db, new_events, now, initially_notified=False,
@@ -1268,6 +1607,24 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         "chain:supply-chain", "Background-item execution chain",
         lambda f: f.get("category") == "btm",
         lambda f: f.get("category") in ("process", "hot-dir", "persistence"))
+    # Credential capture followed by persistence or exfil. These two stages are
+    # each individually explainable, but TOGETHER on one entity they are the
+    # infostealer kill chain — worth a CRITICAL chain rather than two HIGHs that
+    # each have to survive the notify floor on their own.
+    correlate(
+        "chain:credential-capture", "Credential capture with persistence/exfil",
+        lambda f: has_marker(f, {
+            "osascript-password-phish", "dscl-authonly-passcheck",
+            "keychain-db-access", "keychain-security-dump", "keychain-dump",
+            "gui-kill-coercion", "gui-kill-loop-coercion"}),
+        lambda f: f.get("category") in ("persistence", "staging", "net-listener")
+        or has_marker(f, {"curl-exfil-post", "fileless-fetch-exec"}))
+
+    # Durable lineage: a remembered drop that is later executed/persisted, at any
+    # distance in time. Runs BEFORE the uncorrelated-signal fallback so a joined
+    # event becomes one chain incident instead of two standalone ones.
+    attached.update(_apply_path_lineage(
+        db, new_events, now, initially_notified, suppressed_categories))
 
     # Middle tier: pile-up of weak signals on one entity → one 'risk' incident.
     _accumulate_risk(db, now, new_ids)
@@ -1409,6 +1766,9 @@ def incident_detail(incident_id):
             "SELECT e.id,e.observed_at,e.source,e.event_type,e.data_json FROM events e "
             "JOIN incident_events ie ON ie.event_id=e.id WHERE ie.incident_id=? "
             "ORDER BY e.observed_at", (incident_id,)).fetchall())
+        # Which sensors contributed — drives the known-benign-cause lookup that
+        # makes triage a match-against-known-list instead of an investigation.
+        result["categories"] = sorted(_incident_categories(db, incident_id))
         return result
     finally:
         db.close()
@@ -1427,7 +1787,33 @@ _INCIDENT_TRANSITIONS = {
 }
 
 
-def transition_incident(incident_id, new_status, now=None):
+def _incident_categories(db, incident_id):
+    """The distinct sensor categories of an incident's evidence, for per-sensor
+    dismissal accounting."""
+    cats = set()
+    rows = db.execute(
+        "SELECT e.data_json FROM events e JOIN incident_events ie "
+        "ON ie.event_id=e.id WHERE ie.incident_id=?", (incident_id,)).fetchall()
+    for row in rows:
+        try:
+            category = json.loads(row["data_json"]).get("category")
+        except Exception:
+            continue
+        if category:
+            cats.add(str(category))
+    return cats
+
+
+def transition_incident(incident_id, new_status, now=None, reason_code=None):
+    """Move an incident through its lifecycle. `reason_code` distinguishes the
+    two dismissal kinds the SOC literature separates, because they need OPPOSITE
+    handling and conflating them is the main alert-fatigue driver:
+      false-positive  — the DETECTION was wrong (tune or retire the rule)
+      benign-positive — the event was REAL but authorized (suppress this
+                        instance; the rule itself is working)
+    Both land in FALSE_POSITIVE (the suppression semantics are identical) but are
+    recorded separately so the tuning queues, and the per-sensor precision
+    feedback, can tell a broken rule from an expected-but-noisy one."""
     now = _epoch(now)
     new_status = str(new_status).upper().replace("-", "_")
     db = _event_connection()
@@ -1440,6 +1826,8 @@ def transition_incident(incident_id, new_status, now=None):
             next_at = now + _REMINDER_DELAYS[0] if new_status == "OPEN" else None
             resolution = new_status.lower() if new_status in \
                 ("RESOLVED", "FALSE_POSITIVE") else None
+            if new_status == "FALSE_POSITIVE" and reason_code:
+                resolution = reason_code
             db.execute("UPDATE incidents SET status=?,updated_at=?,resolution=?,"
                        "next_reminder_at=?,reminder_count=? WHERE id=?",
                        (new_status, now, resolution, next_at,
@@ -1448,7 +1836,21 @@ def transition_incident(incident_id, new_status, now=None):
             db.execute("INSERT INTO events(occurred_at,observed_at,source,event_type,"
                        "incident_id,data_json) VALUES(?,?,?,?,?,?)",
                        (now, now, "incident", "incident.lifecycle", incident_id,
-                        json.dumps({"from": row["status"], "to": new_status})))
+                        json.dumps({"from": row["status"], "to": new_status,
+                                    "reason_code": reason_code})))
+            if new_status == "FALSE_POSITIVE":
+                code = reason_code or "false-positive"
+                cats = _incident_categories(db, incident_id) or {""}
+                for category in cats:
+                    db.execute(
+                        "INSERT INTO dismissals(incident_id,correlation_key,"
+                        "reason_code,category,dismissed_at) VALUES(?,?,?,?,?)",
+                        (incident_id, row["correlation_key"], code, category, now))
+            elif new_status == "OPEN":
+                # Reopened: the dismissal was itself wrong, so it must stop
+                # counting against the sensor's precision.
+                db.execute("DELETE FROM dismissals WHERE incident_id=?",
+                           (incident_id,))
         return True
     finally:
         db.close()
@@ -1583,6 +1985,46 @@ _INTERPRETERS = frozenset((
 _INLINE_EXEC_FLAGS = frozenset(("-c", "-e"))
 _FETCH_RE = re.compile(r"\b(?:curl|wget|nscurl)\b.*?https?://", re.I | re.S)
 
+# Apple-signed LOLBin launchers that merely WRAP the real payload. A launchd job
+# whose ProgramArguments start with one of these looks benign if you only score
+# argv[0] — `caffeinate -i ~/.payload` fronts an Apple binary in a trusted path
+# while the payload is the argument (a documented 2026 persistence wrapper, and
+# the same trick works with nohup/setsid/screen). The wrapper must be stripped so
+# the interpreter/script-target scoring below sees the ACTUAL program.
+_WRAPPER_LAUNCHERS = frozenset((
+    "caffeinate", "nohup", "setsid", "stdbuf", "timeout", "gtimeout", "script",
+    "screen", "tmux", "arch", "sudo", "doas",
+))
+# Wrapper flags that consume a following value (so it is not mistaken for the
+# payload): caffeinate -t <sec>, timeout -s <sig>, screen -S <name>, arch -arch …
+_WRAPPER_VALUE_FLAGS = frozenset(("-t", "-s", "-S", "-arch", "-u", "-c", "-w"))
+
+
+def _unwrap_launchers(args, depth=4):
+    """Strip leading LOLBin wrapper launchers (and their flags) from an argv list
+    so the effective program is exposed. `env` is intentionally NOT handled here:
+    it is already in _INTERPRETERS and carries KEY=VALUE assignments that the
+    caller's own logic inspects. Returns the unwrapped argv (possibly unchanged)."""
+    if not isinstance(args, list):
+        return args
+    out = [str(a) for a in args if a is not None]
+    for _ in range(depth):
+        if not out or os.path.basename(out[0]) not in _WRAPPER_LAUNCHERS:
+            break
+        rest = out[1:]
+        i = 0
+        while i < len(rest) and rest[i].startswith("-"):
+            flag = rest[i]
+            i += 1
+            # `-t 30` style: skip the flag's value too (but not another flag).
+            if flag in _WRAPPER_VALUE_FLAGS and i < len(rest) \
+                    and not rest[i].startswith("-"):
+                i += 1
+        if i >= len(rest):
+            break                      # wrapper with no payload — nothing to score
+        out = rest[i:]
+    return out
+
 
 def _interp_fronted(args, program=None):
     """Is this process an interpreter driving a payload? The interpreter identity
@@ -1599,10 +2041,25 @@ def _interp_fronted(args, program=None):
     return False
 
 
+def _effective_argv(args, program=None):
+    """(args, program) with any Apple-signed wrapper launcher stripped. When a
+    wrapper WAS stripped, the resolved plist `Program` described the WRAPPER, not
+    the payload, so it is dropped — the payload now fronts the argv and must be
+    what the interpreter/script-target scoring sees."""
+    if not isinstance(args, list) or not args:
+        return args, program
+    flat = [str(a) for a in args if a is not None]
+    unwrapped = _unwrap_launchers(args)
+    if unwrapped != flat:
+        return unwrapped, None
+    return args, program
+
+
 def _script_target(args, program=None):
     """The script an interpreter is told to run: the first path-like, non-flag
     argument after the interpreter binary. None if the process isn't interpreter-
     fronted (by resolved program OR args[0]) or no such argument exists."""
+    args, program = _effective_argv(args, program)
     if not isinstance(args, list) or len(args) < 2 or args[0] is None:
         return None
     if not _interp_fronted(args, program):
@@ -1648,6 +2105,13 @@ def _hostile_args(args, program=None):
     'alert rarely' (a false HIGH is worse than a rare miss)."""
     if not isinstance(args, list) or not args or args[0] is None:
         return False
+    # Strip Apple-signed wrapper LOLBins (caffeinate/nohup/setsid/sudo -u …) so
+    # the payload — not the trusted wrapper — is what gets scored. A wrapper
+    # pointed straight at a hidden $HOME/tmp file is itself the AMOS shape.
+    joined_raw = " ".join(str(a) for a in args)
+    args, program = _effective_argv(args, program)
+    if args and _hidden_home_or_tmp(str(args[0])):
+        return True
     rest = [str(a) for a in args[1:]]
     if _interp_fronted(args, program) and any(a in _INLINE_EXEC_FLAGS for a in rest):
         return True
@@ -1658,10 +2122,12 @@ def _hostile_args(args, program=None):
     tgt = _script_target(args, program)
     if tgt and _hidden_home_or_tmp(tgt):
         return True
-    joined = " ".join(str(a) for a in args)
-    if _FETCH_RE.search(joined):
+    # Content-scan the ORIGINAL argv (wrapper included): unwrapping only ever
+    # removes the launcher, so scanning the pre-unwrap string is a superset and
+    # guarantees stripping a wrapper can never LOSE a hostile idiom.
+    if _FETCH_RE.search(joined_raw):
         return True
-    return bool(_hostile_content(joined))
+    return bool(_hostile_content(joined_raw))
 
 
 def _persistence_severity(rec):
@@ -1801,6 +2267,65 @@ def check_cron():
 # --------------------------------------------------------------------------- #
 
 
+# Apple system-daemon names a masquerading process typosquats. ClickLock (2026)
+# ran its reverse shell as "SystemUIServerl" — one character off the real
+# menu-bar daemon — to blend into a `ps`/Activity-Monitor listing. A binary whose
+# NAME is edit-distance-1 from one of these but which runs from a user-writable
+# path is a near-certain masquerade regardless of its signature.
+#
+# Only names of _TYPOSQUAT_MIN_LEN or more are compared. Short daemon names
+# collide with ordinary commands at edit-distance 1 — `log` vs `logd`, `finger`
+# vs `finder`, `dock` vs `doc` — which would fire a false HIGH on any such binary
+# in a user-writable path (verified against a live 537-process table, where
+# `/usr/bin/log` matches `logd`). The dropped short names lose little: an
+# unsigned short-named binary in a user-writable path is already caught by the
+# suspicious-signature check below, and vendor-label impersonation (com.finder.*)
+# is covered by the persistence sensor's Team-ID check.
+_TYPOSQUAT_MIN_LEN = 7
+_APPLE_DAEMON_NAMES = frozenset((
+    "systemuiserver", "windowserver", "loginwindow", "cfprefsd", "coreauthd",
+    "spotlight", "mdworker", "launchd", "distnoted", "nsurlsessiond",
+    "usereventagent", "controlcenter", "coreservicesd", "securityd",
+    "notificationcenter", "backgroundtaskmanagementagent",
+))
+
+
+def _edit_distance_le1(a, b):
+    """True if Levenshtein distance(a, b) <= 1 (one insert/delete/substitute)."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:
+        return sum(1 for x, y in zip(a, b) if x != y) <= 1
+    if la > lb:                       # make `a` the shorter of the two
+        a, b, la, lb = b, a, lb, la
+    i = j = 0
+    skipped = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        elif skipped:
+            return False
+        else:
+            skipped = True            # consume one extra char of the longer string
+            j += 1
+    return True
+
+
+def _typosquats_apple_daemon(name):
+    """The Apple daemon `name` impersonates within edit-distance 1, else None. An
+    exact (case-insensitive) match is NOT returned: that is the real daemon or a
+    same-name masquerade the signature/location checks already handle."""
+    low = (name or "").lower()
+    if len(low) < _TYPOSQUAT_MIN_LEN or low in _APPLE_DAEMON_NAMES:
+        return None
+    for real in _APPLE_DAEMON_NAMES:
+        if len(real) >= _TYPOSQUAT_MIN_LEN and _edit_distance_le1(low, real):
+            return real
+    return None
+
+
 def check_processes():
     findings = []
     out, _, rc = run(["ps", "-axo", "pid=,comm="], timeout=12)
@@ -1823,6 +2348,21 @@ def check_processes():
             continue
         seen_paths.add(comm)
         sig = classify_signature(comm)
+        # Apple-daemon name masquerade (ClickLock "SystemUIServerl"): the NAME is
+        # the tell, so this fires regardless of signature — a validly-signed or
+        # ad-hoc binary named one char off a system daemon, running from a
+        # user-writable path, is impersonating the OS in the process list.
+        squat = _typosquats_apple_daemon(os.path.basename(comm))
+        if squat and is_risky_location(comm):
+            sha = sha256(comm)
+            findings.append(finding(
+                "HIGH", "process", "Apple-daemon name masquerade",
+                "%s (%s) runs from a user-writable path but its name is one "
+                "character off the Apple system daemon %r — a process-name "
+                "masquerade (ClickLock TTP)" % (comm, sig["trust"], squat),
+                "process:typosquat:%s:%s" % (comm, sha),
+                path=comm, trust=sig["trust"], typosquats=squat, sha256=sha,
+                markers=["name-masquerade"]))
         if suspicious_sig(sig["trust"]) and is_risky_location(comm):
             # Fold the content hash into the fingerprint so a DIFFERENT binary
             # later reusing the same path is a new finding (and not silently
@@ -1893,6 +2433,10 @@ def _argv_signals(argv):
     for rx, name in _ANTIVM_ARGV_RES:
         if rx.search(argv):
             add(name, "MEDIUM")
+    # A GUI-kill wrapped in a tight loop is the ClickLock coercion primitive —
+    # escalate the HIGH kill signal to a short-circuit CRITICAL.
+    if "gui-kill-coercion" in best and _KILL_LOOP_RE.search(argv):
+        add("gui-kill-loop-coercion", "CRITICAL")
     return sorted(best.items())
 
 
@@ -2174,16 +2718,22 @@ def _check_hot_app(path, st, cutoff):
     when = datetime.fromtimestamp(newest).strftime("%Y-%m-%d")
     if suspicious_sig(sig["trust"]):
         sha = sha256(exe)
-        quar, agent = quarantine_origin(path)
+        # Same provenance grading as the bare-Mach-O path: a DMG-dragged .app is
+        # the #1 delivery shape, so knowing WHERE it came from matters most here.
+        quar, agent, origin, trusted_origin = download_provenance(path)
         prov = ("via %s" % agent if agent else
                 ("quarantined" if quar else
                  "NO quarantine flag — side-loaded (bypassed Gatekeeper)"))
+        if origin:
+            prov += " from %s" % _origin_host(origin)
         return [finding(
             "HIGH", "hot-dir", "Unsigned app bundle in watched folder",
             "%s [%s], modified %s, %s" % (path, sig["trust"], when, prov),
             "hotdir:app:%s:%s:%s" % (path, sig["trust"], sha),
             path=path, trust=sig["trust"], sha256=sha,
-            quarantined=quar, download_agent=agent)]
+            quarantined=quar, download_agent=agent,
+            origin_url=origin, trusted_origin=trusted_origin,
+            confidence=("low" if trusted_origin else "medium"))]
     if sig["trust"] in ("apple", "app-store"):
         return []
     verdict, source = gatekeeper_verdict(path)
@@ -2238,10 +2788,23 @@ def check_hot_dirs(max_age_days=14):
             sig = classify_signature(path)
             if suspicious_sig(sig["trust"]):
                 sha = sha256(path)  # content hash → path reuse ≠ same fingerprint
-                quar, agent = quarantine_origin(path)
+                # Provenance enrichment (one xattr read): WHO downloaded it and
+                # from WHERE, read from the user's own QuarantineEventsV2 /
+                # Chrome downloads table (no FDA, no root). Turns "unsigned
+                # binary appeared" into an attributable event — and grades it: a
+                # drop from a trusted origin is demoted to digest, an
+                # unattributed one stays loud.
+                quar, agent, origin, trusted_origin = download_provenance(path)
                 prov = ("via %s" % agent if agent else
                         ("quarantined" if quar else "NO quarantine flag — side-loaded (bypassed Gatekeeper)"))
+                if origin:
+                    prov += " from %s" % _origin_host(origin)
                 ts_note = "; TIMESTOMP: %s" % ts_reason if ts_reason else ""
+                # A trusted origin only LOWERS confidence (routing it to the
+                # digest instead of a notification); it never lowers severity and
+                # never closes the finding — provenance is an attacker-supplyable
+                # hint, not an authority. A timestomped file is never demoted.
+                demote = trusted_origin and not ts_reason
                 findings.append(finding(
                     "HIGH", "hot-dir", "Unsigned executable in watched folder",
                     "%s [%s], modified %s, %s%s" % (
@@ -2251,6 +2814,8 @@ def check_hot_dirs(max_age_days=14):
                     "hotdir:%s:%s:%s" % (path, sig["trust"], sha),
                     path=path, trust=sig["trust"], sha256=sha,
                     quarantined=quar, download_agent=agent,
+                    origin_url=origin, trusted_origin=trusted_origin,
+                    confidence=("low" if demote else "medium"),
                     timestomp=ts_reason,
                     markers=(["timestomp"] if ts_reason else None)))
     return findings
@@ -2298,6 +2863,237 @@ def check_staging(max_age_days=3):
                 % (path, ioc),
                 "staging:%s:%s" % (path, int(st.st_mtime)),
                 path=path, ioc=ioc))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Check 3b2: developer-toolchain supply chain + known dropper dotfiles.
+#
+# In 2025-26 the developer's own machine became the target, and NONE of the other
+# sensors observe package-manager activity:
+#   * DPRK "Contagious Interview" shipped 300+ malicious npm packages whose
+#     INSTALL-TIME lifecycle script (preinstall/postinstall) fetches and runs the
+#     BeaverTail stealer, which then drops a Python InvisibleFerret backdoor.
+#   * The Shai-Hulud worm compromised 700+ npm packages with a credential-
+#     harvesting postinstall.
+# Both leave a durable, unprivileged-readable artifact: the hostile lifecycle
+# script sitting in an installed package's manifest, and a fixed set of hidden
+# dropper files at $HOME root.
+#
+# FALSE-POSITIVE DISCIPLINE (the reason this is narrow): legitimate packages —
+# esbuild, sharp, puppeteer, node-sass — routinely DOWNLOAD prebuilt binaries in
+# postinstall. So a bare network fetch is deliberately NOT scored. Only an
+# unambiguous exec/obfuscation idiom, or the fetch+exec COMBINATION, fires —
+# exactly the rule the live-process argv scorer uses.
+#
+# SCOPE BOUNDARY: npm-family manifests only. A malicious pip package executes
+# setup.py at install time and usually leaves no equivalent durable hook in the
+# installed wheel, so there is no honest local artifact to diff — claiming pip
+# coverage here would be theater.
+# --------------------------------------------------------------------------- #
+
+# The tree(s) this sensor reads. A module-level global (like STAGING_DIRS /
+# HOT_DIRS) so tests can point it at a fixture instead of the live home.
+SUPPLY_CHAIN_ROOTS = [HOME]
+
+_PKG_LIFECYCLE_KEYS = ("preinstall", "install", "postinstall", "prepare",
+                       "prepublish", "preprepare", "postprepare")
+_PKG_MANIFEST_CAP = 4000     # hard cap on manifests inspected per scan
+_PKG_DIR_CAP = 20000         # hard cap on directories visited per scan
+_PKG_MAX_DEPTH = 8           # relative to $HOME
+_PKG_MAX_AGE_DAYS = 30       # only recently-installed/changed manifests
+_PKG_TIME_BUDGET = 20.0      # seconds; a scan runs hourly, never let it hang
+_PKG_SKIP_DIRS = frozenset((
+    "Library", "Applications", "Pictures", "Movies", "Music", "Public",
+    ".Trash", ".git", ".hg", ".svn", "__pycache__", ".tox", ".mypy_cache",
+    ".pytest_cache", ".cache", ".venv", "venv", ".rustup", ".cargo",
+    "site-packages", ".gradle", ".m2", "Photos Library.photoslibrary",
+))
+
+# Idioms that are hostile in an INSTALL HOOK even standing alone (an installer
+# never legitimately pipes a download into a shell or decodes a blob to run it).
+_PKG_UNAMBIGUOUS = frozenset((
+    "pipe-to-shell", "pipe-to-interpreter", "base64-decode", "eval-subshell",
+    "bash-reverse-shell", "netcat-exec", "osascript-shell", "python-oneliner",
+    "raw-ip-fetch", "launchctl-tmp", "applescript-url-scheme",
+    "gui-kill-coercion", "osascript-password-phish", "keychain-dump",
+))
+
+# Hidden files at $HOME ROOT that are documented malware droppers/stashes. These
+# are EXACT names in the home directory itself (not a subdir), where no ordinary
+# tool puts a file — legitimate tooling lives in ~/.config, ~/.local, ~/.cargo.
+_HOME_DROPPER_IOCS = {
+    ".npc": "dprk-invisibleferret-dropper",
+    ".myvars": "dprk-exfil-vars",
+    ".pyp": "dprk-python-stage",
+    ".mainhelper": "amos-backdoor-binary",
+    ".agent": "amos-persistence-script",
+    ".helper": "amos-stealer-payload",
+    ".logged": "amos-campaign-id",
+    ".sysinfo": "stealer-host-recon",
+}
+
+
+# The JS-native loader shape the shell-oriented idiom table cannot see: DPRK's
+# "HexEval" packages run `node -e "eval(Buffer.from(<blob>,'base64')…)"`, decoding
+# an embedded blob in-process — no `base64 -d`, no pipe, nothing for a shell
+# regex to match. Split into an EXEC vector and a DECODE vector because either
+# alone appears in ordinary build tooling; only the COMBINATION (decode a blob,
+# then execute it) is the loader, and that is essentially never legitimate.
+_PKG_JS_EXEC_RES = [
+    (re.compile(r"\bnode\b[^\n]*\s-e\b", re.I), "node-inline-exec"),
+    (re.compile(r"\beval\s*\(", re.I), "js-eval"),
+    (re.compile(r"\bnew\s+Function\s*\(", re.I), "js-new-function"),
+    (re.compile(r"require\s*\(\s*['\"]child_process['\"]", re.I), "js-child-process"),
+]
+_PKG_JS_DECODE_RES = [
+    (re.compile(r"Buffer\.from\s*\([^)]{0,80}?['\"](?:base64|hex)['\"]", re.I),
+     "js-encoded-blob"),
+    (re.compile(r"\batob\s*\(", re.I), "js-atob-decode"),
+    (re.compile(r"\bfromCharCode\b", re.I), "js-charcode-obfuscation"),
+]
+# JS-native egress: the shell fetch idioms (curl/wget) never match an installer
+# that pulls its second stage through node's own http/net modules — BeaverTail's
+# actual shape. Paired with an exec vector below, this is the fetch-and-run hook.
+_PKG_JS_NET_RES = [
+    (re.compile(r"require\s*\(\s*['\"](?:https?|net|dgram)['\"]", re.I),
+     "js-net-module"),
+    (re.compile(r"\bfetch\s*\(\s*['\"]https?://", re.I), "js-fetch"),
+    (re.compile(r"https?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-url"),
+]
+
+
+def _pkg_hostile_script(script):
+    """Hostile-idiom names in one lifecycle script, or [] if it is ordinary.
+    Mirrors _argv_signals' rule: unambiguous idioms fire alone; a plain network
+    fetch fires ONLY together with an exec idiom (else every prebuilt-binary
+    installer would alert)."""
+    script = script or ""
+    idioms = set(_hostile_content(script))
+    hits = idioms & _PKG_UNAMBIGUOUS
+    if idioms & _FETCH_IDIOMS and idioms & _PIPE_EXEC_IDIOMS:
+        hits = hits | {"fileless-fetch-exec"}
+    js_exec = {n for rx, n in _PKG_JS_EXEC_RES if rx.search(script)}
+    js_decode = {n for rx, n in _PKG_JS_DECODE_RES if rx.search(script)}
+    js_net = {n for rx, n in _PKG_JS_NET_RES if rx.search(script)}
+    if js_exec and js_decode:
+        hits = hits | js_exec | js_decode | {"js-encoded-loader"}
+    # An inline JS exec that ALSO reaches the network is the second-stage
+    # fetcher shape (BeaverTail's installer), hostile without a decode step.
+    elif js_exec and (js_net or idioms & _FETCH_IDIOMS):
+        hits = hits | js_exec | js_net | {"js-network-loader"}
+    return sorted(hits)
+
+
+def _iter_package_manifests(cutoff):
+    """Yield (manifest_path, mtime) for npm manifests changed since `cutoff`.
+    Walks the user's own tree with pruning and hard caps. At a node_modules the
+    INSTALLED packages' manifests are inspected one (or two, for @scoped) levels
+    deep and then descent stops — that is exactly where a malicious dependency's
+    postinstall lives, and it keeps a huge dependency tree from being walked."""
+    started = time.time()
+    dirs_seen = 0
+    yielded = 0
+
+    def fresh(path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return st.st_mtime if st.st_mtime >= cutoff else None
+
+    for base_root in SUPPLY_CHAIN_ROOTS:
+        for root, dirnames, filenames in os.walk(
+                base_root, topdown=True, onerror=lambda e: None,
+                followlinks=False):
+            dirs_seen += 1
+            if (dirs_seen > _PKG_DIR_CAP or yielded >= _PKG_MANIFEST_CAP
+                    or time.time() - started > _PKG_TIME_BUDGET):
+                return
+            if os.path.basename(root) == "node_modules":
+                for d in list(dirnames):
+                    try:
+                        bases = ([os.path.join(root, d, s) for s in os.listdir(
+                            os.path.join(root, d))] if d.startswith("@") else
+                            [os.path.join(root, d)])
+                    except OSError:
+                        continue
+                    for pkg in bases[:500]:
+                        mani = os.path.join(pkg, "package.json")
+                        mtime = fresh(mani)
+                        if mtime is not None:
+                            yielded += 1
+                            yield mani, mtime
+                            if yielded >= _PKG_MANIFEST_CAP:
+                                return
+                dirnames[:] = []      # never descend INTO a dependency tree
+                continue
+            if root[len(base_root):].count(os.sep) >= _PKG_MAX_DEPTH:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [d for d in dirnames
+                               if d not in _PKG_SKIP_DIRS
+                               and (d == "node_modules" or not d.startswith("."))]
+            if "package.json" in filenames:
+                mani = os.path.join(root, "package.json")
+                mtime = fresh(mani)
+                if mtime is not None:
+                    yielded += 1
+                    yield mani, mtime
+
+
+def check_supply_chain():
+    findings = []
+    # (a) Known dropper dotfiles sitting directly in $HOME.
+    for base_root in SUPPLY_CHAIN_ROOTS:
+        for name, family in _HOME_DROPPER_IOCS.items():
+            path = os.path.join(base_root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not os.path.isfile(path):
+                continue
+            findings.append(finding(
+                "HIGH", "supply-chain",
+                "Known malware dropper file in home directory",
+                "%s matches the documented %s artifact — no legitimate tool "
+                "places this file at the root of $HOME." % (path, family),
+                "dropper:%s:%s" % (path, int(st.st_mtime)),
+                path=path, ioc=family, markers=["dropper-dotfile"]))
+
+    # (b) Hostile install-time lifecycle hooks in installed npm packages.
+    cutoff = time.time() - _PKG_MAX_AGE_DAYS * 86400
+    for mani, mtime in _iter_package_manifests(cutoff):
+        try:
+            with open(mani, "r", errors="replace") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        scripts = data.get("scripts")
+        if not isinstance(scripts, dict):
+            continue
+        pkg_name = str(data.get("name") or os.path.basename(os.path.dirname(mani)))
+        for key in _PKG_LIFECYCLE_KEYS:
+            script = scripts.get(key)
+            if not isinstance(script, str):
+                continue
+            hits = _pkg_hostile_script(script)
+            if not hits:
+                continue
+            digest = hashlib.sha256(script.encode()).hexdigest()
+            findings.append(finding(
+                "HIGH", "supply-chain",
+                "Malicious install hook in npm package",
+                "%s: '%s' lifecycle script triggers [%s] — an install-time hook "
+                "that fetches/decodes and executes code (Contagious Interview / "
+                "Shai-Hulud shape). Manifest: %s" % (
+                    pkg_name, key, ", ".join(hits), mani),
+                "pkghook:%s:%s:%s" % (mani, key, digest[:16]),
+                path=mani, package=pkg_name, lifecycle=key,
+                script_sha256=digest, markers=hits))
     return findings
 
 
@@ -3664,6 +4460,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("shell-history", check_shell_history, ()),
         ("hot-dir", check_hot_dirs, ()),
         ("staging", check_staging, ()),
+        ("supply-chain", check_supply_chain, ()),
         ("canary", check_canaries, ()),
         ("outbound", check_outbound, ()),
         ("security-log", check_security_log, ()),
@@ -4061,19 +4858,59 @@ def cmd_incidents(show_all=False):
             item["id"], item["status"], item["severity"], item["title"],
             item["correlation_key"], item["evidence_count"],
             "" if item["evidence_count"] == 1 else "s"))
-    print("\nDetails/actions: aegis.py incident <id> "
-          "[ack|investigate|contain|recover|monitor|resolve|false-positive|reopen]")
+    print("\nDetails/actions: aegis.py incident <id> [ack|investigate|contain|"
+          "recover|monitor|resolve|false-positive|benign-positive|reopen]")
     return 0
 
 
 _INCIDENT_ACTIONS = {
     "ack": "ACK", "investigate": "INVESTIGATING", "contain": "CONTAINED",
     "recover": "RECOVERING", "monitor": "MONITORING", "resolve": "RESOLVED",
-    "false-positive": "FALSE_POSITIVE", "reopen": "OPEN",
+    "false-positive": "FALSE_POSITIVE", "benign-positive": "FALSE_POSITIVE",
+    "reopen": "OPEN",
+}
+
+# Documenting each sensor's EXPECTED benign causes turns triage from an
+# investigation into a lookup — the single biggest triage-ergonomics lever for a
+# one-person SOC. Shown on the incident card next to the evidence.
+SENSOR_BENIGN_NOTES = {
+    "persistence": "Homebrew services, Docker/VSCode helpers, backup agents, "
+                   "and printer/VPN vendors all install launchd jobs.",
+    "process": "Dev toolchains run unsigned binaries from ~/ (cargo/go build "
+               "output, node_modules/.bin, pyenv shims).",
+    "behavior": "Installer one-liners (Homebrew/rustup) legitimately pipe curl "
+                "into a shell; CI and dotfile scripts use base64/eval.",
+    "hot-dir": "Freshly downloaded developer tools land unsigned in ~/Downloads; "
+               "check the origin URL recorded on the finding.",
+    "staging": "Archivers and installers write .zip files to /tmp routinely — "
+               "the IOC filename, not the archive itself, is the signal.",
+    "supply-chain": "Some legitimate packages run build steps in postinstall; "
+                    "the flagged idiom (decode-and-exec) is what matters.",
+    "net-listener": "Dev servers, Docker, syncthing, and AirPlay bind ports; "
+                    "loopback-only listeners are already excluded.",
+    "btm": "Any app you install can register a login item or background agent.",
+    "browserext": "Extensions you installed yourself appear here on first sight.",
+    "ide_ext": "VSCode/Cursor extensions auto-update, which re-fires this.",
+    "wallet": "Wallet apps rewrite their own config on update or account change.",
+    "web-protection": "Editing /etc/hosts for local development is expected.",
+    "hardening": "A deliberately disabled firewall or Remote Login you enabled.",
+    "canary": "A backup/indexing tool touching the decoy file, or your own edit.",
+    "self-protection": "Re-running install.sh or editing the trust store by hand.",
 }
 
 
-def cmd_incident(incident_id, action=None):
+def _benign_note_for(item):
+    """The benign-cause notes relevant to an incident, keyed on its evidence
+    categories (falling back to the correlation key's own prefix)."""
+    notes = []
+    for category in sorted(item.get("categories") or ()):
+        note = SENSOR_BENIGN_NOTES.get(category)
+        if note and note not in notes:
+            notes.append("%s: %s" % (category, note))
+    return notes
+
+
+def cmd_incident(incident_id, action=None, reason=None):
     try:
         incident_id = int(incident_id)
     except (TypeError, ValueError):
@@ -4084,7 +4921,15 @@ def cmd_incident(incident_id, action=None):
         if not new_status:
             print("unknown incident action: %s" % action)
             return 1
-        if not transition_incident(incident_id, new_status):
+        # A dismissal records WHICH kind it was, so a broken rule and an
+        # authorized-but-noisy one feed different tuning queues.
+        reason_code = None
+        if new_status == "FALSE_POSITIVE":
+            reason_code = reason or action.lower()
+            if reason_code not in ("false-positive", "benign-positive"):
+                reason_code = "false-positive"
+        if not transition_incident(incident_id, new_status,
+                                   reason_code=reason_code):
             current = incident_detail(incident_id)
             print("refuse: invalid transition from %s to %s" %
                   ((current or {}).get("status", "missing"), new_status))
@@ -4107,6 +4952,90 @@ def cmd_incident(incident_id, action=None):
             summary = evidence["event_type"]
         print("  - %s · %s · %s" %
               (evidence["observed_at"], evidence["source"], summary))
+    notes = _benign_note_for(item)
+    if notes:
+        print("\nKnown benign causes for these sensors (check before acting):")
+        for note in notes:
+            print("  · %s" % note)
+    print("\nActions: ack | investigate | contain | recover | monitor | resolve"
+          "\n         false-positive   (the DETECTION was wrong — rule needs tuning)"
+          "\n         benign-positive  (real event, but authorized — suppress this one)"
+          "\n         reopen")
+    return 0
+
+
+def cmd_replay(days=30):
+    """Backtest the CURRENT correlation/scoring logic against recorded history.
+
+    Detection-as-code's first discipline: a rule change must be replayed over
+    real past telemetry before it ships, or you cannot tell a precision gain from
+    a silent regression. This re-runs today's chain rules over the stored finding
+    events in a THROWAWAY in-memory database, so it never creates an incident,
+    never notifies, and never mutates durable state — it only reports what the
+    current logic WOULD have opened over that window."""
+    ensure_state()
+    init_event_store()
+    now = _epoch()
+    since = now - int(days) * 86400
+    src = _event_connection()
+    try:
+        rows = src.execute(
+            "SELECT id,occurred_at,observed_at,source,event_type,data_json "
+            "FROM events WHERE event_type='observation.finding' AND observed_at>=? "
+            "ORDER BY observed_at", (since,)).fetchall()
+        dismissals = src.execute(
+            "SELECT category,reason_code,COUNT(*) AS n FROM dismissals "
+            "WHERE dismissed_at>=? GROUP BY category,reason_code "
+            "ORDER BY n DESC", (since,)).fetchall()
+    finally:
+        src.close()
+    print("# Aegis replay — last %s days, %d recorded finding events\n"
+          % (days, len(rows)))
+    if not rows:
+        print("No recorded findings in that window; nothing to replay.")
+        return 0
+    # Rebuild the events into a scratch DB and run the real correlation code.
+    scratch = sqlite3.connect(":memory:")
+    scratch.row_factory = sqlite3.Row
+    scratch.executescript(_EVENT_SCHEMA_SQL)
+    new_events = []
+    with scratch:
+        for row in rows:
+            cur = scratch.execute(
+                "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                "data_json) VALUES(?,?,?,?,?)",
+                (row["occurred_at"], row["observed_at"], row["source"],
+                 row["event_type"], row["data_json"]))
+            try:
+                new_events.append((cur.lastrowid, json.loads(row["data_json"])))
+            except Exception:
+                continue
+        _apply_correlations(scratch, new_events, now, initially_notified=True)
+        opened = _dict_rows(scratch.execute(
+            "SELECT kind,severity,title,correlation_key FROM incidents "
+            "ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 "
+            "ELSE 2 END, id").fetchall())
+    scratch.close()
+    by_kind = {}
+    for item in opened:
+        by_kind[item["kind"]] = by_kind.get(item["kind"], 0) + 1
+    print("Incidents the CURRENT logic would open: %d" % len(opened))
+    for kind in sorted(by_kind):
+        print("  %-12s %d" % (kind, by_kind[kind]))
+    print()
+    for item in opened[:40]:
+        print("  %-8s %-11s %s" % (item["severity"], item["kind"],
+                                   item["title"][:96]))
+    if len(opened) > 40:
+        print("  … %d more" % (len(opened) - 40))
+    if dismissals:
+        print("\nDismissal history (per-sensor tuning queue):")
+        for row in dismissals:
+            print("  %-16s %-16s %d" % (row["category"] or "-",
+                                        row["reason_code"], row["n"]))
+        print("\n  false-positive → the rule is wrong; tune or retire it."
+              "\n  benign-positive → the rule works; the activity was authorized.")
+    print("\nReplay is read-only: no incident was created and nothing was notified.")
     return 0
 
 
@@ -5551,8 +6480,15 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
   status           print hardening, XProtect, sensor coverage, and incidents
   doctor           verify actual coverage/liveness (unknown is never green)
   incidents [all]  list active incidents (or complete history)
-  incident <id> [ack|investigate|contain|recover|monitor|resolve|
-                 false-positive|reopen]
+  incident <id> [ack|investigate|contain|recover|monitor|resolve|reopen|
+                 false-positive|benign-positive]
+                   ...the two dismissals are recorded separately and feed
+                   different tuning queues: false-positive = the DETECTION was
+                   wrong (tune the rule), benign-positive = the event was real
+                   but authorized (suppress this instance, rule is fine)
+  replay [days]    backtest the CURRENT correlation logic against recorded
+                   history (default 30d). Read-only: opens no incident, sends
+                   no notification — run it after changing detection logic
   baseline         reset the known-good persistence baseline to current state
   allow <path>     suppress future alerts for findings matching <path>
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
@@ -5596,7 +6532,15 @@ def main(argv):
     if cmd == "incidents":
         return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
     if cmd == "incident" and len(argv) > 2:
-        return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None)
+        return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
+                            argv[4] if len(argv) > 4 else None)
+    if cmd == "replay":
+        try:
+            days = int(argv[2]) if len(argv) > 2 else 30
+        except ValueError:
+            print("usage: aegis.py replay [days]")
+            return 1
+        return cmd_replay(days)
     if cmd == "baseline":
         return cmd_baseline()
     if cmd == "baseline-unverified":  # installer-only: adopt, never bless

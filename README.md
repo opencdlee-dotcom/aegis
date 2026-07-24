@@ -30,8 +30,12 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Process watch** | Running processes whose executable is unsigned/ad-hoc **and** in a user-writable path | Malware runs ad-hoc-signed binaries from `/tmp`, `~/`, `/Users/Shared` |
 | **Behavioral watch** *(new)* | The full **command line** of every same-user process, scored for the fileless-stealer TTPs: a fake `osascript … display dialog … hidden answer` **password phish** (CRITICAL), `dscl . -authonly` local-password check, `xattr -c/-d com.apple.quarantine` **provenance strip**, `hdiutil attach -nobrowse` **invisible DMG mount**, `tccutil reset`, a `login.keychain-db` copy, a `curl -F file=@/tmp/*.zip` **exfil POST**, and a `curl … \| bash/osascript` **fileless pipeline** | The dominant 2025-26 stealer TTP is fileless — it runs through Apple-signed interpreters (bash/osascript/curl) whose *path* is trusted, so only the argv reveals the attack. This is the biggest coverage gain in this release |
 | **XProtect harvest** *(new)* | Reads Apple's own **XProtect Remediator** detections straight from the unified log (`com.apple.XProtectFramework.PluginAPI`) — a `status != NoThreatDetected` event means Apple's engine found/removed malware (CRITICAL) — plus flags **stale XProtect definitions** (>60 days) | Piggybacks Apple's professionally-maintained, always-updating signature/behavioral engine for free — no entitlement, no cloud. The single highest-value signal a signature-less tool can add |
-| **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables **and `.app` bundles** in Downloads/Desktop/tmp/Shared, tagged with **quarantine provenance** — a binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop). A fresh signed-but-**unnotarized** app additionally gets Gatekeeper's own `spctl` verdict surfaced (MEDIUM — a normal quarantined launch would refuse it, so one that runs was side-loaded or force-approved) | Catches a payload the moment it lands, before it runs — including the #1 delivery shape, a DMG/ZIP-dragged `.app`, which is a *directory* and invisible to any file-only check |
+| **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables **and `.app` bundles** in Downloads/Desktop/tmp/Shared, tagged with **full download provenance** — not just *whether* a quarantine flag exists but **who** downloaded it and **from what URL**, resolved from the user's own `QuarantineEventsV2` store and the Chrome-family `downloads` table (both same-user-readable, **no Full Disk Access**). A binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop); one from a **trusted origin** (github/apple/brew/npm/pypi…) is demoted to the digest instead of notifying — provenance grades the finding, and because an attacker can supply it, it only ever *lowers* confidence, never severity, and never closes a finding (a timestomped file is never demoted). A fresh signed-but-**unnotarized** app additionally gets Gatekeeper's own `spctl` verdict surfaced (MEDIUM — a normal quarantined launch would refuse it, so one that runs was side-loaded or force-approved) | Catches a payload the moment it lands, before it runs — including the #1 delivery shape, a DMG/ZIP-dragged `.app`, which is a *directory* and invisible to any file-only check |
 | **Staging watch** *(new)* | Documented stealer **loot-staging artifacts** in `/tmp`/`/Users/Shared` — `app.zip` (Atomic), `ledger.zip` (Odyssey/Poseidon), `salmonela.zip` (MacSync), `wid.txt`, `.pass`, `shub_*`, a copied `login.keychain-db` | Smash-and-grab stealers stage loot then exfil in under a minute, leaving no persistence — this catches the residue |
+| **Developer supply chain** *(new)* | Install-time **npm lifecycle hooks** (`preinstall`/`postinstall`/…) that decode-and-execute or fetch-and-run — including the JS-native loader shape (`node -e "eval(Buffer.from(…,'base64'))"`, `atob`, `require('https')`) that no shell-oriented pattern can see — plus documented **dropper dotfiles** at `$HOME` root (`.npc`, `.myvars`, `.pyp` — DPRK; `.agent`, `.helper`, `.mainhelper`, `.logged` — AMOS) | The developer's own machine became the target: DPRK *Contagious Interview* shipped 300+ malicious npm packages whose install hook runs BeaverTail, and the Shai-Hulud worm hit 700+ packages with a credential-harvesting postinstall. **Deliberately narrow:** a bare network fetch never fires (esbuild/sharp/puppeteer legitimately download binaries in `postinstall`) — only an unambiguous exec/obfuscation idiom, or the fetch+exec combination, does. Measured on a real dev machine: 369 recently-changed manifests scored, **zero** false positives, 0.7 s |
+| **GUI-kill coercion** *(new)* | A process killing **Activity Monitor / SystemUIServer / NotificationCenter / Console** — and the tight-loop variant (`while …; do killall …; sleep 0.2; done`) escalated to CRITICAL | ClickLock (Group-IB; 100+ victims across 33 countries since May 2026) kills the very apps you'd open to notice it, looping every 210 ms for up to ~35 days until you type your password, and kills NotificationCenter to suppress Gatekeeper warnings. "No legitimate use case." A plain `killall Dock` (ordinary troubleshooting) is deliberately **not** flagged |
+| **Daemon name masquerade** *(new)* | A binary in a user-writable path whose name is **edit-distance 1** from an Apple system daemon (`SystemUIServerl` vs `SystemUIServer`, `cfprefsdd` vs `cfprefsd`) | ClickLock's reverse shell runs as `SystemUIServerl` to blend into `ps`/Activity Monitor. The *name* is the signal, so this fires regardless of signature — a validly-signed typosquat is still impersonating the OS |
+| **applescript:// delivery** *(new)* | The `applescript://` URL scheme, which opens Script Editor pre-loaded with the payload | A 2026 ClickFix variant that executes **entirely outside any shell** — leaving no shell history *and* sidestepping Apple's own macOS Tahoe 26.4 Terminal-paste warning. The shell-history sensor is structurally blind here |
 | **Web/phishing posture** | Parses `/etc/hosts` locally for a substantial hosts denylist and flags non-blocking redirects of sensitive identity/update domains or punycode names as HIGH. Missing blocklist coverage is INFO only because DNS or Network Extension filtering may exist outside Aegis's view | Adds an entitlement-free web-defense layer without phoning home, modifying DNS, or pretending that an unobservable network filter is absent |
 | **Shell history** *(new)* | The recent tail of `~/.zsh_history`/`.bash_history`/fish for the **ClickFix terminal-paste** chain — `dscl . -authonly`, `curl … \| sh`, `xattr -c`, `hdiutil -nobrowse` — one alert per unique hostile command | ClickFix (fake-CAPTCHA paste) is now the dominant macOS initial-access vector; the payload is fetched inside a trusted Terminal so it never gets a quarantine xattr — history is the residue |
 | **Wallet integrity** *(new)* | Content-hash of installed crypto-wallet configs + app binaries (Ledger Live `app.json`, Trezor Suite, Exodus); any change alerts HIGH | 2025 stealers hijack funds by rewriting Ledger Live's `app.json` or swapping wallet bundles for drainers (DigitStealer, Odyssey) |
@@ -68,6 +72,26 @@ detections favour **hard-to-vary structural invariants** (a non-Apple
 process copying `login.keychain-db`; a quarantine-xattr strip) over easily-shed
 string patterns, because Aegis is open-source and an attacker can read its checks.
 
+**Correlation remembers paths, not just moments.** The bounded same-entity window
+cannot see the dominant 2025-26 shape: a dropper writes a payload and *exits*,
+then a **separate** launchd job runs it at the next login — different process,
+hours later, often re-signed so the content hash no longer matches. Widening the
+window would only add noise, so instead a suspicious drop is **durably
+remembered by path**, and the chain fires the moment anything later executes or
+persists that path, however much later. The path is the one identifier that must
+survive between the two stages for the attack to work at all.
+
+**Alert fatigue is treated as a failure mode, not a fact of life.** Dismissing an
+incident asks *which kind* it was — `false-positive` (the detection is wrong →
+tune the rule) or `benign-positive` (real, but authorized → suppress this one) —
+because conflating them is what makes tuning impossible. A sensor the operator
+keeps dismissing is automatically **down-weighted** in risk accumulation (never
+to zero, and reopening an incident retracts the dismissal). Each incident card
+lists the **known benign causes** for the sensors that fired, so triage is a
+lookup rather than an investigation. And corroboration is scored, not just
+counted: two *different* sensors implicating one entity outranks the same number
+of hits from one sensor.
+
 ---
 
 ## Install / use
@@ -80,7 +104,17 @@ python3 aegis.py doctor        # coverage/permission/sensor-health diagnostics
 python3 aegis.py report        # reprint the latest report
 python3 aegis.py baseline      # accept current state as known-good (resets diff)
 python3 aegis.py incidents     # active incidents, evidence count, and state
-python3 aegis.py incident ID   # evidence and allowed lifecycle actions
+python3 aegis.py incident ID   # evidence, KNOWN BENIGN CAUSES for the sensors
+                               #   that fired, and allowed lifecycle actions
+python3 aegis.py incident ID false-positive   # the DETECTION was wrong (tune it)
+python3 aegis.py incident ID benign-positive  # real event, but authorized
+                               #   ...the two are recorded separately and feed
+                               #   different tuning queues; reopening an incident
+                               #   retracts the dismissal so it stops counting
+python3 aegis.py replay [days] # backtest the CURRENT correlation logic against
+                               #   recorded history (default 30d). READ-ONLY:
+                               #   opens no incident, sends no notification —
+                               #   run it after changing detection logic
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)
@@ -345,7 +379,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**218 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**300 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -366,6 +400,18 @@ replacement is forced through strict `codesign` verification instead of reusing
 a stale trusted cache entry. Two incident-lifecycle regressions additionally
 prove an exact reviewed false positive stays suppressed while accumulating
 evidence, but a resolved threat that recurs opens a fresh incident.
+
+The **research-derived layer** adds 43 further fail-before/pass-after tests
+([tests/test_research_layers.py](tests/test_research_layers.py)): a `curl|bash`
+and a `node -e "eval(Buffer.from(…,'base64'))"` install hook are both caught while
+five ordinary prebuilt-binary installers stay silent; a GUI-kill loop scores
+CRITICAL while a plain `killall Dock` scores nothing; `SystemUIServerl` is caught
+as a typosquat while the real daemon is not; a `caffeinate`/`sudo -u` wrapper
+fronting a hidden payload is unwrapped and scored, while the same wrapper around
+a legitimate app is not; a drop backdated **30 days** still chains to its later
+execution; two sensors corroborating escalate sooner *without* regressing the
+documented single-sensor guarantee; one dismissal cannot mute a sensor but six
+can down-weight it; and `replay` is proven to leave durable state byte-identical.
 
 The **response tier** pins files and valid `.app` bundles, native metadata-
 preserving round trips, durable crash recovery after the source rename, audit-

@@ -23,11 +23,13 @@ The non-negotiable boundary is:
 | Layer | Control | Failure it covers |
 |---|---|---|
 | Prevent | Gatekeeper/notarization posture, SIP, FileVault, firewall, least privilege | Reduces exposed paths before Aegis observes anything |
-| Observe | Persistence, processes/argv, hot directories/apps, XProtect, staging, shell history, hosts-file web/phishing posture, canaries, listeners, background items, profiles, extensions, wallet integrity | Independent artifacts left by execution, persistence, credential theft, staging, redirection, or tampering |
+| Observe | Persistence, processes/argv, hot directories/apps, XProtect, staging, shell history, hosts-file web/phishing posture, canaries, listeners, background items, profiles, extensions, wallet integrity, developer supply chain | Independent artifacts left by execution, persistence, credential theft, staging, redirection, or tampering |
+| Attribute | Download provenance from `QuarantineEventsV2` and the Chrome-family `downloads` table | Turns "an unsigned binary appeared" into "who fetched it, from where" — and grades the finding accordingly |
 | Prove coverage | Durable per-sensor status, duration, item count, consecutive failures | Prevents an unavailable permission/tool from being reported as clean |
 | Normalize | Versioned finding contract and central redaction | Makes signals comparable without persisting command-line secrets |
-| Correlate | Same-entity, bounded-window chains | Raises confidence when independent layers agree without flooding on unrelated medium findings |
+| Correlate | Same-entity bounded-window chains **plus durable path lineage** | Raises confidence when independent layers agree; lineage additionally links a drop to an execution that happens after any bounded window has closed |
 | Manage | Durable incidents, evidence links, validated lifecycle, bounded reminders | Keeps work visible after a desktop notification disappears |
+| Tune | Typed dismissals (false- vs benign-positive), per-sensor down-weighting, documented benign causes, read-only replay | Keeps the operator trusting the tool: a noisy detector is measurable and correctable instead of being muted wholesale |
 | Contain | Manual process action and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
 | Recover | Exclusive restore, verified delete, crash recovery, audit | Handles false positives and interrupted response without silent data loss |
 
@@ -68,10 +70,42 @@ The current rules intentionally trade breadth for explainability:
   listener for the same entity become a CRITICAL chain.
 - **Supply chain:** background-item installation/change plus suspicious
   execution of the same entity becomes a CRITICAL chain.
+- **Credential capture:** a password phish, `dscl -authonly` check, keychain
+  access, or GUI-kill coercion, plus persistence/staging/exfil on the same
+  entity, becomes a CRITICAL chain. Each stage is individually explainable;
+  together they are the infostealer kill chain.
+- **Path lineage (not time-boxed):** a suspicious drop is remembered durably by
+  normalized path, and any later execution or persistence of that path becomes a
+  CRITICAL chain regardless of elapsed time.
 
 An uncorrelated HIGH or CRITICAL signal still opens an incident. An unrelated
 single MEDIUM signal is recorded but does not become an incident. Correlation is
 deterministic code with inspectable evidence; it is not an AI verdict.
+
+### Why lineage is keyed on the path
+
+The bounded window cannot express the standard 2025-26 sequence: a dropper writes
+a payload and exits, and a *different* launchd job executes it at the next login.
+Widening the window trades precision for a case it still would not reliably
+cover. Content hashes are also the wrong key, because droppers re-sign the
+payload between stages, changing the hash while the code stays identical. The
+path is the one identifier that must remain stable for the attack to function, so
+lineage joins on it — retained for six months, then forgotten.
+
+### Risk accumulation
+
+Weak signals that never notify alone accumulate per entity, weighted by severity
+× confidence. Two refinements keep this honest:
+
+- **Corroboration is scored, not just counted.** Signals from two or more
+  distinct sensors receive a score multiplier against a *constant* threshold —
+  independent sensors agreeing is stronger evidence than the same count from one
+  sensor. The single-sensor path keeps its original bar, so no previously
+  escalating detection stops escalating.
+- **Precision feedback.** A category the operator repeatedly dismisses is
+  down-weighted toward a floor (never to zero, so it can still corroborate), and
+  only after a minimum sample, so one dismissal cannot mute a sensor. Reopening
+  an incident retracts its dismissal.
 
 ## Incident workflow
 
@@ -91,6 +125,23 @@ OPEN -> ACK -> INVESTIGATING -> CONTAINED -> RECOVERING -> MONITORING -> RESOLVE
 
 Use `aegis.py incidents`, then `aegis.py incident ID ACTION`. Response remains a
 separate explicit step; creating an incident never quarantines or kills anything.
+
+Dismissal is **typed**, because the two kinds need opposite handling and merging
+them is what makes a detector impossible to tune:
+
+- `false-positive` — the detection logic was wrong; the rule needs tuning.
+- `benign-positive` — the event was real but authorized; the rule is working.
+
+Both suppress the same way (identical semantics, `FALSE_POSITIVE`), but they are
+recorded separately so the tuning queues and the per-sensor precision feedback
+can tell a broken rule from an expected-but-noisy one. Each incident card also
+prints the documented benign causes for the sensors that fired, so triage is a
+match against a known list rather than an investigation.
+
+`aegis.py replay [days]` re-runs the current correlation logic over recorded
+history in a throwaway in-memory database. It is strictly read-only — no
+incident, no notification, no durable write — so a detection change can be
+backtested before it ships.
 
 ## Transactional quarantine
 

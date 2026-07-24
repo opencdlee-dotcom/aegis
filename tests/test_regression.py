@@ -84,6 +84,10 @@ class Sandbox(unittest.TestCase):
             # single global at fixture data to exercise it.
             "SHELL_HISTORY_FILES": [],
             "STAGING_DIRS": [],
+            # The supply-chain sensor walks the user's dev tree for npm
+            # manifests; pin it to the sandbox so no test reads (or is slowed
+            # by) the real home directory. Its own tests point it at fixtures.
+            "SUPPLY_CHAIN_ROOTS": [self.tmp],
             "WALLET_CONFIG_FILES": [],
             "WALLET_APP_BINS": [],
             "XPROTECT_BUNDLES": [],
