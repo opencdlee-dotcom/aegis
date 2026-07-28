@@ -100,6 +100,7 @@ import os
 import plistlib
 import re
 import select
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -1280,11 +1281,52 @@ def _event_attributes(f):
     return _redact_value({k: v for k, v in f.items() if k not in core})
 
 
+_ENTITY_KEYS = ("path", "program", "script_target", "executable", "bundle",
+                "pid", "label")
+
+
 def _entity(f):
-    for key in ("path", "program", "executable", "bundle", "pid", "label"):
+    for key in _ENTITY_KEYS:
         if f.get(key) not in (None, ""):
             return str(f[key])
     return ""
+
+
+def _entities(f):
+    """Every identity a finding can be JOINED on, primary first.
+
+    A finding often denotes more than one object. A persistence finding is about
+    both the plist that changed (`path`) and the program that plist launches
+    (`program`) — and the program is the only one of the two any OTHER sensor
+    ever reports. Keying the joins on the single primary entity therefore made
+    the documented persistence-execution and path-lineage chains unreachable
+    from real sensor output: they could only ever fire on hand-built findings
+    whose `path` was already the payload.
+
+    Beyond the primary, only ABSOLUTE PATHS join, and never a shared
+    INTERPRETER. A path names one object unambiguously; a pid is recycled and a
+    label/bundle is a name shared by every finding about the same product, so
+    widening the join to those would manufacture matches rather than discover
+    them. `/bin/bash` is the sharpest case of that: half the launchd agents on a
+    normal Mac run a shell, so joining on the interpreter would chain any benign
+    shell-based agent to any unrelated suspicious shell process — a CRITICAL
+    false positive (measured, not theorized). The payload an interpreter is
+    pointed at is carried separately as `script_target`, and THAT is joinable.
+    `_entity()` keeps its single-value contract — display, dedup and incident
+    identity are unchanged.
+    """
+    out = []
+    for key in _ENTITY_KEYS:
+        v = f.get(key)
+        if v in (None, ""):
+            continue
+        v = str(v)
+        if not out:
+            out.append(v)
+        elif os.path.isabs(v) and v not in out \
+                and os.path.basename(v) not in _INTERPRETERS:
+            out.append(v)
+    return out
 
 
 def _severity_max(a, b):
@@ -1364,14 +1406,26 @@ def _canon_entity_path(value):
     return p
 
 
+def _canon_entity_key(value):
+    """Comparison form of one entity: canonicalized + case-folded for paths,
+    verbatim for everything else (a pid or a launchd label is not a path)."""
+    return os.path.normcase(_canon_entity_path(value)) \
+        if os.path.isabs(value) else value
+
+
+def _shared_entity(a, b):
+    """The identity two findings have in common, or None. Returns the value as
+    the finding REPORTED it (not the comparison form) so callers keep deriving
+    correlation keys exactly as they did when only the primary entity joined."""
+    eb = {_canon_entity_key(v) for v in _entities(b)}
+    for v in _entities(a):
+        if _canon_entity_key(v) in eb:
+            return v
+    return None
+
+
 def _same_entity(a, b):
-    ea, eb = _entity(a), _entity(b)
-    if not ea or not eb:
-        return False
-    if os.path.isabs(ea) and os.path.isabs(eb):
-        return os.path.normcase(_canon_entity_path(ea)) == \
-            os.path.normcase(_canon_entity_path(eb))
-    return ea == eb
+    return _shared_entity(a, b) is not None
 
 
 # Per-entity risk accumulation (Elastic building-block → entity-risk → higher-
@@ -1454,6 +1508,12 @@ def _accumulate_risk(db, now, new_ids):
             f = json.loads(row["data_json"])
         except Exception:
             continue
+        # Single primary entity on purpose, unlike the chain rules: accumulation
+        # counts weak signals piling up on ONE object, so bucketing a finding
+        # under its every identity would both double-count it and pool unrelated
+        # findings under a shared interpreter (three ordinary launchd jobs all
+        # running /bin/bash would sum past the threshold). The chains can afford
+        # the wider join because each demands a specific pair of categories.
         entity = _entity(f)
         if not entity:
             continue
@@ -1528,6 +1588,23 @@ def _lineage_path(f):
     return os.path.normcase(_canon_entity_path(entity))
 
 
+def _lineage_paths(f):
+    """Every absolute path a finding is about, normalized. Used on the
+    ACTIVATION side only: "this path is now being executed/persisted" is true of
+    the program a plist launches as well as of the plist itself, and the program
+    is the path the earlier drop was recorded under. The DROP side deliberately
+    keeps the single primary path — recording a launched program as though the
+    finding were itself a drop would remember objects nobody dropped."""
+    out = []
+    for entity in _entities(f):
+        if not os.path.isabs(entity):
+            continue
+        p = os.path.normcase(_canon_entity_path(entity))
+        if p not in out:
+            out.append(p)
+    return out
+
+
 def _apply_path_lineage(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset()):
     """Record suspicious drops durably, and raise a CRITICAL chain when a
@@ -1557,29 +1634,27 @@ def _apply_path_lineage(db, new_events, now, initially_notified=False,
         if category in suppressed_categories \
                 or category not in _LINEAGE_ACTIVATION_CATEGORIES:
             continue
-        path = _lineage_path(f)
-        if not path:
-            continue
-        row = db.execute(
-            "SELECT first_event_id, first_seen, category, detail "
-            "FROM path_lineage WHERE path=?", (path,)).fetchone()
-        if not row or row["first_event_id"] is None \
-                or row["first_event_id"] == event_id:
-            continue
-        evidence = sorted({row["first_event_id"], event_id})
-        age_h = max(0, (now - int(row["first_seen"]))) / 3600.0
-        incident_id = _upsert_incident(
-            db, "chain:lineage:%s" % hashlib.sha256(
-                path.encode("utf-8", "replace")).hexdigest()[:16],
-            "Dropped object later executed or persisted (%s -> %s)"
-            % (row["category"], category),
-            "CRITICAL", "correlation", now, evidence, initially_notified)
-        db.execute(
-            "UPDATE incidents SET title=? WHERE id=?",
-            ("Dropped object later executed or persisted: %s (%s -> %s, %.1fh "
-             "apart)" % (path[:120], row["category"], category, age_h),
-             incident_id))
-        attached.update(evidence)
+        for path in _lineage_paths(f):
+            row = db.execute(
+                "SELECT first_event_id, first_seen, category, detail "
+                "FROM path_lineage WHERE path=?", (path,)).fetchone()
+            if not row or row["first_event_id"] is None \
+                    or row["first_event_id"] == event_id:
+                continue
+            evidence = sorted({row["first_event_id"], event_id})
+            age_h = max(0, (now - int(row["first_seen"]))) / 3600.0
+            incident_id = _upsert_incident(
+                db, "chain:lineage:%s" % hashlib.sha256(
+                    path.encode("utf-8", "replace")).hexdigest()[:16],
+                "Dropped object later executed or persisted (%s -> %s)"
+                % (row["category"], category),
+                "CRITICAL", "correlation", now, evidence, initially_notified)
+            db.execute(
+                "UPDATE incidents SET title=? WHERE id=?",
+                ("Dropped object later executed or persisted: %s (%s -> %s, %.1fh "
+                 "apart)" % (path[:120], row["category"], category, age_h),
+                 incident_id))
+            attached.update(evidence)
     return attached
 
 
@@ -1609,7 +1684,7 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
                 if not _same_entity(left, right):
                     continue
                 if left_id in new_ids or right_id in new_ids:
-                    entity = _canon_entity_path(_entity(left) or _entity(right))
+                    entity = _canon_entity_path(_shared_entity(left, right))
                     entity_key = hashlib.sha256(
                         entity.encode("utf-8", "replace")).hexdigest()[:16]
                     matches_by_entity.setdefault(entity_key, set()).update(
@@ -2283,6 +2358,8 @@ def check_persistence(baseline_snap, current_snap):
                                    rec.get("trust")),
                 "persistence:new:%s:%s" % (path, rec.get("sha256")),
                 path=path, program=rec.get("program"), trust=rec.get("trust"),
+                script_target=_script_target(rec.get("args"),
+                                             rec.get("program")),
                 run_at_load=rec.get("run_at_load")))
         else:
             old = base[path]
@@ -2320,7 +2397,9 @@ def check_persistence(baseline_snap, current_snap):
                         rec["label"], old, rec,
                         prog_changed, env_changed, args_changed),
                     "persistence:changed:%s:%s" % (path, fp),
-                    path=path, program=rec.get("program"), trust=rec.get("trust")))
+                    path=path, program=rec.get("program"), trust=rec.get("trust"),
+                    script_target=_script_target(rec.get("args"),
+                                                 rec.get("program"))))
     for path, old in base.items():
         if path not in current_snap:
             findings.append(finding(
@@ -2328,6 +2407,35 @@ def check_persistence(baseline_snap, current_snap):
                 "%s (%s) no longer present" % (old.get("label"), path),
                 "persistence:removed:%s" % path, path=path))
     return findings
+
+
+# A crontab line is `<5 schedule fields> <command>`, or `@special <command>`.
+# Lines that are neither (PATH=…, MAILTO=…) are settings and execute nothing.
+_CRON_FIELD_RE = re.compile(r"^[A-Za-z0-9*,\-/]+$")
+
+
+def _cron_command(line):
+    """The command a crontab line actually executes, or '' if it runs nothing."""
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return ""
+    if s.startswith("@"):
+        parts = s.split(None, 1)
+        return parts[1].strip() if len(parts) > 1 else ""
+    parts = s.split(None, 5)
+    if len(parts) < 6 or not all(_CRON_FIELD_RE.match(p) for p in parts[:5]):
+        return ""
+    return parts[5].strip()
+
+
+def _cron_argv(cmd):
+    """Tokenized cron command. Quoting is parsed with shlex because cron hands
+    the line to a shell, and a naive split would read `-c 'curl … | bash'` as
+    three separate arguments."""
+    try:
+        return shlex.split(cmd)
+    except ValueError:            # unbalanced quotes — score what we can
+        return cmd.split()
 
 
 def check_cron():
@@ -2342,6 +2450,52 @@ def check_cron():
                 "%d active line(s); command digest %s" % (
                     len(lines), hashlib.sha256(out.encode()).hexdigest()[:16]),
                 "cron:user:%s" % hashlib.sha256(out.encode()).hexdigest()[:16]))
+        # cron is a persistence surface, so its PAYLOAD gets the same argv
+        # scoring launchd's does — otherwise `curl … | bash` installed via
+        # `crontab -e` (T1053.003) is capped at the MEDIUM above, below the
+        # HIGH+ notify floor, and never reaches the operator. Same scorer as the
+        # process and launchd paths, so a payload cannot be hostile through one
+        # surface and invisible through another.
+        seen = set()
+        for line in lines:
+            cmd = _cron_command(line)
+            if not cmd:
+                continue
+            argv = _cron_argv(cmd)
+            if not argv:
+                continue
+            signals = _argv_signals(cmd)
+            eff, eff_prog = _effective_argv(argv, argv[0])
+            target = _script_target(argv, argv[0])
+            # The structural tell a string scan cannot see: the job runs a
+            # hidden $HOME or temp-dir file (the AMOS `bash ~/.agent` shape).
+            # Deliberately NOT the full _hostile_args — its bare-fetch rule
+            # rates any `curl http://…` HIGH, which is right for a launchd plist
+            # but fires on ordinary cron healthchecks. The fetch+exec
+            # COMBINATION still reaches HIGH via _argv_signals, which is the
+            # calibration this tool already applies to live process argv.
+            hidden = bool(eff) and _hidden_home_or_tmp(str(eff[0])) \
+                or bool(target and _hidden_home_or_tmp(target))
+            if not signals and not hidden:
+                continue
+            names = sorted(n for n, _ in signals)
+            top = max((s for _, s in signals), key=lambda s: SEV_ORDER[s],
+                      default="LOW")
+            if hidden:
+                names = sorted(set(names) | {"hidden-script-target"})
+                top = _severity_max(top, "HIGH")
+            cmd_sha = hashlib.sha256(cmd.encode()).hexdigest()
+            fp = "cron:cmd:%s:%s" % ("|".join(names), cmd_sha[:16])
+            if fp in seen:
+                continue
+            seen.add(fp)
+            program = eff_prog or argv[0]
+            findings.append(finding(
+                top, "persistence", "Hostile command in user crontab",
+                "cron runs `%s` [%s]; command sha256=%s"
+                % (cmd, ", ".join(names), cmd_sha[:16]), fp,
+                path=target, program=program, markers=names,
+                command_sha256=cmd_sha))
     return findings
 
 
@@ -4322,6 +4476,42 @@ _NEVER_ADOPT_LIVE = {"auth_sessions"}
 # --------------------------------------------------------------------------- #
 
 
+# Same-uid state files whose integrity Aegis watermarks and re-checks each scan.
+# The canary arming record belongs here for the same reason the trust store does:
+# check_canaries() reads it through load_json(..., {}), so a deleted or
+# encrypted arming record is indistinguishable from "no canaries were ever
+# planted" — one `rm` permanently disarms the CRITICAL ransomware tripwire and
+# every later scan reports CLEAN. Same-uid ransomware encrypts ~/.aegis along
+# with the tree it targets, so this is the tripwire's own failure mode.
+def _self_watermarked():
+    """(name, path) pairs, re-read at CALL time — the state-dir globals are
+    rebound after import (tests, alternate AEGIS_HOME), so a tuple frozen at
+    module level would watermark the wrong files."""
+    return (("allowlist", ALLOWLIST), ("baseline", BASELINE),
+            ("canaries", CANARY_STATE))
+
+
+_SELF_TAMPER_LABEL = {"allowlist": "allowlist", "baseline": "baseline",
+                      "canaries": "canary arming record"}
+_TRUST_STORE_DELETED = ("A missing trust store forces the next scan to silently "
+                        "re-baseline current persistence as known-good, "
+                        "laundering any attacker-blessed state.")
+_TRUST_STORE_MODIFIED = ("If you did not run `aegis.py baseline`/`allow`, the "
+                         "trust store may have been poisoned to hide an "
+                         "intrusion.")
+_SELF_TAMPER_CONSEQUENCE = {
+    "allowlist": (_TRUST_STORE_DELETED, _TRUST_STORE_MODIFIED),
+    "baseline": (_TRUST_STORE_DELETED, _TRUST_STORE_MODIFIED),
+    "canaries": (
+        "The ransomware tripwire is now DISARMED: with no arming record every "
+        "scan reads 'no canaries planted', so deletion or encryption of your "
+        "decoys would be reported as clean. Re-arm with `aegis.py canary`.",
+        "If you did not run `aegis.py canary`, the arming record may have been "
+        "edited to drop decoys from the tripwire — or encrypted in place by the "
+        "very ransomware it exists to catch."),
+}
+
+
 def check_self_protection():
     findings = []
     st = load_json(SELFSTATE, {})
@@ -4385,7 +4575,7 @@ def check_self_protection():
     # non-attacker-writable anchor (a configured heartbeat URL is one). Falls back
     # to the legacy sha watermark for installs upgraded before a MAC was recorded
     # (the next record_selfstate writes the MAC).
-    for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
+    for name, path in _self_watermarked():
         recorded_mac = st.get("%s_mac" % name)
         recorded = recorded_mac or st.get("%s_sha" % name)
         exists = os.path.exists(path)
@@ -4398,20 +4588,18 @@ def check_self_protection():
         # onto the first_run path, silently re-baselining current persistence as
         # known-good). A differing watermark => modification. Both are tampering.
         if recorded and cur_watermark != recorded:
+            deleted_why, modified_why = _SELF_TAMPER_CONSEQUENCE[name]
             if cur_watermark is None:
                 detail = ("%s was DELETED out-of-band — Aegis recorded its "
-                          "integrity hash but the file is now gone. A missing "
-                          "trust store forces the next scan to silently "
-                          "re-baseline current persistence as known-good, "
-                          "laundering any attacker-blessed state." % path)
+                          "integrity hash but the file is now gone. %s"
+                          % (path, deleted_why))
             else:
                 detail = ("%s changed since Aegis last wrote it — its integrity "
-                          "hash no longer matches. If you did not run "
-                          "`aegis.py baseline`/`allow`, the trust store may have "
-                          "been poisoned to hide an intrusion." % path)
+                          "hash no longer matches. %s" % (path, modified_why))
             findings.append(finding(
                 "HIGH", "self-protection",
-                "Aegis %s %s" % (name, "was DELETED out-of-band"
+                "Aegis %s %s" % (_SELF_TAMPER_LABEL[name],
+                                 "was DELETED out-of-band"
                                  if cur_sha is None else "modified out-of-band"),
                 detail,
                 "self:%s:tampered:%s" % (name, (cur_sha or "deleted")[:16])))
@@ -4431,10 +4619,22 @@ def record_selfstate():
     # edits: the keyed HMAC is the primary tamper watermark (an attacker can't
     # forge it without the key), and the plain sha is retained because
     # _migrate_baseline uses `baseline_sha` as its own out-of-band-edit guard.
-    for name, path in (("allowlist", ALLOWLIST), ("baseline", BASELINE)):
+    for name, path in _self_watermarked():
         present = os.path.exists(path)
         st["%s_sha" % name] = sha256(path) if present else None
         st["%s_mac" % name] = _hmac_file(path) if present else None
+    save_json(SELFSTATE, st)
+
+
+def _record_canary_watermark():
+    """Re-watermark the canary arming record right after WE rewrite it, so a
+    deliberate `aegis.py canary` plant/remove is not read as out-of-band
+    tampering on the next scan. Only the canary keys are touched: refreshing the
+    whole selfstate here would also silently re-bless a tampered baseline."""
+    st = load_json(SELFSTATE, {})
+    present = os.path.exists(CANARY_STATE)
+    st["canaries_sha"] = sha256(CANARY_STATE) if present else None
+    st["canaries_mac"] = _hmac_file(CANARY_STATE) if present else None
     save_json(SELFSTATE, st)
 
 
@@ -4896,6 +5096,7 @@ def cmd_canary(action="plant"):
             except Exception:
                 pass
         save_json(CANARY_STATE, {})
+        _record_canary_watermark()
         print("Removed %d canary file(s)." % removed)
         return 0
     # plant
@@ -4915,6 +5116,7 @@ def cmd_canary(action="plant"):
         except Exception:
             continue
     save_json(CANARY_STATE, state)
+    _record_canary_watermark()
     print("Planted %d canary file(s). Aegis will alert CRITICAL if any is "
           "modified or deleted (ransomware / bulk-tamper tripwire).\n"
           "Remove with: aegis.py canary remove" % len(state))
