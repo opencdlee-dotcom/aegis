@@ -2,12 +2,23 @@
 
 The Linux sensors are additionally proven live (real /proc, real systemd units,
 real ELF drops, real listeners) inside a container — see BATTLE-LOG.md. This
-file is the always-on regression net that runs everywhere, and it is the PRIMARY
-evidence for the Windows paths, which cannot be executed on macOS/Linux CI.
+file is the always-on regression net that runs everywhere.
 
-Every Windows fixture below is a real command-output shape (`schtasks /query /fo
-csv /v`, `netstat -ano`, `Get-MpComputerStatus`, `Get-WinEvent`), so the parsers
-are tested against what Windows actually prints rather than an invented format.
+It is NOT the primary evidence for Windows, and believing that it was is how two
+Windows sensors stayed broken for an entire release. The fixtures here are real
+command-output shapes (`schtasks /query /fo csv /v`, `netstat -ano`,
+`Get-MpComputerStatus`, `Get-WinEvent`), so the parsers are tested against what
+Windows actually prints — but a fixture only ever proves the half of the system
+that consumes it. The Winlogon registry path was wrong and the fake-registry
+fixture was built from the same wrong constant; the process query emitted a
+literal `` `t `` and the fixtures here fed the parser real tabs it never had to
+produce. Both passed here and returned nothing on a real machine.
+
+The primary Windows evidence is tests/win_live_harness.py, which runs against a
+real Windows kernel on every CI push. When adding coverage for a Windows path
+that TALKS TO the OS (a registry key, a command's real output shape, a
+signature verdict), add it there, not only here.
+
 Platform-selected constants are exercised by patching the module's platform
 flags where a pure function reads them.
 """
