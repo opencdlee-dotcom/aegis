@@ -533,6 +533,56 @@ class TestClipboardGrammar(unittest.TestCase):
             self.assertIsNone(tier, "%r matched %s" % (benign, hits))
 
 
+class TestClipboardPlatformWiring(unittest.TestCase):
+    """The per-OS clipboard plumbing, asserted without touching a real
+    clipboard. These are the paths a macOS dev cannot exercise locally, which is
+    exactly why they are pinned here."""
+
+    def _capture(self, is_win=False, is_mac=False):
+        calls = {}
+
+        def fake_run(cmd, timeout=15, extra_env=None):
+            calls["cmd"] = list(cmd)
+            calls["env"] = dict(extra_env or {})
+            return "", "", 0
+
+        saved = {name: getattr(aegis, name)
+                 for name in ("run", "IS_WIN", "IS_MAC", "IS_LINUX")}
+
+        def restore():
+            for name, value in saved.items():
+                setattr(aegis, name, value)
+
+        self.addCleanup(restore)
+        aegis.run = fake_run
+        aegis.IS_WIN, aegis.IS_MAC = is_win, is_mac
+        aegis.IS_LINUX = not is_win and not is_mac
+        return calls
+
+    def test_windows_write_passes_text_by_environment_not_pipeline(self):
+        """$input is the PIPELINE variable and is empty here, so a
+        `Set-Clipboard -Value $input` would silently CLEAR the clipboard rather
+        than substitute the inert notice. The value must arrive through
+        extra_env, which is also this codebase's injection-safe channel — the
+        string never reaches the command line, so no quoting can be turned
+        against us."""
+        calls = self._capture(is_win=True)
+        aegis._clipboard_write("REPLACEMENT")
+        joined = " ".join(calls["cmd"])
+        self.assertIn("$env:AEGIS_CLIP", joined)
+        self.assertNotIn("$input", joined)
+        self.assertEqual("REPLACEMENT", calls["env"].get("AEGIS_CLIP"))
+        # The payload must never be interpolated into the command itself.
+        self.assertNotIn("REPLACEMENT", joined)
+
+    def test_windows_read_uses_raw_so_newlines_survive(self):
+        """A trailing \\r is the auto-execute tell the grammar keys on; a
+        non-raw read would strip exactly the evidence that matters."""
+        calls = self._capture(is_win=True)
+        aegis._clipboard_read()
+        self.assertIn("Get-Clipboard -Raw", " ".join(calls["cmd"]))
+
+
 class TestClipboardBehaviour(ProtectiveSandbox):
 
     def test_clean_clipboard_content_is_never_persisted(self):

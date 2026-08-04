@@ -10909,8 +10909,14 @@ def _clipboard_write(text):
         except Exception:
             return False
     if IS_WIN:
+        # $env:AEGIS_CLIP, NOT $input: extra_env is this codebase's
+        # injection-safe channel for handing a string to PowerShell (the value
+        # never touches the command line, so no quoting or escaping can be
+        # turned against us), and $input is the *pipeline* variable — with
+        # nothing piped in it is empty, so the substitution would silently
+        # clear the clipboard instead of replacing it.
         _o, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
-                          "-Command", "Set-Clipboard -Value $input"],
+                          "-Command", "Set-Clipboard -Value $env:AEGIS_CLIP"],
                          timeout=30, extra_env={"AEGIS_CLIP": text})
         return rc == 0
     for tool, args in (("wl-copy", ["wl-copy"]),
