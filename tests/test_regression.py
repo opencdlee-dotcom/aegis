@@ -325,8 +325,8 @@ class TestRiskyLocations(Sandbox):
         # canned `ps` + forced-adhoc classifier: a /usr/local process must be
         # flagged (pre-fix it was short-circuited as trusted and never checked).
         saved_run, saved_cls = aegis.run, aegis.classify_signature
-        aegis.run = lambda cmd, timeout=15: (
-            ("1234 /usr/local/bin/evil\n", "", 0)
+        aegis.run = lambda cmd, timeout=15, extra_env=None: (
+            ("1234 501 /usr/local/bin/evil /usr/local/bin/evil\n", "", 0)
             if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
                                               "authority": None}
@@ -2113,7 +2113,7 @@ class TestOptHomebrewRisky(Sandbox):
 
     def _procs(self, procs):
         saved_run, saved_cls = aegis.run, aegis.classify_signature
-        aegis.run = lambda cmd, timeout=15: (
+        aegis.run = lambda cmd, timeout=15, extra_env=None: (
             ("\n".join(procs) + "\n", "", 0)
             if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
@@ -2126,11 +2126,12 @@ class TestOptHomebrewRisky(Sandbox):
             aegis.run, aegis.classify_signature = saved_run, saved_cls
 
     def test_usr_local_process_flagged_control(self):
-        fs = self._procs(["1234 /usr/local/bin/evil"])
+        fs = self._procs(["1234 501 /usr/local/bin/evil /usr/local/bin/evil"])
         self.assertTrue(any(f.get("path") == "/usr/local/bin/evil" for f in fs))
 
     def test_opt_homebrew_process_flagged(self):
-        fs = self._procs(["1235 /opt/homebrew/bin/evil"])
+        fs = self._procs(
+            ["1235 501 /opt/homebrew/bin/evil /opt/homebrew/bin/evil"])
         self.assertTrue(any(f.get("path") == "/opt/homebrew/bin/evil" for f in fs),
                         "an ad-hoc process in /opt/homebrew must be flagged")
 

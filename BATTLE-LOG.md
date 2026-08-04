@@ -1,3 +1,115 @@
+# Aegis — Cross-platform port (2026-08-03): macOS + Linux + Windows
+
+Aegis became system-agnostic in this pass: one stdlib-only file that detects its
+OS at import and selects the sensor registry, path tables, trust model,
+scheduler and change-detection mechanism for that platform. The bar was not
+"it imports on Linux" — it was **"it actually defends that machine"**, proven
+by planting real attacks and watching them get caught.
+
+## Verification actually performed
+
+**macOS** — full suite 422 passed; `selftest.py` green natively.
+
+**Linux (live, in-container, nothing mocked)** — a 40-assertion siege that
+plants real artifacts against the real OS and asserts severity:
+
+| Planted attack | Result |
+|---|---|
+| systemd user unit with `ExecStart=/bin/bash /tmp/payload.sh` + `LD_PRELOAD` | CRITICAL |
+| XDG autostart `.desktop` (Hidden=true) executing from `/tmp` | CRITICAL |
+| live `curl http://…/a.sh \| bash` process | HIGH (`fileless-fetch-exec`) |
+| process executing from `/tmp` | HIGH |
+| binary deleted while still running (run-then-unlink) | HIGH |
+| cron running a hidden `$HOME` script | HIGH |
+| executable ELF dropped in `/tmp` | HIGH |
+| staged `shadow.bak` loot | HIGH |
+| new setuid-root binary (`/usr/local/bin/rootme`, mode 4755) | CRITICAL |
+| `/etc/ld.so.preload` rootkit write | HIGH |
+| newly loaded kernel module | HIGH |
+| real non-loopback listener on `0.0.0.0:18081` (via `/proc/net/tcp`) | detected |
+| loopback-only listener on `127.0.0.1:18082` | correctly IGNORED (no FP) |
+| hostile line appended to `~/.bashrc` | HIGH |
+| 12× SSH `Failed password` + `useradd` in `auth.log` | brute-force + new-account HIGH |
+
+Plus: full `scan` writes report/DB/heartbeat and opens incidents; a second scan
+does not storm duplicates; quarantine→restore round-trips byte-for-byte;
+`/etc`, `$HOME` and `/usr/bin/python3` are refused as protected paths.
+
+**Linux install lifecycle (real systemd, PID 1, unprivileged user session)** —
+`aegis.py install` enabled `aegis.timer`; the timer **fired unattended**
+(`Result=success`, `ExecMainStatus=0`) and produced a report, baseline, DB and
+heartbeat. Then, simulating an attacker: `systemctl --user disable --now` →
+self-protection reported **HIGH "Aegis systemd unit is not scheduled"**;
+deleting the unit files → **HIGH "Aegis systemd unit is missing"**. A
+*deliberate* `aegis.py uninstall` correctly stayed silent (uninstall is not
+tampering) and kept the evidence. Generated units pass `systemd-analyze verify`
+with zero warnings.
+
+**Cross-distro** — `scan` completes cleanly on Debian slim, Alpine (musl) and
+Fedora (rpm). The Linux process/listener sensors read `/proc` directly, so they
+work on minimal images with no `procps` installed.
+
+**Windows** — unit-tested against **captured real command output**
+(`schtasks /query /fo csv /v`, `netstat -ano`, `Get-MpComputerStatus`,
+`Get-WinEvent`), not executed on Windows. That is the honest limit of the
+current evidence and it is stated as such in the README rather than implied
+away. 78 cross-platform tests cover the parsers, the Defender/firewall/BitLocker
+scoring, WMI-subscription and exclusion diffs, the LOLBin/encoded-PowerShell/
+LSASS-dump idioms, and the false-positive guards.
+
+## Genuine defects found and fixed during the port
+
+1. **Persistence severity under-rated the dominant shape.** Scoring keyed only
+   on `program`, so `ExecStart=/bin/bash /tmp/payload.sh` scored on
+   `/bin/bash` — a trusted path — and returned HIGH instead of CRITICAL. Risk is
+   now evaluated over the program **and** its script target. Deliberately scoped
+   to *volatile* targets only: a helper script under `~/Library`/`~/.config` is
+   ordinary for real software, and escalating that would flatten the scale (the
+   macOS `bash ~/.agent` case stays HIGH, as its pinned test requires).
+2. **`privileged-group-add` never matched.** `\b-G\b` cannot match ` -G ` —
+   a space followed by `-` is not a word boundary — so a real
+   `usermod -G sudo backdoor` line was invisible. Caught by a test written
+   against a real log line.
+3. **Unattributable listener scored as a deleted binary.** A listener that
+   cannot be attributed without root is recorded as `"?"`; `_exec_alert` then
+   found no such file and reported "deleted-while-running" — a false positive on
+   every root-owned listener. Now non-absolute paths are never scored.
+4. **`_expand_win_env` was silently a no-op off-Windows.** It used
+   `os.path.expandvars`, which only understands `%VAR%` on Windows, making the
+   registry-autostart path untestable elsewhere. Replaced with an explicit
+   `%VAR%` expander so the Windows path behaves identically — and is provable —
+   on any host.
+
+## Design decisions worth keeping
+
+- **A sensor with no meaning on a platform is ABSENT, not DEGRADED.** Reporting
+  a launchd check as a failed sensor on Linux would manufacture a permanent fake
+  coverage gap and train the operator to ignore health warnings.
+- **Linux does not get a fake signature model.** There is no ambient code
+  signing; package-manager ownership is the honest analog, and `unmanaged` is
+  *not* treated as malicious (every locally built binary is unmanaged). Linux
+  keys its exec signal on structure instead — volatile-dir execution, or a
+  running binary unlinked from disk.
+- **No inotify dependency.** Linux/Windows poll the same watched path set every
+  5s rather than take a third-party dependency; the single auditable stdlib-only
+  file is load-bearing for security review.
+- **macOS-era tests were scoped, not weakened.** 28 genuinely macOS-specific
+  test classes (kqueue, `.app` bundles, BTM, codesign verdicts) are skipped
+  off-macOS via `tests/conftest.py` rather than diluted into platform-agnostic
+  mush that would delete real macOS coverage.
+
+## Residual risk
+
+- Windows remains unexecuted; the first run on a real Windows box is the
+  outstanding validation step (the parsers are pinned, the live plumbing —
+  winreg enumeration, CIM queries, `schtasks` registration — is not).
+- `check_auth_log` returns DEGRADED where `auth.log` is root-only and no journal
+  is readable; on many distros an unprivileged user genuinely cannot see it.
+- Linux listener attribution needs root for other users' sockets; unattributable
+  listeners are reported with an unknown path rather than dropped or guessed.
+
+---
+
 # Aegis — Battle-Test pass 5 (2026-07-24): fileless-pipeline EVASION closure
 
 `/battle-test` (no arg → target = repo). **Tier: siege** (the response tier can

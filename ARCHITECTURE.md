@@ -2,29 +2,55 @@
 
 ## Security objective
 
-Aegis is a local macOS **Observer** with human-approved response. Its job is not
-to make one detector look infallible; it is to arrange independent, imperfect
-controls so that an attack missed by one layer can still leave evidence in
-another. A sensor failure is data, never a clean result.
+Aegis is a local **Observer** with human-approved response, running on macOS,
+Linux and Windows. Its job is not to make one detector look infallible; it is
+to arrange independent, imperfect controls so that an attack missed by one
+layer can still leave evidence in another. A sensor failure is data, never a
+clean result.
 
 The non-negotiable boundary is:
 
 - Observer Basic may sample, diff, correlate, alert, quarantine a named object,
   and recover that object. It does not authorize process, file, or network events.
-- It does not request root or Full Disk Access for a shared interpreter.
+- It does not request root/administrator or Full Disk Access for a shared interpreter.
 - It does not execute suspect samples on the host.
 - It does not let an LLM or heuristic automatically take response authority.
-- Power-tier blocking requires a dedicated signed/notarized app, Apple-approved
-  Endpoint Security entitlement, system-extension activation, and a separate
-  Network Extension if network filtering is added.
+- Power-tier blocking requires OS-privileged interception the unprivileged tier
+  deliberately forgoes: on macOS a signed/notarized app with the Apple-approved
+  Endpoint Security entitlement (plus a Network Extension for filtering); on
+  Linux a root-privileged eBPF/fanotify/audit agent; on Windows a kernel
+  minifilter or an ELAM/PPL-signed AV service registered with the OS.
+
+## Platform strategy
+
+One stdlib-only file detects its OS at import and selects the sensor registry,
+path tables, trust model, scheduler and change-detection mechanism for that OS.
+Three rules keep this honest rather than merely portable:
+
+1. **A sensor with no meaning on a platform is absent, not degraded.** Reporting
+   a launchd check as a failed sensor on Linux would manufacture a permanent
+   fake coverage gap and train the operator to ignore health warnings.
+2. **The trust model is per-OS, because "who vouches for this binary" genuinely
+   differs.** macOS and Windows have ambient code signing, so unsigned/ad-hoc in
+   a user-writable path is itself the signal. Linux has none — every locally
+   built binary is unowned by any package — so treating "unmanaged" as
+   suspicious would bury a developer in false positives. Linux therefore keys
+   its exec signal on *structure* instead: execution from a volatile directory,
+   or a running process whose executable has been unlinked from disk.
+3. **Everything above the sensor line is shared.** The finding contract,
+   redaction, event store, dedup, correlation and path lineage, incident
+   lifecycle, typed dismissals, risk accumulation, sensor health, the
+   transactional quarantine store, replay, and the heartbeat all operate on
+   platform-neutral records, so a detection cannot be well-managed on one OS
+   and sloppily managed on another.
 
 ## Swiss-cheese layers
 
 | Layer | Control | Failure it covers |
 |---|---|---|
-| Prevent | Gatekeeper/notarization posture, SIP, FileVault, firewall, least privilege | Reduces exposed paths before Aegis observes anything |
-| Observe | Persistence, processes/argv, hot directories/apps, XProtect, staging, shell history, hosts-file web/phishing posture, canaries, listeners, background items, profiles, extensions, wallet integrity, developer supply chain | Independent artifacts left by execution, persistence, credential theft, staging, redirection, or tampering |
-| Attribute | Download provenance from `QuarantineEventsV2` and the Chrome-family `downloads` table | Turns "an unsigned binary appeared" into "who fetched it, from where" — and grades the finding accordingly |
+| Prevent | Per-OS preventive posture: Gatekeeper/SIP/FileVault/firewall (macOS), SELinux-AppArmor/ufw-firewalld-nftables/LUKS/sshd exposure (Linux), Defender RTP + tamper protection/firewall profiles/BitLocker (Windows) | Reduces exposed paths before Aegis observes anything |
+| Observe | Persistence, processes/argv, hot directories, staging, shell + PowerShell history, hosts-file web/phishing posture, canaries, listeners, outbound, extensions, wallet integrity, developer supply chain — plus the OS-specific surfaces: XProtect/BTM/profiles (macOS), kernel modules and setuid-root binaries (Linux), WMI subscriptions and Defender exclusions (Windows) | Independent artifacts left by execution, persistence, credential theft, staging, redirection, or tampering |
+| Attribute | Download provenance from `QuarantineEventsV2` and the Chrome-family `downloads` table (macOS); OS security-log harvest elsewhere (`auth.log`/journal on Linux, the Security/Defender/PowerShell event channels on Windows) | Turns "an unsigned binary appeared" into "who fetched it, from where" — and grades the finding accordingly |
 | Prove coverage | Durable per-sensor status, duration, item count, consecutive failures | Prevents an unavailable permission/tool from being reported as clean |
 | Normalize | Versioned finding contract and central redaction | Makes signals comparable without persisting command-line secrets |
 | Correlate | Same-entity bounded-window chains **plus durable path lineage** | Raises confidence when independent layers agree; lineage additionally links a drop to an execution that happens after any bounded window has closed |

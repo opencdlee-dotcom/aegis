@@ -1,13 +1,14 @@
-# Aegis — a personal macOS background security monitor
+# Aegis — a personal background security monitor for macOS, Linux and Windows
 
-A small, honest **layered defense monitor** for your own Mac, with an opt-in
-**response tier** to act on what it finds. It runs in the background (launchd),
-watches the surfaces macOS malware actually uses, records the health of every
-sensor, correlates related signals into incidents, and tells you when something
-new and suspicious appears. Only when *you* run a response command by hand can
-it **quarantine, neutralize, restore, or destroy** a reviewed threat. Zero
-third-party dependencies (Python standard library only),
-**local-only** (no telemetry, no cloud), **no signing cert required**.
+A small, honest **layered defense monitor** for your own machine, with an opt-in
+**response tier** to act on what it finds. It runs in the background (launchd /
+systemd user timer / Task Scheduler), watches the surfaces malware actually
+uses on that OS, records the health of every sensor, correlates related signals
+into incidents, and tells you when something new and suspicious appears. Only
+when *you* run a response command by hand can it **quarantine, neutralize,
+restore, or destroy** a reviewed threat. Zero third-party dependencies (Python
+standard library only), **local-only** (no telemetry, no cloud), **no signing
+cert required**.
 
 The complete logic, workflow, safety invariants, and future power-tier gate are
 in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -15,8 +16,49 @@ in [ARCHITECTURE.md](ARCHITECTURE.md).
 > It is not "Norton," and it deliberately doesn't pretend to be. The background
 > scan is **detect-only and never destructive**; response is a separate, opt-in,
 > reversible-by-default tier you invoke deliberately (see *Response tier* below).
-> Read *Honest scope* too — the real-time-*blocking* ceiling is set by Apple, not
-> by effort.
+> Read *Honest scope* too — the real-time-*blocking* ceiling is set by the OS,
+> not by effort.
+
+## One tool, three operating systems
+
+Aegis is a single stdlib-only Python file. It detects its platform at import and
+selects the sensors, path tables, trust model and scheduler that OS actually
+has. A sensor with no meaning on a platform is **absent** from that platform's
+registry — not reported as a broken or degraded sensor, because a launchd check
+on Linux is not a coverage gap.
+
+| Layer | macOS | Linux | Windows |
+|---|---|---|---|
+| **Persistence** | launchd agents/daemons, cron, login hooks, config profiles, background items (BTM) | systemd user+system units, XDG autostart, cron, `/etc/cron.d`, rc.local, profile.d | Run/RunOnce keys, Winlogon Shell/Userinit, Startup folders, scheduled tasks, services outside the protected trees |
+| **"Who vouches for this binary"** | `codesign`: apple / app-store / developer-id / adhoc / unsigned / broken | package-manager ownership: dpkg/rpm/pacman `os-managed` vs `unmanaged` | Authenticode: os-signed / signed-valid / unsigned / broken |
+| **Suspicious-exec rule** | unsigned/ad-hoc/broken in a user-writable path | **structural** — execution from a volatile dir, or a running binary deleted from disk (no ambient signing exists, so "unmanaged" is *not* treated as malicious: every locally built binary is unmanaged) | unsigned/broken in a user-writable path |
+| **Process + argv** | one `ps` call | `/proc` directly (works on minimal containers with no `procps`, and no argv truncation) | one CIM query (`Win32_Process`) |
+| **Network** | `lsof` listeners, `netstat` outbound | `/proc/net/tcp[6]` listeners + outbound, inode→pid via `/proc/*/fd` | `netstat -ano` listeners + outbound |
+| **Fileless TTPs scored in argv** | `osascript` password phish, `xattr -c`, `hdiutil -nobrowse`, keychain copy, `curl\|bash` | `LD_PRELOAD` injection, `/etc/ld.so.preload` writes, memfd exec, `systemctl enable /tmp/...`, `/etc/shadow` + SSH key access | `powershell -enc`, IEX download cradles, LOLBin proxy exec (mshta/regsvr32/rundll32/certutil), Defender/AMSI tamper, LSASS + SAM-hive dumps, shadow-copy deletion |
+| **OS engine harvest** | XProtect Remediator detections + definition age, Gatekeeper/syspolicy denials | `auth.log`/journal: SSH brute force, new accounts, privileged group adds, root logins | Event log: Defender detections (1116/1117), RTP disabled (5001), account creation (4720), audit-log cleared (1102), PowerShell script blocks (4104) |
+| **OS-unique surface** | XProtect Behavioral (Bastion), agent skills, wallet integrity | **loaded kernel modules** (ring-0 rootkit), **new setuid-root binaries** | **WMI event subscriptions** (fileless persistence), **Defender exclusion changes** |
+| **Hardening posture** | SIP, Gatekeeper, FileVault, firewall, stealth, Remote Login | SELinux/AppArmor enforcement, ufw/firewalld/nftables, sshd exposure + weak sshd settings, LUKS, unattended upgrades | Defender RTP + tamper protection + signature age, firewall profiles, BitLocker |
+| **Change-driven watch** | kqueue (sub-second) + live XProtect log tail | short-cycle poll of the same watched path set | short-cycle poll of the same watched path set |
+| **Background scheduling** | launchd agent | `systemd --user` service + timer | Scheduled Task |
+| **Neutralize kill-chain** | `launchctl bootout` → kill → quarantine | `systemctl --user disable --now` → kill → quarantine | `schtasks /change /disable` → kill → quarantine |
+
+Everything else — the finding contract, redaction, SQLite event store, dedup,
+correlation and path lineage, incident lifecycle and reminders, typed
+dismissals, risk accumulation, sensor health, the transactional quarantine store
+with its protected-path refusals, replay, and the heartbeat/dead-man's switch —
+is platform-independent and shared.
+
+**Verification status.** macOS and Linux are both exercised for real: the full
+suite runs natively on each, and the Linux sensors are additionally proven by a
+live in-container siege that plants real attacks (a systemd unit executing from
+`/tmp`, an XDG autostart entry, a live `curl|bash` process, a binary deleted
+while running, a setuid-root backdoor, an `ld.so.preload` rootkit write, a real
+non-loopback listener, an SSH brute-force log) and asserts each is caught at the
+right severity. **The Windows paths are unit-tested against captured real
+command output** (`schtasks /query /fo csv /v`, `netstat -ano`,
+`Get-MpComputerStatus`, `Get-WinEvent`) rather than executed on Windows — that
+is the honest limit of the current evidence, and it is stated here rather than
+implied away.
 
 ---
 
@@ -97,6 +139,19 @@ of hits from one sensor.
 ## Install / use
 
 ```bash
+# Register the background monitor for THIS OS (launchd agent on macOS,
+# systemd --user timer on Linux, Scheduled Task on Windows). Idempotent:
+# re-run to change mode/interval or to refresh the runtime copy.
+python3 aegis.py install                 # a scan every hour (default)
+python3 aegis.py install 1800            # ...every 30 minutes
+python3 aegis.py install watch           # change-driven + 600s full-scan floor
+python3 aegis.py uninstall               # remove the registration, keep evidence
+
+# On macOS `bash install.sh [watch] [interval]` remains available and does the
+# same thing; `aegis.py install` is the cross-platform equivalent.
+```
+
+```bash
 # from the aegis/ directory:
 python3 aegis.py scan          # run once, print report, establish baseline
 python3 aegis.py status        # fast hardening posture + XProtect definition age
@@ -127,8 +182,9 @@ python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
                                #   AEGIS_HEARTBEAT_URL (or heartbeat_url in
                                #   ~/.aegis/config.json) to ALSO POST a small
                                #   redacted beat off-box — OPT-IN, off by default
-python3 aegis.py bastion       # OPT-IN, needs sudo: surface Apple's XProtect
-                               #   Behavioral (Bastion) violations it never alerts on
+python3 aegis.py bastion       # macOS only, OPT-IN, needs sudo: surface Apple's
+                               #   XProtect Behavioral (Bastion) violations it
+                               #   records but never alerts on
 
 # RESPONSE TIER — opt-in, run by hand on a reviewed finding (never automatic):
 python3 aegis.py quarantine PATH     # atomically confine a file or valid .app bundle
@@ -137,7 +193,10 @@ python3 aegis.py restore ID          # un-quarantine byte-for-byte (undo a false
 python3 aegis.py destroy ID --yes    # verified deletion from quarantine (IRREVERSIBLE)
 python3 aegis.py kill PID            # terminate one of YOUR processes (SIGTERM→SIGKILL)
 python3 aegis.py sandbox PATH        # refuse host execution; use a disposable VM
-python3 aegis.py neutralize PLIST    # launchd kill-chain: bootout → kill → quarantine
+python3 aegis.py neutralize TARGET   # persistence kill-chain: unregister → kill →
+                                     #   quarantine. TARGET = a launchd .plist (macOS),
+                                     #   a systemd unit/.desktop file (Linux), or
+                                     #   task:NAME / a Startup-folder file (Windows)
 
 bash install.sh              # background it via launchd (hourly); one baseline first
 bash install.sh 1800         # ...or every 30 min (re-run keeps your baseline)
@@ -196,9 +255,9 @@ can act **only on something already
 | `quarantine PATH` | Durably records `PREPARED`, then performs an exclusive same-volume rename into a mode-000 sealed container. The native file or valid `.app` bundle is preserved intact, including inode identity and bundle metadata. It refuses symlinks, hard-linked files, ordinary directories, protected paths, identity races, cross-volume moves, and unavailable audit storage. | ✅ `restore` |
 | `restore ID` | Verifies the sealed object's identity, durably records intent, and performs an exclusive native rename. It never overwrites: if the original path is occupied, it chooses a unique `.restored.<id>` destination. | — |
 | `destroy ID --yes` | **Irreversible.** Durably records approval, removes only an already-quarantined object, and verifies that the object is gone. It refuses without `--yes`. | ❌ |
-| `kill PID` | `SIGTERM`→`SIGKILL` a **same-user** process. Refuses other users' processes, `pid 0/1`, Aegis's own tree, and session-critical comms. | — |
+| `kill PID` | Graceful-then-forced termination of a **same-user** process (`SIGTERM`→`SIGKILL`; `taskkill` then `/F` on Windows). Refuses other users' processes, `pid 0/1`, Aegis's own tree, and session-critical processes on every OS. | — |
 | `sandbox PATH` | Refuses to execute an untrusted sample on the host. Use an isolated disposable VM for detonation; a deprecated userspace profile is not treated as a safe malware boundary. | — |
-| `neutralize PLIST` | Ordered launchd kill-chain: **`launchctl bootout` first** (so a `KeepAlive` job can't relaunch), then kill any surviving instance, then quarantine the plist (+ its binary if risky). | ✅ (artifacts land in the store) |
+| `neutralize TARGET` | Ordered persistence kill-chain, same doctrine on every OS: **unregister first** (`launchctl bootout` / `systemctl --user disable --now` / `schtasks /change /disable`) so a `KeepAlive`/`Restart=always` job can't relaunch, then kill any surviving instance, then quarantine the job definition (+ its binary if risky). | ✅ (artifacts land in the store) |
 
 Each quarantine item has an authoritative, crash-recoverable `txn.json` state
 machine. The human-readable manifest is derived cache, never authority. Every

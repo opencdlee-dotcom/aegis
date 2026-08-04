@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """
-Aegis - a personal macOS background security monitor (detect + opt-in response).
+Aegis - a personal background security monitor for macOS, Linux and Windows
+        (detect + opt-in response).
 
 HONEST SCOPE
 ------------
 This is a KnockKnock / osquery-tier *detection* tool with an opt-in RESPONSE
-tier — not an antivirus and not a real-time *blocker*. Real-time blocking on
-macOS requires Apple's Endpoint Security framework, which needs the restricted
-`com.apple.developer.endpoint-security.client` entitlement PLUS a Developer-ID
-signing certificate (Apple grants these case-by-case, often not to individuals).
-Aegis deliberately uses only unprivileged, entitlement-free APIs and the stable
-system CLIs, so it runs today with zero setup, no signing cert, and a minimal
-attack/maintenance surface: Python standard library only, no third-party deps.
+tier — not an antivirus and not a real-time *blocker*. Real-time blocking needs
+OS-privileged interception this tool deliberately forgoes: Apple's Endpoint
+Security entitlement (granted case-by-case, often not to individuals) plus a
+Developer-ID cert on macOS; a root eBPF/fanotify/audit agent on Linux; a kernel
+minifilter or ELAM/PPL-signed service on Windows. Aegis deliberately uses only
+unprivileged APIs and stable system CLIs, so it runs today with zero setup, no
+signing cert, and a minimal attack/maintenance surface: Python standard library
+only, no third-party deps.
+
+ONE FILE, THREE OPERATING SYSTEMS
+---------------------------------
+The platform is detected at import (IS_MAC / IS_LINUX / IS_WIN) and selects the
+sensor registry, path tables, trust model, scheduler and change-detection
+mechanism. A sensor with no meaning on a platform is ABSENT from that
+platform's registry — never reported as a failed/degraded sensor, because a
+launchd check on Linux is not a coverage gap. The trust model is genuinely
+per-OS: macOS/Windows have ambient code signing (unsigned/ad-hoc in a
+user-writable path IS the signal), while Linux has none — every locally built
+binary is package-unowned — so Linux keys its exec signal on structure instead
+(execution from a volatile dir; a running binary unlinked from disk). Everything
+above the sensor line — findings, redaction, the event store, correlation,
+lineage, incidents, quarantine, replay, heartbeat — is shared and
+platform-neutral.
 
 The scan/watch path is DETECT-ONLY and never destructive. Acting on a threat is
 a separate, opt-in RESPONSE tier that you invoke by hand on a reviewed finding —
@@ -23,10 +40,17 @@ positive costs minutes, not data), and
 destroy — the only irreversible verb — can act ONLY on an already-quarantined
 item (quarantine-first, never-delete-first). Plus kill (same-user process),
 sandbox (refuse host execution and require a disposable VM), and
-neutralize (ordered bootout→kill→quarantine kill-chain for launchd persistence).
+neutralize (ordered unregister→kill→quarantine kill-chain for persistence, using
+that OS's supervisor: launchctl bootout / systemctl --user disable / schtasks).
 
-WHAT IT DOES (on an interval, via launchd)
-------------------------------------------
+WHAT IT DOES (on an interval, via launchd / systemd timer / Scheduled Task)
+--------------------------------------------------------------------------
+The list below describes the macOS sensor set, the most mature of the three.
+The Linux and Windows equivalents (systemd units + XDG autostart; Run keys,
+scheduled tasks, services and WMI subscriptions) map onto the SAME record
+shape, diff, severity scoring and incident pipeline — see the platform matrix
+in README.md and the per-platform snapshot functions below.
+
   1. Persistence watch - enumerates third-party launchd agents/daemons + cron,
      resolves each program, hashes it, validates its code signature, inspects its
      arguments AND its DYLD_* injection env, catches an interpreter aimed at a
@@ -69,14 +93,19 @@ WHAT IT DOES (on an interval, via launchd)
   time each is seen (per-surface "trust what's already installed"), so upgrading
   Aegis on an existing install never produces a day-one alert storm.
 
-  `watch` mode (bash install.sh watch) is EVENT-DRIVEN: a stdlib kqueue over
-  the persistence/hot/staging/rc/history paths rescans within seconds of a
-  change (debounced + rate-limited), with the interval scan as a floor —
-  closing most of the polling-latency gap without any Apple entitlement. A
-  persistent `log stream` tail of Apple's XProtect subsystem is armed on the
-  same kqueue (EVFILT_READ), so a live XProtect detection wakes a rescan the
-  instant Apple writes it; the tail is a wake source only — the rescan's
-  windowed harvest still does the one authoritative parse/dedup/notify.
+  `watch` mode (aegis.py install watch) is CHANGE-DRIVEN: on macOS a stdlib
+  kqueue over the persistence/hot/staging/rc/history paths rescans within
+  seconds of a change (debounced + rate-limited), with the interval scan as a
+  floor — closing most of the polling-latency gap without any Apple
+  entitlement. A persistent `log stream` tail of Apple's XProtect subsystem is
+  armed on the same kqueue (EVFILT_READ), so a live XProtect detection wakes a
+  rescan the instant Apple writes it; the tail is a wake source only — the
+  rescan's windowed harvest still does the one authoritative
+  parse/dedup/notify. Linux and Windows have no stdlib kqueue equivalent (and
+  taking an inotify dependency would break the auditable-single-file rule), so
+  they poll the SAME watched path set every WATCH_POLL_SECS — one to two orders
+  of magnitude better than the interval floor, at a cost of a few hundred
+  stat() calls per cycle.
 
 DESIGN PRINCIPLE: many imperfect layers, one honest decision path. The first run
 establishes an UNVERIFIED silent baseline (no day-one storm and no clean claim).
@@ -86,16 +115,17 @@ written locally so an unavailable sensor can never masquerade as clean coverage.
 
 STATE  -> ~/.aegis/   (aegis.db, baseline.json, findings.jsonl, latest.md,
                        quarantine transactions, actions.jsonl audit, ...)
-USAGE  -> aegis.py [scan|report|status|doctor|incidents|incident|baseline|
+USAGE  -> aegis.py [install [watch] [secs]|uninstall]
+          aegis.py [scan|report|status|doctor|incidents|incident|baseline|
                     allow <path>|vt <path|sha>|
                     canary|watch]
           aegis.py [quarantine <path>|quarantine-list|restore <id>|
-                    destroy <id> --yes|kill <pid>|sandbox <path>|neutralize <plist>]
+                    destroy <id> --yes|kill <pid>|sandbox <path>|
+                    neutralize <target>]
 """
 
 import json
 import errno
-import fcntl
 import os
 import plistlib
 import re
@@ -113,6 +143,25 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------- #
+# Platform detection. One file, three operating systems: every OS-specific
+# sensor, path table, and helper dispatches on these three constants. Sensors
+# that have no meaning on a platform are absent from its registry (not
+# "DEGRADED" — a Mac-only sensor missing on Linux is not a coverage failure).
+# --------------------------------------------------------------------------- #
+
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform.startswith("win")
+IS_LINUX = not IS_MAC and not IS_WIN  # posix-other treated as Linux-like
+PLATFORM = "mac" if IS_MAC else ("windows" if IS_WIN else "linux")
+
+if IS_WIN:
+    import msvcrt  # file locking (fcntl has no Windows port)
+    fcntl = None
+else:
+    import fcntl
+    msvcrt = None
+
+# --------------------------------------------------------------------------- #
 # Constants / paths
 # --------------------------------------------------------------------------- #
 
@@ -128,7 +177,20 @@ ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
 BASELINE_SCHEMA_VERSION = 2
-HOSTS_FILE = "/etc/hosts"
+HOSTS_FILE = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                           "System32", "drivers", "etc", "hosts")
+              if IS_WIN else "/etc/hosts")
+
+# Windows well-known roots (empty strings elsewhere; only consulted when IS_WIN).
+WIN_SYSTEMROOT = os.environ.get("SystemRoot", r"C:\Windows") if IS_WIN else ""
+WIN_PROGRAMDATA = os.environ.get("ProgramData", r"C:\ProgramData") if IS_WIN else ""
+WIN_APPDATA = os.environ.get("APPDATA",
+                             os.path.join(HOME, "AppData", "Roaming")) if IS_WIN else ""
+WIN_LOCALAPPDATA = os.environ.get(
+    "LOCALAPPDATA", os.path.join(HOME, "AppData", "Local")) if IS_WIN else ""
+WIN_TEMP = os.environ.get("TEMP", os.path.join(
+    WIN_LOCALAPPDATA, "Temp")) if IS_WIN else ""
+WIN_PUBLIC = os.environ.get("PUBLIC", r"C:\Users\Public") if IS_WIN else ""
 
 # A StevenBlack-style hosts denylist normally contains many thousands of
 # entries. This is a posture threshold, not a claim that every smaller list is
@@ -215,55 +277,143 @@ SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
 SEV_ICON = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦", "INFO": "⬜"}
 NOTIFY_MIN_SEV = "HIGH"  # only >= this AND new gets a desktop notification
 
-# launchd persistence directories (third-party). We deliberately skip
-# /System/Library/Launch* - those are Apple-signed, SIP-protected, and pure noise.
-PERSISTENCE_DIRS = [
-    os.path.join(HOME, "Library", "LaunchAgents"),
-    "/Library/" + "LaunchAgents",
-    "/Library/" + "LaunchDaemons",
-]
+# Persistence directories the snapshot walks, per platform.
+#   mac:    launchd agents/daemons (third-party; /System/Library/Launch* is
+#           Apple-signed, SIP-protected, pure noise — deliberately skipped).
+#   linux:  systemd unit dirs an admin or attacker actually writes (the
+#           /usr/lib/systemd distro tree is package-managed churn) + XDG
+#           autostart (T1547.013).
+#   windows: startup folders (registry Run keys / services / scheduled tasks are
+#           enumerated separately in the windows snapshot).
+if IS_MAC:
+    PERSISTENCE_DIRS = [
+        os.path.join(HOME, "Library", "LaunchAgents"),
+        "/Library/" + "LaunchAgents",
+        "/Library/" + "LaunchDaemons",
+    ]
+elif IS_LINUX:
+    PERSISTENCE_DIRS = [
+        os.path.join(HOME, ".config", "systemd", "user"),
+        "/etc/systemd/system",
+        "/etc/systemd/user",
+        "/usr/local/lib/systemd/system",
+        "/usr/local/lib/systemd/user",
+        os.path.join(HOME, ".config", "autostart"),
+        "/etc/xdg/autostart",
+    ]
+else:
+    PERSISTENCE_DIRS = [
+        os.path.join(WIN_APPDATA, "Microsoft", "Windows", "Start Menu",
+                     "Programs", "Startup"),
+        os.path.join(WIN_PROGRAMDATA, "Microsoft", "Windows", "Start Menu",
+                     "Programs", "StartUp"),
+    ]
 
 # Directories where a freshly-dropped executable is inherently suspicious.
-HOT_DIRS = [
-    os.path.join(HOME, "Downloads"),
-    os.path.join(HOME, "Desktop"),
-    "/tmp",
-    "/private/tmp",
-    "/Users/Shared",
-]
+if IS_MAC:
+    HOT_DIRS = [
+        os.path.join(HOME, "Downloads"),
+        os.path.join(HOME, "Desktop"),
+        "/tmp",
+        "/private/tmp",
+        "/Users/Shared",
+    ]
+elif IS_LINUX:
+    HOT_DIRS = [
+        os.path.join(HOME, "Downloads"),
+        os.path.join(HOME, "Desktop"),
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+    ]
+else:
+    HOT_DIRS = [
+        os.path.join(HOME, "Downloads"),
+        os.path.join(HOME, "Desktop"),
+        WIN_TEMP,
+        WIN_PUBLIC,
+    ]
 
-# Path prefixes we treat as trusted-by-location (Apple-owned, read-only under
-# SIP). NOTE: /usr/ is deliberately narrowed to its SIP subpaths — /usr/local is
-# NOT SIP-protected (Homebrew's default Intel prefix is group-writable and a real
-# malware drop target), so it must go through normal signature+location scoring.
-TRUSTED_PREFIXES = ("/System/", "/usr/bin/", "/usr/lib/", "/usr/sbin/",
-                    "/usr/libexec/", "/usr/share/", "/bin/", "/sbin/",
-                    "/Library/Apple/")
-
-# Path prefixes that are user-writable and therefore higher-risk for exec.
-# /var is a symlink to /private/var on macOS, so the same location can appear
-# under either form — list both. /usr/local (Intel Homebrew) and /opt/homebrew
-# (Apple-Silicon Homebrew) are included per the note above: Homebrew chowns its
-# prefix to the invoking user, so both are writable without sudo and a real
-# malware drop target — neither is SIP-protected.
-RISKY_PREFIXES = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders",
-                  "/usr/local", "/opt/homebrew", "/Users/Shared", HOME)
+# Path prefixes we treat as trusted-by-location.
+#   mac:    Apple-owned, read-only under SIP. /usr/ is deliberately narrowed to
+#           its SIP subpaths — /usr/local is NOT SIP-protected (Homebrew's
+#           default Intel prefix is group-writable and a real malware drop
+#           target), so it must go through normal signature+location scoring.
+#   linux:  root-owned package-manager trees. NO integrity guarantee like SIP —
+#           location trust only says "writing here needed root", so a compromise
+#           that already has root is out of scope for these prefixes (as it is
+#           for every unprivileged monitor).
+#   windows: %SystemRoot% and Program Files (admin-writable only; Authenticode
+#           does the heavy lifting there).
+if IS_MAC:
+    TRUSTED_PREFIXES = ("/System/", "/usr/bin/", "/usr/lib/", "/usr/sbin/",
+                        "/usr/libexec/", "/usr/share/", "/bin/", "/sbin/",
+                        "/Library/Apple/")
+    RISKY_PREFIXES = ("/tmp", "/private/tmp", "/var/folders",
+                      "/private/var/folders",
+                      "/usr/local", "/opt/homebrew", "/Users/Shared", HOME)
+elif IS_LINUX:
+    TRUSTED_PREFIXES = ("/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/lib64/",
+                        "/usr/libexec/", "/usr/share/", "/bin/", "/sbin/",
+                        "/lib/", "/lib64/", "/opt/",
+                        # /snap and flatpak app trees are root-owned mount/store
+                        # paths (their *content* trust comes from the store).
+                        "/snap/", "/var/lib/flatpak/", "/nix/store/")
+    RISKY_PREFIXES = ("/tmp", "/var/tmp", "/dev/shm", "/run/user",
+                      "/usr/local", HOME)
+else:
+    TRUSTED_PREFIXES = tuple(p for p in (
+        WIN_SYSTEMROOT + "\\",
+        os.environ.get("ProgramFiles", r"C:\Program Files") + "\\",
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)") + "\\",
+    ) if p != "\\")
+    RISKY_PREFIXES = tuple(p for p in (
+        WIN_TEMP, WIN_PUBLIC, os.path.join(HOME, "Downloads"),
+        WIN_PROGRAMDATA, WIN_APPDATA, WIN_LOCALAPPDATA, HOME) if p)
 
 MACHO_MAGIC = {
     b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",  # 32/64-bit
     b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # 32/64-bit LE
     b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",  # fat/universal
 }
+ELF_MAGIC = b"\x7fELF"
+PE_MAGIC = b"MZ"
 
-# Shell startup files (ATT&CK T1546.004). Readable with no special privilege; a
-# documented execution-persistence surface — stealers append `curl…|sh` or a
-# base64 blob here so a payload re-runs at every login/new-shell. We baseline
-# their content hashes and alert on any NEW file or CHANGE.
+# Volatile drop directories: wiped on reboot, never host durable software, so a
+# persistence entry or script target here is anomalous on every platform.
+if IS_MAC:
+    _TEMP_DROP_DIRS = ("/tmp", "/private/tmp", "/var/folders",
+                       "/private/var/folders", "/Users/Shared")
+elif IS_LINUX:
+    _TEMP_DROP_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/run/user")
+else:
+    _TEMP_DROP_DIRS = tuple(d for d in (WIN_TEMP, WIN_PUBLIC) if d)
+
+# Shell startup files (ATT&CK T1546.004; PowerShell profiles are T1546.013).
+# Readable with no special privilege; a documented execution-persistence
+# surface — stealers append `curl…|sh` or a base64 blob here so a payload
+# re-runs at every login/new-shell. We baseline their content hashes and alert
+# on any NEW file or CHANGE.
 SHELL_RC_FILES = [os.path.join(HOME, n) for n in (
     ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
     ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile",
     ".config/fish/config.fish", ".config/fish/conf.d/aegis.fish",
-)] + ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv", "/etc/profile", "/etc/bashrc"]
+)]
+if IS_MAC:
+    SHELL_RC_FILES += ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv",
+                       "/etc/profile", "/etc/bashrc"]
+elif IS_LINUX:
+    SHELL_RC_FILES += ["/etc/zsh/zshrc", "/etc/zsh/zprofile", "/etc/zsh/zshenv",
+                       "/etc/profile", "/etc/bash.bashrc", "/etc/bashrc"]
+else:
+    # A dropped/edited PowerShell profile re-runs at every console open — the
+    # exact Windows analog of a .zshrc implant. Both Windows PowerShell 5 and
+    # PowerShell 7 locations, per-user and (readable) all-users.
+    SHELL_RC_FILES = [os.path.join(HOME, "Documents", d, n) for d in
+                      ("WindowsPowerShell", "PowerShell") for n in
+                      ("profile.ps1", "Microsoft.PowerShell_profile.ps1")]
+    SHELL_RC_FILES += [os.path.join(WIN_SYSTEMROOT, "System32",
+                                    "WindowsPowerShell", "v1.0", "profile.ps1")]
 
 # Login/every-invocation-scoped rc files (sourced even by non-interactive shells
 # and scripts). A NEWLY-appearing one is a high-signal persistence install — the
@@ -279,45 +429,98 @@ _LOGIN_SCOPED_RC = frozenset((
 # files are here too: a NEWLY-appearing ~/.ssh/authorized_keys — or an edit to
 # it — is the classic durable-remote-access implant (ATT&CK T1098.004), and an
 # ~/.ssh/config ProxyCommand hijack runs code on every ssh.
-EXTRA_PERSIST_FILES = ["/etc/crontab", "/etc/rc.common", "/etc/launchd.conf",
-                       os.path.join(HOME, ".launchd.conf"),
-                       "/etc/hosts", "/etc/ssh/sshd_config",
-                       os.path.join(HOME, ".ssh", "authorized_keys"),
-                       os.path.join(HOME, ".ssh", "config")]
+if IS_MAC:
+    EXTRA_PERSIST_FILES = ["/etc/crontab", "/etc/rc.common", "/etc/launchd.conf",
+                           os.path.join(HOME, ".launchd.conf"),
+                           "/etc/hosts", "/etc/ssh/sshd_config",
+                           os.path.join(HOME, ".ssh", "authorized_keys"),
+                           os.path.join(HOME, ".ssh", "config")]
+elif IS_LINUX:
+    # /etc/ld.so.preload is the classic userland-rootkit injection point (a
+    # library preloaded into EVERY process, T1574.006); a passwd/shadow edit is
+    # how a backdoor uid-0 account appears; rc.local and modprobe.d are
+    # boot-time exec/module-autoload persistence.
+    EXTRA_PERSIST_FILES = ["/etc/crontab", "/etc/rc.local",
+                           "/etc/ld.so.preload", "/etc/passwd",
+                           "/etc/hosts", "/etc/ssh/sshd_config",
+                           os.path.join(HOME, ".ssh", "authorized_keys"),
+                           os.path.join(HOME, ".ssh", "config")]
+else:
+    # Windows: hosts-file redirect + the user's ssh trust files (OpenSSH ships
+    # with Windows 10+). Registry persistence is handled by the windows
+    # persistence snapshot, not by file hashing.
+    EXTRA_PERSIST_FILES = [HOSTS_FILE,
+                           os.path.join(HOME, ".ssh", "authorized_keys"),
+                           os.path.join(HOME, ".ssh", "config")]
 # pam.d / sudoers.d: an added pam module line or sudoers drop-in is silent
 # privilege persistence (T1556). Root-only-readable entries (most sudoers.d
 # files) hash to None and are skipped — coverage degrades gracefully, and a
 # world-readable drop or a pam edit (644 root:wheel — readable) is still caught.
-EXTRA_PERSIST_DIRS = ["/etc/periodic", "/etc/emond.d/rules",
-                      "/Library/StartupItems", "/System/Library/StartupItems",
-                      "/etc/pam.d", "/etc/sudoers.d", "/etc/ssh/sshd_config.d",
-                      # Residual ASEP surfaces from KnockKnock's 60+ categories,
-                      # walked by the same content-hash+diff machinery: a NEW
-                      # authorization plugin, Spotlight importer (.mdimporter),
-                      # QuickLook generator, scripting addition (OSAX), or folder
-                      # action bundle is a rarely-legit persistence install. Only
-                      # the world-readable ones hash; existing plugins are
-                      # baselined silently, so only a net-new one alerts.
-                      "/Library/Security/SecurityAgentPlugins",
-                      "/Library/Spotlight",
-                      os.path.join(HOME, "Library", "Spotlight"),
-                      "/Library/QuickLook",
-                      os.path.join(HOME, "Library", "QuickLook"),
-                      "/Library/ScriptingAdditions",
-                      os.path.join(HOME, "Library", "ScriptingAdditions"),
-                      os.path.join(HOME, "Library", "Workflows",
-                                   "Applications", "Folder Actions")]
+if IS_MAC:
+    EXTRA_PERSIST_DIRS = ["/etc/periodic", "/etc/emond.d/rules",
+                          "/Library/StartupItems", "/System/Library/StartupItems",
+                          "/etc/pam.d", "/etc/sudoers.d", "/etc/ssh/sshd_config.d",
+                          # Residual ASEP surfaces from KnockKnock's 60+ categories,
+                          # walked by the same content-hash+diff machinery: a NEW
+                          # authorization plugin, Spotlight importer (.mdimporter),
+                          # QuickLook generator, scripting addition (OSAX), or folder
+                          # action bundle is a rarely-legit persistence install. Only
+                          # the world-readable ones hash; existing plugins are
+                          # baselined silently, so only a net-new one alerts.
+                          "/Library/Security/SecurityAgentPlugins",
+                          "/Library/Spotlight",
+                          os.path.join(HOME, "Library", "Spotlight"),
+                          "/Library/QuickLook",
+                          os.path.join(HOME, "Library", "QuickLook"),
+                          "/Library/ScriptingAdditions",
+                          os.path.join(HOME, "Library", "ScriptingAdditions"),
+                          os.path.join(HOME, "Library", "Workflows",
+                                       "Applications", "Folder Actions")]
+elif IS_LINUX:
+    EXTRA_PERSIST_DIRS = ["/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
+                          "/etc/cron.weekly", "/etc/cron.monthly",
+                          "/etc/profile.d", "/etc/init.d",
+                          "/etc/pam.d", "/etc/sudoers.d", "/etc/ssh/sshd_config.d",
+                          # ld.so.conf.d redirects the loader search path;
+                          # modprobe.d autoloads/aliases kernel modules;
+                          # NetworkManager dispatcher scripts run as root on
+                          # every network change (a documented implant spot).
+                          "/etc/ld.so.conf.d", "/etc/modprobe.d",
+                          "/etc/NetworkManager/dispatcher.d",
+                          "/etc/udev/rules.d"]
+else:
+    EXTRA_PERSIST_DIRS = []
 
 # Chromium-family + Firefox extension roots (in the user's own home — no special
 # privilege). A newly-appearing extension ID is the signal; we diff the inventory.
-BROWSER_EXT_ROOTS = [
-    (os.path.join(HOME, "Library/Application Support/Google/Chrome"), "chromium"),
-    (os.path.join(HOME, "Library/Application Support/BraveSoftware/Brave-Browser"), "chromium"),
-    (os.path.join(HOME, "Library/Application Support/Microsoft Edge"), "chromium"),
-    (os.path.join(HOME, "Library/Application Support/Chromium"), "chromium"),
-    (os.path.join(HOME, "Library/Application Support/Vivaldi"), "chromium"),
-    (os.path.join(HOME, "Library/Application Support/Firefox/Profiles"), "firefox"),
-]
+if IS_MAC:
+    BROWSER_EXT_ROOTS = [
+        (os.path.join(HOME, "Library/Application Support/Google/Chrome"), "chromium"),
+        (os.path.join(HOME, "Library/Application Support/BraveSoftware/Brave-Browser"), "chromium"),
+        (os.path.join(HOME, "Library/Application Support/Microsoft Edge"), "chromium"),
+        (os.path.join(HOME, "Library/Application Support/Chromium"), "chromium"),
+        (os.path.join(HOME, "Library/Application Support/Vivaldi"), "chromium"),
+        (os.path.join(HOME, "Library/Application Support/Firefox/Profiles"), "firefox"),
+    ]
+elif IS_LINUX:
+    BROWSER_EXT_ROOTS = [
+        (os.path.join(HOME, ".config/google-chrome"), "chromium"),
+        (os.path.join(HOME, ".config/chromium"), "chromium"),
+        (os.path.join(HOME, ".config/BraveSoftware/Brave-Browser"), "chromium"),
+        (os.path.join(HOME, ".config/microsoft-edge"), "chromium"),
+        (os.path.join(HOME, ".config/vivaldi"), "chromium"),
+        (os.path.join(HOME, ".mozilla/firefox"), "firefox"),
+        (os.path.join(HOME, "snap/firefox/common/.mozilla/firefox"), "firefox"),
+    ]
+else:
+    BROWSER_EXT_ROOTS = [
+        (os.path.join(WIN_LOCALAPPDATA, "Google", "Chrome", "User Data"), "chromium"),
+        (os.path.join(WIN_LOCALAPPDATA, "Microsoft", "Edge", "User Data"), "chromium"),
+        (os.path.join(WIN_LOCALAPPDATA, "BraveSoftware", "Brave-Browser", "User Data"), "chromium"),
+        (os.path.join(WIN_LOCALAPPDATA, "Chromium", "User Data"), "chromium"),
+        (os.path.join(WIN_LOCALAPPDATA, "Vivaldi", "User Data"), "chromium"),
+        (os.path.join(WIN_APPDATA, "Mozilla", "Firefox", "Profiles"), "firefox"),
+    ]
 
 # IDE / code-editor extension dirs. A backdoored editor extension is a live 2025
 # supply-chain vector (Objective-See's "Paradox" shipped via a trojanised Cursor
@@ -328,9 +531,13 @@ IDE_EXT_ROOTS = [os.path.join(HOME, d) for d in (
     ".cursor/extensions", ".windsurf/extensions",
 )]
 
-# Aegis's own launchd agent (label from install.sh). Self-protection self-learns
-# that this exists; if it later vanishes, the monitor may have been disabled.
+# Aegis's own scheduler registration (launchd plist / systemd user units /
+# Windows scheduled task). Self-protection self-learns that this exists; if it
+# later vanishes, the monitor may have been disabled.
 SELF_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.charlie.aegis.plist")
+SELF_SYSTEMD_UNITS = [os.path.join(HOME, ".config", "systemd", "user", n)
+                      for n in ("aegis.service", "aegis.timer")]
+SELF_WIN_TASK = "AegisScan"
 SELFSTATE = os.path.join(STATE_DIR, "selfstate.json")
 
 # Optional launcher between a pipe and the interpreter it feeds. A source-reading
@@ -389,6 +596,58 @@ _HOSTILE_CONTENT_RES = [
     # payload — executing OUTSIDE any shell, so it dodges shell history AND
     # Apple's Tahoe 26.4 Terminal-paste warning (Jamf/Netskope, 2026 ClickFix).
     (re.compile(r"\bapplescript://", re.I), "applescript-url-scheme"),
+    # --- Windows-native fileless idioms (the PowerShell half of ClickFix) ----
+    # `powershell -enc <base64>` is THE Windows obfuscated-exec primitive; the
+    # flag is prefix-matchable (-e/-en/-enc/-encoded…), which attackers exploit.
+    (re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\n]*\s-[eE][a-zA-Z]*\s+"
+                r"[A-Za-z0-9+/=]{40,}", re.I), "powershell-encoded-command"),
+    (re.compile(r"\b(?:IEX|Invoke-Expression)\b", re.I), "powershell-iex"),
+    (re.compile(r"\b(?:DownloadString|DownloadFile|DownloadData)\s*\(", re.I),
+     "powershell-webclient-download"),
+    (re.compile(r"\bInvoke-(?:WebRequest|RestMethod)\b|\b(?:iwr|curl|wget)\b"
+                r"[^\n]*\s-Uri\b", re.I), "powershell-fetch"),
+    (re.compile(r"\bFromBase64String\s*\(", re.I), "powershell-base64-decode"),
+    # Signed-binary proxy execution (T1218): the LOLBins that run attacker code
+    # under a Microsoft-signed parent, bypassing naive allowlists.
+    (re.compile(r"\b(?:mshta|regsvr32|rundll32|installutil|msbuild|certutil|"
+                r"bitsadmin|wmic|cmstp|msiexec)(?:\.exe)?\b[^\n]*"
+                r"(?:https?://|\\\\|scrobj|javascript:|vbscript:|urlcache|"
+                r"-decode|/i:)", re.I), "windows-lolbin-proxy-exec"),
+    # Defender/AMSI/ETW teardown — the universal pre-payload step (T1562.001).
+    (re.compile(r"\b(?:Set-MpPreference|Add-MpPreference)\b[^\n]*"
+                r"(?:Disable\w*\s+\$?true|-ExclusionPath)", re.I),
+     "defender-tamper"),
+    (re.compile(r"\bamsiInitFailed\b|\bAmsiScanBuffer\b", re.I), "amsi-bypass"),
+    (re.compile(r"\b(?:vssadmin|wbadmin)\b[^\n]*\bdelete\b[^\n]*"
+                r"(?:shadows?|catalog)", re.I), "shadow-copy-deletion"),
+    (re.compile(r"\bbcdedit\b[^\n]*\brecoveryenabled\s+no\b", re.I),
+     "recovery-disabled"),
+    # Windows credential stores (T1003): SAM/SYSTEM hive dump, LSASS dump.
+    (re.compile(r"\breg\b[^\n]*\bsave\b[^\n]*\bhk(?:lm|ey_local_machine)\\+"
+                r"(?:sam|system|security)\b", re.I), "sam-hive-dump"),
+    (re.compile(r"\b(?:procdump|comsvcs\.dll[^\n]*MiniDump|MiniDumpWriteDump)"
+                r"[^\n]*\blsass\b|\blsass\b[^\n]*\bMiniDump", re.I),
+     "lsass-dump"),
+    # --- Linux-native persistence/injection idioms --------------------------
+    # LD_PRELOAD injection and /etc/ld.so.preload writes (T1574.006).
+    (re.compile(r"\bLD_PRELOAD\s*=", re.I), "ld-preload-injection"),
+    (re.compile(r"ld\.so\.preload", re.I), "ld-so-preload-write"),
+    # A payload installing its own systemd unit / crontab from a script.
+    (re.compile(r"\bsystemctl\b[^\n]*\b(?:enable|start)\b[^\n]*"
+                r"(?:/tmp/|/dev/shm/|/var/tmp/)", re.I), "systemd-tmp-unit"),
+    (re.compile(r"\bcrontab\b\s+(?:-\s*)?[^\n]*/(?:tmp|dev/shm|var/tmp)/", re.I),
+     "crontab-tmp-install"),
+    # memfd_create + fexecve: the canonical Linux fileless exec (nothing on disk).
+    (re.compile(r"\bmemfd_create\b|/proc/self/fd/\d+\b[^\n]*exec", re.I),
+     "memfd-fileless-exec"),
+    # Linux credential/loot targets: shadow file and SSH private keys.
+    (re.compile(r"/etc/shadow\b", re.I), "shadow-file-access"),
+    (re.compile(r"~?/\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)\b", re.I),
+     "ssh-private-key-access"),
+    # History/log wiping — anti-forensics that precedes or follows the payload.
+    (re.compile(r"\b(?:history\s+-c|unset\s+HISTFILE|HISTFILE=/dev/null|"
+                r"Clear-History|Remove-Item[^\n]*ConsoleHost_history)", re.I),
+     "history-tamper"),
 ]
 
 # launchd EnvironmentVariables keys that inject code into other processes.
@@ -484,6 +743,20 @@ _ARGV_WATCH_BINS = frozenset((
     # Adding them only means their argv gets SCORED — _argv_signals still
     # requires a real hostile pattern (keychain-db, DYLD, xattr strip) to fire.
     "cp", "mv", "cat", "tar", "rsync", "dd",
+    # Windows interpreters + the signed-binary proxy-exec LOLBins (T1218). Both
+    # the bare and .exe forms appear depending on how the process was spawned.
+    "powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe",
+    "wscript", "wscript.exe", "cscript", "cscript.exe", "mshta", "mshta.exe",
+    "regsvr32", "regsvr32.exe", "rundll32", "rundll32.exe",
+    "certutil", "certutil.exe", "bitsadmin", "bitsadmin.exe",
+    "wmic", "wmic.exe", "msbuild", "msbuild.exe", "installutil",
+    "installutil.exe", "msiexec", "msiexec.exe", "cmstp", "cmstp.exe",
+    "reg", "reg.exe", "vssadmin", "vssadmin.exe", "wbadmin", "wbadmin.exe",
+    "bcdedit", "bcdedit.exe", "schtasks", "schtasks.exe", "procdump",
+    "procdump.exe", "net", "net.exe", "netsh", "netsh.exe",
+    # Linux utilities that carry the credential-theft / injection payloads.
+    "systemctl", "systemd-run", "chattr", "setcap", "insmod", "modprobe",
+    "gsettings", "xdg-open", "socat", "openssl", "gpg",
 ))
 
 # A watched interpreter/utility invoked ANYWHERE in an argv — used as a fallback
@@ -522,6 +795,13 @@ SHELL_HISTORY_FILES = [os.path.join(HOME, n) for n in (
     ".zsh_history", ".bash_history", ".sh_history",
     ".local/share/fish/fish_history",
 )]
+if IS_WIN:
+    # ClickFix on Windows lands in PowerShell (or the Win+R Run dialog — the
+    # RunMRU registry residue is scanned by the windows persistence snapshot).
+    # PSReadLine keeps a durable cross-session command history file.
+    SHELL_HISTORY_FILES = [os.path.join(
+        WIN_APPDATA, "Microsoft", "Windows", "PowerShell", "PSReadLine",
+        "ConsoleHost_history.txt")]
 SHELL_HISTORY_TAIL = 400  # only inspect the most-recent N lines (cheap, recent-focused)
 
 # --- /tmp loot-staging IOC filenames (smash-and-grab) ------------------------ #
@@ -539,8 +819,28 @@ STAGING_IOC_RES = [
     (re.compile(r"^shub_", re.I), "shub-stealer-staging"),
     (re.compile(r"login\.keychain-db$", re.I), "staged-keychain-copy"),
     (re.compile(r"^FileGrabber$", re.I), "amos-filegrabber-dir"),
+    # Windows credential-theft residue: a saved SAM/SYSTEM hive or an LSASS
+    # dump in a temp dir is loot mid-exfil — neither has a benign reason to be
+    # there (T1003.001/.002).
+    (re.compile(r"^(?:sam|system|security)\.(?:hiv|save|bak|dmp)$", re.I),
+     "windows-hive-dump"),
+    (re.compile(r"^lsass.*\.dmp$", re.I), "lsass-dump-file"),
+    (re.compile(r"^(?:mimikatz|procdump\d*|nanodump).*", re.I),
+     "credential-tool-binary"),
+    # Linux loot: a copied shadow file or a harvested SSH key set.
+    (re.compile(r"^shadow(?:\.bak|\.copy|\.txt)?$", re.I), "staged-shadow-copy"),
+    (re.compile(r"^id_(?:rsa|ed25519|ecdsa)(?:\.bak|\.txt)?$", re.I),
+     "staged-ssh-key"),
+    # Generic staging archive names used across families on every OS.
+    (re.compile(r"^(?:loot|dump|exfil|creds?|passwords?|browserdata)\."
+                r"(?:zip|tar|gz|7z|rar)$", re.I), "generic-loot-archive"),
 ]
-STAGING_DIRS = ["/tmp", "/private/tmp", "/Users/Shared"]
+if IS_MAC:
+    STAGING_DIRS = ["/tmp", "/private/tmp", "/Users/Shared"]
+elif IS_LINUX:
+    STAGING_DIRS = ["/tmp", "/var/tmp", "/dev/shm"]
+else:
+    STAGING_DIRS = [d for d in (WIN_TEMP, WIN_PUBLIC, WIN_PROGRAMDATA) if d]
 
 # --- Crypto-wallet integrity (wallet-drainer surface) ------------------------ #
 # 2025 stealers don't just steal — they tamper with installed wallet apps to
@@ -548,16 +848,37 @@ STAGING_DIRS = ["/tmp", "/private/tmp", "/Users/Shared"]
 # endpoints; Odyssey replaces Ledger Live / Trezor Suite bundles with drainers.
 # We baseline-hash the config files + app main executables that EXIST; a change
 # is HIGH (wallet apps update rarely and the blast radius is a drained wallet).
-WALLET_CONFIG_FILES = [os.path.join(HOME, p) for p in (
-    "Library/Application Support/Ledger Live/app.json",
-    "Library/Application Support/Ledger Live/user.json",
-)]
-WALLET_APP_BINS = [
-    "/Applications/Ledger Live.app/Contents/MacOS/Ledger Live",
-    "/Applications/Trezor Suite.app/Contents/MacOS/Trezor Suite",
-    "/Applications/Exodus.app/Contents/MacOS/Exodus",
-    os.path.join(HOME, "Applications/Ledger Live.app/Contents/MacOS/Ledger Live"),
-]
+if IS_MAC:
+    WALLET_CONFIG_FILES = [os.path.join(HOME, p) for p in (
+        "Library/Application Support/Ledger Live/app.json",
+        "Library/Application Support/Ledger Live/user.json",
+    )]
+    WALLET_APP_BINS = [
+        "/Applications/Ledger Live.app/Contents/MacOS/Ledger Live",
+        "/Applications/Trezor Suite.app/Contents/MacOS/Trezor Suite",
+        "/Applications/Exodus.app/Contents/MacOS/Exodus",
+        os.path.join(HOME, "Applications/Ledger Live.app/Contents/MacOS/Ledger Live"),
+    ]
+elif IS_LINUX:
+    WALLET_CONFIG_FILES = [os.path.join(HOME, p) for p in (
+        ".config/Ledger Live/app.json",
+        ".config/Ledger Live/user.json",
+    )]
+    WALLET_APP_BINS = [
+        "/opt/Ledger Live/ledger-live-desktop",
+        "/opt/Trezor Suite/trezor-suite",
+        os.path.join(HOME, ".local/bin/ledger-live-desktop"),
+    ]
+else:
+    WALLET_CONFIG_FILES = [
+        os.path.join(WIN_APPDATA, "Ledger Live", "app.json"),
+        os.path.join(WIN_APPDATA, "Ledger Live", "user.json"),
+    ]
+    WALLET_APP_BINS = [
+        os.path.join(WIN_LOCALAPPDATA, "Programs", "Ledger Live", "Ledger Live.exe"),
+        os.path.join(WIN_LOCALAPPDATA, "Programs", "Trezor Suite", "Trezor Suite.exe"),
+        os.path.join(WIN_LOCALAPPDATA, "exodus", "Exodus.exe"),
+    ]
 
 # --- Network listeners (bind-shell / rogue-server surface) -------------------- #
 # LuLu-tier OUTBOUND blocking needs an Apple Network Extension entitlement, but
@@ -643,6 +964,34 @@ def load_json(path, default):
         return default
 
 
+def _lock_fd(fd):
+    """Exclusive advisory lock, blocking (flock on POSIX, msvcrt on Windows)."""
+    if IS_WIN:
+        # msvcrt LK_LOCK retries ~10s then raises; loop so the semantics match
+        # flock's indefinite blocking (scans are seconds, not minutes).
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                return
+            except OSError as e:
+                if e.errno not in (errno.EDEADLK, errno.EACCES):
+                    raise
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _unlock_fd(fd):
+    if IS_WIN:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def _sync_fd(fd):
     """Push a state mutation to stable storage as far as macOS permits."""
     os.fsync(fd)
@@ -697,19 +1046,48 @@ def save_json(path, obj):
             pass
 
 
-_TRUSTED_TOOLS = {
-    "chflags": "/usr/bin/chflags", "codesign": "/usr/bin/codesign",
-    "crontab": "/usr/bin/crontab", "csrutil": "/usr/bin/csrutil",
-    "defaults": "/usr/bin/defaults", "fdesetup": "/usr/bin/fdesetup",
-    "launchctl": "/bin/launchctl", "log": "/usr/bin/log",
-    "lsof": "/usr/sbin/lsof", "mdls": "/usr/bin/mdls",
-    "osascript": "/usr/bin/osascript", "plutil": "/usr/bin/plutil",
-    "profiles": "/usr/bin/profiles", "ps": "/bin/ps",
-    "sfltool": "/usr/bin/sfltool", "spctl": "/usr/sbin/spctl",
-    "sysctl": "/usr/sbin/sysctl", "xattr": "/usr/bin/xattr",
-    "netstat": "/usr/sbin/netstat", "last": "/usr/bin/last",
-    "who": "/usr/bin/who",
-}
+if IS_MAC:
+    _TRUSTED_TOOLS = {
+        "chflags": "/usr/bin/chflags", "codesign": "/usr/bin/codesign",
+        "crontab": "/usr/bin/crontab", "csrutil": "/usr/bin/csrutil",
+        "defaults": "/usr/bin/defaults", "fdesetup": "/usr/bin/fdesetup",
+        "launchctl": "/bin/launchctl", "log": "/usr/bin/log",
+        "lsof": "/usr/sbin/lsof", "mdls": "/usr/bin/mdls",
+        "osascript": "/usr/bin/osascript", "plutil": "/usr/bin/plutil",
+        "profiles": "/usr/bin/profiles", "ps": "/bin/ps",
+        "sfltool": "/usr/bin/sfltool", "spctl": "/usr/sbin/spctl",
+        "sysctl": "/usr/sbin/sysctl", "xattr": "/usr/bin/xattr",
+        "netstat": "/usr/sbin/netstat", "last": "/usr/bin/last",
+        "who": "/usr/bin/who",
+    }
+elif IS_LINUX:
+    # Distros disagree on /usr/bin vs /bin (usrmerge) and /usr/sbin vs /sbin;
+    # pin to the first that exists so the restricted-PATH exec stays deterministic.
+    def _first_path(name, candidates):
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return name  # resolved via the restricted PATH in run()
+    _TRUSTED_TOOLS = {n: _first_path(n, ["/usr/bin/" + n, "/bin/" + n,
+                                         "/usr/sbin/" + n, "/sbin/" + n])
+                      for n in ("crontab", "ps", "ss", "netstat", "who", "last",
+                                "systemctl", "loginctl", "getenforce",
+                                "aa-enabled", "ufw", "firewall-cmd", "nft",
+                                "dpkg", "dpkg-query", "rpm", "pacman",
+                                "sestatus", "notify-send")}
+else:
+    _SYS32 = os.path.join(WIN_SYSTEMROOT, "System32")
+    _TRUSTED_TOOLS = {
+        "schtasks": os.path.join(_SYS32, "schtasks.exe"),
+        "netstat": os.path.join(_SYS32, "NETSTAT.EXE"),
+        "netsh": os.path.join(_SYS32, "netsh.exe"),
+        "reg": os.path.join(_SYS32, "reg.exe"),
+        "tasklist": os.path.join(_SYS32, "tasklist.exe"),
+        "taskkill": os.path.join(_SYS32, "taskkill.exe"),
+        "sc": os.path.join(_SYS32, "sc.exe"),
+        "powershell": os.path.join(_SYS32, "WindowsPowerShell", "v1.0",
+                                   "powershell.exe"),
+    }
 
 
 def _trusted_command(cmd):
@@ -719,14 +1097,41 @@ def _trusted_command(cmd):
     return normalized
 
 
-def run(cmd, timeout=15):
-    """Run a command, return (stdout, stderr, rc). Never raises."""
+def run(cmd, timeout=15, extra_env=None):
+    """Run a command, return (stdout, stderr, rc). Never raises. extra_env
+    entries are added to the restricted environment — the injection-safe way to
+    hand attacker-influenced strings (paths, titles) to PowerShell."""
     try:
-        safe_env = {
-            "HOME": HOME, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "LANG": "C", "LC_ALL": "C",
-            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-        }
+        if IS_WIN:
+            # SystemRoot is load-bearing on Windows (WinSock/CryptoAPI fail
+            # without it); PATH pinned to the system tool directories.
+            safe_env = {
+                "SystemRoot": WIN_SYSTEMROOT, "SystemDrive":
+                    os.environ.get("SystemDrive", "C:"),
+                "USERPROFILE": HOME, "HOMEPATH": os.environ.get("HOMEPATH", ""),
+                "HOMEDRIVE": os.environ.get("HOMEDRIVE", ""),
+                "APPDATA": WIN_APPDATA, "LOCALAPPDATA": WIN_LOCALAPPDATA,
+                "ProgramData": WIN_PROGRAMDATA,
+                "TEMP": WIN_TEMP, "TMP": WIN_TEMP,
+                "PATH": os.pathsep.join((
+                    _SYS32, WIN_SYSTEMROOT,
+                    os.path.join(_SYS32, "WindowsPowerShell", "v1.0"))),
+            }
+        else:
+            safe_env = {
+                "HOME": HOME, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "LANG": "C", "LC_ALL": "C",
+                "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+            }
+            if IS_LINUX:
+                # Session-bus plumbing so notify-send/systemctl --user work;
+                # values pass through untouched or not at all.
+                for k in ("DISPLAY", "WAYLAND_DISPLAY",
+                          "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"):
+                    if os.environ.get(k):
+                        safe_env[k] = os.environ[k]
+        if extra_env:
+            safe_env.update(extra_env)
         p = subprocess.run(
             _trusted_command(cmd), capture_output=True, text=True, timeout=timeout,
             check=False, env=safe_env
@@ -754,6 +1159,15 @@ def sha256(path):
 def is_risky_location(path):
     if not path:
         return False
+    if IS_WIN:
+        # Case-insensitive filesystem; both separators appear in the wild.
+        norm = os.path.normcase(os.path.normpath(path))
+        if any(norm.startswith(os.path.normcase(os.path.normpath(p)) + os.sep)
+               or norm == os.path.normcase(os.path.normpath(p))
+               for p in TRUSTED_PREFIXES):
+            return False
+        return any(norm.startswith(os.path.normcase(os.path.normpath(p)))
+                   for p in RISKY_PREFIXES)
     if any(path.startswith(p) for p in TRUSTED_PREFIXES):
         return False
     # A hidden component anywhere (/.foo/) is a classic hiding spot.
@@ -762,18 +1176,42 @@ def is_risky_location(path):
     return any(path.startswith(p) for p in RISKY_PREFIXES)
 
 
+# PowerShell toast fallback: a tray balloon via Windows Forms — dependency-free
+# and works on every supported Windows without a registered AppId (the WinRT
+# toast API silently drops notifications from unregistered console hosts).
+_WIN_NOTIFY_PS = (
+    "Add-Type -AssemblyName System.Windows.Forms;"
+    "$n=New-Object System.Windows.Forms.NotifyIcon;"
+    "$n.Icon=[System.Drawing.SystemIcons]::Warning;"
+    "$n.Visible=$true;"
+    "$n.ShowBalloonTip(10000,$env:AEGIS_NT,$env:AEGIS_NM,"
+    "[System.Windows.Forms.ToolTipIcon]::Warning);"
+    "Start-Sleep -Seconds 6;$n.Dispose()")
+
+
 def notify(title, message):
-    """Best-effort macOS desktop notification. Never fatal."""
+    """Best-effort desktop notification (osascript / notify-send / PowerShell
+    balloon). Never fatal; a missed notification is why findings are durable."""
     try:
-        run(
-            [
-                "osascript",
-                "-e",
-                "display notification %s with title %s"
-                % (json.dumps(message), json.dumps(title)),
-            ],
-            timeout=8,
-        )
+        if IS_MAC:
+            run(
+                [
+                    "osascript",
+                    "-e",
+                    "display notification %s with title %s"
+                    % (json.dumps(message), json.dumps(title)),
+                ],
+                timeout=8,
+            )
+        elif IS_LINUX:
+            run(["notify-send", "--urgency=critical", "--app-name=Aegis",
+                 title, message], timeout=8)
+        else:
+            # Values travel via env, not interpolation, so a finding title can
+            # never inject PowerShell.
+            run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 _WIN_NOTIFY_PS], timeout=25,
+                extra_env={"AEGIS_NT": title, "AEGIS_NM": message})
     except Exception:
         pass
 
@@ -982,13 +1420,18 @@ def _sig_stat(path):
 
 def classify_signature(path):
     """
-    Return {trust, team, authority}.
-      trust in {apple, developer-id, signed-other, adhoc, unsigned, broken,
-                missing, unknown}
-    Only 'adhoc', 'unsigned', 'broken' are treated as suspicious for exec.
-    Cached per PATH (not per path+mtime+size) with the stat-signature stored as a
-    field, so a rebuilt binary OVERWRITES its own entry instead of orphaning a
-    stale key — the cache stays one-entry-per-path and cheap on battery.
+    Return {trust, team, authority} — the platform's answer to "who vouches for
+    this executable".
+      mac (codesign):      apple, app-store, developer-id, signed-other, adhoc,
+                           unsigned, broken, missing, unknown
+      windows (Authenticode): os-signed, signed-valid, unsigned, broken,
+                           missing, unknown
+      linux (pkg manager): os-managed (dpkg/rpm/pacman owns the file),
+                           unmanaged, missing, unknown
+    suspicious_sig() decides which of these gate an exec-in-risky-location
+    alert. Cached per PATH (not per path+mtime+size) with the stat-signature
+    stored as a field, so a rebuilt binary OVERWRITES its own entry instead of
+    orphaning a stale key — the cache stays one-entry-per-path and cheap.
     """
     global _sigcache
     if _sigcache is None:
@@ -1007,6 +1450,86 @@ def classify_signature(path):
         _sigcache[path] = cached
         return cached["result"]
 
+    if IS_LINUX:
+        result = _classify_linux(path)
+    elif IS_WIN:
+        result = _classify_windows(path)
+    else:
+        result = _classify_mac(path)
+
+    if stat_sig is not None:
+        _sigcache.pop(path, None)  # overwrite any prior entry for this path
+        _sigcache[path] = {"stat": stat_sig, "result": result}
+    return result
+
+
+def _classify_linux(path):
+    """Linux has no ambient code-signing; the honest analog is package-manager
+    ownership: a file dpkg/rpm/pacman accounts for was installed by root through
+    the distro pipeline. Everything else is 'unmanaged' — scored by location and
+    behavior, not treated as malign by itself (every locally-built dev binary is
+    unmanaged)."""
+    result = {"trust": "unmanaged", "team": None, "authority": None}
+    real = os.path.realpath(path)
+    # Package managers never own $HOME/tmp content — skip the subprocess.
+    if any(real.startswith(p) for p in
+           (HOME + "/", "/home/", "/root/", "/tmp/", "/var/tmp/", "/dev/shm/",
+            "/run/")):
+        return result
+    out, _, rc = run(["dpkg-query", "-S", real], timeout=10)
+    if rc == 0 and ":" in (out or ""):
+        result["trust"] = "os-managed"
+        result["authority"] = "dpkg:" + out.split(":", 1)[0].strip()
+        return result
+    out, _, rc = run(["rpm", "-qf", real], timeout=10)
+    if rc == 0 and out.strip() and "not owned" not in out:
+        result["trust"] = "os-managed"
+        result["authority"] = "rpm:" + out.strip().splitlines()[0]
+        return result
+    out, _, rc = run(["pacman", "-Qqo", real], timeout=10)
+    if rc == 0 and out.strip():
+        result["trust"] = "os-managed"
+        result["authority"] = "pacman:" + out.strip().splitlines()[0]
+        return result
+    return result
+
+
+# One PowerShell round-trip per classification; results are stat-cached so a
+# stable binary costs the subprocess once, not once per scan.
+_WIN_SIG_PS = (
+    "$s=Get-AuthenticodeSignature -LiteralPath $env:AEGIS_SIG_PATH;"
+    "$sub=$null;if($s.SignerCertificate){$sub=$s.SignerCertificate.Subject};"
+    "Write-Output ([string]$s.Status);Write-Output ([string]$sub)")
+
+
+def _classify_windows(path):
+    result = {"trust": "unknown", "team": None, "authority": None}
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_SIG_PS], timeout=30,
+                     extra_env={"AEGIS_SIG_PATH": path})
+    if rc != 0 or not out:
+        return result
+    lines = out.splitlines()
+    status = lines[0].strip() if lines else ""
+    signer = lines[1].strip() if len(lines) > 1 else ""
+    if status == "Valid":
+        result["trust"] = ("os-signed" if "Microsoft Windows" in signer
+                           else "signed-valid")
+    elif status == "NotSigned":
+        result["trust"] = "unsigned"
+    elif status in ("HashMismatch", "NotTrusted"):
+        # Tampered-after-signing, or a signature chained to an untrusted root —
+        # both are the Windows shape of a broken/forged identity.
+        result["trust"] = "broken"
+    elif status == "NotSupportedFileFormat":
+        result["trust"] = "unsigned"
+    if signer:
+        m = re.search(r"CN=([^,]+)", signer)
+        result["authority"] = m.group(1).strip() if m else signer
+    return result
+
+
+def _classify_mac(path):
     out, err, _ = run(["codesign", "-dv", "--verbose=4", path], timeout=12)
     text = (out or "") + (err or "")  # codesign writes detail to stderr
 
@@ -1049,10 +1572,6 @@ def classify_signature(path):
         _, verr, vrc = run(["codesign", "--verify", "--strict", path], timeout=20)
         if vrc != 0 and "not signed" not in (verr or "").lower():
             result["trust"] = "broken"
-
-    if stat_sig is not None:
-        _sigcache.pop(path, None)  # overwrite any prior entry for this path
-        _sigcache[path] = {"stat": stat_sig, "result": result}
     return result
 
 
@@ -1066,6 +1585,17 @@ def flush_sigcache():
 
 
 def suspicious_sig(trust):
+    """Is this signature verdict suspicious enough to gate an alert?
+
+    mac: ad-hoc/unsigned/broken. windows: unsigned/broken (an Authenticode
+    HashMismatch or untrusted chain). linux: only 'broken' — 'unmanaged' means
+    'no package owns it', which is true of every locally-built binary, so
+    treating it as suspicious would drown the user in development noise. Linux
+    gets its exec signal from structure instead (see _exec_alert)."""
+    if IS_LINUX:
+        return trust == "broken"
+    if IS_WIN:
+        return trust in ("unsigned", "broken")
     return trust in ("adhoc", "unsigned", "broken")
 
 
@@ -2053,7 +2583,373 @@ def _plist_program(d):
     return prog, args
 
 
+def _persist_record(label=None):
+    """The one persistence-record shape every platform snapshot produces, so
+    check_persistence/_persistence_severity diff and score identically whether
+    the item is a launchd plist, a systemd unit, or a registry Run key."""
+    return {"label": label, "program": None, "args": None, "args_sha256": None,
+            "sha256": None, "trust": "unknown", "run_at_load": False,
+            "authority": None, "env": None}
+
+
+def _finish_persist_record(rec, prog, args):
+    """Common tail: hash+classify the resolved program, redact+hash the args."""
+    rec["program"] = prog
+    if args is not None:
+        raw_args = json.dumps(args, sort_keys=True, default=str)
+        rec["args_sha256"] = hashlib.sha256(raw_args.encode()).hexdigest()
+        rec["args"] = _redact_value(args)
+    if prog and os.path.exists(prog):
+        rec["sha256"] = sha256(prog)
+        sig = classify_signature(prog)
+        rec["trust"] = sig["trust"]
+        rec["authority"] = sig["authority"]
+    elif prog:
+        rec["trust"] = "missing"
+    return rec
+
+
+# Linux env keys that inject code into other processes — the LD_* family is the
+# direct analog of macOS DYLD_INSERT_LIBRARIES (T1574.006).
+_LD_INJECT_KEYS = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
+
+
+def _parse_systemd_unit(text):
+    """Pure parser: unit-file text → (exec_cmds, inject_env, run_at_boot).
+    exec_cmds is a list of shell-split argv lists from Exec* directives (systemd
+    exec prefixes @-:!+ stripped); inject_env holds LD_* Environment entries."""
+    execs, env, run_at_boot = [], {}, False
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].lower()
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if section == "install" and key in ("WantedBy", "RequiredBy") and val:
+            run_at_boot = True
+        if section != "service" and section != "unit" and section != "timer":
+            if section != "socket":
+                continue
+        if key in ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop",
+                   "ExecReload", "ExecCondition"):
+            if not val:
+                continue  # `ExecStart=` (reset) lines execute nothing
+            try:
+                argv = shlex.split(val)
+            except ValueError:
+                argv = val.split()
+            # strip systemd exec prefixes (@, -, :, +, !, !!) off argv[0]
+            if argv:
+                argv[0] = argv[0].lstrip("@-:!+")
+            if argv:
+                execs.append(argv)
+        elif key == "Environment":
+            try:
+                pairs = shlex.split(val)
+            except ValueError:
+                pairs = val.split()
+            for p in pairs:
+                if "=" in p:
+                    k, _, v = p.partition("=")
+                    if k in _LD_INJECT_KEYS:
+                        env[k] = v
+    return execs, env, run_at_boot
+
+
+def _parse_desktop_entry(text):
+    """Pure parser: XDG .desktop autostart text → (argv, hidden). Exec= supports
+    %-field codes, stripped here; Hidden=true means 'pretend not installed'."""
+    argv, hidden = None, False
+    in_entry = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            in_entry = line.lower() == "[desktop entry]"
+            continue
+        if not in_entry or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip().lower()
+        if key == "exec":
+            val = re.sub(r"%[a-zA-Z%]", "", val).strip()
+            try:
+                argv = shlex.split(val) or None
+            except ValueError:
+                argv = val.split() or None
+        elif key == "hidden":
+            hidden = val.strip().lower() == "true"
+    return argv, hidden
+
+
+def _snapshot_persistence_linux():
+    """{unit_or_desktop_path: record} for systemd units (admin/user-writable
+    trees only — the distro's /usr/lib tree is package churn) and XDG autostart
+    entries. Same record shape as launchd's, so the same diff/scoring applies."""
+    snap = {}
+    for d in PERSISTENCE_DIRS:
+        try:
+            entries = sorted(os.listdir(d))
+        except Exception:
+            continue
+        for name in entries:
+            path = os.path.join(d, name)
+            if not os.path.isfile(path) and not os.path.islink(path):
+                continue
+            is_unit = name.endswith((".service", ".timer", ".socket", ".path"))
+            is_desktop = name.endswith(".desktop")
+            if not is_unit and not is_desktop:
+                continue
+            rec = _persist_record(label=name)
+            text = _read_text(path) or ""
+            prog, args = None, None
+            if is_unit:
+                execs, env, run_at_boot = _parse_systemd_unit(text)
+                if execs:
+                    args = execs[0]
+                    prog = args[0]
+                    if prog and not prog.startswith("/"):
+                        prog = shutil.which(prog) or prog
+                    # extra Exec* lines are part of the scored payload
+                    if len(execs) > 1:
+                        args = [a for cmd in execs for a in cmd]
+                rec["env"] = env or None
+                rec["run_at_load"] = run_at_boot
+            else:
+                argv, hidden = _parse_desktop_entry(text)
+                if argv:
+                    args = argv
+                    prog = argv[0]
+                    if prog and not prog.startswith("/"):
+                        prog = shutil.which(prog) or prog
+                rec["run_at_load"] = True
+                if hidden and argv:
+                    # Hidden=true with a live Exec is a masquerade tell: the
+                    # entry runs but asks desktop tooling not to show it.
+                    rec["env"] = {"XDG_HIDDEN": "true"}
+            snap[path] = _finish_persist_record(rec, prog, args)
+    return snap
+
+
+def _win_split_cmd(cmdline):
+    """Windows command-line → argv-ish list. Handles the two real shapes:
+    `"C:\\path with spaces\\x.exe" args` and `C:\\path\\x.exe args`. Registry Run
+    values and service ImagePaths are stored as single strings, sometimes
+    unquoted with spaces — resolved conservatively (first token)."""
+    if not cmdline:
+        return None
+    s = cmdline.strip()
+    if not s:
+        return None
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end > 0:
+            head = s[1:end]
+            rest = s[end + 1:].strip()
+            return [head] + (rest.split() if rest else [])
+    parts = s.split()
+    return parts or None
+
+
+_WIN_ENVVAR_RE = re.compile(r"%([A-Za-z_][A-Za-z0-9_()]*)%")
+
+
+def _expand_win_env(s):
+    """Expand %VAR% references the way cmd does (registry autostart values are
+    routinely REG_EXPAND_SZ: `%SystemRoot%\\system32\\x.exe`). Implemented
+    explicitly rather than via os.path.expandvars, which only understands the
+    %VAR% form when the interpreter itself runs on Windows — this keeps the
+    Windows parsing path identical, and testable, on any host. An undefined
+    variable is left verbatim, matching cmd."""
+    if not s:
+        return s
+    return _WIN_ENVVAR_RE.sub(
+        lambda m: os.environ.get(m.group(1), m.group(0)), s)
+
+
+_WIN_RUN_KEYS = [
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKLM", r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
+]
+
+# Winlogon values an attacker rewrites for persistence; each has exactly one
+# healthy shape, so anything else is a finding-grade anomaly (T1547.004).
+_WIN_LOGON_EXPECT = {
+    "Shell": re.compile(r"^explorer\.exe$", re.I),
+    "Userinit": re.compile(r"^C:\\Windows\\system32\\userinit\.exe,?$", re.I),
+}
+
+
+def _parse_schtasks_csv(text):
+    """Pure parser: `schtasks /query /fo csv /v` → [(task_name, command)].
+    Skips the \\Microsoft\\ OS tree (thousands of stock tasks; attacker-created
+    tasks live at the root or a shallow custom folder)."""
+    import csv as _csv
+    import io as _io
+    out = []
+    try:
+        rows = list(_csv.reader(_io.StringIO(text)))
+    except Exception:
+        return out
+    header = None
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "HostName" or row[0] == '"HostName"':
+            header = row
+            continue
+        if header is None or len(row) != len(header):
+            continue
+        rec = dict(zip(header, row))
+        name = rec.get("TaskName", "")
+        cmd = rec.get("Task To Run", "")
+        if not name or name.startswith("\\Microsoft\\"):
+            continue
+        if not cmd or cmd.strip().upper() in ("N/A", "COM HANDLER"):
+            continue
+        out.append((name, cmd.strip()))
+    return out
+
+
+def _snapshot_persistence_windows():
+    """{key: record} across the Windows autostart surfaces an unprivileged scan
+    can read: Run/RunOnce keys, Winlogon Shell/Userinit, startup folders,
+    non-Microsoft scheduled tasks, and services whose binary lives outside the
+    protected trees. Registry enumeration uses stdlib winreg (no subprocess)."""
+    import winreg
+    snap = {}
+    hives = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
+
+    def _reg_values(hive, subkey):
+        vals = []
+        try:
+            with winreg.OpenKey(hives[hive], subkey) as k:
+                i = 0
+                while True:
+                    try:
+                        name, val, _t = winreg.EnumValue(k, i)
+                    except OSError:
+                        break
+                    vals.append((name, val))
+                    i += 1
+        except OSError:
+            pass
+        return vals
+
+    # 1. Run/RunOnce keys — the classic autostart (T1547.001).
+    for hive, subkey in _WIN_RUN_KEYS:
+        for name, val in _reg_values(hive, subkey):
+            if not isinstance(val, str) or not val.strip():
+                continue
+            key = "%s\\%s\\%s" % (hive, subkey, name)
+            rec = _persist_record(label=key)
+            rec["run_at_load"] = True
+            args = _win_split_cmd(_expand_win_env(val))
+            prog = args[0] if args else None
+            snap[key] = _finish_persist_record(rec, prog, args)
+
+    # 2. Winlogon Shell/Userinit — one healthy value each; a deviation is how
+    # a stealer wedges itself before the desktop (T1547.004).
+    for name, val in _reg_values(
+            "HKLM", r"Software\Microsoft\Windows\CurrentVersion\Winlogon"):
+        if name not in _WIN_LOGON_EXPECT or not isinstance(val, str):
+            continue
+        if _WIN_LOGON_EXPECT[name].match(val.strip()):
+            continue  # healthy default — not even snapshotted (zero churn)
+        key = "HKLM\\...\\Winlogon\\%s" % name
+        rec = _persist_record(label=key)
+        rec["run_at_load"] = True
+        args = _win_split_cmd(_expand_win_env(val))
+        prog = args[0] if args else None
+        snap[key] = _finish_persist_record(rec, prog, args)
+
+    # 3. Startup folders — dropped .lnk/.exe/script files.
+    for d in PERSISTENCE_DIRS:
+        try:
+            entries = sorted(os.listdir(d))
+        except Exception:
+            continue
+        for nm in entries:
+            if nm.lower() == "desktop.ini":
+                continue
+            path = os.path.join(d, nm)
+            if not os.path.isfile(path):
+                continue
+            rec = _persist_record(label="Startup\\" + nm)
+            rec["run_at_load"] = True
+            args = None
+            if nm.lower().endswith((".bat", ".cmd", ".vbs", ".js", ".ps1",
+                                    ".wsf", ".hta")):
+                # a script's payload is its content — feed it to the same
+                # hostile-idiom scorer the argv path uses
+                body = _read_text(path, limit=64 * 1024) or ""
+                args = [body[:4096]] if body else None
+            snap["startup:" + path] = _finish_persist_record(rec, path, args)
+
+    # 4. Non-Microsoft scheduled tasks (T1053.005) — one schtasks call.
+    out, _, rc = run(["schtasks", "/query", "/fo", "csv", "/v"], timeout=60)
+    if rc == 0 and out:
+        for task_name, cmd in _parse_schtasks_csv(out):
+            key = "task:" + task_name
+            rec = _persist_record(label=task_name)
+            rec["run_at_load"] = True
+            args = _win_split_cmd(_expand_win_env(cmd))
+            prog = args[0] if args else None
+            snap[key] = _finish_persist_record(rec, prog, args)
+
+    # 5. Services whose binary lives OUTSIDE the protected trees (a service
+    # image in %AppData%/%TEMP% is the malware shape; system32 services are
+    # endless trusted churn we deliberately skip).
+    try:
+        with winreg.OpenKey(hives["HKLM"], r"SYSTEM\CurrentControlSet\Services") as root:
+            i = 0
+            while True:
+                try:
+                    svc = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, svc) as sk:
+                        img, _t = winreg.QueryValueEx(sk, "ImagePath")
+                except OSError:
+                    continue
+                if not isinstance(img, str) or not img.strip():
+                    continue
+                args = _win_split_cmd(_expand_win_env(img))
+                prog = args[0] if args else None
+                if not prog:
+                    continue
+                if not is_risky_location(prog):
+                    continue
+                key = "service:" + svc
+                rec = _persist_record(label=key)
+                rec["run_at_load"] = True
+                snap[key] = _finish_persist_record(rec, prog, args)
+    except OSError:
+        pass
+    return snap
+
+
 def snapshot_persistence():
+    if IS_LINUX:
+        return _snapshot_persistence_linux()
+    if IS_WIN:
+        return _snapshot_persistence_windows()
+    return _snapshot_persistence_mac()
+
+
+def _snapshot_persistence_mac():
     """Return {plist_path: record} for all third-party launchd jobs."""
     snap = {}
     for d in PERSISTENCE_DIRS:
@@ -2197,6 +3093,17 @@ def _script_target(args, program=None):
     return None
 
 
+def _in_temp_drop_dir(path):
+    """Is `path` inside a volatile drop directory (reboot-wiped)?"""
+    if not path:
+        return False
+    norm = os.path.normpath(path)
+    if IS_WIN:
+        low = os.path.normcase(norm)
+        return any(low.startswith(os.path.normcase(d)) for d in _TEMP_DROP_DIRS)
+    return norm.startswith(_TEMP_DROP_DIRS)
+
+
 def _hidden_home_or_tmp(path):
     """A script location that is anomalous for a launchd job to point an
     interpreter at: a hidden file sitting DIRECTLY in $HOME (~/.agent, ~/.helper —
@@ -2211,8 +3118,11 @@ def _hidden_home_or_tmp(path):
     # execvp/launchd run the same file). normpath is pure-lexical by design — we
     # do NOT want realpath here (it would hit the FS and resolve symlinks).
     norm = os.path.normpath(path)
-    if norm.startswith(("/tmp", "/private/tmp", "/var/folders",
-                        "/private/var/folders", "/Users/Shared")):
+    if IS_WIN:
+        low = os.path.normcase(norm)
+        return any(low.startswith(os.path.normcase(d))
+                   for d in (WIN_TEMP, WIN_PUBLIC) if d)
+    if norm.startswith(_TEMP_DROP_DIRS):
         return True
     return (os.path.dirname(norm) == HOME
             and os.path.basename(norm).startswith("."))
@@ -2259,6 +3169,18 @@ def _persistence_severity(rec):
     prog = rec.get("program")
     trust = rec.get("trust")
     label = rec.get("label") or ""
+    # WHERE this job actually executes from. Keying only on `program` under-
+    # rates the dominant shape: a TRUSTED interpreter (/bin/bash, /usr/bin/
+    # python3) driving a payload elsewhere — `ExecStart=/bin/bash
+    # /tmp/payload.sh`. The interpreter's own location says "safe" while the
+    # script is the malware, so a VOLATILE script target counts as executing
+    # from a volatile path. Deliberately volatile-only, not every user-writable
+    # path: a helper script under ~/Library or ~/.config is ordinary for real
+    # software, and treating that as top severity would flatten the scale.
+    target = _script_target(rec.get("args"), prog)
+    volatile_here = bool((prog and _in_temp_drop_dir(prog))
+                         or (target and _in_temp_drop_dir(target)))
+    risky_here = is_risky_location(prog) or volatile_here
     if label.startswith("com.apple.") and trust not in ("apple", "app-store"):
         # A third-party plist (we never scan /System) whose LABEL claims to be
         # Apple's but whose program is not Apple-signed is impersonating the OS —
@@ -2284,28 +3206,32 @@ def _persistence_severity(rec):
             if trust not in ("missing", "unknown") and team not in (rec.get("authority") or ""):
                 return "CRITICAL" if is_risky_location(prog) else "HIGH"
     if rec.get("env"):
-        # a launchd job that injects a dylib/lib path into what it spawns
-        # (DYLD_INSERT_LIBRARIES &c.) is a code-injection persistence pattern.
-        return "CRITICAL" if is_risky_location(prog) else "HIGH"
+        # a job that injects a dylib/lib path into what it spawns
+        # (DYLD_INSERT_LIBRARIES / LD_PRELOAD) is a code-injection pattern.
+        return "CRITICAL" if risky_here else "HIGH"
     if _hostile_args(rec.get("args"), rec.get("program")):
         # signed-interpreter + hostile payload: the #1 infostealer pattern.
-        return "CRITICAL" if is_risky_location(prog) else "HIGH"
+        return "CRITICAL" if risky_here else "HIGH"
+    if volatile_here:
+        # Persistence that launches something out of a volatile temp dir is the
+        # shape no legitimate installer has: the target is wiped on reboot, so
+        # whoever wrote it expects to re-drop it. Platform-independent, and it
+        # does not depend on a signature verdict (Linux has none to give).
+        return "CRITICAL"
     if suspicious_sig(trust) and is_risky_location(prog):
-        return "CRITICAL" if prog and prog.startswith(
-            ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
-        ) else "HIGH"
+        return "HIGH"
     if suspicious_sig(trust):
         return "HIGH"
     if trust == "missing":
         return "LOW"  # points at a program that isn't on disk: can't execute
     if is_risky_location(prog):
         return "MEDIUM"
-    # An Apple-signed interpreter in a trusted path, but the SCRIPT it runs lives
-    # in a user-writable location (Phexia: `osascript ~/Library/<random>`). Not a
-    # notify-grade HIGH (legit agents run ~/Library helper scripts too), but worth
-    # surfacing at MEDIUM rather than the LOW the interpreter's own path implies.
-    tgt = _script_target(rec.get("args"), rec.get("program"))
-    if tgt and is_risky_location(tgt):
+    # A trusted-path interpreter, but the SCRIPT it runs lives in a
+    # user-writable location (Phexia: `osascript ~/Library/<random>`). Not a
+    # notify-grade HIGH (legit agents run ~/Library helper scripts too), but
+    # worth surfacing at MEDIUM rather than the LOW the interpreter's own path
+    # implies.
+    if target and is_risky_location(target):
         return "MEDIUM"
     return "LOW"
 
@@ -2519,12 +3445,34 @@ def check_cron():
 # suspicious-signature check below, and vendor-label impersonation (com.finder.*)
 # is covered by the persistence sensor's Team-ID check.
 _TYPOSQUAT_MIN_LEN = 7
-_APPLE_DAEMON_NAMES = frozenset((
-    "systemuiserver", "windowserver", "loginwindow", "cfprefsd", "coreauthd",
-    "spotlight", "mdworker", "launchd", "distnoted", "nsurlsessiond",
-    "usereventagent", "controlcenter", "coreservicesd", "securityd",
-    "notificationcenter", "backgroundtaskmanagementagent",
-))
+if IS_MAC:
+    _SYSTEM_DAEMON_NAMES = frozenset((
+        "systemuiserver", "windowserver", "loginwindow", "cfprefsd", "coreauthd",
+        "spotlight", "mdworker", "launchd", "distnoted", "nsurlsessiond",
+        "usereventagent", "controlcenter", "coreservicesd", "securityd",
+        "notificationcenter", "backgroundtaskmanagementagent",
+    ))
+elif IS_LINUX:
+    # Long-enough core daemon names; a user-writable binary one character off
+    # `systemd`/`pipewire`/`gnome-shell` is blending into `ps`, the same TTP.
+    _SYSTEM_DAEMON_NAMES = frozenset((
+        "systemd", "systemd-journald", "systemd-logind", "systemd-resolved",
+        "systemd-udevd", "systemd-networkd", "dbus-daemon", "polkitd",
+        "pipewire", "pulseaudio", "gnome-shell", "gnome-session", "xorg",
+        "networkmanager", "wpa_supplicant", "rsyslogd", "crond", "sshd",
+        "containerd", "dockerd", "kworker", "auditd", "chronyd",
+    ))
+else:
+    # svchost/lsass/csrss impersonation is the canonical Windows masquerade
+    # (T1036.005) — e.g. `scvhost.exe`, `lsasss.exe` from %AppData%.
+    _SYSTEM_DAEMON_NAMES = frozenset((
+        "svchost", "services", "lsass", "csrss", "winlogon", "explorer",
+        "spoolsv", "taskhostw", "dllhost", "conhost", "sihost", "ctfmon",
+        "runtimebroker", "searchindexer", "wininit", "smss", "fontdrvhost",
+        "audiodg", "msmpeng", "securityhealthservice",
+    ))
+# Back-compat alias: the mac-era name is referenced by existing regression tests.
+_APPLE_DAEMON_NAMES = _SYSTEM_DAEMON_NAMES
 
 
 def _edit_distance_le1(a, b):
@@ -2551,63 +3499,200 @@ def _edit_distance_le1(a, b):
 
 
 def _typosquats_apple_daemon(name):
-    """The Apple daemon `name` impersonates within edit-distance 1, else None. An
-    exact (case-insensitive) match is NOT returned: that is the real daemon or a
-    same-name masquerade the signature/location checks already handle."""
+    """The system daemon `name` impersonates within edit-distance 1, else None.
+    An exact (case-insensitive) match is NOT returned: that is the real daemon
+    or a same-name masquerade the signature/location checks already handle.
+    On Windows a trailing `.exe` is stripped before comparing."""
     low = (name or "").lower()
-    if len(low) < _TYPOSQUAT_MIN_LEN or low in _APPLE_DAEMON_NAMES:
+    if IS_WIN and low.endswith(".exe"):
+        low = low[:-4]
+    if len(low) < _TYPOSQUAT_MIN_LEN or low in _SYSTEM_DAEMON_NAMES:
         return None
-    for real in _APPLE_DAEMON_NAMES:
+    for real in _SYSTEM_DAEMON_NAMES:
         if len(real) >= _TYPOSQUAT_MIN_LEN and _edit_distance_le1(low, real):
             return real
     return None
 
 
+# One PowerShell round-trip yields pid/uid-equivalent/exe/argv for every visible
+# process (tasklist gives no command line, and WMIC is deprecated/removed).
+_WIN_PROC_PS = (
+    "Get-CimInstance Win32_Process | ForEach-Object {"
+    "$o=$_ | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue;"
+    "'{0}`t{1}`t{2}`t{3}' -f $_.ProcessId,"
+    "($(if($o){$o.User}else{''})),$_.ExecutablePath,$_.CommandLine}")
+
+
+def _iter_processes():
+    """Yield (pid, owner, exe, argv) for every process this user can see.
+      mac:     one `ps` call (comm = exec path, args = full argv)
+      linux:   /proc directly — works on minimal containers with no procps, and
+               avoids ps's argv truncation
+      windows: one CIM query
+    `owner` is the uid string (posix) or DOMAIN\\user (Windows); callers compare
+    it against _own_owner() to enforce the same-user boundary."""
+    if IS_LINUX:
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except Exception:
+            return
+        for pid in pids:
+            base = "/proc/" + pid
+            try:
+                uid = str(os.stat(base).st_uid)
+            except Exception:
+                continue
+            try:
+                exe = os.readlink(base + "/exe")
+            except Exception:
+                exe = ""          # kernel thread, or another user's process
+            try:
+                with open(base + "/cmdline", "rb") as f:
+                    raw = f.read(64 * 1024)
+                argv = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            except Exception:
+                argv = ""
+            if not exe and not argv:
+                continue
+            # A deleted-on-disk executable still running is the classic
+            # run-then-unlink stealer shape; keep the path, drop the marker.
+            if exe.endswith(" (deleted)"):
+                exe = exe[:-len(" (deleted)")]
+            yield pid, uid, exe, (argv or exe)
+        return
+    if IS_WIN:
+        out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", _WIN_PROC_PS], timeout=60)
+        if rc != 0 or not out:
+            return
+        for line in out.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if len(parts) < 4:
+                continue
+            pid, owner, exe, argv = parts[0], parts[1], parts[2], "\t".join(parts[3:])
+            if not pid.strip().isdigit():
+                continue
+            yield pid.strip(), owner.strip(), exe.strip(), (argv.strip() or exe.strip())
+        return
+    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
+    if rc != 0:
+        return
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, uid, rest = parts
+        # `comm` is the full exec path and may contain spaces, so it cannot be
+        # split off as a token; argv[0] repeats it, making `rest` usable as both
+        # the argv string and (via its head) the exec path.
+        exe = rest.split(None, 1)[0]
+        yield pid, uid, exe, rest
+
+
+def _own_owner():
+    """This process's owner in the same namespace _iter_processes() reports."""
+    if IS_WIN:
+        return (os.environ.get("USERNAME") or "").strip()
+    return str(os.getuid())
+
+
+def _same_owner(owner):
+    if IS_WIN:
+        me = _own_owner().lower()
+        o = (owner or "").lower()
+        return bool(me) and (o == me or o.endswith("\\" + me))
+    return owner == _own_owner()
+
+
+# Volatile exec dirs: a *running* binary here is high-signal on any OS. Unlike
+# $HOME (full of legitimately-built dev binaries) these are wiped on reboot and
+# essentially never host durable software.
+_VOLATILE_EXEC_DIRS = ("/tmp/", "/private/tmp/", "/var/tmp/", "/dev/shm/",
+                       "/run/user/", "/var/folders/", "/private/var/folders/")
+
+
+def _exec_alert(path, trust):
+    """Should a RUNNING executable at `path` with signature verdict `trust`
+    alert? Returns (severity, reason) or None.
+
+    The rule is deliberately per-platform, because "who vouches for this binary"
+    means different things:
+      * mac/windows have ambient code signing, so unsigned/ad-hoc/broken in a
+        user-writable path IS the signal.
+      * Linux has none — every locally-built binary is 'unmanaged', so treating
+        that as suspicious would alert on ordinary development. Linux instead
+        keys on structural tells: execution from a volatile dir, or a running
+        binary whose file no longer exists (run-then-unlink)."""
+    if not path:
+        return None
+    if IS_LINUX:
+        if not os.path.isabs(path):
+            # An unresolvable exec path (e.g. a listener we could not attribute
+            # without root, recorded as "?") proves nothing — never score it.
+            return None
+        real = os.path.realpath(path)
+        if any(real.startswith(d) for d in _VOLATILE_EXEC_DIRS):
+            return ("HIGH", "is executing from a volatile temp directory")
+        if not os.path.exists(path):
+            # Deleted-while-running: the payload unlinked itself so no file
+            # remains to scan (ATT&CK T1070.004), or it lives on a memfd.
+            return ("HIGH", "is running but its executable no longer exists on "
+                            "disk (deleted-while-running / memfd exec)")
+        return None
+    if suspicious_sig(trust) and is_risky_location(path):
+        if IS_MAC and path.startswith(
+                ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")):
+            return ("HIGH", "running from a volatile temp directory")
+        return ("HIGH", "running from user-writable path")
+    return None
+
+
 def check_processes():
     findings = []
-    out, _, rc = run(["ps", "-axo", "pid=,comm="], timeout=12)
-    if rc != 0:
-        return findings
     seen_paths = set()
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
+    for _pid, _owner, comm, _argv in _iter_processes():
+        if not comm:
             continue
-        parts = line.split(None, 1)
-        if len(parts) != 2:
+        if IS_WIN:
+            if not re.match(r"^[a-zA-Z]:\\", comm):
+                continue
+        elif not comm.startswith("/"):
             continue
-        _pid, comm = parts
-        if not comm.startswith("/"):
-            continue
-        if any(comm.startswith(p) for p in TRUSTED_PREFIXES):
+        if IS_WIN:
+            norm = os.path.normcase(comm)
+            if any(norm.startswith(os.path.normcase(p)) for p in TRUSTED_PREFIXES):
+                continue
+        elif any(comm.startswith(p) for p in TRUSTED_PREFIXES):
             continue
         if comm in seen_paths:
             continue
         seen_paths.add(comm)
         sig = classify_signature(comm)
-        # Apple-daemon name masquerade (ClickLock "SystemUIServerl"): the NAME is
-        # the tell, so this fires regardless of signature — a validly-signed or
-        # ad-hoc binary named one char off a system daemon, running from a
+        # System-daemon name masquerade (ClickLock "SystemUIServerl", Windows
+        # "scvhost.exe"): the NAME is the tell, so this fires regardless of
+        # signature — a binary named one char off a core daemon, running from a
         # user-writable path, is impersonating the OS in the process list.
         squat = _typosquats_apple_daemon(os.path.basename(comm))
         if squat and is_risky_location(comm):
             sha = sha256(comm)
             findings.append(finding(
-                "HIGH", "process", "Apple-daemon name masquerade",
+                "HIGH", "process", "System-daemon name masquerade",
                 "%s (%s) runs from a user-writable path but its name is one "
-                "character off the Apple system daemon %r — a process-name "
+                "character off the system daemon %r — a process-name "
                 "masquerade (ClickLock TTP)" % (comm, sig["trust"], squat),
                 "process:typosquat:%s:%s" % (comm, sha),
                 path=comm, trust=sig["trust"], typosquats=squat, sha256=sha,
                 markers=["name-masquerade"]))
-        if suspicious_sig(sig["trust"]) and is_risky_location(comm):
+        verdict = _exec_alert(comm, sig["trust"])
+        if verdict:
+            sev, reason = verdict
             # Fold the content hash into the fingerprint so a DIFFERENT binary
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
             findings.append(finding(
-                "HIGH", "process", "Suspicious running process",
-                "%s (%s) running from user-writable path" % (comm, sig["trust"]),
+                sev, "process", "Suspicious running process",
+                "%s (%s) %s" % (comm, sig["trust"], reason),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
                 path=comm, trust=sig["trust"], sha256=sha))
     return findings
@@ -2633,8 +3718,28 @@ def check_processes():
 # low-FP (the moderator's 'alert rarely' + Bitdefender-ATC threshold lesson).
 _PIPE_EXEC_IDIOMS = frozenset((
     "pipe-to-shell", "pipe-to-interpreter", "osascript-shell", "base64-decode",
-    "python-oneliner", "eval-subshell", "exec-eval"))
-_FETCH_IDIOMS = frozenset(("network-fetch", "raw-ip-fetch", "interp-fetch"))
+    "python-oneliner", "eval-subshell", "exec-eval",
+    # Windows equivalents: IEX is the PowerShell exec sink, FromBase64String the
+    # decode half of the same download-cradle shape.
+    "powershell-iex", "powershell-base64-decode"))
+_FETCH_IDIOMS = frozenset((
+    "network-fetch", "raw-ip-fetch", "interp-fetch",
+    "powershell-fetch", "powershell-webclient-download"))
+
+# Idioms with essentially no benign use: HIGH on a single sighting, no
+# corroboration required (the fetch/pipe idioms stay MEDIUM alone because
+# benign installers legitimately use them).
+_UNAMBIGUOUS_HIGH_IDIOMS = frozenset((
+    "bash-reverse-shell", "netcat-exec", "launchctl-tmp",
+    "osascript-password-phish", "keychain-dump",
+    # windows
+    "powershell-encoded-command", "windows-lolbin-proxy-exec",
+    "defender-tamper", "amsi-bypass", "shadow-copy-deletion",
+    "recovery-disabled", "sam-hive-dump", "lsass-dump",
+    # linux
+    "ld-so-preload-write", "memfd-fileless-exec", "systemd-tmp-unit",
+    "crontab-tmp-install",
+))
 
 
 def _argv_signals(argv):
@@ -2662,11 +3767,7 @@ def _argv_signals(argv):
     # Unambiguous idioms are HIGH even alone (a reverse shell / netcat-exec is
     # never benign); the fetch/pipe idioms alone stay MEDIUM (benign-installer FP).
     for name in idioms:
-        if name in ("bash-reverse-shell", "netcat-exec", "launchctl-tmp",
-                    "osascript-password-phish", "keychain-dump"):
-            add(name, "HIGH")
-        else:
-            add(name, "MEDIUM")
+        add(name, "HIGH" if name in _UNAMBIGUOUS_HIGH_IDIOMS else "MEDIUM")
     for rx, name in _ANTIVM_ARGV_RES:
         if rx.search(argv):
             add(name, "MEDIUM")
@@ -2680,25 +3781,15 @@ def _argv_signals(argv):
 def check_behavior():
     """Inspect running processes' full command lines for hostile behavior."""
     findings = []
-    my_uid = str(os.getuid())
     my_pid = str(os.getpid())
-    # -o …= suppresses headers; comm is the exec path, args is the full argv.
-    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
-    if rc != 0:
-        return findings
     seen = set()
-    for line in out.splitlines():
-        # Only pid and uid are guaranteed space-free (integers); split just those
-        # off the left and keep the REST as one string. macOS `comm` prints the
-        # full exec path, which can contain spaces, so splitting comm out as a
-        # single token (the old split(None, 3)) sheared any spaced path and fed a
-        # bogus basename to the pre-filter. `rest` holds comm+argv; the exec path
-        # is duplicated at its head (argv[0] repeats comm) but that is harmless
-        # prefix noise to the pattern scorer.
-        parts = line.split(None, 2)
-        if len(parts) < 3:
+    # _iter_processes yields (pid, owner, exe, argv) on every platform: one `ps`
+    # call on macOS, /proc directly on Linux (no procps dependency, no argv
+    # truncation), one CIM query on Windows. `argv` carries the exec path at its
+    # head — harmless prefix noise to the pattern scorer.
+    for pid, owner, _exe, argv in _iter_processes():
+        if not argv:
             continue
-        pid, uid, argv = parts
         # Same-user only: an unprivileged process gets truncated/empty argv for
         # other users' processes, so a match there would be unreliable. And never
         # inspect our OWN scanning process (its argv legitimately carries these
@@ -2706,7 +3797,7 @@ def check_behavior():
         # "aegis" substring in argv, which an attacker reading this open-source
         # check could trivially abuse to evade detection (e.g. a phishing dialog
         # whose text reads "System aegis needs your password…").
-        if uid != my_uid or pid == my_pid:
+        if not _same_owner(owner) or pid == my_pid:
             continue
         base = os.path.basename(argv.split(None, 1)[0]) if argv else ""
         # Cheap pre-filter: only argv-inspect known interpreter/utility binaries
@@ -2897,6 +3988,23 @@ def _is_macho(path):
         return False
 
 
+def _executable_kind(path):
+    """'macho' | 'elf' | 'pe' | None — what kind of native executable this file
+    is, read from its magic bytes (the extension is attacker-controlled)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except Exception:
+        return None
+    if head in MACHO_MAGIC:
+        return "macho"
+    if head[:4] == ELF_MAGIC:
+        return "elf"
+    if head[:2] == PE_MAGIC:
+        return "pe"
+    return None
+
+
 def gatekeeper_verdict(path):
     """Gatekeeper's own assessment (`spctl -a -t exec`) → (verdict, source).
     On an .app BUNDLE this is authoritative: 'accepted'/'Notarized Developer ID'
@@ -2988,6 +4096,40 @@ def _check_hot_app(path, st, cutoff):
         path=path, trust=sig["trust"], sha256=sha, gatekeeper=verdict)]
 
 
+def _hot_elf_finding(path, st, kind):
+    """Score a freshly-arrived ELF on Linux. There is no signature to consult,
+    so the graded signals are structural: the executable BIT (a downloaded
+    binary only becomes a threat once it is chmod +x) and the directory (a
+    volatile temp dir is a dropper's staging ground; ~/Downloads is where the
+    user legitimately puts binaries). Non-executable downloads stay silent —
+    alerting on every downloaded tarball would be noise, not defense."""
+    executable = bool(st.st_mode & stat.S_IXUSR)
+    volatile = _in_temp_drop_dir(path)
+    when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")
+    ts_reason = timestomp_signal(path, st)
+    if not executable and not volatile:
+        return []
+    if volatile and executable:
+        sev, why = "HIGH", ("an executable %s dropped in a volatile temp "
+                            "directory is the classic dropper staging shape" % kind)
+    elif volatile:
+        sev, why = "MEDIUM", ("a %s binary staged in a volatile temp directory "
+                              "(not yet executable)" % kind)
+    else:
+        sev, why = "MEDIUM", ("a downloaded %s binary was made executable — "
+                              "verify you built or trust it" % kind)
+    sha = sha256(path)
+    return [finding(
+        sev, "hot-dir", "Executable dropped in watched folder",
+        "%s [%s], modified %s — %s%s" % (
+            path, kind, when, why,
+            "; TIMESTOMP: %s" % ts_reason if ts_reason else ""),
+        "hotdir:%s:%s:%s" % (path, kind, sha),
+        path=path, trust=kind, sha256=sha, timestomp=ts_reason,
+        confidence="medium",
+        markers=(["timestomp"] if ts_reason else None))]
+
+
 def check_hot_dirs(max_age_days=14):
     findings = []
     cutoff = time.time() - max_age_days * 86400
@@ -3002,7 +4144,7 @@ def check_hot_dirs(max_age_days=14):
                 st = os.stat(path)
             except Exception:
                 continue
-            if name.endswith(".app") and os.path.isdir(path):
+            if IS_MAC and name.endswith(".app") and os.path.isdir(path):
                 # cutoff decided inside — bundle freshness is max(root, exe).
                 findings.extend(_check_hot_app(path, st, cutoff))
                 continue
@@ -3020,9 +4162,13 @@ def check_hot_dirs(max_age_days=14):
                 continue
             if not os.path.isfile(path):
                 continue
-            if not _is_macho(path):
+            kind = _executable_kind(path)
+            if kind is None or (IS_MAC and kind != "macho"):
                 continue
             sig = classify_signature(path)
+            if IS_LINUX:
+                findings.extend(_hot_elf_finding(path, st, kind))
+                continue
             if suspicious_sig(sig["trust"]):
                 sha = sha256(path)  # content hash → path reuse ≠ same fingerprint
                 # Provenance enrichment (one xattr read): WHO downloaded it and
@@ -3421,6 +4567,241 @@ def check_web_protection():
 
 
 def check_hardening():
+    """Preventive-control posture. Each platform reports the controls it
+    actually has; an unreadable probe is 'UNKNOWN' (coverage), never 'fine'."""
+    if IS_LINUX:
+        return _check_hardening_linux()
+    if IS_WIN:
+        return _check_hardening_windows()
+    return _check_hardening_mac()
+
+
+def _hardening_unknown(findings, component, title, err):
+    findings.append(finding(
+        "MEDIUM", "coverage", "%s status is UNKNOWN" % title,
+        "%s probe unavailable or unrecognized: %s" %
+        (component, redact_sensitive(err or "empty output")),
+        "hardening:%s:unknown" % component))
+
+
+def _check_hardening_linux():
+    """SELinux/AppArmor (MAC enforcement), the host firewall, sshd exposure,
+    disk encryption, and automatic security updates — the Linux equivalents of
+    the SIP/Gatekeeper/FileVault/firewall block."""
+    findings = []
+
+    # 1. Mandatory access control: SELinux enforcing, or AppArmor enabled.
+    mac_state, mac_detail = None, ""
+    out, _, rc = run(["getenforce"], timeout=8)
+    if rc == 0 and out.strip():
+        mac_state = out.strip().lower()   # enforcing | permissive | disabled
+        mac_detail = "SELinux: %s" % out.strip()
+    else:
+        out, _, rc = run(["aa-enabled"], timeout=8)
+        if rc == 0 and out.strip():
+            mac_state = "enforcing" if "yes" in out.lower() else "disabled"
+            mac_detail = "AppArmor: %s" % out.strip()
+        elif os.path.exists("/sys/kernel/security/apparmor"):
+            mac_state, mac_detail = "enforcing", "AppArmor: LSM present"
+    if mac_state is None:
+        _hardening_unknown(findings, "mac-lsm",
+                           "Mandatory access control (SELinux/AppArmor)",
+                           "neither getenforce nor aa-enabled available")
+    elif mac_state in ("disabled", "permissive"):
+        findings.append(finding(
+            "MEDIUM", "hardening",
+            "Mandatory access control is not enforcing",
+            "%s — SELinux/AppArmor confinement is the Linux analog of SIP; "
+            "without it a compromised service is unconfined." % mac_detail,
+            "hardening:mac-lsm:off"))
+
+    # 2. Host firewall (ufw / firewalld / nftables). Absent rules ⇒ every
+    # listening service is reachable from the LAN.
+    fw_active, fw_detail = None, ""
+    out, _, rc = run(["ufw", "status"], timeout=8)
+    if rc == 0 and out.strip():
+        fw_active = "status: active" in out.lower()
+        fw_detail = out.strip().splitlines()[0]
+    else:
+        out, _, rc = run(["firewall-cmd", "--state"], timeout=8)
+        if rc == 0 and out.strip():
+            fw_active = "running" in out.lower()
+            fw_detail = "firewalld: %s" % out.strip()
+        else:
+            out, _, rc = run(["nft", "list", "ruleset"], timeout=10)
+            if rc == 0:
+                # An empty ruleset means no filtering, not "unknown".
+                fw_active = bool(out.strip())
+                fw_detail = ("nftables: %d rule line(s)"
+                             % len(out.strip().splitlines()))
+    if fw_active is None:
+        _hardening_unknown(findings, "firewall", "Host firewall",
+                           "no ufw/firewalld/nft probe succeeded (may require "
+                           "privilege)")
+    elif not fw_active:
+        findings.append(finding(
+            "MEDIUM", "hardening", "Host firewall is not active",
+            fw_detail or "no active ufw/firewalld/nftables ruleset",
+            "hardening:firewall:off"))
+
+    # 3. sshd reachable: the #1 remotely-exploited Linux service.
+    out, _, rc = run(["systemctl", "is-active", "ssh"], timeout=8)
+    if rc != 0 or "inactive" in (out or ""):
+        out2, _, rc2 = run(["systemctl", "is-active", "sshd"], timeout=8)
+        ssh_on = rc2 == 0 and out2.strip() == "active"
+    else:
+        ssh_on = out.strip() == "active"
+    if ssh_on:
+        detail = "sshd is running"
+        cfg = _read_text("/etc/ssh/sshd_config") or ""
+        weak = []
+        if re.search(r"^\s*PermitRootLogin\s+yes", cfg, re.I | re.M):
+            weak.append("PermitRootLogin yes")
+        if re.search(r"^\s*PasswordAuthentication\s+yes", cfg, re.I | re.M):
+            weak.append("PasswordAuthentication yes")
+        findings.append(finding(
+            "HIGH" if weak else "MEDIUM", "hardening",
+            "Remote login (SSH) is enabled"
+            + (" with weak settings" if weak else ""),
+            detail + ("; " + ", ".join(weak) if weak else ""),
+            "hardening:ssh:on" + (":weak" if weak else ""),
+            markers=weak or None))
+
+    # 4. Disk encryption (LUKS). Absent ⇒ an offline attacker reads everything.
+    crypt = ""
+    try:
+        crypt = "\n".join(os.listdir("/dev/mapper"))
+    except Exception:
+        crypt = ""
+    blk = _read_text("/proc/self/mountinfo") or ""
+    if "dm-" not in blk and "crypt" not in crypt:
+        findings.append(finding(
+            "LOW", "hardening", "No LUKS-encrypted volume detected",
+            "No device-mapper crypt target is in use. If this disk is not "
+            "encrypted, physical access yields all data.",
+            "hardening:diskencryption:off"))
+
+    # 5. Unattended security updates (the patch-gap control).
+    if os.path.exists("/etc/apt"):
+        auto = _read_text("/etc/apt/apt.conf.d/20auto-upgrades") or ""
+        if not re.search(r'Unattended-Upgrade"?\s+"1"', auto):
+            findings.append(finding(
+                "LOW", "hardening", "Automatic security updates are not enabled",
+                "APT unattended-upgrades is not configured; security patches "
+                "wait for a manual `apt upgrade`.",
+                "hardening:autoupdate:off"))
+    return findings
+
+
+# Registry-free posture probe: Defender's real-time state and the firewall
+# profiles, both readable by a normal user.
+_WIN_POSTURE_PS = (
+    "$d=try{Get-MpComputerStatus}catch{$null};"
+    "$p=try{Get-MpPreference}catch{$null};"
+    "Write-Output ('rtp=' + $(if($d){$d.RealTimeProtectionEnabled}else{'?'}));"
+    "Write-Output ('tamper=' + $(if($d){$d.IsTamperProtected}else{'?'}));"
+    "Write-Output ('sigage=' + $(if($d){$d.AntivirusSignatureAge}else{'?'}));"
+    "Write-Output ('excl=' + $(if($p -and $p.ExclusionPath){"
+    "($p.ExclusionPath -join ';')}else{''}));"
+    "$fw=try{Get-NetFirewallProfile -ErrorAction Stop}catch{$null};"
+    "if($fw){foreach($f in $fw){Write-Output ('fw=' + $f.Name + '=' + $f.Enabled)}}"
+    "else{Write-Output 'fw=?'};"
+    "$bl=try{Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop}"
+    "catch{$null};"
+    "Write-Output ('bitlocker=' + $(if($bl){$bl.ProtectionStatus}else{'?'}))")
+
+
+def _parse_win_posture(text):
+    """Pure parser: the posture script's key=value lines → dict (fw profiles
+    collected into a list of (name, enabled))."""
+    d = {"fw": []}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key == "fw":
+            if val == "?":
+                continue
+            name, _, enabled = val.partition("=")
+            d["fw"].append((name, enabled.strip().lower() in ("true", "1",
+                                                             "enabled")))
+        else:
+            d[key] = val.strip()
+    return d
+
+
+def _check_hardening_windows():
+    findings = []
+    out, err, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", _WIN_POSTURE_PS], timeout=90)
+    if rc != 0 or not out.strip():
+        _hardening_unknown(findings, "posture", "Windows security posture",
+                           err or out)
+        return findings
+    d = _parse_win_posture(out)
+
+    rtp = d.get("rtp", "?")
+    if rtp == "?":
+        _hardening_unknown(findings, "defender", "Microsoft Defender", out)
+    elif rtp.lower() != "true":
+        findings.append(finding(
+            "CRITICAL", "hardening",
+            "Microsoft Defender real-time protection is OFF",
+            "RealTimeProtectionEnabled=%s — the OS anti-malware engine is not "
+            "scanning. Disabling it is a standard pre-payload step." % rtp,
+            "hardening:defender:off"))
+    if d.get("tamper", "?").lower() == "false":
+        findings.append(finding(
+            "HIGH", "hardening", "Defender tamper protection is OFF",
+            "IsTamperProtected=False — malware can disable Defender's settings "
+            "without an admin prompt.", "hardening:defender:tamper-off"))
+    try:
+        age = int(d.get("sigage", "-1"))
+    except ValueError:
+        age = -1
+    if age > 14:
+        findings.append(finding(
+            "MEDIUM", "hardening", "Defender signatures are stale",
+            "AntivirusSignatureAge=%d days" % age,
+            "hardening:defender:stale-signatures"))
+    if d.get("excl"):
+        # An exclusion path is a legitimate admin tool AND the classic way
+        # malware carves a safe directory for itself, so it is surfaced (not
+        # judged) — the operator knows which they configured.
+        paths = [p for p in d["excl"].split(";") if p]
+        findings.append(finding(
+            "MEDIUM", "hardening", "Defender scan exclusions are configured",
+            "%d excluded path(s): %s — malware adds exclusions to create a "
+            "scan-free directory; confirm you set these."
+            % (len(paths), ", ".join(paths[:5])),
+            "hardening:defender:exclusions:%s"
+            % hashlib.sha256(d["excl"].encode()).hexdigest()[:16],
+            markers=["defender-exclusion"]))
+
+    if not d["fw"]:
+        _hardening_unknown(findings, "firewall", "Windows Firewall", out)
+    else:
+        off = [n for n, en in d["fw"] if not en]
+        if off:
+            findings.append(finding(
+                "MEDIUM", "hardening", "Windows Firewall is off for %s"
+                % ", ".join(off),
+                "Firewall profile(s) disabled: %s" % ", ".join(off),
+                "hardening:firewall:off:%s" % ",".join(sorted(off))))
+
+    bl = d.get("bitlocker", "?")
+    if bl == "?":
+        _hardening_unknown(findings, "bitlocker", "BitLocker", out)
+    elif bl.lower() not in ("on", "1"):
+        findings.append(finding(
+            "MEDIUM", "hardening", "BitLocker is not protecting the system drive",
+            "ProtectionStatus=%s — an offline attacker can read the disk." % bl,
+            "hardening:bitlocker:off"))
+    return findings
+
+
+def _check_hardening_mac():
     findings = []
 
     def unknown(component, title, err):
@@ -3955,11 +5336,129 @@ def _parse_lsof_listeners(text):
     return out
 
 
+def _parse_proc_net_tcp(text):
+    """Pure parser: /proc/net/tcp[6] → [(port, inode)] for sockets in state 0A
+    (LISTEN) bound to a NON-loopback address. Addresses are little-endian hex;
+    loopback is 0100007F (v4) or ...0100 (v6 ::1), and 00000000 is the wildcard
+    0.0.0.0 — reachable, so kept."""
+    rows = []
+    for line in (text or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 10 or parts[3] != "0A":
+            continue
+        local = parts[1]
+        addr_hex, _, port_hex = local.partition(":")
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        a = addr_hex.upper()
+        if a in ("0100007F",                                  # 127.0.0.1
+                 "00000000000000000000000001000000"):         # ::1
+            continue
+        rows.append((str(port), parts[9]))
+    return rows
+
+
+def _linux_socket_inode_pids():
+    """{socket-inode: pid} from /proc/<pid>/fd. Other users' processes are
+    unreadable without root — that is the honest unprivileged boundary, and a
+    listener we cannot attribute is still reported (with an unknown path)."""
+    out = {}
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except Exception:
+        return out
+    for pid in pids:
+        fd_dir = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except Exception:
+                continue
+            if target.startswith("socket:["):
+                out.setdefault(target[8:-1], pid)
+    return out
+
+
+def _snapshot_listeners_linux():
+    rows = []
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        text = _read_text(proc_file, limit=4 * 1024 * 1024)
+        if text is None:
+            continue
+        rows.extend(_parse_proc_net_tcp(text))
+    if not rows:
+        # /proc/net/tcp always exists on Linux; unreadable ⇒ non-answer.
+        if not os.path.exists("/proc/net/tcp"):
+            return None
+        return {}
+    inode_pid = _linux_socket_inode_pids()
+    snap = {}
+    for port, inode in rows:
+        pid = inode_pid.get(inode)
+        path = None
+        if pid:
+            try:
+                path = os.readlink("/proc/%s/exe" % pid)
+            except Exception:
+                path = None
+        if not _listener_worth_tracking(path):
+            continue
+        snap["%s:%s" % (path or "?", port)] = path or "?"
+    return snap
+
+
+def _parse_netstat_listen_windows(text):
+    """Pure parser: `netstat -ano` → [(port, pid)] for non-loopback TCP
+    LISTENING rows."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or not parts[0].upper().startswith("TCP"):
+            continue
+        if parts[3].upper() != "LISTENING":
+            continue
+        local = parts[1]
+        host, _, port = local.rpartition(":")
+        if not port.isdigit():
+            continue
+        host = host.strip("[]")
+        if host in ("127.0.0.1", "::1"):
+            continue
+        rows.append((port, parts[4]))
+    return rows
+
+
+def _snapshot_listeners_windows():
+    out, _, rc = run(["netstat", "-ano", "-p", "tcp"], timeout=30)
+    if rc in (124, 127):
+        return None
+    if not out:
+        return {}
+    pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
+    snap = {}
+    for port, pid in _parse_netstat_listen_windows(out):
+        path = pid_exe.get(pid)
+        if not _listener_worth_tracking(path):
+            continue
+        snap["%s:%s" % (path or "?", port)] = path or "?"
+    return snap
+
+
 def snapshot_listeners():
     """{'<exec-path>:<port>': exec-path} for every tracked non-loopback TCP
     listener. Keyed on path+port (not pid) so a routine process restart is not
     a 'new listener'; the same server on a new port — or a new binary on the
     same port — is."""
+    if IS_LINUX:
+        return _snapshot_listeners_linux()
+    if IS_WIN:
+        return _snapshot_listeners_windows()
     # lsof exits non-zero when it hit ANY warning (unstattable fuse mount, a
     # vanished fd) while still emitting perfectly good records — so trust the
     # OUTPUT, not the exit code for WARNINGS. But a HARD failure (timeout=124,
@@ -3986,9 +5485,15 @@ def snapshot_listeners():
 def diff_listeners(prior, cur):
     def new_fn(key, path):
         port = key.rsplit(":", 1)[1]
-        trust = (classify_signature(path)["trust"]
-                 if path.startswith("/") else "unknown")
-        hostile = suspicious_sig(trust) and is_risky_location(path)
+        resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
+        trust = classify_signature(path)["trust"] if resolvable else "unknown"
+        # On Linux there is no signature to lean on, so the hostile shape is
+        # structural: a listener whose binary sits in a user-writable path (or
+        # a volatile temp dir) is the bind-shell/rogue-server shape.
+        hostile = (bool(_exec_alert(path, trust)) if IS_LINUX
+                   else (suspicious_sig(trust) and is_risky_location(path)))
+        if IS_LINUX and not hostile:
+            hostile = resolvable and is_risky_location(path)
         return finding(
             "HIGH" if hostile else "MEDIUM",
             "net-listener", "New network listener",
@@ -4042,15 +5547,22 @@ def _outbound_finding(path, rip, rport):
     for a signed or system-path process (a browser/updater talking out is normal).
     MEDIUM/medium-confidence: logged + fed to correlation, below the notify floor
     (ad-hoc dev binaries talk to the network routinely — must not page alone)."""
-    if not (path and path.startswith("/")):
+    if not path:
+        return None
+    if not (path.startswith("/") or (IS_WIN and ":" in path[:3])):
         return None
     trust = classify_signature(path)["trust"]
-    if not (suspicious_sig(trust) and is_risky_location(path)):
+    # Same split as the listener sensor: signature-bearing platforms key on an
+    # unsigned/ad-hoc verdict; Linux keys on the structural exec tell.
+    if IS_LINUX:
+        if not (_exec_alert(path, trust) or is_risky_location(path)):
+            return None
+    elif not (suspicious_sig(trust) and is_risky_location(path)):
         return None
     return finding(
-        "MEDIUM", "net-outbound", "Unsigned binary connected outbound",
+        "MEDIUM", "net-outbound", "Untrusted binary connected outbound",
         "%s [%s] in a user-writable path is connected to %s:%s — an "
-        "ad-hoc/unsigned binary holding an outbound socket is a payload-"
+        "unvouched-for binary holding an outbound socket is a payload-"
         "phoning-home / exfil shape. Recorded for correlation."
         % (path, trust, rip, rport),
         "outbound:%s:%s:%s" % (path, rip, rport), path=path, program=path,
@@ -4058,25 +5570,108 @@ def _outbound_finding(path, rip, rport):
         markers=["outbound-exfil"])
 
 
+def _parse_proc_net_tcp_established(text):
+    """Pure parser: /proc/net/tcp[6] → [(remote_ip, port, inode)] for state 01
+    (ESTABLISHED), loopback dropped. Hex addresses are little-endian per 32-bit
+    word — decoded here so the finding shows a real IP."""
+    rows = []
+    for line in (text or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 10 or parts[3] != "01":
+            continue
+        addr_hex, _, port_hex = parts[2].partition(":")
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        ip = _decode_proc_hex_addr(addr_hex)
+        if not ip or ip.startswith(("127.", "::1", "fe80:")):
+            continue
+        rows.append((ip, str(port), parts[9]))
+    return rows
+
+
+def _decode_proc_hex_addr(addr_hex):
+    """/proc/net hex address → printable IP. IPv4 is one little-endian word;
+    IPv6 is four little-endian words."""
+    try:
+        if len(addr_hex) == 8:
+            b = bytes.fromhex(addr_hex)[::-1]
+            return "%d.%d.%d.%d" % tuple(b)
+        if len(addr_hex) == 32:
+            words = [addr_hex[i:i + 8] for i in range(0, 32, 8)]
+            raw = b"".join(bytes.fromhex(w)[::-1] for w in words)
+            import socket as _socket
+            return _socket.inet_ntop(_socket.AF_INET6, raw)
+    except Exception:
+        return None
+    return None
+
+
+def _outbound_rows():
+    """[(path, remote_ip, remote_port)] of live outbound TCP, per platform."""
+    if IS_LINUX:
+        rows = []
+        for pf in ("/proc/net/tcp", "/proc/net/tcp6"):
+            text = _read_text(pf, limit=4 * 1024 * 1024)
+            if text:
+                rows.extend(_parse_proc_net_tcp_established(text))
+        if not rows:
+            return []
+        inode_pid = _linux_socket_inode_pids()
+        out = []
+        for rip, rport, inode in rows:
+            pid = inode_pid.get(inode)
+            if not pid:
+                continue
+            try:
+                path = os.readlink("/proc/%s/exe" % pid)
+            except Exception:
+                continue
+            out.append((path, rip, rport))
+        return out
+    if IS_WIN:
+        text, _, rc = run(["netstat", "-ano", "-p", "tcp"], timeout=30)
+        if rc in (124, 127) or not text:
+            return []
+        pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
+        out = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) < 5 or not parts[0].upper().startswith("TCP"):
+                continue
+            if parts[3].upper() != "ESTABLISHED":
+                continue
+            host, _, port = parts[2].rpartition(":")
+            host = host.strip("[]")
+            if not port.isdigit() or host in ("127.0.0.1", "::1"):
+                continue
+            path = pid_exe.get(parts[4])
+            if path:
+                out.append((path, host, port))
+        return out
+    text, _, rc = run(NETSTAT_CMD, timeout=15)
+    if rc in (124, 127) or not text:
+        return []
+    out = []
+    for _proc, pid, rip, rport in _parse_netstat_established(text):
+        if not pid:
+            continue
+        pout, _, prc = run(["ps", "-o", "comm=", "-p", pid], timeout=6)
+        if prc == 0 and pout.strip():
+            out.append((pout.strip(), rip, rport))
+    return out
+
+
 def check_outbound():
     """Record the exfil shape the listener surface is structurally blind to: an
-    unsigned/ad-hoc/broken binary in a user-writable path holding an ESTABLISHED
-    outbound connection. We can't baseline-diff outbound (a browser opens
-    hundreds) and `netstat -n` shows only numeric peers, so this scores live via
-    _outbound_finding. Best-effort: a netstat non-answer yields no findings."""
-    out, _, rc = run(NETSTAT_CMD, timeout=15)
-    if rc in (124, 127) or not out:
-        return []
+    untrusted binary in a user-writable path holding an ESTABLISHED outbound
+    connection. We can't baseline-diff outbound (a browser opens hundreds), so
+    this scores live via _outbound_finding. Best-effort: a non-answer from the
+    platform probe yields no findings."""
     findings = []
     seen = set()
-    for _proc, pid, rip, rport in _parse_netstat_established(out):
-        path = None
-        if pid:
-            pout, _, prc = run(["ps", "-o", "comm=", "-p", pid], timeout=6)
-            if prc == 0 and pout.strip():
-                path = pout.strip()
-        if not (path and path.startswith("/")):
-            continue
+    for path, rip, rport in _outbound_rows():
         key = "%s:%s:%s" % (path, rip, rport)
         if key in seen:
             continue
@@ -4085,6 +5680,203 @@ def check_outbound():
         if f:
             findings.append(f)
     return findings
+
+
+# --- Linux: loaded kernel modules (rootkit surface, T1014/T1547.006) ---------
+# A loaded LKM runs in ring 0 and can hide files, processes, and network
+# connections from every userland sensor in this file — so a NEW module is one
+# of the few Linux signals worth a durable alert on its own. Baseline-diffed:
+# the distro's own module churn (usb, bluetooth) is adopted on first sight, and
+# only a module that appears afterwards is reported.
+def snapshot_kernel_modules():
+    text = _read_text("/proc/modules", limit=1024 * 1024)
+    if text is None:
+        return None  # non-answer (no /proc): never adopt as "no modules"
+    snap = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        # size + the "Live/Loading" state; enough to notice a reload with a
+        # different binary without hashing an unreadable /lib/modules path.
+        snap[name] = parts[1] if len(parts) > 1 else "?"
+    return snap
+
+
+def diff_kernel_modules(prior, cur):
+    def new_fn(name, size):
+        # An out-of-tree module has no signature we can check unprivileged, so
+        # the honest framing is "this appeared, confirm you loaded it".
+        return finding(
+            "HIGH", "kernel-module", "New kernel module loaded",
+            "%s (size %s) was loaded into the kernel since the last scan. A "
+            "kernel module runs in ring 0 and can hide files, processes and "
+            "connections from every userland check — confirm you or a package "
+            "update loaded it." % (name, size),
+            "kmod:new:%s" % name, module=name, markers=["kernel-module"])
+    return _diff_map(prior, cur, new_fn)
+
+
+# --- Linux: setuid-root binaries (privilege-escalation persistence) ----------
+# A NEW setuid-root file is the classic "keep root forever" backdoor (T1548.001)
+# — e.g. a copied /bin/bash with mode 4755. The system's own setuid set (sudo,
+# su, passwd, ping) is stable, so it baselines silently and only an addition
+# alerts. Bounded walk: the dirs where a setuid file can actually matter.
+_SUID_SCAN_DIRS = ("/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin",
+                   "/usr/local/sbin", "/opt", "/tmp", "/var/tmp", "/dev/shm")
+
+
+def snapshot_suid():
+    snap = {}
+    seen_any = False
+    for d in _SUID_SCAN_DIRS:
+        if not os.path.isdir(d):
+            continue
+        seen_any = True
+        for root, dirs, files in os.walk(d):
+            # /opt can be deep; keep the walk bounded and predictable.
+            if root.count(os.sep) - d.count(os.sep) >= 3:
+                dirs[:] = []
+            for name in files:
+                p = os.path.join(root, name)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    continue
+                if not (st.st_mode & (stat.S_ISUID | stat.S_ISGID)):
+                    continue
+                if st.st_uid != 0:
+                    continue
+                snap[p] = "%o:%d" % (stat.S_IMODE(st.st_mode), st.st_size)
+    return snap if seen_any else None
+
+
+def diff_suid(prior, cur):
+    def new_fn(path, meta):
+        risky = is_risky_location(path) or _in_temp_drop_dir(path)
+        return finding(
+            "CRITICAL" if risky else "HIGH", "suid",
+            "New setuid-root binary",
+            "%s (mode/size %s) is newly setuid-root. A setuid-root file grants "
+            "instant root to anyone who runs it — the standard privilege-"
+            "persistence backdoor%s." % (
+                path, meta,
+                " and it sits in a user-writable/volatile path" if risky else ""),
+            "suid:new:%s:%s" % (path, meta), path=path, markers=["setuid-root"])
+
+    def changed_fn(path, meta, old):
+        return finding(
+            "HIGH", "suid", "Setuid-root binary CHANGED",
+            "%s changed (%s -> %s) while remaining setuid-root — a replaced "
+            "setuid binary is a root backdoor even if the path is familiar."
+            % (path, old, meta),
+            "suid:changed:%s:%s" % (path, meta), path=path,
+            markers=["setuid-root"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Windows: Defender exclusion paths (a scan-free zone for the payload) ----
+# Adding an exclusion is the standard pre-payload step (T1562.001): everything
+# under an excluded path stops being scanned. The hardening sensor reports the
+# CURRENT set; this surface reports a CHANGE, which is the event.
+_WIN_EXCLUSION_PS = (
+    "$p=try{Get-MpPreference}catch{$null};"
+    "if($p){foreach($x in $p.ExclusionPath){Write-Output ('path=' + $x)};"
+    "foreach($x in $p.ExclusionProcess){Write-Output ('proc=' + $x)};"
+    "foreach($x in $p.ExclusionExtension){Write-Output ('ext=' + $x)}}")
+
+
+def snapshot_win_exclusions():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_EXCLUSION_PS], timeout=60)
+    if rc in (124, 127):
+        return None
+    snap = {}
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if "=" in line:
+            snap[line] = "1"
+    return snap
+
+
+def diff_win_exclusions(prior, cur):
+    def new_fn(key, _v):
+        kind, _, val = key.partition("=")
+        return finding(
+            "HIGH", "defender", "New Microsoft Defender exclusion",
+            "A Defender exclusion (%s) was added for %r — everything matching "
+            "it is no longer scanned. Malware adds exclusions to carve out a "
+            "safe directory; confirm you made this change." % (kind, val),
+            "defender:exclusion:%s" % key, markers=["defender-exclusion"])
+    return _diff_map(prior, cur, new_fn)
+
+
+# --- Windows: WMI event subscriptions (fileless persistence, T1546.003) ------
+# A permanent WMI subscription (filter + consumer + binding) runs a payload on
+# an event — a reboot, a process start, a clock tick — with NO file on disk and
+# NO registry Run key. It is the stealthiest documented Windows persistence, and
+# a normal machine has only a handful of stock Microsoft subscriptions.
+_WIN_WMI_PS = (
+    "foreach($c in Get-CimInstance -Namespace root\\subscription "
+    "-ClassName __EventConsumer -ErrorAction SilentlyContinue){"
+    "Write-Output ('consumer=' + $c.Name + '=' + "
+    "$(if($c.CommandLineTemplate){$c.CommandLineTemplate}"
+    "elseif($c.ScriptText){$c.ScriptText}else{''}))};"
+    "foreach($f in Get-CimInstance -Namespace root\\subscription "
+    "-ClassName __EventFilter -ErrorAction SilentlyContinue){"
+    "Write-Output ('filter=' + $f.Name + '=' + $f.Query)}")
+
+
+def snapshot_wmi_subscriptions():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_WMI_PS], timeout=60)
+    if rc in (124, 127):
+        return None
+    snap = {}
+    for line in (out or "").splitlines():
+        line = line.rstrip()
+        if not line or "=" not in line:
+            continue
+        kind, _, rest = line.partition("=")
+        name, _, payload = rest.partition("=")
+        snap["%s:%s" % (kind, name)] = payload.strip()
+    return snap
+
+
+def diff_wmi_subscriptions(prior, cur):
+    def _score(payload):
+        hostile = _hostile_content(payload or "")
+        return ("CRITICAL" if hostile else "HIGH"), hostile
+
+    def new_fn(key, payload):
+        sev, hostile = _score(payload)
+        return finding(
+            sev, "wmi", "New WMI event subscription",
+            "%s appeared with payload %r%s — a permanent WMI subscription runs "
+            "code on a system event with no file and no Run key (T1546.003). "
+            "Confirm you created it."
+            % (key, (payload or "")[:200],
+               "; hostile pattern(s): " + ", ".join(hostile) if hostile else ""),
+            "wmi:new:%s:%s" % (
+                key, hashlib.sha256((payload or "").encode()).hexdigest()[:16]),
+            markers=(hostile or None) + ["wmi-persistence"]
+            if hostile else ["wmi-persistence"])
+
+    def changed_fn(key, payload, old):
+        sev, hostile = _score(payload)
+        return finding(
+            sev, "wmi", "WMI event subscription CHANGED",
+            "%s payload changed to %r%s — an in-place edit of a WMI consumer "
+            "swaps the executed code while the subscription name stays familiar."
+            % (key, (payload or "")[:200],
+               "; hostile pattern(s): " + ", ".join(hostile) if hostile else ""),
+            "wmi:changed:%s:%s" % (
+                key, hashlib.sha256((payload or "").encode()).hexdigest()[:16]),
+            markers=["wmi-persistence"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
 
 
 # --- Unified-log security harvest (Gatekeeper / syspolicy denials) ------------
@@ -4139,6 +5931,185 @@ def check_security_log(window_hours=None):
             "not trust tried to run; verify it was expected." % (ts, msg[:240]),
             "gatekeeper:deny:%s" % digest, confidence="low",
             markers=["gatekeeper-deny"]))
+    return findings
+
+
+# --- Linux: auth log harvest (brute force, new accounts, sudo abuse) ---------
+# The Linux analog of the unified-log harvest. auth.log/secure is usually
+# 640 root:adm, so an unprivileged run often CANNOT read it — that returns None
+# (DEGRADED coverage), never an empty "all clear". Where the user is in `adm`
+# (Debian/Ubuntu default for the primary account) or journalctl is readable,
+# this is a genuinely high-value surface.
+_AUTH_LOG_FILES = ("/var/log/auth.log", "/var/log/secure")
+_AUTH_LOG_TAIL = 2000
+
+_AUTH_PATTERNS = [
+    (re.compile(r"\buseradd\b|\bnew user:", re.I), "new-user-account", "HIGH",
+     "a new local account was created"),
+    # NOTE: no \b before the flag — a space followed by '-' is not a word
+    # boundary, so `\b-G\b` never matches a real `usermod -G sudo` line.
+    (re.compile(r"\busermod\b[^\n]*(?:\s-G|--groups)\b[^\n]*\b(?:sudo|wheel|"
+                r"admin|root)\b", re.I), "privileged-group-add", "HIGH",
+     "an account was added to a privileged group"),
+    (re.compile(r"\bAccepted\s+(?:password|publickey)\s+for\s+root\b", re.I),
+     "root-ssh-login", "HIGH", "a remote root SSH login succeeded"),
+    (re.compile(r"\bauthentication failure\b[^\n]*\blogname=.*\buid=0\b", re.I),
+     "root-auth-failure", "MEDIUM", "a root authentication attempt failed"),
+    (re.compile(r"\bPOSSIBLE BREAK-IN ATTEMPT\b", re.I), "reverse-dns-mismatch",
+     "MEDIUM", "sshd reported a reverse-DNS mismatch"),
+]
+# A burst of failed passwords is brute force; one typo is not.
+_AUTH_FAIL_RE = re.compile(r"\bFailed password for(?: invalid user)?\s+(\S+)"
+                           r"\s+from\s+(\S+)", re.I)
+_AUTH_FAIL_THRESHOLD = 10
+
+
+def _parse_auth_log(text):
+    """Pure parser: auth-log text → (pattern_hits, brute_force). pattern_hits is
+    [(name, severity, description, line)]; brute_force is {(user, ip): count}
+    for entries at or above the burst threshold."""
+    hits, fails = [], {}
+    for line in (text or "").splitlines():
+        for rx, name, sev, desc in _AUTH_PATTERNS:
+            if rx.search(line):
+                hits.append((name, sev, desc, line.strip()))
+        m = _AUTH_FAIL_RE.search(line)
+        if m:
+            key = (m.group(1), m.group(2))
+            fails[key] = fails.get(key, 0) + 1
+    brute = {k: v for k, v in fails.items() if v >= _AUTH_FAIL_THRESHOLD}
+    return hits, brute
+
+
+def check_auth_log():
+    text = None
+    for path in _AUTH_LOG_FILES:
+        body = _read_text(path, limit=4 * 1024 * 1024)
+        if body is not None:
+            text = "\n".join(body.splitlines()[-_AUTH_LOG_TAIL:])
+            break
+    if text is None:
+        out, _, rc = run(["journalctl", "-n", str(_AUTH_LOG_TAIL),
+                          "--no-pager", "-t", "sshd", "-t", "sudo",
+                          "-t", "useradd"], timeout=30)
+        if rc == 0 and out:
+            text = out
+    if text is None:
+        # Root-only log and no readable journal: honest DEGRADED, not "clean".
+        return None
+    findings = []
+    hits, brute = _parse_auth_log(text)
+    seen = set()
+    for name, sev, desc, line in hits:
+        digest = hashlib.sha256(line.encode("utf-8", "replace")).hexdigest()[:16]
+        fp = "authlog:%s:%s" % (name, digest)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        findings.append(finding(
+            sev, "auth-log", "Authentication log: %s" % desc,
+            "%s — %s" % (desc.capitalize(), line[:240]), fp,
+            markers=[name]))
+    for (user, ip), count in sorted(brute.items()):
+        findings.append(finding(
+            "HIGH", "auth-log", "SSH brute-force attempts",
+            "%d failed password attempts for %r from %s in the recent log tail "
+            "— an active credential-guessing campaign against this host."
+            % (count, user, ip),
+            "authlog:bruteforce:%s:%s" % (user, ip),
+            markers=["ssh-brute-force"], remote=ip))
+    return findings
+
+
+# --- Windows: security event log harvest -------------------------------------
+# The Windows analog: a handful of event IDs that mean something security-
+# relevant just happened. The Security channel needs admin, so the sensor asks
+# for what it can get and degrades honestly when denied. PowerShell 4104
+# (script-block logging) is the single highest-value ID — it records
+# deobfuscated script text, defeating -EncodedCommand.
+_WIN_EVENT_PS = (
+    "$ids=@{'Microsoft-Windows-PowerShell/Operational'=@(4104);"
+    "'Microsoft-Windows-Windows Defender/Operational'=@(1116,1117,5001,5010);"
+    "'Security'=@(4720,4732,4625,1102)};"
+    "foreach($log in $ids.Keys){"
+    "try{$evts=Get-WinEvent -FilterHashtable @{LogName=$log;Id=$ids[$log];"
+    "StartTime=(Get-Date).AddHours(-6)} -MaxEvents 40 -ErrorAction Stop}"
+    "catch{continue};"
+    "foreach($e in $evts){"
+    "$m=($e.Message -replace '\\s+',' ');"
+    "Write-Output ($log + '|' + $e.Id + '|' + $e.TimeCreated.ToString('o') + "
+    "'|' + $m.Substring(0,[Math]::Min(400,$m.Length)))}}")
+
+# id → (severity, what it means). Only IDs whose meaning is unambiguous.
+_WIN_EVENT_MEANING = {
+    "4104": ("MEDIUM", "PowerShell script block executed (deobfuscated text "
+                       "recorded)"),
+    "1116": ("CRITICAL", "Microsoft Defender detected malware"),
+    "1117": ("HIGH", "Microsoft Defender took action on malware"),
+    "5001": ("HIGH", "Microsoft Defender real-time protection was disabled"),
+    "5010": ("HIGH", "Microsoft Defender scanning was disabled"),
+    "4720": ("HIGH", "a new local user account was created"),
+    "4732": ("HIGH", "a member was added to a privileged local group"),
+    "1102": ("HIGH", "the Security audit log was cleared"),
+    "4625": ("MEDIUM", "failed logon attempt"),
+}
+_WIN_FAILED_LOGON_THRESHOLD = 10
+
+
+def _parse_win_events(text):
+    """Pure parser: `log|id|time|message` lines → [(log, id, time, message)]."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split("|", 3)
+        if len(parts) != 4 or not parts[1].strip().isdigit():
+            continue
+        rows.append((parts[0].strip(), parts[1].strip(), parts[2].strip(),
+                     parts[3].strip()))
+    return rows
+
+
+def check_windows_event_log():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_EVENT_PS], timeout=120)
+    if rc in (124, 127):
+        return None  # probe unavailable — DEGRADED, not clean
+    rows = _parse_win_events(out)
+    findings = []
+    failed_logons = 0
+    seen = set()
+    for _log, eid, ts, msg in rows:
+        meaning = _WIN_EVENT_MEANING.get(eid)
+        if not meaning:
+            continue
+        sev, desc = meaning
+        if eid == "4625":
+            failed_logons += 1
+            continue
+        if eid == "4104":
+            # Script-block text is the payload itself: score it, and only
+            # surface blocks that actually look hostile (4104 fires constantly
+            # on a developer box otherwise).
+            hostile = _hostile_content(msg)
+            if not hostile:
+                continue
+            sev = "HIGH"
+            desc += " with hostile pattern(s): " + ", ".join(hostile)
+        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]
+        fp = "winevent:%s:%s" % (eid, digest)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        findings.append(finding(
+            sev, "event-log", "Windows event %s: %s" % (eid, desc),
+            "%s at %s — %s" % (desc.capitalize(), ts, msg[:300]), fp,
+            markers=["winevent-" + eid]))
+    if failed_logons >= _WIN_FAILED_LOGON_THRESHOLD:
+        findings.append(finding(
+            "HIGH", "event-log", "Burst of failed logon attempts",
+            "%d failed logons (event 4625) in the last 6 hours — a credential-"
+            "guessing campaign against this host." % failed_logons,
+            "winevent:4625:burst:%d" % (failed_logons // 10),
+            markers=["logon-brute-force"]))
     return findings
 
 
@@ -4449,19 +6420,38 @@ def _parse_xpdb(db_path):
 
 
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
+# Baseline-diffed surfaces. Portable ones run everywhere; a surface with no
+# meaning on a platform is simply ABSENT from its registry rather than reported
+# as a failed sensor (a launchd LoginHook check on Linux is not a coverage gap).
 SURFACES = [
     ("shellrc", snapshot_shellrc, diff_shellrc),
-    ("loginhooks", snapshot_loginhooks, diff_loginhooks),
-    ("profiles", snapshot_profiles, diff_profiles),
     ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
     ("browserext", snapshot_browserext, diff_browserext),
     ("ide_ext", snapshot_ide_ext, diff_ide_ext),
     ("wallet", snapshot_wallet, diff_wallet),
     ("listeners", snapshot_listeners, diff_listeners),
-    ("btm", snapshot_btm, diff_btm),
-    ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
     ("agent_skills", snapshot_agent_skills, diff_agent_skills),
 ]
+if IS_MAC:
+    SURFACES += [
+        ("loginhooks", snapshot_loginhooks, diff_loginhooks),
+        ("profiles", snapshot_profiles, diff_profiles),
+        ("btm", snapshot_btm, diff_btm),
+        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+    ]
+elif IS_LINUX:
+    SURFACES += [
+        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+        ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
+        ("suid_binaries", snapshot_suid, diff_suid),
+    ]
+else:
+    SURFACES += [
+        ("win_defender_exclusions", snapshot_win_exclusions,
+         diff_win_exclusions),
+        ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
+         diff_wmi_subscriptions),
+    ]
 
 # Surfaces whose first-sight items are LIVE risks, not installed-residue: they
 # must NOT be silently adopted on the very first scan (see _scan_surfaces). An
@@ -4512,37 +6502,90 @@ _SELF_TAMPER_CONSEQUENCE = {
 }
 
 
+def _check_self_scheduler(st):
+    """Is Aegis's own scheduled execution still registered? Same doctrine on
+    every platform: a monitor an attacker can silently unschedule is theater,
+    so the registration's ABSENCE (after we learned it existed) is an alert, and
+    a present-but-broken registration is caught while it is still fixable."""
+    findings = []
+    if IS_MAC:
+        if not os.path.exists(SELF_PLIST) and st.get("installed"):
+            findings.append(finding(
+                "HIGH", "self-protection", "Aegis launchd agent is missing",
+                "%s no longer exists — the background monitor may have been "
+                "unloaded or deleted. Re-run install.sh if this was not "
+                "intentional." % SELF_PLIST, "self:agent:removed"))
+        # The plist EXISTS but is malformed — invalid XML (e.g. a raw '&' from
+        # an install path like ".../Work & Projects/..."). launchd may still run
+        # a previously-loaded copy, so the monitor looks alive — but on the next
+        # reboot launchd silently refuses the bad plist and the monitor dies
+        # with no signal. Catch it WHILE it is still limping and fixable.
+        elif os.path.exists(SELF_PLIST):
+            try:
+                with open(SELF_PLIST, "rb") as f:
+                    plistlib.load(f)
+            except Exception:
+                findings.append(finding(
+                    "HIGH", "self-protection", "Aegis launchd plist is malformed",
+                    "%s exists but is not valid — launchd will silently refuse "
+                    "to (re)load it on the next reboot and the monitor will "
+                    "stop running with no alert. Re-run install.sh to "
+                    "regenerate a valid agent." % SELF_PLIST,
+                    "self:agent:malformed"))
+        return findings
+    if IS_LINUX:
+        if not st.get("installed"):
+            return findings
+        missing = [u for u in SELF_SYSTEMD_UNITS if not os.path.exists(u)]
+        if missing:
+            findings.append(finding(
+                "HIGH", "self-protection", "Aegis systemd unit is missing",
+                "%s no longer exists — the background monitor may have been "
+                "disabled or deleted. Re-run `aegis.py install` if this was "
+                "not intentional." % ", ".join(missing), "self:agent:removed"))
+            return findings
+        # Present on disk but neither scheduled nor running: systemd will never
+        # fire it, so the monitor is dead while its files look healthy.
+        tout, _, trc = run(["systemctl", "--user", "is-enabled", "aegis.timer"],
+                           timeout=10)
+        timer_ok = trc == 0 and tout.strip() in (
+            "enabled", "enabled-runtime", "static", "indirect")
+        sout, _, src = run(["systemctl", "--user", "is-active", "aegis.service"],
+                           timeout=10)
+        service_ok = src == 0 and sout.strip() == "active"
+        if not timer_ok and not service_ok:
+            findings.append(finding(
+                "HIGH", "self-protection", "Aegis systemd unit is not scheduled",
+                "aegis.timer reports %r and aegis.service is %r — systemd will "
+                "not run the monitor. Re-enable with `systemctl --user enable "
+                "--now aegis.timer`." % (tout.strip(), sout.strip()),
+                "self:agent:disabled"))
+        return findings
+    if not st.get("installed"):
+        return findings
+    out, _, rc = run(["schtasks", "/query", "/tn", SELF_WIN_TASK], timeout=30)
+    if rc != 0:
+        findings.append(finding(
+            "HIGH", "self-protection", "Aegis scheduled task is missing",
+            "The %s scheduled task no longer exists — the background monitor "
+            "may have been deleted. Re-run the installer if this was not "
+            "intentional." % SELF_WIN_TASK, "self:agent:removed"))
+    elif re.search(r"\bDisabled\b", out or "", re.I):
+        findings.append(finding(
+            "HIGH", "self-protection", "Aegis scheduled task is disabled",
+            "The %s scheduled task exists but is disabled — Task Scheduler "
+            "will not run the monitor." % SELF_WIN_TASK, "self:agent:disabled"))
+    return findings
+
+
 def check_self_protection():
     findings = []
     st = load_json(SELFSTATE, {})
 
-    # (a) Our own launchd agent vanished after we'd learned it exists — the
-    # monitor may have been unloaded/deleted. Self-learned, so a machine that
-    # never installed the agent is never falsely flagged.
-    if not os.path.exists(SELF_PLIST) and st.get("installed"):
-        findings.append(finding(
-            "HIGH", "self-protection", "Aegis launchd agent is missing",
-            "%s no longer exists — the background monitor may have been unloaded "
-            "or deleted. Re-run install.sh if this was not intentional."
-            % SELF_PLIST, "self:agent:removed"))
-    # (a2) The agent plist EXISTS but is malformed — invalid XML (e.g. a raw '&'
-    # from an install path like ".../Work & Projects/...", the F0 bug in an
-    # install predating its fix). launchd may still run a previously-loaded copy,
-    # so the monitor looks alive — but on the next reboot/reload launchd will
-    # silently refuse the bad plist and the monitor dies with no signal. Catch it
-    # WHILE it is still limping (and fixable) rather than after it is silently
-    # gone. Only checked when the file exists (absence is handled above).
-    elif os.path.exists(SELF_PLIST):
-        try:
-            with open(SELF_PLIST, "rb") as f:
-                plistlib.load(f)
-        except Exception:
-            findings.append(finding(
-                "HIGH", "self-protection", "Aegis launchd plist is malformed",
-                "%s exists but is not valid — launchd will silently refuse to "
-                "(re)load it on the next reboot and the monitor will stop "
-                "running with no alert. Re-run install.sh to regenerate a valid "
-                "agent." % SELF_PLIST, "self:agent:malformed"))
+    # (a) Our own scheduler registration vanished after we'd learned it exists —
+    # the monitor may have been unloaded/deleted. Self-learned, so a machine
+    # that never installed the agent is never falsely flagged.
+    findings += _check_self_scheduler(st)
 
     # (b) The append-only findings log shrank since last scan — someone truncated
     # the durable evidence trail.
@@ -4606,10 +6649,22 @@ def check_self_protection():
     return findings
 
 
+def _scheduler_registered():
+    """Is Aegis currently registered to run in the background on this OS?
+    Self-learning input for check_self_protection: a box that never installed
+    the agent must never be told its agent went missing."""
+    if IS_MAC:
+        return os.path.exists(SELF_PLIST)
+    if IS_LINUX:
+        return all(os.path.exists(u) for u in SELF_SYSTEMD_UNITS)
+    _o, _e, rc = run(["schtasks", "/query", "/tn", SELF_WIN_TASK], timeout=30)
+    return rc == 0
+
+
 def record_selfstate():
     """Persist self-protection watermarks AFTER a scan's log writes complete."""
     st = load_json(SELFSTATE, {})
-    if os.path.exists(SELF_PLIST):
+    if _scheduler_registered():
         st["installed"] = True
     try:
         st["findings_size"] = os.path.getsize(FINDINGS_LOG)
@@ -4734,23 +6789,38 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
 def gather_all(baseline_snap, current_snap, health=None):
     health_sink = health if health is not None else []
     findings = []
-    sensors = (
+    # Portable sensors run on every platform; each platform then adds the
+    # sensors only it can answer. A sensor that cannot exist here is absent
+    # rather than permanently DEGRADED.
+    sensors = [
         ("persistence.diff", check_persistence, (baseline_snap, current_snap)),
-        ("cron", check_cron, ()),
         ("process", check_processes, ()),
         ("behavior", check_behavior, ()),
-        ("xprotect", check_xprotect, ()),
         ("shell-history", check_shell_history, ()),
         ("hot-dir", check_hot_dirs, ()),
         ("staging", check_staging, ()),
         ("supply-chain", check_supply_chain, ()),
         ("canary", check_canaries, ()),
         ("outbound", check_outbound, ()),
-        ("security-log", check_security_log, ()),
         ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
         ("self-protection", check_self_protection, ()),
-    )
+    ]
+    if IS_MAC:
+        sensors += [
+            ("cron", check_cron, ()),
+            ("xprotect", check_xprotect, ()),
+            ("security-log", check_security_log, ()),
+        ]
+    elif IS_LINUX:
+        sensors += [
+            ("cron", check_cron, ()),
+            ("auth-log", check_auth_log, ()),
+        ]
+    else:
+        sensors += [
+            ("windows-event-log", check_windows_event_log, ()),
+        ]
     for sensor_id, fn, args in sensors:
         findings += _collect_sensor(sensor_id, fn, health_sink, *args)
     # Sort by severity desc, then category.
@@ -4937,10 +7007,10 @@ def _scan_lock():
     path = os.path.join(STATE_DIR, ".scan.lock")
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
         os.close(fd)
 
 
@@ -5369,15 +7439,15 @@ def cmd_preflight():
     ensure_state()
     try:
         init_event_store()
-        if not hasattr(select, "kqueue"):
+        if IS_MAC and not hasattr(select, "kqueue"):
             raise RuntimeError("Python lacks macOS kqueue support")
         if sys.version_info < (3, 9):
             raise RuntimeError("Python 3.9 or newer is required")
     except Exception as e:
         print("Aegis preflight failed: %s" % e)
         return 1
-    print("Aegis preflight OK: Python %s, kqueue, SQLite, private state" %
-          sys.version.split()[0])
+    print("Aegis preflight OK (%s): Python %s, SQLite, private state" %
+          (PLATFORM, sys.version.split()[0]))
     return 0
 
 
@@ -5630,20 +7700,65 @@ def _watch_paths():
             child = os.path.join(directory, name)
             if name.endswith(".plist") and os.path.isfile(child):
                 paths.append(child)
-    for directory in HOT_DIRS:
+    if IS_MAC:
+        for directory in HOT_DIRS:
+            try:
+                entries = os.listdir(directory)
+            except OSError:
+                continue
+            for name in entries:
+                app = os.path.join(directory, name)
+                if not name.lower().endswith(".app") or not os.path.isdir(app):
+                    continue
+                paths.append(app)
+                executable = _bundle_executable(app)
+                if executable:
+                    paths.append(executable)
+    return list(dict.fromkeys(paths))
+
+
+# --- portable change detection (Linux/Windows) -------------------------------
+# kqueue is macOS-only, and inotify has no stdlib binding. Rather than take a
+# dependency (the zero-dependency rule is load-bearing here — this is security
+# code that must be auditable in one file), the other platforms poll the SAME
+# path set on a short cycle. Latency is WATCH_POLL_SECS instead of kqueue's
+# sub-second, which is still one to two orders of magnitude better than the
+# interval-only floor, and the cost is a few hundred stat() calls per cycle.
+WATCH_POLL_SECS = 5
+
+
+def _watch_fingerprint():
+    """{path: (mtime_ns, size, inode)} over the watched set, plus a directory's
+    entry list digest so a create/delete inside it registers even when the
+    directory mtime granularity hides it."""
+    snap = {}
+    for p in _watch_paths():
         try:
-            entries = os.listdir(directory)
+            st = os.stat(p)
         except OSError:
             continue
-        for name in entries:
-            app = os.path.join(directory, name)
-            if not name.lower().endswith(".app") or not os.path.isdir(app):
-                continue
-            paths.append(app)
-            executable = _bundle_executable(app)
-            if executable:
-                paths.append(executable)
-    return list(dict.fromkeys(paths))
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                entries = ",".join(sorted(os.listdir(p)))
+            except OSError:
+                entries = "?"
+            snap[p] = (st.st_mtime_ns, len(entries),
+                       hashlib.sha256(entries.encode()).hexdigest()[:16])
+        else:
+            snap[p] = (st.st_mtime_ns, st.st_size, st.st_ino)
+    return snap
+
+
+def _poll_for_change(timeout):
+    """Block up to `timeout` seconds, returning True as soon as any watched path
+    changes. The portable counterpart to _wait_for_change()."""
+    deadline = time.time() + timeout
+    before = _watch_fingerprint()
+    while time.time() < deadline:
+        time.sleep(min(WATCH_POLL_SECS, max(0.1, deadline - time.time())))
+        if _watch_fingerprint() != before:
+            return True
+    return False
 
 
 def _build_watch(extra_read_fds=()):
@@ -5763,11 +7878,12 @@ def cmd_watch(interval=600):
     `interval` seconds as a floor. Production: `bash install.sh watch` runs this
     under launchd KeepAlive. Falls back to plain interval polling if kqueue is
     somehow unavailable."""
-    has_kq = hasattr(select, "kqueue")
+    has_kq = IS_MAC and hasattr(select, "kqueue")
     print("Aegis watch: %s. Ctrl-C to stop."
           % ("event-driven (kqueue + live XProtect tail) + full scan every %ds"
-             % interval
-             if has_kq else "interval polling every %ds (no kqueue)" % interval))
+             % interval if has_kq else
+             "change-polled every %ds + full scan every %ds"
+             % (WATCH_POLL_SECS, interval)))
     stream = _spawn_xprotect_stream() if has_kq else None
     try:
         while True:
@@ -5775,7 +7891,14 @@ def cmd_watch(interval=600):
                 started = time.time()
                 cmd_scan(quiet=True)
                 if not has_kq:
-                    time.sleep(interval)
+                    # Portable path: poll the same watched set, then apply the
+                    # same debounce + rate-limit the kqueue path uses.
+                    if _poll_for_change(interval):
+                        time.sleep(WATCH_DEBOUNCE_SECS)
+                        remain = WATCH_MIN_GAP_SECS - (time.time() - started)
+                        if remain > 0:
+                            time.sleep(remain)
+                        log_run("watch: change event -> rescan")
                     continue
                 if stream is not None and stream.poll() is not None:
                     stream = _spawn_xprotect_stream()  # tail died → respawn
@@ -5880,10 +8003,10 @@ def _response_lock():
     ensure_quarantine()
     fd = os.open(_response_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
         os.close(fd)
 
 
@@ -6231,9 +8354,20 @@ def log_action(action, target, result, **extra):
 # Top-level paths whose removal/quarantine would be catastrophic — refuse even
 # though they exist and are "files" to os. HOME itself and any ancestor of HOME
 # are added dynamically in _is_protected_path.
-_PROTECTED_EXACT = frozenset((
-    "/", "/Users", "/Applications", "/System", "/Library", "/bin", "/sbin",
-    "/usr", "/etc", "/var", "/private", "/opt", HOME))
+if IS_WIN:
+    _PROTECTED_EXACT = frozenset(
+        [os.path.realpath(p) for p in (
+            os.environ.get("SystemDrive", "C:") + "\\", WIN_SYSTEMROOT,
+            os.path.join(WIN_SYSTEMROOT, "System32"),
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            WIN_PROGRAMDATA, WIN_APPDATA, WIN_LOCALAPPDATA,
+            os.path.dirname(HOME), HOME) if p])
+else:
+    _PROTECTED_EXACT = frozenset((
+        "/", "/Users", "/home", "/root", "/Applications", "/System", "/Library",
+        "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev",
+        "/usr", "/etc", "/var", "/private", "/opt", "/run", HOME))
 
 
 def _is_protected_path(path):
@@ -6244,10 +8378,20 @@ def _is_protected_path(path):
     if not path:
         return True
     rp = os.path.realpath(path)
-    if rp in _PROTECTED_EXACT:
-        return True
-    if any(rp == p or rp.startswith(p.rstrip("/") + "/") for p in TRUSTED_PREFIXES):
-        return True
+    if IS_WIN:
+        rp_cmp = os.path.normcase(rp)
+        if rp_cmp in {os.path.normcase(p) for p in _PROTECTED_EXACT}:
+            return True
+        if any(rp_cmp == os.path.normcase(p.rstrip("\\"))
+               or rp_cmp.startswith(os.path.normcase(p.rstrip("\\")) + os.sep)
+               for p in TRUSTED_PREFIXES):
+            return True
+    else:
+        if rp in _PROTECTED_EXACT:
+            return True
+        if any(rp == p or rp.startswith(p.rstrip("/") + "/")
+               for p in TRUSTED_PREFIXES):
+            return True
     # Aegis's own state, store, and script. Compare against REAL paths so a
     # symlinked ~/.aegis or script location is still covered (same reason as HOME).
     self_rp = os.path.realpath(_SELF_PATH)
@@ -6530,9 +8674,46 @@ def cmd_destroy(qid, confirmed=False):
 # session. (kernel_task/launchd/WindowServer run as root/_windowserver, so the
 # same-user gate already excludes them; this is defence-in-depth for the rest.)
 _PROTECTED_COMMS = frozenset((
-    "launchd", "logind", "loginwindow", "WindowServer", "Dock", "Finder",
+    # macOS
+    "launchd", "loginwindow", "WindowServer", "Dock", "Finder",
     "SystemUIServer", "coreauthd", "opendirectoryd", "cfprefsd", "Terminal",
-    "iTerm2", "sshd", "aegis.py", "python3", "python"))
+    "iTerm2", "aegis.py", "python3", "python",
+    # linux
+    "systemd", "systemd-logind", "logind", "dbus-daemon", "init", "sshd",
+    "gnome-shell", "gnome-session", "Xorg", "wayland", "plasmashell",
+    # windows (killing any of these bluescreens or logs the user out)
+    "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe",
+    "smss.exe", "explorer.exe", "svchost.exe", "System", "Registry",
+    "aegis.exe", "python.exe", "pythonw.exe"))
+
+
+def _process_identity(pid):
+    """(owner, comm) for a live pid, or (None, None) if it is gone. Owner is a
+    uid string on POSIX and DOMAIN\\user on Windows — the same namespace
+    _iter_processes() reports, so the same-user check is one comparison."""
+    for p, owner, exe, argv in _iter_processes():
+        if p == str(pid):
+            name = os.path.basename(exe) if exe else ""
+            if not name and argv:
+                name = os.path.basename(argv.split(None, 1)[0])
+            return owner, (name or "?")
+    return None, None
+
+
+def _process_alive(pid):
+    if IS_WIN:
+        out, _, rc = run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                         timeout=15)
+        return rc == 0 and str(pid) in (out or "")
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, just not ours to signal
+    except Exception:
+        return False
 
 
 def cmd_kill(pid):
@@ -6544,26 +8725,42 @@ def cmd_kill(pid):
     except Exception:
         print("usage: aegis.py kill <pid>")
         return 1
-    if pid in (0, 1, os.getpid(), os.getppid()):
+    if pid in (0, 1, 4, os.getpid()) or (not IS_WIN and pid == os.getppid()):
         print("refuse: will not kill pid %d (self/parent/init)" % pid)
         log_action("kill", str(pid), "refused-self")
         return 1
-    out, _, rc = run(["ps", "-o", "uid=,comm=", "-p", str(pid)], timeout=8)
-    if rc != 0 or not out.strip():
+    owner, comm = _process_identity(pid)
+    if owner is None:
         print("no such process: %d" % pid)
         return 1
-    parts = out.strip().split(None, 1)
-    puid = parts[0]
-    comm = os.path.basename(parts[1]) if len(parts) > 1 else "?"
-    if puid != str(os.getuid()):
-        print("refuse: pid %d belongs to uid %s, not you; Aegis only acts on "
-              "your own processes" % (pid, puid))
-        log_action("kill", str(pid), "refused-other-user", uid=puid, comm=comm)
+    if not _same_owner(owner):
+        print("refuse: pid %d belongs to %s, not you; Aegis only acts on "
+              "your own processes" % (pid, owner))
+        log_action("kill", str(pid), "refused-other-user", uid=owner, comm=comm)
         return 1
     if comm in _PROTECTED_COMMS:
         print("refuse: pid %d is a session-critical process (%s)" % (pid, comm))
         log_action("kill", str(pid), "refused-protected-comm", comm=comm)
         return 1
+
+    if IS_WIN:
+        # No POSIX signals: taskkill without /F requests a clean WM_CLOSE, then
+        # /F is the SIGKILL equivalent — the same graceful-then-forced ladder.
+        run(["taskkill", "/PID", str(pid)], timeout=20)
+        for _ in range(10):
+            time.sleep(0.1)
+            if not _process_alive(pid):
+                log_action("kill", str(pid), "ok-graceful", comm=comm)
+                print("Killed pid %d (%s) gracefully." % (pid, comm))
+                return 0
+        run(["taskkill", "/PID", str(pid), "/F"], timeout=20)
+        gone = not _process_alive(pid)
+        log_action("kill", str(pid), "ok-forced" if gone else "failed", comm=comm)
+        print("%s pid %d (%s)%s" % ("Killed" if gone else "Could NOT kill", pid,
+                                    comm, " (forced)." if gone else
+                                    " — still running."))
+        return 0 if gone else 1
+
     import signal as _signal
     try:
         os.kill(pid, _signal.SIGTERM)
@@ -6575,7 +8772,7 @@ def cmd_kill(pid):
         return 1
     for _ in range(10):  # up to ~1s for a graceful exit
         time.sleep(0.1)
-        if run(["ps", "-p", str(pid)], timeout=5)[2] != 0:
+        if not _process_alive(pid):
             log_action("kill", str(pid), "ok-sigterm", comm=comm)
             print("Killed pid %d (%s) with SIGTERM." % (pid, comm))
             return 0
@@ -6583,7 +8780,7 @@ def cmd_kill(pid):
         os.kill(pid, _signal.SIGKILL)
     except Exception:
         pass
-    gone = run(["ps", "-p", str(pid)], timeout=5)[2] != 0
+    gone = not _process_alive(pid)
     log_action("kill", str(pid), "ok-sigkill" if gone else "failed", comm=comm)
     print("%s pid %d (%s)%s" % ("Killed" if gone else "Could NOT kill", pid, comm,
                                 " with SIGKILL." if gone else " — still running."))
@@ -6609,8 +8806,138 @@ def cmd_sandbox(path, extra_args=None):
     return 2
 
 
-def cmd_neutralize(plist_path):
-    """Ordered kill-chain for a launchd-backed threat (a persistence finding):
+def _kill_program_instances(program):
+    """SIGKILL/force-kill every SAME-USER process running `program`. Shared by
+    the neutralize kill-chains; returns how many were killed."""
+    if not program:
+        return 0
+    killed = 0
+    for pid, owner, exe, _argv in _iter_processes():
+        if not _same_owner(owner) or exe != program or pid == str(os.getpid()):
+            continue
+        try:
+            if IS_WIN:
+                run(["taskkill", "/PID", pid, "/F"], timeout=20)
+            else:
+                import signal as _signal
+                os.kill(int(pid), _signal.SIGKILL)
+            killed += 1
+        except Exception:
+            continue
+    return killed
+
+
+def cmd_neutralize(target):
+    """Ordered kill-chain for a persistence-backed threat. The ORDER is the
+    point on every platform: remove the job definition FIRST, because a
+    KeepAlive/Restart=always job killed first is immediately respawned by its
+    supervisor; only then kill the process and quarantine the artifacts."""
+    if IS_LINUX:
+        return _neutralize_systemd(target)
+    if IS_WIN:
+        return _neutralize_windows(target)
+    return _neutralize_launchd(target)
+
+
+def _neutralize_systemd(unit_path):
+    """systemd/XDG-autostart counterpart: disable+stop the unit, kill survivors,
+    quarantine the unit file and (when risky) its ExecStart binary."""
+    rp = os.path.realpath(unit_path)
+    if not os.path.isfile(rp) or not rp.endswith(
+            (".service", ".timer", ".socket", ".path", ".desktop")):
+        print("usage: aegis.py neutralize <path-to-systemd-unit-or-.desktop>")
+        return 1
+    if _is_protected_path(rp):
+        print("refuse: %s is a protected/system path" % rp)
+        return 1
+    name = os.path.basename(rp)
+    text = _read_text(rp) or ""
+    if rp.endswith(".desktop"):
+        argv, _hidden = _parse_desktop_entry(text)
+        program = argv[0] if argv else None
+    else:
+        execs, _env, _boot = _parse_systemd_unit(text)
+        program = execs[0][0] if execs else None
+    if program and not program.startswith("/"):
+        program = shutil.which(program) or program
+    system_scope = rp.startswith("/etc/") or rp.startswith("/usr/")
+
+    print("Neutralizing persistence unit: %s" % name)
+    if rp.endswith(".desktop"):
+        print("  [1/3] XDG autostart entry — no supervisor to stop; removing "
+              "the entry below prevents the next login launch")
+        log_action("neutralize", rp, "autostart-no-daemon", label=name)
+    elif system_scope:
+        print("  [1/3] system unit — stop/disable needs root; run:\n"
+              "        sudo systemctl disable --now %s" % name)
+        log_action("neutralize", rp, "system-unit-needs-root", label=name)
+    else:
+        _o, _e, drc = run(["systemctl", "--user", "disable", "--now", name],
+                          timeout=20)
+        print("  [1/3] systemctl --user disable --now %s -> %s"
+              % (name, "ok" if drc == 0 else "not loaded/none"))
+        log_action("neutralize", rp,
+                   "disable-%s" % ("ok" if drc == 0 else "noop"), label=name)
+
+    killed = _kill_program_instances(program)
+    print("  [2/3] killed %d running instance(s) of %s" % (killed, program or "?"))
+
+    print("  [3/3] quarantining artifacts:")
+    rc_unit = cmd_quarantine(rp, detection="neutralize:%s" % name)
+    if program and os.path.isfile(program) and is_risky_location(program) \
+            and not _is_protected_path(program):
+        cmd_quarantine(program, detection="neutralize:%s:binary" % name)
+    return 0 if rc_unit == 0 else 1
+
+
+def _neutralize_windows(target):
+    """Windows counterpart. `target` is a scheduled-task name (`task:<name>`),
+    a registry Run value (`HKCU\\...\\Run\\<name>`), or a startup-folder file."""
+    if target.lower().startswith("task:"):
+        task = target[5:]
+        print("Neutralizing scheduled task: %s" % task)
+        out, _, rc = run(["schtasks", "/query", "/tn", task, "/fo", "csv", "/v"],
+                         timeout=30)
+        program = None
+        if rc == 0:
+            rows = _parse_schtasks_csv(out)
+            if rows:
+                args = _win_split_cmd(_expand_win_env(rows[0][1]))
+                program = args[0] if args else None
+        _o, _e, drc = run(["schtasks", "/change", "/tn", task, "/disable"],
+                          timeout=30)
+        print("  [1/3] disable task -> %s" % ("ok" if drc == 0 else "failed"))
+        log_action("neutralize", target,
+                   "disable-%s" % ("ok" if drc == 0 else "failed"), label=task)
+        killed = _kill_program_instances(program)
+        print("  [2/3] killed %d running instance(s) of %s"
+              % (killed, program or "?"))
+        print("  [3/3] quarantining artifacts:")
+        if program and os.path.isfile(program) and is_risky_location(program) \
+                and not _is_protected_path(program):
+            return cmd_quarantine(program, detection="neutralize:%s:binary" % task)
+        print("      (no user-writable binary to quarantine; the task is "
+              "disabled — delete it with: schtasks /delete /tn %s /f)" % task)
+        return 0 if drc == 0 else 1
+
+    rp = os.path.realpath(target)
+    if os.path.isfile(rp):
+        # A startup-folder drop: the file IS the persistence.
+        if _is_protected_path(rp):
+            print("refuse: %s is a protected/system path" % rp)
+            return 1
+        print("Neutralizing startup item: %s" % rp)
+        killed = _kill_program_instances(rp)
+        print("  [1/2] killed %d running instance(s)" % killed)
+        print("  [2/2] quarantining artifacts:")
+        return cmd_quarantine(rp, detection="neutralize:startup")
+    print("usage: aegis.py neutralize <task:NAME | startup-folder-file>\n"
+          "       (registry Run values: remove with `reg delete` after review)")
+    return 1
+
+
+def _neutralize_launchd(plist_path):
+    """launchd counterpart:
       1) bootout the launchd job so it can't relaunch,
       2) SIGKILL any still-running same-user process for its program,
       3) quarantine the .plist (and, if it lives in a risky location, its binary).
@@ -6649,19 +8976,7 @@ def cmd_neutralize(plist_path):
                    label=label)
 
     # 2) kill any surviving same-user process for the program.
-    killed = 0
-    if program:
-        out, _, rc = run(["ps", "-axo", "pid=,uid=,comm="], timeout=10)
-        if rc == 0:
-            for line in out.splitlines():
-                p = line.split(None, 2)
-                if len(p) == 3 and p[1] == str(os.getuid()) and p[2] == program:
-                    try:
-                        import signal as _signal
-                        os.kill(int(p[0]), _signal.SIGKILL)
-                        killed += 1
-                    except Exception:
-                        pass
+    killed = _kill_program_instances(program)
     print("  [2/3] killed %d running instance(s) of %s" % (killed, program or "?"))
 
     # 3) quarantine the plist (stops reload next login), then the binary if risky.
@@ -6671,6 +8986,260 @@ def cmd_neutralize(plist_path):
             and not _is_protected_path(program):
         cmd_quarantine(program, detection="neutralize:%s:binary" % label)
     return 0 if rc_plist == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
+# Background registration (launchd / systemd user timer / Task Scheduler).
+#
+# One command per platform, same contract everywhere: copy the script to a
+# stable runtime location, register it to run on an interval (or as a watch
+# daemon), and record that registration so self-protection can alarm if it
+# later disappears. Idempotent — re-running updates the runtime copy and the
+# schedule in place.
+#
+# The runtime COPY is not incidental. On macOS a repo under ~/Documents sits in
+# a TCC-protected location and a launchd-spawned python3 has no Full Disk
+# Access, so it fails merely OPENING the script — the monitor then fails every
+# scheduled run with no signal. ~/.aegis is not TCC-protected. The same copy
+# gives Linux/Windows a schedule that survives moving or rebuilding the repo.
+# --------------------------------------------------------------------------- #
+
+RUNTIME_SCRIPT = os.path.join(STATE_DIR, "aegis.py")
+
+
+def _install_runtime_copy():
+    """Atomically refresh the runtime copy. Returns its path."""
+    ensure_state()
+    src = os.path.realpath(_SELF_PATH)
+    dst = RUNTIME_SCRIPT
+    if os.path.realpath(dst) == src:
+        return dst  # already running the installed copy
+    tmp = dst + ".new"
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, 0o700)
+    os.replace(tmp, dst)
+    return dst
+
+
+def _xml_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _install_mac(runtime, mode, interval):
+    py = sys.executable or "/usr/bin/python3"
+    agents = os.path.dirname(SELF_PLIST)
+    os.makedirs(agents, mode=0o700, exist_ok=True)
+    args = [py, runtime] + (["watch", str(interval)] if mode == "watch"
+                            else ["scan"])
+    # A path containing &, <, > (e.g. ".../Work & Projects/...") MUST be
+    # entity-escaped or launchd silently refuses to load the agent and the
+    # whole tool never runs on schedule.
+    prog_xml = "".join("        <string>%s</string>\n" % _xml_escape(a)
+                       for a in args)
+    if mode == "watch":
+        sched = "    <key>KeepAlive</key>\n    <true/>\n"
+    else:
+        sched = "    <key>StartInterval</key>\n    <integer>%d</integer>\n" \
+            % interval
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n  <dict>\n'
+        '    <key>Label</key>\n    <string>com.charlie.aegis</string>\n'
+        '    <key>ProgramArguments</key>\n    <array>\n%s    </array>\n'
+        '%s'
+        '    <key>RunAtLoad</key>\n    <true/>\n'
+        '    <key>StandardOutPath</key>\n    <string>%s</string>\n'
+        '    <key>StandardErrorPath</key>\n    <string>%s</string>\n'
+        '  </dict>\n</plist>\n'
+        % (prog_xml, sched,
+           _xml_escape(os.path.join(STATE_DIR, "run.out")),
+           _xml_escape(os.path.join(STATE_DIR, "run.err"))))
+    with open(SELF_PLIST, "w") as f:
+        f.write(plist)
+    os.chmod(SELF_PLIST, 0o600)
+    uid = os.getuid()
+    run(["launchctl", "bootout", "gui/%d" % uid, SELF_PLIST], timeout=15)
+    _o, err, rc = run(["launchctl", "bootstrap", "gui/%d" % uid, SELF_PLIST],
+                      timeout=15)
+    if rc != 0:
+        return rc, "launchctl bootstrap failed: %s" % (err or "").strip()
+    return 0, "launchd agent com.charlie.aegis loaded (%s)" % mode
+
+
+_SYSTEMD_SERVICE = """\
+[Unit]
+Description=Aegis security monitor
+After=network.target
+
+[Service]
+Type=%(type)s
+ExecStart=%(exec)s
+%(restart)s
+# Least privilege for a monitor that only ever READS the system.
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target
+"""
+
+_SYSTEMD_TIMER = """\
+[Unit]
+Description=Aegis periodic security scan
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=%(interval)ds
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _install_linux(runtime, mode, interval):
+    py = sys.executable or "/usr/bin/python3"
+    unit_dir = os.path.join(HOME, ".config", "systemd", "user")
+    os.makedirs(unit_dir, exist_ok=True)
+    if mode == "watch":
+        service = _SYSTEMD_SERVICE % {
+            "type": "simple",
+            "exec": "%s %s watch %d" % (py, runtime, interval),
+            "restart": "Restart=always\nRestartSec=10"}
+    else:
+        service = _SYSTEMD_SERVICE % {
+            "type": "oneshot", "exec": "%s %s scan" % (py, runtime),
+            "restart": ""}
+    with open(os.path.join(unit_dir, "aegis.service"), "w") as f:
+        f.write(service)
+    with open(os.path.join(unit_dir, "aegis.timer"), "w") as f:
+        f.write(_SYSTEMD_TIMER % {"interval": interval})
+    _o, err, rc = run(["systemctl", "--user", "daemon-reload"], timeout=30)
+    if rc != 0:
+        return rc, ("systemctl --user daemon-reload failed: %s\n"
+                    "(No user systemd? Run `%s %s scan` from cron instead.)"
+                    % ((err or "").strip(), py, runtime))
+    unit = "aegis.service" if mode == "watch" else "aegis.timer"
+    _o, err, rc = run(["systemctl", "--user", "enable", "--now", unit],
+                      timeout=30)
+    if rc != 0:
+        return rc, "systemctl --user enable --now %s failed: %s" % (
+            unit, (err or "").strip())
+    # Without lingering, the user manager (and therefore Aegis) stops at
+    # logout — which is exactly when an attacker would prefer it stopped.
+    note = ""
+    lout, _, lrc = run(["loginctl", "show-user", str(os.getuid()),
+                        "--property=Linger"], timeout=15)
+    if lrc != 0 or "Linger=yes" not in (lout or ""):
+        note = ("\nNOTE: enable lingering so Aegis keeps running when you are "
+                "logged out:\n  sudo loginctl enable-linger %s"
+                % os.environ.get("USER", "$USER"))
+    return 0, "systemd user unit %s enabled (%s)%s" % (unit, mode, note)
+
+
+def _install_windows(runtime, mode, interval):
+    py = sys.executable or "python.exe"
+    # pythonw runs without a console window; fall back to python.exe.
+    pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+    if os.path.exists(pyw):
+        py = pyw
+    action = '"%s" "%s" %s' % (py, runtime,
+                               "watch %d" % interval if mode == "watch"
+                               else "scan")
+    if mode == "watch":
+        # One long-running process, started at logon and kept alive by the
+        # scheduler's restart policy.
+        cmd = ["schtasks", "/create", "/tn", SELF_WIN_TASK, "/tr", action,
+               "/sc", "onlogon", "/rl", "limited", "/f"]
+    else:
+        minutes = max(1, interval // 60)
+        cmd = ["schtasks", "/create", "/tn", SELF_WIN_TASK, "/tr", action,
+               "/sc", "minute", "/mo", str(minutes), "/rl", "limited", "/f"]
+    out, err, rc = run(cmd, timeout=60)
+    if rc != 0:
+        return rc, "schtasks /create failed: %s" % ((err or out or "").strip())
+    return 0, "scheduled task %s registered (%s)" % (SELF_WIN_TASK, mode)
+
+
+def cmd_install(mode="scan", interval=None):
+    """Register Aegis to run in the background on this OS."""
+    if mode not in ("scan", "watch"):
+        print("usage: aegis.py install [watch] [interval_seconds]")
+        return 1
+    if interval is None:
+        interval = 600 if mode == "watch" else 3600
+    if interval < 60:
+        print("interval must be at least 60 seconds")
+        return 1
+    if sys.version_info < (3, 9):
+        print("Aegis requires Python 3.9 or newer (found %s)"
+              % sys.version.split()[0])
+        return 1
+    ensure_state()
+    try:
+        init_event_store()
+    except Exception as e:
+        print("refuse: cannot initialize the event store: %s" % e)
+        return 1
+    runtime = _install_runtime_copy()
+    installer = (_install_mac if IS_MAC else
+                 _install_linux if IS_LINUX else _install_windows)
+    rc, message = installer(runtime, mode, interval)
+    if rc != 0:
+        print("Aegis install FAILED: %s" % message)
+        log_run("install failed: %s" % message)
+        return 1
+    state = load_json(SELFSTATE, {})
+    state["installed"] = True
+    state["installed_at"] = now_iso()
+    state["install_mode"] = mode
+    save_json(SELFSTATE, state)
+    log_run("installed: %s mode=%s interval=%d" % (PLATFORM, mode, interval))
+    print("Aegis installed on %s: %s" % (PLATFORM, message))
+    print("Runtime copy: %s (re-run install after editing aegis.py)" % runtime)
+    print("First scan records a SILENT, UNVERIFIED baseline. Review the machine, "
+          "then run:\n  %s %s baseline" % (sys.executable or "python3", runtime))
+    return 0
+
+
+def cmd_uninstall():
+    """Remove the background registration. State/evidence in ~/.aegis is kept
+    (uninstalling the schedule is not a reason to destroy the audit trail)."""
+    messages = []
+    if IS_MAC:
+        run(["launchctl", "bootout", "gui/%d" % os.getuid(), SELF_PLIST],
+            timeout=15)
+        if os.path.exists(SELF_PLIST):
+            try:
+                os.remove(SELF_PLIST)
+                messages.append("removed %s" % SELF_PLIST)
+            except OSError as e:
+                messages.append("could NOT remove %s: %s" % (SELF_PLIST, e))
+    elif IS_LINUX:
+        for unit in ("aegis.timer", "aegis.service"):
+            run(["systemctl", "--user", "disable", "--now", unit], timeout=30)
+        for path in SELF_SYSTEMD_UNITS:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    messages.append("removed %s" % path)
+                except OSError as e:
+                    messages.append("could NOT remove %s: %s" % (path, e))
+        run(["systemctl", "--user", "daemon-reload"], timeout=30)
+    else:
+        _o, err, rc = run(["schtasks", "/delete", "/tn", SELF_WIN_TASK, "/f"],
+                          timeout=60)
+        messages.append("deleted scheduled task %s" % SELF_WIN_TASK if rc == 0
+                        else "could NOT delete task: %s" % (err or "").strip())
+    cmd_mark_uninstalled()
+    print("Aegis background monitor uninstalled on %s." % PLATFORM)
+    for m in messages:
+        print("  %s" % m)
+    print("Local state kept at %s (delete it by hand if you want it gone)."
+          % STATE_DIR)
+    return 0
 
 
 def cmd_watchdog():
@@ -6757,9 +9326,17 @@ def cmd_bastion():
     return 0
 
 
-HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
+HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
+                    (detect + opt-in response; Python stdlib only)
 
- DETECT (default; runs on a launchd interval, never destructive)
+ SETUP
+  install [watch] [secs] register the background monitor for this OS
+                   (launchd agent / systemd --user timer / Scheduled Task).
+                   Default: a scan every 3600s; `watch` = change-driven
+                   monitoring with a [secs] full-scan floor (default 600)
+  uninstall        remove that registration (local evidence is kept)
+
+ DETECT (default; runs on the scheduled interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
   report           print the latest report
   status           print hardening, XProtect, sensor coverage, and incidents
@@ -6780,23 +9357,28 @@ HELP = """aegis.py - personal macOS security monitor (detect + opt-in response)
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
                    the scan path stays local-only regardless)
   canary [remove]  plant (or remove) ransomware canary/honeypot files
-  watch [secs]     event-driven monitor: kqueue rescan seconds after a watched
-                   path changes + a full scan every [secs] (default 600) as a
-                   floor. Production: bash install.sh watch
+  watch [secs]     change-driven monitor: rescan seconds after a watched path
+                   changes (kqueue on macOS, short-cycle polling elsewhere) +
+                   a full scan every [secs] (default 600) as a floor.
+                   Production: aegis.py install watch
   watchdog         dead-man's switch: exit non-zero + alert if the monitor has
-                   stopped beating (run from a 2nd launchd agent/cron as a
+                   stopped beating (run from a 2nd agent/timer/task as a
                    mutual-watchdog, or externally)
-  bastion          OPT-IN, needs sudo: surface Apple's XProtect Behavioral
-                   (Bastion) violations Apple records but never alerts on
+  bastion          macOS only, OPT-IN, needs sudo: surface Apple's XProtect
+                   Behavioral (Bastion) violations Apple records but never
+                   alerts on
 
  RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
   quarantine <path>      atomically confine a file or valid .app bundle
   quarantine-list        list the quarantine store (ids to restore/destroy)
   restore <id>           reverse the native move without overwriting
   destroy <id> --yes     verified deletion from quarantine (IRREVERSIBLE)
-  kill <pid>             terminate one of YOUR processes (SIGTERM->SIGKILL)
+  kill <pid>             terminate one of YOUR processes (graceful, then forced)
   sandbox <path> [args]  refuses host execution; use an isolated VM dynamically
-  neutralize <plist>     kill-chain a launchd threat: bootout->kill->quarantine
+  neutralize <target>    kill-chain a persistence threat — unregister, then
+                         kill, then quarantine. <target> is a launchd .plist
+                         (macOS), a systemd unit / .desktop file (Linux), or
+                         task:<NAME> / a startup-folder file (Windows)
 """
 
 
@@ -6838,6 +9420,19 @@ def main(argv):
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
+    if cmd == "install":
+        rest = argv[2:]
+        mode = "scan"
+        if rest and rest[0] == "watch":
+            mode, rest = "watch", rest[1:]
+        try:
+            secs = int(rest[0]) if rest else None
+        except ValueError:
+            print("usage: aegis.py install [watch] [interval_seconds]")
+            return 1
+        return cmd_install(mode, secs)
+    if cmd == "uninstall":
+        return cmd_uninstall()
     if cmd == "watchdog":
         return cmd_watchdog()
     if cmd == "bastion":
