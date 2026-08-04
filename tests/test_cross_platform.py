@@ -1076,9 +1076,22 @@ class FoundOnRealWindows(unittest.TestCase):
                                  "status %r must not be trusted" % status)
                 self.assertFalse(got.get("probe_failed"),
                                  "the probe answered; it did not fail")
-                self.assertTrue(aegis.suspicious_sig("unsigned"))
         finally:
             aegis.run = saved
+
+        # ...and on the Windows trust model that verdict is suspicious, which
+        # is the whole point of the remapping. suspicious_sig() reads the
+        # platform flags, and `unsigned` is deliberately NOT suspicious on
+        # Linux (every locally built binary is unmanaged there), so assert it
+        # against the Windows model rather than whichever host runs the suite.
+        flags = (aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX)
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
+        try:
+            self.assertTrue(aegis.suspicious_sig("unsigned"))
+            self.assertFalse(aegis.suspicious_sig("unknown"),
+                             "a probe with no answer must not be alerted on")
+        finally:
+            aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = flags
 
     def test_valid_and_tampered_statuses_still_map_correctly(self):
         # Positive control: broadening the fall-through must not swallow the

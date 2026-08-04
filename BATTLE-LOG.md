@@ -46,6 +46,7 @@ its stdout redirected to a pipe.
 | W3 | **CRITICAL** | `_WIN_PROC_PS` joined fields with a backtick-t inside a **single-quoted** PowerShell string, where backtick is not an escape. Every line came back as one field, every line failed the 4-field check: `_iter_processes()` yielded **zero processes, always** — no process surface, no argv scoring, no owner for listener attribution. | 0 processes | built with `[char]9` (which also avoids the double quotes CreateProcess argument quoting would mangle); pinned by a class guard — no PowerShell snippet may contain a backtick escape |
 | W4 | **HIGH** | A failed signature probe was indistinguishable from a verdict of "fine". A cold `Get-AuthenticodeSignature` measured **21.4s and 28.8s** on two separate runs, against a 30s ceiling; on timeout `_classify_windows` returned `trust="unknown"`, and `suspicious_sig("unknown")` is `False` — so a timed-out probe rendered every unsigned **and every tampered** binary un-suspicious, and cached it until the file's mtime changed. | tampered binary → `unknown` (not suspicious), cached | 90s timeout; a failed probe is marked, never cached, and counted into a `signature.classify` DEGRADED sensor entry so a clean report cannot be read as "nothing found" when it means "I could not check N of them" |
 | W5 | **HIGH** | `schtasks /query /fo csv /v` does not double the quotes inside its Task-To-Run column, so a conforming CSV reader returns `C:\p\x.exe" args"`. The program resolved to a path with a trailing quote: no trusted-prefix match, `sha256` None, trust `missing` — a task pointing at a real payload was scored against a path that does not exist. | `program` = `…pythonw.exe"`, severity `None` | `_win_strip_quotes` trims stray quotes; a quote is an illegal Windows filename character, so this cannot damage a legitimate path |
+| W6 | **HIGH** | Real `Get-AuthenticodeSignature` answers `UnknownError` for a non-PE or corrupt image — a status named in no branch, so trust fell through to `unknown`, which `suspicious_sig()` does not flag. A script renamed `.exe`, or a corrupt/truncated dropper, was un-suspicious on Windows while macOS called the identical file `unsigned` and flagged it. | text file named `.exe` → `unknown` (not suspicious) | an ANSWERED probe whose answer is not a valid signature is `unsigned`; `unknown` is now reserved for the one case with genuinely no answer — a **failed** probe, which is marked, never cached and counted as DEGRADED |
 
 ## What the live run showed AFTER the fixes
 
@@ -62,7 +63,9 @@ Linux siege — the before/after column is the same harness, two runs apart:
 | `schtasks` lifecycle | register/query/disable/delete/uninstall all correct | unchanged — the one surface that worked first time |
 | Defender/BitLocker posture, exclusions, WMI subscriptions, listeners | real values, no false-empty | unchanged |
 | Two full scans + `aegis.py report` into a pipe | rc 0, no storm, report written | unchanged |
-| Suite wall time | >45 min (job cancelled at the ceiling) | **14:12** |
+| **Tamper gate** (the Windows analog of the macOS strict-verify rule) | never exercised — the harness copied a *catalog*-signed binary, whose copy reports NotSigned before anything is tampered with, so the test proved nothing | copy of an **embedded**-signed binary (`python.exe`, Python Software Foundation) with one byte flipped → **`trust: 'broken'`**, `suspicious_sig('broken') = True` |
+| Windows suite | 28 failed → 4 failed → 2 failed | **337 passed, 137 skipped, 0 failed** |
+| Suite wall time | >45 min (job cancelled at the ceiling) | **~14 min** |
 
 ## Test-suite defects the same run exposed
 
