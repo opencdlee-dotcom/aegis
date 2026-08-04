@@ -1,3 +1,117 @@
+# Aegis — protective tier (2026-08-04): pre-commit, contain reversibly, leave a witness
+
+Every prior pass in this log made the detector see more. This one asked a
+different question: the README's honest ceiling says an unprivileged process
+cannot block, so is *detect and report* actually the whole of what it can do?
+
+It is not, and the reason is narrower than the ceiling suggests. A veto must be
+privileged **because it is irreversible** — the kernel is the only thing entitled
+to arbitrate an act that cannot be taken back. Nothing in that argument applies
+to an act that *can* be taken back. So three regions were open the whole time:
+**before** the event (pre-commitment), **after** it (reversible containment), and
+**outside** the attacker's trust domain (a witness). None needs a privilege Aegis
+was refusing to ask for.
+
+Six mechanisms shipped as by-hand commands — `freeze`/`thaw`/`frozen`, `latch`/
+`unlatch`, `decoy`, `assay`, `notary`, `clipboard`, plus `rehunt`/`backtest` as
+developer tooling. The invariant did not move: nothing here fires automatically
+from a heuristic. What changed is that the operator now has reversible verbs to
+reach for, not that Aegis acquired judgement.
+
+## The defect this pass exists to have found
+
+| # | Sev | Defect | Before | After |
+|---|-----|--------|--------|-------|
+| P1 | **HIGH** | macOS `ps` truncates the `comm` column to 16 characters **when `args` is requested in the same call** — which is exactly how `_iter_processes()` queries it. `/System/…/CoreServices/Dock.app/Contents/MacOS/Dock` arrives as `/System/Library/`, so `_process_identity()` basenames it to nothing matching `_PROTECTED_COMMS`. The session-critical guard silently matched nothing for any exec path over 16 chars. | Dock's `comm` resolved to `'?'`; guard would **not** have refused it | freeze matches on the untruncated `argv[0]` as well; verified on-host before/after against the live Dock pid |
+
+P1 is pre-existing and **not fully fixed here**. The same truncation still
+degrades `cmd_kill`'s guard and the `exe` field of every macOS process finding —
+a wider blast radius across a sensor 537 tests depend on, which deserves its own
+change rather than being folded into a feature branch. It is recorded here
+because the log's own standing lesson applies to it exactly: a simulation
+inherits its author's model of the system. The tests asserted the guard's
+*logic* and never asked what `ps` actually returns.
+
+## Defects introduced by this pass and caught before merge
+
+| # | Sev | Defect | Caught by |
+|---|-----|--------|-----------|
+| P2 | **HIGH** | Freeze inherited `_PROTECTED_COMMS` wholesale, which carries `python`/`python3` as a blunt proxy for "do not kill Aegis itself". Correct for an irreversible verb reached by name; wrong for freeze, which already refuses its own pid and every ancestor structurally. It refused to suspend **any** python process — and interpreted payloads are a large share of what the tier exists to contain. | Linux CI. macOS hid it: `ps` spells the framework binary `Python`, the set lists `python`. |
+| P3 | **HIGH** | The Windows clipboard substitution ran `Set-Clipboard -Value $input`. `$input` is the *pipeline* variable and nothing is piped in, so the "replace with an inert notice" path would have silently **cleared** the clipboard — destroying the payload the incident record promises is restorable, at the moment the user is mid-paste. | Inspection. No test could see it: `TestClipboardBehaviour` stubs `_clipboard_write` to avoid touching a real clipboard. |
+| P4 | **MEDIUM** | `ctypes` defaults `restype` to C `int` (32-bit) but a Win64 `HANDLE` is a 64-bit pointer, so `OpenProcess`'s handle was truncated on return and handed back to `NtSuspendProcess`/`CloseHandle` at the wrong width. Survives by luck because Windows hands out small handle values — the shape of defect that passes review and fails on someone else's machine. | Inspection. CI structurally cannot reach it (see Residual risk). |
+| P5 | **MEDIUM** | `_freeze_refusal` walked the process table **twice per pid** (owner via `_process_identity`, names via `_process_names`) and is called once per descendant during a tree sweep. On Windows one walk is a CIM query this repo already measured at 41s for 135 processes, so freezing a five-process tree would have spent minutes in enumeration — for a verb whose entire value is landing before the payload finishes. | Reading the call sites against W4's own measurement. |
+| P6 | **LOW** | The notary's macOS anchor read-back used an `eventMessage CONTAINS` predicate: a full-text scan of the archive, measured at **>120s** against a 1.7GB store. `process == "logger"` is indexed and returns the same set in ~4s. | It hung the first end-to-end run. |
+
+## Two tests that were green and proved nothing
+
+Worth recording separately, because a test that cannot fail is worse than no
+test — it reports coverage that does not exist:
+
+- `test_freeze_refuses_another_users_process` hard-coded uid `0` as "another
+  user". CI and containers run the suite **as root**, so `0` was this process's
+  own owner and the guard correctly allowed it. It now derives an owner that
+  cannot be us whoever we are.
+- The first draft of the notary tests asserted only that an edited chain fails
+  verification. That is the easy adversary. The one that matters can read
+  `hmac.key` — 0600 is no barrier to the file's owner — and recompute every head
+  and MAC until the chain is internally flawless.
+
+## The claim the notary actually makes
+
+Tested against that second adversary rather than the first: a chain forged with
+every head and MAC recomputed **defeats all local checks** — internal
+verification caught 0 — and is still caught by the anchors already sitting in the
+root-owned log store, which caught 2. That asymmetry is the whole design, and it
+is why the claim is split in the docs rather than rounded up:
+
+- **erasure-resistant** — removing an anchor needs root, so a sequence gap is
+  real evidence, including the gap left by killing Aegis;
+- **only partly forgery-resistant** — a same-uid attacker with the key can write
+  a consistent local chain and matching new anchors.
+
+What they cannot do is make a *past* anchor say something else. This is the
+specific failure that kills unprivileged Tripwire/AIDE clones — the checker and
+the checked share a trust boundary — and the only thing that closes it is a
+witness in a domain the adversary does not hold.
+
+## Verification actually performed
+
+- Freeze asserted on **work a child process performs**, not on a process-state
+  string: a child that writes a file after 1s produced nothing while frozen and
+  wrote it after `thaw`.
+- Notary anchors round-tripped through the **real macOS unified log**
+  (`ok:2-anchors-matched`), not a stub.
+- FIFO decoy detected a genuinely blocked reader as CRITICAL with its pid
+  resolved.
+- All six assay lanes pass, including a real quarantine → restore byte-exact
+  round trip.
+- Clipboard grammar: rustup's documented `curl … | sh` stays *suspect* and is
+  never rewritten; the `\r` variant escalates to *certain*.
+- 537 tests on macOS · 420 on Linux 3.9 and 3.12 in containers · full CI matrix
+  green including **Windows 3.9 (20m) and Windows 3.12 (33m)** on a real kernel.
+
+## Residual risk
+
+- **P1 is only half-closed.** `cmd_kill`'s guard and the macOS `exe` field still
+  consume a truncated `comm`. Stated above rather than left implicit.
+- **Two Windows paths are implemented and reviewed but never executed.**
+  `NtSuspendProcess` (the freeze tests are POSIX-only by construction) and the
+  clipboard substitution (the harness never touches a real clipboard). They are
+  pinned structurally — the prototypes and the `$env:` channel are asserted from
+  source — which is strictly weaker than execution and must not be read as
+  equivalent. A green Windows matrix does **not** cover them.
+- **Freeze contains, it does not rewind.** It stops new reads, connections and
+  forks; bytes already handed to the kernel's socket buffers still transmit.
+- **A source-aware attacker can kill Aegis rather than evade the freeze.** No
+  unprivileged tool prevents that. The notary does not stop it either — it makes
+  it leave a gap that cannot be backfilled, which is a different and lesser
+  claim, made deliberately.
+- **Linux latches are a speed bump.** No unprivileged immutable flag exists
+  (`chattr +i` needs `CAP_LINUX_IMMUTABLE`), so a same-uid attacker chmods back.
+  The tamper signal is the value there, not the block.
+
+---
+
 # Aegis — first real-Windows run (2026-08-04): CI + a live-hardware harness
 
 The cross-platform port shipped with one residual risk software could not close:
