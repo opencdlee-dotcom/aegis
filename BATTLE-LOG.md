@@ -98,15 +98,47 @@ LSASS-dump idioms, and the false-positive guards.
   off-macOS via `tests/conftest.py` rather than diluted into platform-agnostic
   mush that would delete real macOS coverage.
 
+## Follow-up pass — closing the port's own residual risks
+
+The port shipped with four named residual risks. Three were closed by finding
+real defects behind them; the fourth (no Windows hardware) was reduced as far as
+software can reduce it. Each was baselined with a failing reproducer at HEAD
+before any edit.
+
+| # | Defect (proven at HEAD) | Before | After |
+|---|---|---|---|
+| A | `check_auth_log` returned DEGRADED when the journal was **readable but empty** — `rc==0` with no matching sshd/sudo/useradd lines was indistinguishable from "cannot read". On any quiet box with a root-only `auth.log` this opens a false recurring *"Security coverage degraded: auth-log"* HIGH incident after 3 scans. | `None` (DEGRADED) | `[]` (OK) |
+| B | Three Windows probes returned a **false-empty** on probe failure — exactly the bug class the repo already fixed once for `sfltool`/BTM. A blocked execution policy made `snapshot_win_exclusions`/`snapshot_wmi_subscriptions` return `{}` (adopting an empty baseline, so every real exclusion/subscription storms as "newly added" the first time PowerShell succeeds) and `check_windows_event_log` return `[]` (reporting security coverage it does not have). | `{}` / `[]` | `None` (DEGRADED) on any non-zero exit; `rc==0` with no output still `{}` |
+| C | An unattributable Linux listener reported `path='?'` and nothing else. Attributing a socket to a *pid* needs root — but the socket's **uid is in `/proc/net/tcp` itself**, free. | `? is accepting connections on TCP port 22` | `an unattributable process (uid 0 — attributing it to a pid needs root) is accepting connections on TCP port 22` |
+| D | `_snapshot_persistence_windows` had **never executed a single line** off Windows — the parsers were tested, the winreg enumeration loops, Winlogon deviation rule, startup-folder walk, `schtasks` call and service filter were not. | 0 executions | 9 tests execute the real function end-to-end against an injected fake `winreg` |
+
+C is deliberately keyed so it cannot storm: the uid rides in the snapshot
+**value**, never the key, and `diff_listeners` has no `changed_fn` — so an
+upgrade re-keys nothing and already-baselined listeners stay silent. Both the
+new dict form and the legacy bare-string form are handled, and all three cases
+are pinned by tests.
+
+Live-verified on Linux: a socket owned by another user reports
+`uid 1000` from real `/proc/net/tcp`, not a guess.
+
+Also removed two functions this port orphaned (`_is_macho`, superseded by
+`_executable_kind`; and an unused `_APPLE_DAEMON_NAMES` back-compat alias) —
+dead code in security-review-critical paths is a review hazard.
+
+Verification after the follow-up: macOS 442 passed (+20), Linux 325 passed /
+117 skipped, live siege 40/40, `selftest.py` green on both.
+
 ## Residual risk
 
-- Windows remains unexecuted; the first run on a real Windows box is the
-  outstanding validation step (the parsers are pinned, the live plumbing —
-  winreg enumeration, CIM queries, `schtasks` registration — is not).
-- `check_auth_log` returns DEGRADED where `auth.log` is root-only and no journal
-  is readable; on many distros an unprivileged user genuinely cannot see it.
-- Linux listener attribution needs root for other users' sockets; unattributable
-  listeners are reported with an unknown path rather than dropped or guessed.
+- Windows still has no hardware run. The live plumbing is now *executed* against
+  a simulated registry (D), which catches structural defects, but a fake winreg
+  is not Windows: the first run on real hardware remains the outstanding
+  validation step for `schtasks` registration, CIM owner lookup, and
+  Authenticode verdicts.
+- `check_auth_log` still degrades honestly where `auth.log` is root-only **and**
+  no journal is readable — that is a genuine permission boundary, not a bug.
+- Linux listener attribution still cannot resolve another user's *pid* without
+  root; it now names the owning uid instead of guessing.
 
 ---
 

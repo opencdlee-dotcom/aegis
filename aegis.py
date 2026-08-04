@@ -3471,8 +3471,6 @@ else:
         "runtimebroker", "searchindexer", "wininit", "smss", "fontdrvhost",
         "audiodg", "msmpeng", "securityhealthservice",
     ))
-# Back-compat alias: the mac-era name is referenced by existing regression tests.
-_APPLE_DAEMON_NAMES = _SYSTEM_DAEMON_NAMES
 
 
 def _edit_distance_le1(a, b):
@@ -3978,14 +3976,6 @@ def check_shell_history():
 # --------------------------------------------------------------------------- #
 # Check 3: hot-directory freshly-dropped executables
 # --------------------------------------------------------------------------- #
-
-
-def _is_macho(path):
-    try:
-        with open(path, "rb") as f:
-            return f.read(4) in MACHO_MAGIC
-    except Exception:
-        return False
 
 
 def _executable_kind(path):
@@ -5337,10 +5327,16 @@ def _parse_lsof_listeners(text):
 
 
 def _parse_proc_net_tcp(text):
-    """Pure parser: /proc/net/tcp[6] → [(port, inode)] for sockets in state 0A
-    (LISTEN) bound to a NON-loopback address. Addresses are little-endian hex;
-    loopback is 0100007F (v4) or ...0100 (v6 ::1), and 00000000 is the wildcard
-    0.0.0.0 — reachable, so kept."""
+    """Pure parser: /proc/net/tcp[6] → [(port, uid, inode)] for sockets in state
+    0A (LISTEN) bound to a NON-loopback address. Addresses are little-endian
+    hex; loopback is 0100007F (v4) or ...0100 (v6 ::1), and 00000000 is the
+    wildcard 0.0.0.0 — reachable, so kept.
+
+    The uid column is read because it is available WITHOUT root even when the
+    owning process is not: attributing a listener to a pid requires reading
+    another user's /proc/<pid>/fd, but the socket's owner is right here. "an
+    unknown process running as uid 0 is listening on 22" is actionable; a bare
+    "?" is not."""
     rows = []
     for line in (text or "").splitlines()[1:]:
         parts = line.split()
@@ -5356,7 +5352,7 @@ def _parse_proc_net_tcp(text):
         if a in ("0100007F",                                  # 127.0.0.1
                  "00000000000000000000000001000000"):         # ::1
             continue
-        rows.append((str(port), parts[9]))
+        rows.append((str(port), parts[7], parts[9]))
     return rows
 
 
@@ -5399,7 +5395,7 @@ def _snapshot_listeners_linux():
         return {}
     inode_pid = _linux_socket_inode_pids()
     snap = {}
-    for port, inode in rows:
+    for port, uid, inode in rows:
         pid = inode_pid.get(inode)
         path = None
         if pid:
@@ -5409,7 +5405,11 @@ def _snapshot_listeners_linux():
                 path = None
         if not _listener_worth_tracking(path):
             continue
-        snap["%s:%s" % (path or "?", port)] = path or "?"
+        # The KEY stays "<path>:<port>" so adding uid attribution does not
+        # re-key existing baselines (which would storm every known listener on
+        # upgrade). The uid rides in the VALUE, which no diff compares —
+        # diff_listeners has no changed_fn, so only new keys ever fire.
+        snap["%s:%s" % (path or "?", port)] = {"path": path or "?", "uid": uid}
     return snap
 
 
@@ -5436,10 +5436,8 @@ def _parse_netstat_listen_windows(text):
 
 def _snapshot_listeners_windows():
     out, _, rc = run(["netstat", "-ano", "-p", "tcp"], timeout=30)
-    if rc in (124, 127):
-        return None
-    if not out:
-        return {}
+    if rc != 0 or not out:
+        return None  # non-answer: netstat always prints a header when it runs
     pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
     snap = {}
     for port, pid in _parse_netstat_listen_windows(out):
@@ -5483,7 +5481,14 @@ def snapshot_listeners():
 
 
 def diff_listeners(prior, cur):
-    def new_fn(key, path):
+    def new_fn(key, val):
+        # The snapshot VALUE is a bare path string on macOS/Windows and in any
+        # baseline written before uid attribution existed; Linux now records
+        # {"path", "uid"}. Accept both so an upgrade needs no migration.
+        if isinstance(val, dict):
+            path, uid = val.get("path") or "?", val.get("uid")
+        else:
+            path, uid = val, None
         port = key.rsplit(":", 1)[1]
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
@@ -5494,15 +5499,22 @@ def diff_listeners(prior, cur):
                    else (suspicious_sig(trust) and is_risky_location(path)))
         if IS_LINUX and not hostile:
             hostile = resolvable and is_risky_location(path)
+        # Naming the socket's OWNER keeps an unattributable listener actionable:
+        # "an unknown process running as uid 0" tells you where to look, where a
+        # bare "?" tells you nothing.
+        who = (path if resolvable else
+               ("an unattributable process (uid %s — attributing it to a pid "
+                "needs root)" % uid if uid is not None
+                else "an unattributable process"))
         return finding(
             "HIGH" if hostile else "MEDIUM",
             "net-listener", "New network listener",
             "%s is accepting connections on TCP port %s [%s]%s"
-            % (path, port, trust,
-               " — an unsigned/ad-hoc binary in a user-writable path listening "
+            % (who, port, trust,
+               " — an untrusted binary in a user-writable path listening "
                "on the network is a bind-shell / rogue-server shape" if hostile
                else " — reachable from the network; verify you started this"),
-            "listener:%s" % key, path=path, port=port, trust=trust)
+            "listener:%s" % key, path=path, port=port, trust=trust, uid=uid)
     return _diff_map(prior, cur, new_fn)
 
 
@@ -5792,7 +5804,12 @@ _WIN_EXCLUSION_PS = (
 def snapshot_win_exclusions():
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                       _WIN_EXCLUSION_PS], timeout=60)
-    if rc in (124, 127):
+    # ANY probe failure is a NON-ANSWER, not "no exclusions configured" — the
+    # same rule snapshot_btm() already enforces. Returning {} here would adopt
+    # a false-empty baseline, and every real exclusion would then storm as
+    # "newly added" the first time PowerShell succeeds. A clean box legitimately
+    # returns rc=0 with no output, which stays {}.
+    if rc != 0:
         return None
     snap = {}
     for line in (out or "").splitlines():
@@ -5833,7 +5850,10 @@ _WIN_WMI_PS = (
 def snapshot_wmi_subscriptions():
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                       _WIN_WMI_PS], timeout=60)
-    if rc in (124, 127):
+    # Probe failure ⇒ non-answer (see snapshot_win_exclusions). A machine with
+    # no permanent subscriptions returns rc=0 and no output, which is a real
+    # empty and stays {}.
+    if rc != 0:
         return None
     snap = {}
     for line in (out or "").splitlines():
@@ -5992,8 +6012,12 @@ def check_auth_log():
         out, _, rc = run(["journalctl", "-n", str(_AUTH_LOG_TAIL),
                           "--no-pager", "-t", "sshd", "-t", "sudo",
                           "-t", "useradd"], timeout=30)
-        if rc == 0 and out:
-            text = out
+        # rc==0 means the journal WAS readable. Empty output then means "no
+        # matching entries", which is coverage, not a coverage gap — treating
+        # it as a non-answer would open a bogus "Security coverage degraded"
+        # incident on every quiet box whose auth.log is root-only.
+        if rc == 0:
+            text = out or ""
     if text is None:
         # Root-only log and no readable journal: honest DEGRADED, not "clean".
         return None
@@ -6071,8 +6095,11 @@ def _parse_win_events(text):
 def check_windows_event_log():
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                       _WIN_EVENT_PS], timeout=120)
-    if rc in (124, 127):
-        return None  # probe unavailable — DEGRADED, not clean
+    # Any non-zero exit (timeout, missing PowerShell, blocked execution policy,
+    # Get-WinEvent unavailable) is a NON-ANSWER. Returning [] would report
+    # "no security events" — a monitor claiming clean coverage it does not have.
+    if rc != 0:
+        return None
     rows = _parse_win_events(out)
     findings = []
     failed_logons = 0
