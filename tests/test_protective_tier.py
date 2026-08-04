@@ -658,6 +658,41 @@ class TestClipboardBehaviour(ProtectiveSandbox):
 # --------------------------------------------------------------------------- #
 # Hindsight (developer tooling)
 # --------------------------------------------------------------------------- #
+class TestScanPathStaysInsideStateDir(ProtectiveSandbox):
+    """The trust model promises the background scan writes only inside
+    ~/.aegis. This tier ADDED two scan-path writers (the notary link and the
+    raw-observation snapshot) plus the auto-thaw sweep, so the promise is
+    re-asserted here rather than assumed to have survived."""
+
+    def test_notary_and_observations_write_only_under_state_dir(self):
+        self._saved_anchor = aegis._notary_emit_anchor
+        aegis._notary_emit_anchor = lambda seq, head: "stubbed"
+        self.addCleanup(lambda: setattr(aegis, "_notary_emit_anchor",
+                                        self._saved_anchor))
+        with open(aegis.BASELINE, "w", encoding="utf-8") as f:
+            f.write('{"persistence": {}}')
+
+        before = self._snapshot(self.tmp)
+        aegis.notary_append()
+        aegis.record_observation("persistence.snapshot", {"a": 1})
+        aegis._thaw_expired()
+        after = self._snapshot(self.tmp)
+
+        new = sorted(set(after) - set(before))
+        self.assertTrue(new, "expected the writers to create something")
+        state = os.path.realpath(self.state)
+        for path in new:
+            self.assertTrue(os.path.realpath(path).startswith(state),
+                            "scan path wrote outside the state dir: %s" % path)
+
+    @staticmethod
+    def _snapshot(root):
+        out = []
+        for base, _dirs, files in os.walk(root):
+            out.extend(os.path.join(base, f) for f in files)
+        return out
+
+
 class TestHindsight(ProtectiveSandbox):
 
     def test_observations_round_trip(self):
