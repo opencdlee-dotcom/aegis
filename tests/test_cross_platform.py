@@ -1410,6 +1410,65 @@ class SignatureBatchPrefetch(unittest.TestCase):
             aegis.HOT_DIRS = saved
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_a_large_batch_is_chunked_inside_the_environment_limit(self):
+        # Windows caps a process environment block at 32767 chars and the paths
+        # ride in an env var, so an unbounded batch eventually fails outright.
+        paths = [r"C:\Users\c\AppData\Local\Programs\vendor%03d\tool%03d.exe"
+                 % (i, i) for i in range(300)]
+        sizes = []
+
+        def _run(cmd, timeout=15, extra_env=None):
+            blob = (extra_env or {})["AEGIS_SIG_PATHS"]
+            sizes.append(len(blob))
+            return ("".join("%s\tNotSigned\t\n" % q for q in blob.split("\n")),
+                    "", 0)
+        aegis.run = _run
+
+        self.assertEqual(300, aegis.warm_signature_cache(paths),
+                         "chunking must not lose any path")
+        self.assertGreater(len(sizes), 1, "300 paths must be chunked")
+        self.assertLess(max(sizes), 32767 // 2,
+                        "every chunk must stay well inside the env limit")
+
+    def test_one_bad_chunk_does_not_lose_the_others(self):
+        # A single wedging path (a file on a dead network mount) used to cost
+        # the entire batch, which then fell back to per-path probes -- strictly
+        # worse than never batching. Now it costs only its own chunk.
+        paths = ["C:\\p%03d.exe" % i for i in range(200)]
+        seen = []
+
+        def _run(cmd, timeout=15, extra_env=None):
+            blob = (extra_env or {})["AEGIS_SIG_PATHS"]
+            seen.append(len(blob.split("\n")))
+            if len(seen) == 1:
+                return ("", "timeout", 124)      # first chunk wedges
+            return ("".join("%s\tNotSigned\t\n" % q for q in blob.split("\n")),
+                    "", 0)
+        aegis.run = _run
+
+        resolved = aegis.warm_signature_cache(paths)
+        self.assertGreater(len(seen), 1)
+        self.assertEqual(200 - seen[0], resolved,
+                         "only the wedged chunk is lost")
+        self.assertGreater(resolved, 0,
+                           "a single bad path must not sink the whole prefetch")
+
+    def test_batch_timeout_scales_with_the_chunk(self):
+        # A flat ceiling means a timeout burns the full budget before falling
+        # back; the cost should be proportional to what was actually asked for.
+        seen = []
+
+        def _run(cmd, timeout=15, extra_env=None):
+            seen.append((len((extra_env or {})["AEGIS_SIG_PATHS"].split("\n")),
+                         timeout))
+            return ("", "", 1)
+        aegis.run = _run
+        aegis.warm_signature_cache(["C:\\a.exe", "C:\\b.exe"])
+        count, timeout = seen[0]
+        self.assertEqual(2, count)
+        self.assertLess(timeout, 120,
+                        "two paths must not reserve a multi-minute ceiling")
+
     def test_prefetch_is_a_no_op_off_windows(self):
         aegis.IS_WIN, aegis.IS_LINUX = False, True
         aegis.run, calls = self._counting_run(lambda env: ("", "", 0))

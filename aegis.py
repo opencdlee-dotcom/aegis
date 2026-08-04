@@ -1644,29 +1644,61 @@ def warm_signature_cache(paths):
     if not pending:
         return 0
 
-    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                      _WIN_SIG_BATCH_PS], timeout=300,
-                     extra_env={"AEGIS_SIG_PATHS": "\n".join(pending)})
-    if rc != 0 or not out:
-        return 0  # fall back to per-path probes; no verdict is invented here
-
     resolved = 0
-    for line in out.splitlines():
-        parts = line.rstrip("\r").split("\t")
-        if len(parts) < 2:
-            continue
-        path, status = parts[0].strip(), parts[1].strip()
-        signer = parts[2].strip() if len(parts) > 2 else ""
-        stat_sig = pending.get(path)
-        if stat_sig is None or not status:
-            # No status means the cmdlet said nothing about this path — a
-            # non-answer, and non-answers are never cached.
-            continue
-        _sigcache.pop(path, None)
-        _sigcache[path] = {"stat": stat_sig,
-                           "result": _win_verdict(status, signer)}
-        resolved += 1
+    for chunk in _sig_batch_chunks(list(pending)):
+        out, _, rc = run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             _WIN_SIG_BATCH_PS],
+            # Proportional to the chunk, not a flat ceiling: a timeout costs the
+            # chunk, and the paths in it simply fall back to per-path probes.
+            timeout=60 + 2 * len(chunk),
+            extra_env={"AEGIS_SIG_PATHS": "\n".join(chunk)})
+        if rc != 0 or not out:
+            continue  # this chunk falls back; the others still count
+        for line in out.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if len(parts) < 2:
+                continue
+            path, status = parts[0].strip(), parts[1].strip()
+            signer = parts[2].strip() if len(parts) > 2 else ""
+            stat_sig = pending.get(path)
+            if stat_sig is None or not status:
+                # No status means the cmdlet said nothing about this path — a
+                # non-answer, and non-answers are never cached.
+                continue
+            _sigcache.pop(path, None)
+            _sigcache[path] = {"stat": stat_sig,
+                               "result": _win_verdict(status, signer)}
+            resolved += 1
     return resolved
+
+
+# One giant batch is the wrong shape for three separate reasons, all of which
+# only bite on a real machine with a lot of unknown binaries:
+#   * Windows caps a process environment block at 32767 characters, and the
+#     paths ride in an env var. Enough of them and the call fails outright.
+#   * A single path that makes Get-AuthenticodeSignature wedge (a file on a
+#     disconnected network mount) would cost the whole batch.
+#   * An all-or-nothing batch that times out costs its full timeout AND leaves
+#     every path to be probed individually afterwards — strictly slower than
+#     never having batched at all.
+# Chunking bounds all three: a lost chunk is a lost chunk.
+_SIG_BATCH_MAX_PATHS = 64
+_SIG_BATCH_MAX_CHARS = 8000
+
+
+def _sig_batch_chunks(paths):
+    """Split paths into batches that stay well inside the environment limit."""
+    chunk, size = [], 0
+    for p in paths:
+        if chunk and (len(chunk) >= _SIG_BATCH_MAX_PATHS
+                      or size + len(p) + 1 > _SIG_BATCH_MAX_CHARS):
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(p)
+        size += len(p) + 1
+    if chunk:
+        yield chunk
 
 
 def _classify_mac(path):
