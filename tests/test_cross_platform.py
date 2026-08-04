@@ -761,7 +761,7 @@ class WindowsPersistenceLivePlumbing(unittest.TestCase):
     def test_healthy_winlogon_defaults_are_not_snapshotted(self):
         # Zero churn: the healthy values must produce NO baseline entries at all.
         snap = self._run_snapshot({
-            ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Winlogon"):
+            ("HKLM", aegis._WIN_LOGON_KEY):
                 _FakeWinregKey({"Shell": "explorer.exe",
                                 "Userinit": "C:\\Windows\\system32\\userinit.exe,",
                                 "Unrelated": "somevalue"}),
@@ -771,7 +771,7 @@ class WindowsPersistenceLivePlumbing(unittest.TestCase):
     def test_tampered_winlogon_shell_is_captured(self):
         payload = os.path.join(self.appdata, "evil.exe")
         snap = self._run_snapshot({
-            ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Winlogon"):
+            ("HKLM", aegis._WIN_LOGON_KEY):
                 _FakeWinregKey({"Shell": "explorer.exe, %s" % payload}),
         })
         hits = [k for k in snap if "Winlogon" in k]
@@ -987,6 +987,130 @@ class RegistryIntegrity(unittest.TestCase):
 # any new text-mode open without an explicit encoding is a fresh instance of the
 # same bug on the next Windows box.
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Defects found by the FIRST run against a real Windows machine. Each one was
+# invisible to the fake-winreg / captured-output tests above, and in two cases
+# those tests actively agreed with the bug.
+# --------------------------------------------------------------------------- #
+class FoundOnRealWindows(unittest.TestCase):
+
+    def test_winlogon_key_lives_under_windows_nt(self):
+        # Winlogon is under "Windows NT"; the Run keys are under plain
+        # "Windows". aegis used the latter for both, winreg raised, _reg_values
+        # swallowed it, and the Shell/Userinit hijack check (T1547.004) examined
+        # nothing on every Windows host that ever ran it. The fake-registry test
+        # was BUILT FROM THE SAME CONSTANT, so it passed throughout.
+        self.assertIn(r"Windows NT\CurrentVersion\Winlogon",
+                      aegis._WIN_LOGON_KEY)
+        self.assertNotIn(r"Software\Microsoft\Windows\CurrentVersion\Winlogon",
+                         aegis._WIN_LOGON_KEY)
+
+    def test_no_powershell_snippet_uses_a_backtick_escape(self):
+        # PowerShell honours backtick escapes only inside DOUBLE-quoted strings.
+        # `_WIN_PROC_PS` used '{0}`t{1}' -- single-quoted -- so the separator was
+        # emitted literally, every line failed the 4-field split, and
+        # _iter_processes() yielded ZERO processes on Windows: the whole
+        # process/argv surface was dead. Pin the class, not just that one site.
+        snippets = {n: v for n, v in vars(aegis).items()
+                    if n.endswith("_PS") and isinstance(v, str)}
+        self.assertTrue(snippets, "no PowerShell snippets found to check")
+        offenders = {n: v for n, v in snippets.items() if "`" in v}
+        self.assertEqual({}, offenders,
+                         "backtick escapes do not survive a single-quoted "
+                         "PowerShell string; build the character explicitly "
+                         "(e.g. [char]9): %s" % sorted(offenders))
+
+    def test_process_query_joins_fields_with_a_real_tab(self):
+        self.assertIn("[char]9", aegis._WIN_PROC_PS)
+
+    def test_schtasks_unescaped_quotes_do_not_poison_the_program_path(self):
+        # `schtasks /query /fo csv /v` prints the Task-To-Run column without
+        # doubling its embedded quotes, so a conforming CSV reader returns a
+        # program path with a trailing quote. That path matches no trusted
+        # prefix, hashes to None and classifies as `missing`, so a task pointing
+        # at a real payload was scored against a path that does not exist.
+        malformed = 'C:\\Py\\pythonw.exe" "C:\\T\\aegis.py" scan"'
+        self.assertEqual(["C:\\Py\\pythonw.exe", "C:\\T\\aegis.py", "scan"],
+                         aegis._win_split_cmd(malformed))
+
+    def test_well_formed_command_lines_are_unchanged(self):
+        self.assertEqual(["C:\\Py\\pythonw.exe", "C:\\T\\a.py", "scan"],
+                         aegis._win_split_cmd('"C:\\Py\\pythonw.exe" '
+                                              '"C:\\T\\a.py" scan'))
+        self.assertEqual(["C:\\Windows\\system32\\x.exe", "-q"],
+                         aegis._win_split_cmd(r"C:\Windows\system32\x.exe -q"))
+
+    def test_a_failed_signature_probe_is_not_a_verdict_of_fine(self):
+        # A cold powershell.exe was measured at 21.4s against a 30s ceiling.
+        # On timeout _classify_windows returned trust="unknown", and
+        # suspicious_sig("unknown") is False -- so a timed-out probe rendered
+        # every unsigned and every TAMPERED binary un-suspicious. Fail-open.
+        saved_run, saved_n = aegis.run, aegis._SIG_PROBE_FAILURES
+        aegis.run = lambda *a, **k: ("", "timeout", 124)
+        aegis._SIG_PROBE_FAILURES = 0
+        try:
+            result = aegis._classify_windows(r"C:\Users\x\payload.exe")
+            self.assertTrue(result.get("probe_failed"),
+                            "a failed probe must be distinguishable from a "
+                            "verdict: %r" % result)
+            self.assertEqual(1, aegis._SIG_PROBE_FAILURES,
+                             "the scan must be able to report the gap")
+        finally:
+            aegis.run, aegis._SIG_PROBE_FAILURES = saved_run, saved_n
+
+    def test_a_failed_signature_probe_is_never_cached(self):
+        # Caching the failure makes the fail-open DURABLE: the binary stays
+        # un-suspicious until its mtime or size changes.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="aegis_sigfail_")
+        target = os.path.join(tmp, "payload.exe")
+        with open(target, "wb") as fh:
+            fh.write(b"MZ\x00\x00")
+        saved = (aegis._sigcache, aegis._classify_windows, aegis._classify_mac,
+                 aegis._classify_linux)
+        aegis._sigcache = {}
+        failed = {"trust": "unknown", "team": None, "authority": None,
+                  "probe_failed": True}
+        aegis._classify_windows = lambda p: dict(failed)
+        aegis._classify_mac = lambda p: dict(failed)
+        aegis._classify_linux = lambda p: dict(failed)
+        try:
+            out = aegis.classify_signature(target)
+            self.assertNotIn("probe_failed", out,
+                             "the marker is internal; callers see the normal "
+                             "shape")
+            self.assertNotIn(target, aegis._sigcache,
+                             "a failed probe must not be cached")
+        finally:
+            (aegis._sigcache, aegis._classify_windows, aegis._classify_mac,
+             aegis._classify_linux) = saved
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_real_verdict_is_still_cached(self):
+        # Positive control: the no-cache rule must not disable caching outright.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="aegis_sigok_")
+        target = os.path.join(tmp, "ok.exe")
+        with open(target, "wb") as fh:
+            fh.write(b"MZ\x00\x00")
+        saved = (aegis._sigcache, aegis._classify_windows, aegis._classify_mac,
+                 aegis._classify_linux)
+        aegis._sigcache = {}
+        good = {"trust": "unsigned", "team": None, "authority": None}
+        aegis._classify_windows = lambda p: dict(good)
+        aegis._classify_mac = lambda p: dict(good)
+        aegis._classify_linux = lambda p: dict(good)
+        try:
+            aegis.classify_signature(target)
+            self.assertIn(target, aegis._sigcache)
+        finally:
+            (aegis._sigcache, aegis._classify_windows, aegis._classify_mac,
+             aegis._classify_linux) = saved
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TextEncodingIsPinned(unittest.TestCase):
     _SOURCE = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "aegis.py")

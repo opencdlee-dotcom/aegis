@@ -201,9 +201,10 @@ try:
     # (a) The Winlogon expectations must match the REAL values. If they do not,
     #     aegis manufactures a Winlogon-deviation finding on every Windows host
     #     it is ever installed on -- a permanent false positive.
-    with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"Software\Microsoft\Windows\CurrentVersion\Winlogon") as k:
+    # Deliberately the module's own constant: if it ever regresses to the
+    # "Windows" (rather than "Windows NT") path, this raises here instead of
+    # quietly agreeing with the typo the way a fake registry does.
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, aegis._WIN_LOGON_KEY) as k:
         for name, pattern in aegis._WIN_LOGON_EXPECT.items():
             try:
                 val, _t = winreg.QueryValueEx(k, name)

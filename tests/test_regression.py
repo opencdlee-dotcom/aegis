@@ -113,6 +113,38 @@ class Sandbox(unittest.TestCase):
             self._saved[k] = getattr(aegis, k)
             setattr(aegis, k, v)
 
+        if aegis.IS_WIN:
+            # Every override above pins a live-host source behind a path or a
+            # command, which is enough on POSIX because persistence there IS
+            # files. Windows persistence also comes from the registry, the
+            # service hive and Task Scheduler — none of which can be redirected
+            # into a tmp dir, so a sandboxed scan picked up the runner's REAL
+            # Run keys and scheduled tasks and notified HIGH on them. Restrict
+            # the snapshot to the sandboxed startup folder, which is the exact
+            # isolation PERSISTENCE_DIRS already provides on POSIX. The full
+            # function keeps its coverage: every branch in
+            # WindowsPersistenceLivePlumbing, and the real hives in
+            # tests/win_live_harness.py on real Windows.
+            def _sandboxed_win_persistence():
+                snap = {}
+                for d in aegis.PERSISTENCE_DIRS:
+                    try:
+                        entries = sorted(os.listdir(d))
+                    except OSError:
+                        continue
+                    for nm in entries:
+                        path = os.path.join(d, nm)
+                        if not os.path.isfile(path):
+                            continue
+                        rec = aegis._persist_record(label="Startup\\" + nm)
+                        rec["run_at_load"] = True
+                        snap["startup:" + path] = aegis._finish_persist_record(
+                            rec, path, None)
+                return snap
+
+            self._saved["snapshot_persistence"] = aegis.snapshot_persistence
+            aegis.snapshot_persistence = _sandboxed_win_persistence
+
         self.notifications = []
         self._saved["notify"] = aegis.notify
         aegis.notify = lambda title, msg: self.notifications.append((title, msg))

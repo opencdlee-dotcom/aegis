@@ -1476,7 +1476,7 @@ def classify_signature(path):
     else:
         result = _classify_mac(path)
 
-    if stat_sig is not None:
+    if stat_sig is not None and not result.pop("probe_failed", False):
         _sigcache.pop(path, None)  # overwrite any prior entry for this path
         _sigcache[path] = {"stat": stat_sig, "result": result}
     return result
@@ -1515,6 +1515,11 @@ def _classify_linux(path):
 
 # One PowerShell round-trip per classification; results are stat-cached so a
 # stable binary costs the subprocess once, not once per scan.
+# Count of signature probes that could not reach a verdict this scan. A failed
+# probe is a coverage gap, not a clean bill of health, so cmd_scan reports it as
+# a DEGRADED sensor rather than letting the silence read as "everything signed".
+_SIG_PROBE_FAILURES = 0
+
 _WIN_SIG_PS = (
     "$s=Get-AuthenticodeSignature -LiteralPath $env:AEGIS_SIG_PATH;"
     "$sub=$null;if($s.SignerCertificate){$sub=$s.SignerCertificate.Subject};"
@@ -1522,11 +1527,22 @@ _WIN_SIG_PS = (
 
 
 def _classify_windows(path):
+    global _SIG_PROBE_FAILURES
     result = {"trust": "unknown", "team": None, "authority": None}
+    # 90s, not 30s: a COLD powershell.exe on a real machine was measured at
+    # 21.4s just to start, and the old ceiling left almost no margin. A timeout
+    # here is not a cheap miss -- see below.
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                      _WIN_SIG_PS], timeout=30,
+                      _WIN_SIG_PS], timeout=90,
                      extra_env={"AEGIS_SIG_PATH": path})
     if rc != 0 or not out:
+        # The probe FAILED; that is not a verdict of "fine". suspicious_sig()
+        # does not flag "unknown", so silently returning it means a timed-out
+        # or blocked PowerShell renders every unsigned and every TAMPERED
+        # binary un-suspicious -- fail-open, and worse, cached. Mark it so the
+        # result is never cached and the scan can report the coverage gap.
+        _SIG_PROBE_FAILURES += 1
+        result["probe_failed"] = True
         return result
     lines = out.splitlines()
     status = lines[0].strip() if lines else ""
@@ -2770,9 +2786,23 @@ def _win_split_cmd(cmdline):
         if end > 0:
             head = s[1:end]
             rest = s[end + 1:].strip()
-            return [head] + (rest.split() if rest else [])
+            return _win_strip_quotes([head] + (rest.split() if rest else []))
     parts = s.split()
-    return parts or None
+    return _win_strip_quotes(parts) or None
+
+
+def _win_strip_quotes(parts):
+    r"""Strip stray quotes off each token.
+
+    `schtasks /query /fo csv /v` emits the Task-To-Run column WITHOUT escaping
+    the quotes inside it: RFC4180 wants every embedded quote doubled, and
+    schtasks just prints them raw. A conforming CSV reader therefore hands back
+    `C:\p\x.exe" args"` instead of `C:\p\x.exe args`, and the program resolved to
+    a path carrying a trailing quote -- it matched no trusted prefix, hashed to
+    None, and classified as `missing`, so a task pointing at a real payload was
+    scored against a path that does not exist. A quote is an illegal character
+    in a Windows filename, so trimming it can never damage a legitimate path."""
+    return [p.strip('"') for p in parts]
 
 
 _WIN_ENVVAR_RE = re.compile(r"%([A-Za-z_][A-Za-z0-9_()]*)%")
@@ -2800,6 +2830,14 @@ _WIN_RUN_KEYS = [
     ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
     ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
 ]
+
+# Winlogon lives under "Windows NT", NOT "Windows" -- the Run keys above are the
+# ones under plain "Windows", and the two are easy to conflate. The wrong path
+# raised OSError, _reg_values swallowed it and returned [], so the Shell/Userinit
+# hijack check (T1547.004) silently examined nothing on every Windows host. Only
+# a real registry could show this: a fake winreg built from the same constant
+# agrees with the typo.
+_WIN_LOGON_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
 
 # Winlogon values an attacker rewrites for persistence; each has exactly one
 # healthy shape, so anything else is a finding-grade anomaly (T1547.004).
@@ -2879,8 +2917,7 @@ def _snapshot_persistence_windows():
 
     # 2. Winlogon Shell/Userinit — one healthy value each; a deviation is how
     # a stealer wedges itself before the desktop (T1547.004).
-    for name, val in _reg_values(
-            "HKLM", r"Software\Microsoft\Windows\CurrentVersion\Winlogon"):
+    for name, val in _reg_values("HKLM", _WIN_LOGON_KEY):
         if name not in _WIN_LOGON_EXPECT or not isinstance(val, str):
             continue
         if _WIN_LOGON_EXPECT[name].match(val.strip()):
@@ -3533,11 +3570,20 @@ def _typosquats_apple_daemon(name):
 
 # One PowerShell round-trip yields pid/uid-equivalent/exe/argv for every visible
 # process (tasklist gives no command line, and WMIC is deprecated/removed).
+# The separator is built with [char]9 rather than written as a backtick escape.
+# PowerShell only honours backtick escapes inside DOUBLE-quoted strings, so the
+# `t in a single-quoted format string was emitted LITERALLY -- every line came
+# back as one field, every line failed the 4-field check, and _iter_processes()
+# yielded nothing at all on Windows. The parser tests never saw it because they
+# feed tab-separated fixtures straight to the parser, bypassing PowerShell.
+# Double quotes are avoided here too: this string crosses Windows' CreateProcess
+# argument quoting, which escapes them and would hand PowerShell a mangled
+# script. [char]9 needs neither.
 _WIN_PROC_PS = (
-    "Get-CimInstance Win32_Process | ForEach-Object {"
+    "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
     "$o=$_ | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue;"
-    "'{0}`t{1}`t{2}`t{3}' -f $_.ProcessId,"
-    "($(if($o){$o.User}else{''})),$_.ExecutablePath,$_.CommandLine}")
+    "(($_.ProcessId),($(if($o){$o.User}else{''})),"
+    "($_.ExecutablePath),($_.CommandLine)) -join $t}")
 
 
 def _iter_processes():
@@ -7132,7 +7178,9 @@ def cmd_scan(quiet=False):
 
 
 def _cmd_scan_locked(quiet=False):
+    global _SIG_PROBE_FAILURES
     ensure_state()
+    _SIG_PROBE_FAILURES = 0  # per-scan; a stale count would mislead every later run
     health = []
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
@@ -7190,6 +7238,15 @@ def _cmd_scan_locked(quiet=False):
     # Re-sort: surface findings (and any corrupt-baseline finding) were appended
     # after gather_all's sort.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
+
+    if _SIG_PROBE_FAILURES:
+        # Never silent: an operator reading a clean report must be able to tell
+        # "nothing suspicious" from "I could not check N of them".
+        health.append({
+            "sensor_id": "signature.classify", "status": "DEGRADED",
+            "detail": "%d signature probe(s) returned no verdict; those "
+                      "binaries were NOT vouched for" % _SIG_PROBE_FAILURES,
+            "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
 
     new_high = emit(findings, first_run, adopt=adopt)
     suppressed_categories = set(adopt)
