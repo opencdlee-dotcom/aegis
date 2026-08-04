@@ -118,6 +118,9 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Background items** *(capability-dependent)* | Where macOS permits `sfltool dumpbtm`, a **new** Login Item / SMAppService background agent is baseline-diffed. A new item with **no Team ID whose URL is in a user-writable path** → HIGH, else MEDIUM. If Apple requires interactive authorization, the sensor reports DEGRADED rather than clean. | Catches the modern persistence path the LaunchAgents-directory scan **cannot see** without pretending the data exists when macOS withholds it |
 | **Self-protection** | Aegis's own launchd agent removed, **its own plist present-but-malformed** (invalid XML that launchd will silently refuse on the next reboot — the monitor dies with no signal), its append-only log truncated, or its **trust store (baseline/allowlist) edited out-of-band** | A monitor an attacker can silently disable, blind, or feed a poisoned baseline — or that quietly rots itself into non-execution — is theater |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, Application Firewall, stealth mode, Remote Login, **+ XProtect definition age** | Surfaces weak settings (a first run typically finds a control the operator assumed was on) |
+| **Latch tamper** *(opt-in)* | A pre-claimed persistence surface (`chflags uchg` / deny-write ACE) found writable again with no authorized `unlatch` in the audit log | Attack-defined, not heuristic: nothing benign clears these flags. The `unlatch` gate refuses non-interactive callers, so malware cannot manufacture the authorization |
+| **Credential decoy read** *(opt-in)* | A process blocked reading a FIFO honeytoken at a credential-shaped path, resolved to a pid | Zero-false-positive by construction — nothing legitimate knows the path exists. Composes with `freeze` to contain the reader while you look |
+| **Unproven coverage** *(opt-in)* | A detector whose positive control has not been re-proven within its half-life, or is now failing | The difference between "nothing found" and "no longer able to find" — every intrusion starts by making the machine silent |
 
 **Design principle — many imperfect layers, one honest decision path.** No
 single sensor is treated as authoritative. Each scan stores redacted
@@ -290,6 +293,50 @@ machine. The human-readable manifest is derived cache, never authority. Every
 response action — success or refusal — is durably appended to
 `~/.aegis/actions.jsonl`; if the audit cannot be written before mutation, the
 mutation is refused.
+
+### Protective tier — pre-commitment and reversible containment (opt-in)
+
+The response tier above acts on a threat you have already identified. This tier
+exists because of the honest limit stated in *Honest scope*: an unprivileged
+process cannot **block**, because blocking is irreversible and only the kernel
+may arbitrate it. Three things it can do without any privilege at all:
+
+| Command | What it does | Reversible? |
+|---|---|---|
+| `freeze <pid>` | **Suspends** a same-user process tree (`SIGSTOP` / `NtSuspendProcess`). A veto must be privileged *because* it is irreversible; a freeze can be taken back, so it needs no arbitration — and since being wrong costs one `thaw`, it can act on weaker evidence than any irreversible verb. Suspends the root first (a stopped parent cannot fork), then sweeps descendants to a fixpoint. Refuses other users' processes, session-critical ones, and any **ancestor** of Aegis. | ✅ `thaw`, and auto-releases after 15 min unreviewed (**fail-open**) |
+| `frozen` | The review queue. Deferred consent is the point: personal firewalls died of prompt fatigue because they asked *at attack time*. A frozen suspect has accomplished nothing and will still be there after breakfast. | — |
+| `latch [on\|off\|status]` | Pre-claims the persistence surfaces so a dropper's write **fails**: `chflags uchg` (macOS) / deny-write ACE (Windows), both settable by the owner unprivileged. Linux has no unprivileged immutable flag, so there it is a mode change — a speed bump, labelled as one. | ✅ `unlatch` |
+| `unlatch <path>` | Opens one surface for a real installer. Requires an interactive terminal **and** a typed one-time code — a script cannot satisfy it. That is deliberate: if malware could call `unlatch`, the "latch cleared without authorization" signal would be worth nothing. | — |
+| `decoy [plant\|remove]` | FIFO honeytokens at credential-shaped paths (POSIX only; **absent** on Windows). A read *blocks*, and any read at all is an attacker by construction — nothing legitimate knows the paths exist. Never replaces a file that already exists. | ✅ `decoy remove` |
+| `assay` | Positive controls: prove each detector still fires against a known-good synthetic stimulus, and record what is currently **proven** vs merely asserted. A control unproven past its half-life is reported as unproven coverage, never as a clean result. | — (read-only) |
+| `notary [verify\|append]` | Hash-chains Aegis's own state and anchors it into the OS's **root-owned** log store, which a same-uid attacker may append to but cannot edit or erase. | — (read-only) |
+| `clipboard [check\|guard\|restore]` | Inspects the clipboard for pasted-command attack shapes *before* you paste — the one moment a ClickFix payload is inert data rather than code running as you. | ✅ `clipboard restore` |
+
+**What the notary does and does not prove**, stated separately because the two
+halves are not equally strong: it is **erasure-resistant** (removing an anchor
+needs root, so a sequence gap is real evidence, including the gap left by
+killing Aegis) but only **partly forgery-resistant** — an attacker who reads
+`hmac.key`, which a same-uid attacker can, may write a self-consistent local
+chain. What they cannot do is make a *past* anchor say something else. The
+regression suite tests exactly that adversary: a forged chain with every head
+and MAC recomputed defeats all local checks and is still caught by the anchors.
+
+**Honest limits of this tier:**
+
+- **Freeze contains, it does not rewind.** It stops new reads, connections and
+  forks; bytes already handed to the kernel's socket buffers still transmit.
+- **A source-aware attacker can kill Aegis instead of evading it.** No
+  unprivileged tool can prevent that. The notary is the answer: it cannot stop
+  the kill, but it makes the kill leave a sequence gap that cannot be backfilled.
+- **`curl … | sh` is never silently rewritten.** It is the documented install
+  path for rustup and much else, so the clipboard grammar reports it and stops
+  there. Only patterns with no legitimate use (fake password dialogs,
+  `powershell -enc`, `mshta`, a trailing `\r` auto-execute) are substituted.
+- **Clipboard content that does not match is never logged or persisted** — in
+  any form, including hashes. Password managers put secrets there.
+- **Nothing in this tier runs automatically off a heuristic.** Every verb is one
+  you type after reviewing a finding. The architecture invariant is unchanged;
+  what is new is that you now have *reversible* verbs to reach for.
 
 **Hard safety rails** (all destructive verbs): quarantine-first-never-delete-first;
 **protected-path refusal** (SIP/system/Apple locations, Aegis's own files, `$HOME`
@@ -464,7 +511,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**300 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**530 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -474,6 +521,28 @@ a swapped binary at an allowlisted path re-alerts (content hash in the
 fingerprint); `/usr/local` and `/private/var/folders` are risky; the signature
 cache invalidates on content change — including a same-size replacement whose
 mtime was restored — and stays bounded.
+
+The **protective tier** adds 40 tests in `tests/test_protective_tier.py`, each
+pinning a property that would otherwise rot silently: a frozen process is proven
+to make no progress and a thawed one to resume (asserted on work the child
+actually performs, not on a process-state string); freeze refuses its own
+ancestors, so it can never suspend the shell it runs under; an unreviewed freeze
+auto-releases; `unlatch` refuses a non-interactive caller; a decoy never replaces
+a real file; the assay uses no EICAR and persists no nonce; clipboard content
+that does not match the grammar is proven absent from every file Aegis writes;
+`curl … | sh` is proven to stay *suspect* and never get rewritten; and — the
+load-bearing one — **a same-uid attacker who reads `hmac.key` and rewrites the
+notary chain with every head and MAC recomputed defeats all local checks and is
+still caught by the anchors in the root-owned log store.** That last test is the
+difference between this design and the unprivileged Tripwire/AIDE clones that
+die because the attacker rewrites the baseline.
+
+One guard bug surfaced while building it, and is fixed: macOS `ps` truncates the
+`comm` column to 16 characters **when `args` is requested in the same call**,
+which is exactly how `_iter_processes` queries it — so `/System/…/MacOS/Dock`
+arrived as `/System/Library/` and the session-critical guard matched nothing.
+Verified on-host: the Dock's `comm` resolved to `?`, so the guard would not have
+refused it. Freeze now matches on the untruncated `argv[0]` as well.
 
 The **web-protection + trust-cache tier** adds 8 fail-before/pass-after tests: a
 substantial local hosts denylist is recognized; default hosts files are reported

@@ -56,7 +56,10 @@ Three rules keep this honest rather than merely portable:
 | Correlate | Same-entity bounded-window chains **plus durable path lineage** | Raises confidence when independent layers agree; lineage additionally links a drop to an execution that happens after any bounded window has closed |
 | Manage | Durable incidents, evidence links, validated lifecycle, bounded reminders | Keeps work visible after a desktop notification disappears |
 | Tune | Typed dismissals (false- vs benign-positive), per-sensor down-weighting, documented benign causes, read-only replay | Keeps the operator trusting the tool: a noisy detector is measurable and correctable instead of being muted wholesale |
-| Contain | Manual process action and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
+| Pre-commit | Latched persistence surfaces (`chflags uchg` / deny-write ACE) and FIFO credential decoys, both placed **before** any attack | Makes the attacker's write fail rather than reporting it afterwards; a cleared latch or a read decoy is attack-defined evidence |
+| Contain | Manual process action, **reversible freeze**, and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
+| Prove detection | Positive-control assay per detector, with an efficacy half-life | Distinguishes "nothing found" from "no longer able to find"; unproven coverage is reported as unproven |
+| Witness | Hash-chained state anchored into the OS's root-owned log store | An attacker who tampers, or who stops the monitor, cannot do so silently |
 | Recover | Exclusive restore, verified delete, crash recovery, audit | Handles false positives and interrupted response without silent data loss |
 
 ## Data and decision flow
@@ -205,6 +208,67 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   DEGRADED when macOS requires interactive authorization; denied data is never
   interpreted as an empty or clean snapshot.
 - Uninstall retains evidence by default. Purge requires the explicit `--purge`.
+
+## Protective tier (opt-in, by hand)
+
+The detect tier answers "what happened". The protective tier is the answer to
+the limitation that produces: an unprivileged process cannot **veto** an event,
+because a veto is irreversible and only the kernel may arbitrate one. Three
+things it *can* do, none of which require privilege:
+
+1. **Pre-commit.** Claim the surface before the attacker reaches it. `chflags
+   uchg` on macOS and a deny-write ACE on Windows are settable by the file's own
+   owner with no privilege; a dropper's write then fails outright. Linux has no
+   unprivileged immutable flag (`chattr +i` needs `CAP_LINUX_IMMUTABLE`), so
+   there a latch is a mode change — a speed bump, documented as one, never sold
+   as equivalent. The detection half is what makes this more than hardening:
+   nothing benign clears a latch, so a latch found cleared with no authorized
+   `unlatch` is attack-defined evidence rather than a heuristic. `unlatch`
+   therefore refuses non-interactive callers and requires a typed one-time code
+   — if a script could call it, malware could call it, and the signal would be
+   worth nothing.
+
+2. **Contain reversibly.** `freeze` suspends a same-user process tree
+   (`SIGSTOP` / `NtSuspendProcess`). The asymmetry that makes this work: a veto
+   must be privileged *because* it is irreversible, whereas a freeze can be
+   taken back, so it needs no arbitration and no privilege — and because being
+   wrong costs one `thaw`, it can act on evidence far weaker than any
+   irreversible action could justify. The root is suspended first, since a
+   stopped parent cannot fork, which turns an unbounded chase into a converging
+   sweep; a tree still growing after the pass cap is reported as such rather
+   than presented as a tidy containment. Guards: never another user's process,
+   never a session-critical one, and never an **ancestor** of Aegis — suspending
+   the shell or terminal is indistinguishable from a hung machine. An
+   unreviewed freeze auto-releases (**fail-open, deliberately**): a monitor that
+   can silently leave your processes stopped forever is a worse failure than one
+   that lets a suspect resume.
+
+   Stated limit: freeze stops new reads, connections and forks. It does not
+   un-send bytes already handed to the kernel's socket buffers. It contains an
+   attack in progress; it does not rewind one.
+
+3. **Witness.** Every scan extends a hash chain over Aegis's own state and
+   anchors one line into the platform's log store — root-owned on every
+   supported OS, so a same-uid attacker may append but cannot edit or erase.
+   The claim is deliberately split, because the two halves are not equally
+   strong: **erasure-resistant** (removing an anchor needs root, so a gap is
+   real evidence) but only **partly forgery-resistant** (an attacker who reads
+   `hmac.key` — which a same-uid attacker can — may write a consistent local
+   chain and matching anchors). What they cannot do is make a *past* anchor say
+   something else, so rewriting history or silencing the monitor both leave
+   evidence. `notary verify` prints which of the two it actually proved.
+
+The invariant that does **not** move: nothing here fires automatically from a
+heuristic. Every verb is one the operator types after reviewing a finding, on
+the same footing as quarantine/kill/neutralize. What changed is that the
+operator now has reversible verbs available, not that Aegis acquired judgement.
+
+Coverage itself is measured rather than asserted: `assay` challenges each
+detector with an inert, nonce-tagged synthetic stimulus and records what is
+currently *proven*. A control unproven past its half-life is reported as
+unproven coverage, never as a clean result. It deliberately uses no EICAR —
+waking a third-party AV would trip Aegis's own file-deletion sensors, a
+self-referential cascade in a tool whose whole value is a calm signal.
 
 ## Power-tier gate
 
