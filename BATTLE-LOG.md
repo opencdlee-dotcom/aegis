@@ -112,9 +112,10 @@ real `Get-AuthenticodeSignature` answers `NotSupportedFileFormat`, and
 `_classify_windows` maps that to exactly `unsigned` — same verdict, no
 subprocess.
 
-## Final state (captured, not asserted)
+## State when W1-W6 closed (captured, not asserted)
 
-`windows-latest / py3.12`, the run where both Windows jobs went green:
+Superseded by the follow-up section below, which carries the final numbers.
+`windows-latest / py3.12`, the first run where both Windows jobs went green:
 
 - test suite **339 passed, 137 skipped, 0 failed** (876s);
 - live harness **`checks failed: 0`** — 35 passing checks against the real
@@ -138,12 +139,52 @@ positive controls (caching still works; `Valid`/`HashMismatch`/`NotTrusted`/
   protection OFF, its Security event log is not readable by the harness's
   principal (correctly reported DEGRADED, not silently empty), and no Group
   Policy applies. Behaviour under an enterprise policy set remains unproven.
-- The signature-probe cost above means a first scan on a Windows machine with
-  many unknown binaries is slow. It self-heals via the cache, and the DEGRADED
-  sensor now makes a probe that never completes visible rather than silent —
-  but batching the classification into one PowerShell round-trip was
-  deliberately **not** attempted here: it touches the trust path, and this pass
-  had no measurement of the batched form to justify the risk.
+- Windows sensor coverage is only as good as what an unprivileged process can
+  read. The Security event log needed a principal the harness did not have, and
+  that surface reports DEGRADED rather than pretending to be clean — correct,
+  but it is a real gap on any machine where Aegis runs unelevated.
+
+## Follow-up in the same session: one more dead sensor, and the batching
+
+Two things were closed after the entry above was first written.
+
+**W7 — the process table failed silently.** `_iter_processes()` returned an
+empty generator when its probe failed, and downstream "no processes" reads as
+"nothing suspicious is running": the same false-empty this repo already refuses
+for sfltool/BTM and the Defender probes, sitting in the sensor W3 had just
+brought back from the dead. Not hypothetical — the harness measured **41.0s for
+135 processes** against what was then a 60s ceiling, and that measurement was
+first filed as a "thin margin" note rather than as the defect it was. The
+Windows query now gets 180s, and a failure on either the Windows or the macOS
+path records `process.enumerate` DEGRADED.
+
+**Batching, which the previous version of this section said had deliberately
+not been attempted.** It has been, and the reasoning that deferred it — no
+measurement, and it touches the trust path — was answered rather than ignored:
+
+- the measurement exists (a cold `powershell.exe` at 21-29s, and every
+  classification is its own start-up);
+- the trust path is untouched, because `warm_signature_cache()` only seeds the
+  cache with verdicts the per-path probe would have produced. Both routes go
+  through one shared `_win_verdict()`, pinned equal across all six statuses. A
+  failed batch caches nothing and every path falls back; a row with no status is
+  a non-answer and is never cached.
+
+Proven positively on real Windows rather than inferred from a green run — which
+matters here, because the fail-soft design means a *broken* batch would have
+left every other check passing. Section 1b of the harness resolves six real
+System32 binaries and asserts the count, the caching, that the verdicts are real
+signature answers rather than defaults, and that batch and single-path agree:
+**6 of 6 in one start-up, all `os-signed`, identical to the single-path probe.**
+
+It is wired into all three Windows cost centres — processes, the persistence
+snapshot (two-phased so all five autostart sources share one resolve), and hot
+dirs. Deliberately not wired into the macOS sites (`codesign` is milliseconds
+and the prefetch is a Windows no-op) or the listener/outbound sites (a handful
+of paths, already behind resolvability guards).
+
+Final state: macOS **487 passed**, Windows **350 passed / 0 failed**, harness
+**`checks failed: 0`**, all five CI jobs green on `main`.
 
 ---
 
