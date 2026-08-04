@@ -1,3 +1,128 @@
+# Aegis — first real-Windows run (2026-08-04): CI + a live-hardware harness
+
+The cross-platform port shipped with one residual risk software could not close:
+**no line of the Windows code had ever executed on Windows.** The parsers were
+tested against captured real command output and `_snapshot_persistence_windows()`
+ran end-to-end only against an injected fake `winreg`. That caught structural
+defects. It could not catch anything that depends on what real Windows returns.
+
+This pass added CI (the repo had none) and a Windows-only live harness, then
+fixed everything the first real run exposed.
+
+## Why a fake registry was never going to be enough
+
+Two of the defects below were **invisible to the existing tests because those
+tests shared the bug's own assumption**:
+
+- the fake-registry fixture was built from the same Winlogon constant aegis
+  used, so it agreed with the typo and passed;
+- the process-table tests fed tab-separated fixtures straight to the parser and
+  never executed the PowerShell that was supposed to produce them.
+
+A simulation inherits the author's model of the system. Only the system itself
+disagrees.
+
+## What the harness executes (`tests/win_live_harness.py`)
+
+Opt-in via `AEGIS_WIN_LIVE=1`; it registers a real scheduled task and writes a
+real registry value, both under names it owns, both removed in `finally`. State
+is sandboxed into a throwaway `USERPROFILE` before `import aegis`; the registry
+and Task Scheduler deliberately are **not** sandboxed, because they are what is
+under test.
+
+Real `Get-AuthenticodeSignature` (including a tampered copy of a signed system
+binary) · real `Win32_Process` + `GetOwner` · a real enumeration of the real
+Run/Winlogon/Services hives · the full `schtasks` lifecycle: register → query →
+parse back out of real CSV → disable → delete → uninstall · the PowerShell
+probes' no-false-empty contract · two full scans · and `aegis.py report` with
+its stdout redirected to a pipe.
+
+## Defects found and fixed
+
+| # | Sev | Defect (proven on real Windows) | Before | After |
+|---|-----|--------------------------------|--------|-------|
+| W1 | **CRITICAL** | `write_report` opened `latest.md` in text mode with no encoding, so Python used the locale codec. On Windows that is cp1252, and every report line starts with a severity icon. `scan` found the threat, then **died with UnicodeEncodeError instead of reporting it**. | crash | 20 text-I/O sites pinned to UTF-8; `run()` decodes with `errors="replace"`; Windows stdout/stderr reconfigured (a scheduled task and `report > out.txt` both redirect, which is exactly where Python falls back to cp1252) |
+| W2 | **CRITICAL** | Winlogon read from `Software\Microsoft\Windows\CurrentVersion\Winlogon`. The real key is under **`Windows NT`**. `winreg` raised, `_reg_values` swallowed it, so the Shell/Userinit hijack check (T1547.004) inspected an empty set on every Windows host it ever ran on. | 0 values read | `_WIN_LOGON_KEY`, asserted to contain `Windows NT`; the fake-registry fixture now keys off the same constant so it can never re-encode the typo |
+| W3 | **CRITICAL** | `_WIN_PROC_PS` joined fields with a backtick-t inside a **single-quoted** PowerShell string, where backtick is not an escape. Every line came back as one field, every line failed the 4-field check: `_iter_processes()` yielded **zero processes, always** — no process surface, no argv scoring, no owner for listener attribution. | 0 processes | built with `[char]9` (which also avoids the double quotes CreateProcess argument quoting would mangle); pinned by a class guard — no PowerShell snippet may contain a backtick escape |
+| W4 | **HIGH** | A failed signature probe was indistinguishable from a verdict of "fine". A cold `Get-AuthenticodeSignature` measured **21.4s and 28.8s** on two separate runs, against a 30s ceiling; on timeout `_classify_windows` returned `trust="unknown"`, and `suspicious_sig("unknown")` is `False` — so a timed-out probe rendered every unsigned **and every tampered** binary un-suspicious, and cached it until the file's mtime changed. | tampered binary → `unknown` (not suspicious), cached | 90s timeout; a failed probe is marked, never cached, and counted into a `signature.classify` DEGRADED sensor entry so a clean report cannot be read as "nothing found" when it means "I could not check N of them" |
+| W5 | **HIGH** | `schtasks /query /fo csv /v` does not double the quotes inside its Task-To-Run column, so a conforming CSV reader returns `C:\p\x.exe" args"`. The program resolved to a path with a trailing quote: no trusted-prefix match, `sha256` None, trust `missing` — a task pointing at a real payload was scored against a path that does not exist. | `program` = `…pythonw.exe"`, severity `None` | `_win_strip_quotes` trims stray quotes; a quote is an illegal Windows filename character, so this cannot damage a legitimate path |
+
+## What the live run showed AFTER the fixes
+
+Captured from the harness on `windows-latest`, same evidence standard as the
+Linux siege — the before/after column is the same harness, two runs apart:
+
+| Check | Before | After |
+|---|---|---|
+| Real `winreg` Winlogon read | `FileNotFoundError [WinError 2]` | real `Shell`=`explorer.exe` and `Userinit`=`C:\Windows\system32\userinit.exe,` read and matched against `_WIN_LOGON_EXPECT` — **no false deviation on a healthy host** |
+| Persistence snapshot | 1 surface | **14 entries** across run-key, service, startup and task |
+| `_iter_processes()` | **0 processes** | **135 processes**; own PID present, `GetOwner` → `runneradmin`, `_same_owner` true, absolute exe path, real argv; 109 of 135 correctly outside the same-user response boundary |
+| Planted HKCU Run value | not reached | enumerated back out of the real registry with its program expanded from `%APPDATA%` |
+| Real scheduled task program | `…\pythonw.exe"` (stray quote) | `…\pythonw.exe` |
+| `schtasks` lifecycle | register/query/disable/delete/uninstall all correct | unchanged — the one surface that worked first time |
+| Defender/BitLocker posture, exclusions, WMI subscriptions, listeners | real values, no false-empty | unchanged |
+| Two full scans + `aegis.py report` into a pipe | rc 0, no storm, report written | unchanged |
+| Suite wall time | >45 min (job cancelled at the ceiling) | **14:12** |
+
+## Test-suite defects the same run exposed
+
+- `TestEventIncidentCore._rows` leaked its sqlite connection. `with
+  sqlite3.connect(...)` commits the transaction; it does **not** close the
+  connection. Invisible on POSIX (an open file can still be unlinked),
+  `WinError 32` on Windows.
+- `test_schema_is_idempotent_and_private` asserted mode `0o600` on the event DB.
+  Windows has no POSIX mode — `os.chmod` there only toggles the read-only bit —
+  so the assertion is now POSIX-scoped and states the Windows model (the
+  inherited `%USERPROFILE%` ACL, the same owner+administrators boundary `0o600`
+  leaves to root) instead of asserting a fiction.
+- `Sandbox` did not isolate Windows persistence. Every other live-host source is
+  pinned behind a path or a command, which suffices on POSIX because persistence
+  there is files; the registry, the service hive and Task Scheduler cannot be
+  redirected into a tmp dir, so sandboxed scans read the runner's real autostarts
+  and notified HIGH on them.
+- 20 POSIX-shaped cases (literal `/tmp` paths, setuid, cron, utmp sessions,
+  `sudo -u`/`caffeinate` wrappers, the `/private/tmp` firmlink pair) are now
+  skipped on Windows **only**, keyed by test name. They were deliberately *not*
+  added to the macOS-only class list, which would have silently deleted their
+  Linux coverage.
+
+## Measured cost of running on Windows
+
+Process spawning is far more expensive here than on POSIX, and on Windows every
+signature classification spawns a `powershell.exe`. That is the same cost that
+made W4 matter — a cold classification is *seconds*, not milliseconds — and in
+production it is bounded by the signature stat-cache exactly as `codesign` is on
+macOS.
+
+In the suite it was not bounded by anything, because signature classification
+was the last live-host source `Sandbox` did not pin: every persistence record
+classifies its program, so a few hundred fixture files became a few hundred
+PowerShell start-ups. Raising the probe timeout to 90s (required by W4) pushed
+that past the job ceiling and the Windows jobs were cancelled mid-run. Pinning
+`classify_signature` in the sandbox took the suite from **>45 min (cancelled) to
+14:12**. The pinned verdict is not a fiction: a plist/txt fixture is not a PE,
+real `Get-AuthenticodeSignature` answers `NotSupportedFileFormat`, and
+`_classify_windows` maps that to exactly `unsigned` — same verdict, no
+subprocess.
+
+## Residual risk
+
+- A GitHub-hosted `windows-latest` runner is a **real Windows kernel with a real
+  registry, real Task Scheduler, real PowerShell and real Authenticode**, which
+  is what the three named unknowns needed. It is **not** a domain-joined
+  workstation: the runner has Defender real-time protection and tamper
+  protection OFF, its Security event log is not readable by the harness's
+  principal (correctly reported DEGRADED, not silently empty), and no Group
+  Policy applies. Behaviour under an enterprise policy set remains unproven.
+- The signature-probe cost above means a first scan on a Windows machine with
+  many unknown binaries is slow. It self-heals via the cache, and the DEGRADED
+  sensor now makes a probe that never completes visible rather than silent —
+  but batching the classification into one PowerShell round-trip was
+  deliberately **not** attempted here: it touches the trust path, and this pass
+  had no measurement of the batched form to justify the risk.
+
+---
+
 # Aegis — Cross-platform port (2026-08-03): macOS + Linux + Windows
 
 Aegis became system-agnostic in this pass: one stdlib-only file that detects its

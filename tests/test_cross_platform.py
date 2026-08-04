@@ -1058,6 +1058,46 @@ class FoundOnRealWindows(unittest.TestCase):
         finally:
             aegis.run, aegis._SIG_PROBE_FAILURES = saved_run, saved_n
 
+    def test_an_answered_probe_with_no_valid_signature_is_unsigned(self):
+        # Real Get-AuthenticodeSignature answers UnknownError for a non-PE or
+        # corrupt image. That status was in no branch, so trust fell through to
+        # "unknown" -- which suspicious_sig() does NOT flag. A script renamed
+        # .exe, or a corrupt dropper, was therefore un-suspicious on Windows
+        # while macOS called the identical file unsigned. Verified against a
+        # real Windows box: a text file with an .exe extension came back
+        # "unknown", not "unsigned".
+        saved = aegis.run
+        try:
+            for status in ("UnknownError", "NotSupportedFileFormat",
+                           "SomeFutureStatus"):
+                aegis.run = lambda *a, _s=status, **k: (_s + "\n\n", "", 0)
+                got = aegis._classify_windows(r"C:\Users\x\payload.exe")
+                self.assertEqual("unsigned", got["trust"],
+                                 "status %r must not be trusted" % status)
+                self.assertFalse(got.get("probe_failed"),
+                                 "the probe answered; it did not fail")
+                self.assertTrue(aegis.suspicious_sig("unsigned"))
+        finally:
+            aegis.run = saved
+
+    def test_valid_and_tampered_statuses_still_map_correctly(self):
+        # Positive control: broadening the fall-through must not swallow the
+        # verdicts that carry the real signal.
+        saved = aegis.run
+        cases = {"Valid\nCN=Microsoft Windows, O=x\n": "os-signed",
+                 "Valid\nCN=Contoso Ltd, O=x\n": "signed-valid",
+                 "HashMismatch\nCN=Contoso Ltd\n": "broken",
+                 "NotTrusted\nCN=Contoso Ltd\n": "broken",
+                 "NotSigned\n\n": "unsigned"}
+        try:
+            for out, expected in cases.items():
+                aegis.run = lambda *a, _o=out, **k: (_o, "", 0)
+                self.assertEqual(
+                    expected,
+                    aegis._classify_windows(r"C:\x.exe")["trust"], out)
+        finally:
+            aegis.run = saved
+
     def test_a_failed_signature_probe_is_never_cached(self):
         # Caching the failure makes the fail-open DURABLE: the binary stays
         # un-suspicious until its mtime or size changes.

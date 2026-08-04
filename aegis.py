@@ -1556,7 +1556,20 @@ def _classify_windows(path):
         # Tampered-after-signing, or a signature chained to an untrusted root —
         # both are the Windows shape of a broken/forged identity.
         result["trust"] = "broken"
-    elif status == "NotSupportedFileFormat":
+    else:
+        # The probe ANSWERED (rc 0, output present) and the answer is not a
+        # valid signature: NotSupportedFileFormat for a non-PE, UnknownError
+        # for a corrupt or truncated image, or any status this table does not
+        # name. Every one of those means the same thing — the file carries no
+        # valid Authenticode signature — so it is `unsigned`, which
+        # suspicious_sig() flags.
+        #
+        # This used to fall through to `unknown`, which suspicious_sig() does
+        # NOT flag, so a payload that was not a well-formed PE (a script
+        # renamed .exe, a corrupt dropper) scored as un-suspicious on Windows
+        # while macOS correctly called the same file unsigned. `unknown` is now
+        # reserved for the one case that genuinely has no answer: a probe that
+        # failed, which returns above with probe_failed set.
         result["trust"] = "unsigned"
     if signer:
         m = re.search(r"CN=([^,]+)", signer)

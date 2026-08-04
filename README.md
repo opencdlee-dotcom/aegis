@@ -48,17 +48,43 @@ dismissals, risk accumulation, sensor health, the transactional quarantine store
 with its protected-path refusals, replay, and the heartbeat/dead-man's switch —
 is platform-independent and shared.
 
-**Verification status.** macOS and Linux are both exercised for real: the full
-suite runs natively on each, and the Linux sensors are additionally proven by a
-live in-container siege that plants real attacks (a systemd unit executing from
-`/tmp`, an XDG autostart entry, a live `curl|bash` process, a binary deleted
-while running, a setuid-root backdoor, an `ld.so.preload` rootkit write, a real
-non-loopback listener, an SSH brute-force log) and asserts each is caught at the
-right severity. **The Windows paths are unit-tested against captured real
-command output** (`schtasks /query /fo csv /v`, `netstat -ano`,
-`Get-MpComputerStatus`, `Get-WinEvent`) rather than executed on Windows — that
-is the honest limit of the current evidence, and it is stated here rather than
-implied away.
+**Verification status.** All three platforms run the full suite in CI
+(`.github/workflows/ci.yml`: Linux 3.9 + 3.12, macOS 3.12, Windows 3.9 + 3.12).
+
+*Linux* is additionally proven by a live in-container siege that plants real
+attacks (a systemd unit executing from `/tmp`, an XDG autostart entry, a live
+`curl|bash` process, a binary deleted while running, a setuid-root backdoor, an
+`ld.so.preload` rootkit write, a real non-loopback listener, an SSH brute-force
+log) and asserts each is caught at the right severity.
+
+*Windows* is no longer inference. `tests/win_live_harness.py` executes the
+Windows code against a real Windows kernel on every CI run: real
+`Get-AuthenticodeSignature` verdicts (including a tampered copy of an
+embedded-signed binary), real `Win32_Process` + `GetOwner` attribution, a real
+`winreg` enumeration of the real Run/Winlogon/Services hives, the full
+`schtasks` lifecycle (register → query → parse back out of real CSV → disable →
+delete → uninstall), the PowerShell probes' no-false-empty contract, and two
+full scans.
+
+That first real run mattered. Until it happened, **three Windows surfaces did
+not work at all** and nothing could show it: `scan` crashed with
+`UnicodeEncodeError` the moment it had anything to report (the report's severity
+icons are not representable in cp1252); the Winlogon hijack check read a key
+path that does not exist, so it inspected nothing; and the process sensor
+returned zero processes on every machine, because its PowerShell built its field
+separator with a backtick escape inside a single-quoted string. Two of those
+were invisible to the existing tests **because the tests shared the bug's own
+assumption** — the fake-registry fixture was built from the same wrong constant,
+and the parser tests fed tab-separated fixtures straight to the parser without
+ever running the PowerShell meant to produce them. A simulation inherits its
+author's model of the system; only the system disagrees. See BATTLE-LOG.md.
+
+What is still *not* proven: a GitHub-hosted runner is a real Windows kernel, but
+it is not a domain-joined workstation. Defender real-time and tamper protection
+are off there, the Security event log is not readable by the harness's principal
+(correctly reported DEGRADED rather than silently empty), and no Group Policy
+applies. Behaviour under an enterprise policy set remains untested, and that is
+stated here rather than implied away.
 
 ---
 
