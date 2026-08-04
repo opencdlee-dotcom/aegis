@@ -1175,6 +1175,159 @@ class FoundOnRealWindows(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
+    """The process enumeration failing must not read as 'nothing is running'.
+
+    Same rule the repo already enforces for sfltool/BTM and the Defender
+    probes, applied to the sensor the live run had just brought back from the
+    dead. The harness measured 41s for 135 processes against what was then a
+    60s ceiling, so this is a reachable failure, not a hypothetical one."""
+
+    def setUp(self):
+        self._saved = (aegis.run, aegis._PROC_ENUM_FAILED, aegis.IS_WIN,
+                       aegis.IS_MAC, aegis.IS_LINUX)
+        aegis._PROC_ENUM_FAILED = False
+
+    def tearDown(self):
+        (aegis.run, aegis._PROC_ENUM_FAILED, aegis.IS_WIN, aegis.IS_MAC,
+         aegis.IS_LINUX) = self._saved
+
+    def test_a_timed_out_windows_query_is_recorded_not_swallowed(self):
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
+        aegis.run = lambda *a, **k: ("", "timeout", 124)
+        self.assertEqual([], list(aegis._iter_processes()))
+        self.assertTrue(aegis._PROC_ENUM_FAILED,
+                        "an unanswered process table must be recorded so the "
+                        "scan can report DEGRADED coverage")
+
+    def test_a_timed_out_mac_ps_is_recorded_not_swallowed(self):
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = False, True, False
+        aegis.run = lambda *a, **k: ("", "timeout", 124)
+        self.assertEqual([], list(aegis._iter_processes()))
+        self.assertTrue(aegis._PROC_ENUM_FAILED)
+
+    def test_a_genuinely_empty_answer_is_not_a_failure(self):
+        # Positive control: rc 0 with no rows is a real (if odd) answer, and
+        # must NOT be reported as degraded coverage.
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
+        aegis.run = lambda *a, **k: ("1\tme\tC:\\W\\x.exe\tx.exe\n", "", 0)
+        self.assertEqual(1, len(list(aegis._iter_processes())))
+        self.assertFalse(aegis._PROC_ENUM_FAILED)
+
+
+class SignatureBatchPrefetch(unittest.TestCase):
+    """One PowerShell start-up for many binaries instead of one apiece.
+
+    A cold powershell.exe measured 21-29s on real Windows, so the count of
+    start-ups is the whole cost of a scan's signature work."""
+
+    def setUp(self):
+        self._saved = (aegis.run, aegis._sigcache, aegis.IS_WIN, aegis.IS_MAC,
+                       aegis.IS_LINUX, aegis._sig_stat)
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
+        aegis._sigcache = {}
+        aegis._sig_stat = lambda p: "stat:" + p
+
+    def tearDown(self):
+        (aegis.run, aegis._sigcache, aegis.IS_WIN, aegis.IS_MAC,
+         aegis.IS_LINUX, aegis._sig_stat) = self._saved
+
+    def _counting_run(self, reply):
+        calls = []
+
+        def _run(cmd, timeout=15, extra_env=None):
+            calls.append(extra_env or {})
+            return reply(extra_env or {})
+        return _run, calls
+
+    def test_many_paths_cost_one_powershell_start_up(self):
+        # Real files: classify_signature short-circuits a nonexistent path to
+        # `missing` before it ever consults the cache.
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="aegis_batch_")
+        try:
+            paths = []
+            for i in range(25):
+                p = os.path.join(tmp, "p%d.exe" % i)
+                with open(p, "wb") as fh:
+                    fh.write(b"MZ\x00\x00")
+                paths.append(p)
+
+            def reply(env):
+                return ("".join("%s\tNotSigned\t\n" % p
+                                for p in env["AEGIS_SIG_PATHS"].split("\n")),
+                        "", 0)
+            aegis.run, calls = self._counting_run(reply)
+
+            self.assertEqual(25, aegis.warm_signature_cache(paths))
+            self.assertEqual(
+                1, len(calls),
+                "25 binaries must cost ONE PowerShell start-up, not 25")
+
+            # ...and every path now answers from cache: still one call total.
+            for p in paths:
+                self.assertEqual("unsigned",
+                                 aegis.classify_signature(p)["trust"])
+            self.assertEqual(1, len(calls),
+                             "classify_signature must hit the warmed cache")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_batch_agrees_with_the_single_path_probe(self):
+        # Both must route through _win_verdict; a divergence here would mean
+        # the fast path and the careful path disagree about what a status means.
+        for status, signer, expected in (
+                ("Valid", "CN=Microsoft Windows, O=x", "os-signed"),
+                ("Valid", "CN=Contoso Ltd, O=x", "signed-valid"),
+                ("HashMismatch", "CN=Contoso Ltd", "broken"),
+                ("NotTrusted", "CN=Contoso Ltd", "broken"),
+                ("NotSigned", "", "unsigned"),
+                ("UnknownError", "", "unsigned")):
+            aegis._sigcache = {}
+            path = "C:\\Users\\a\\one.exe"
+            aegis.run = lambda *a, _s=status, _g=signer, **k: (
+                "%s\t%s\t%s\n" % (path, _s, _g), "", 0)
+            aegis.warm_signature_cache([path])
+            batched = aegis._sigcache[path]["result"]
+
+            aegis.run = lambda *a, _s=status, _g=signer, **k: (
+                "%s\n%s\n" % (_s, _g), "", 0)
+            single = aegis._classify_windows(path)
+            self.assertEqual(single, batched,
+                             "batch and single-path verdicts diverged for %r"
+                             % status)
+            self.assertEqual(expected, batched["trust"])
+
+    def test_a_failed_batch_changes_no_verdict(self):
+        # The prefetch is an optimization. If PowerShell refuses, nothing may
+        # be cached and nothing may be decided -- the per-path probe still runs.
+        aegis.run = lambda *a, **k: ("", "blocked", 1)
+        self.assertEqual(0, aegis.warm_signature_cache(["C:\\a\\x.exe"]))
+        self.assertEqual({}, aegis._sigcache,
+                         "a failed prefetch must invent no verdicts")
+
+    def test_a_path_the_batch_skipped_is_never_cached(self):
+        # A row with no status is a non-answer; caching it would be the
+        # fail-open the single-path probe is careful to avoid.
+        aegis.run = lambda *a, **k: ("C:\\a\\x.exe\t\t\n", "", 0)
+        self.assertEqual(0, aegis.warm_signature_cache(["C:\\a\\x.exe"]))
+        self.assertEqual({}, aegis._sigcache)
+
+    def test_already_cached_paths_are_not_re_probed(self):
+        aegis._sigcache = {"C:\\a\\x.exe": {"stat": "stat:C:\\a\\x.exe",
+                                            "result": {"trust": "os-signed"}}}
+        aegis.run, calls = self._counting_run(lambda env: ("", "", 0))
+        self.assertEqual(0, aegis.warm_signature_cache(["C:\\a\\x.exe"]))
+        self.assertEqual([], calls, "a warm cache must cost no subprocess")
+
+    def test_prefetch_is_a_no_op_off_windows(self):
+        aegis.IS_WIN, aegis.IS_LINUX = False, True
+        aegis.run, calls = self._counting_run(lambda env: ("", "", 0))
+        self.assertEqual(0, aegis.warm_signature_cache(["/usr/bin/x"]))
+        self.assertEqual([], calls)
+
+
 class TextEncodingIsPinned(unittest.TestCase):
     _SOURCE = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "aegis.py")

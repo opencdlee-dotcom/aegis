@@ -1175,6 +1175,18 @@ def sha256(path):
         return None
 
 
+def _is_trusted_prefix(path):
+    """Does `path` live under a vouched-for system tree? Windows compares
+    case-insensitively (its filesystem does); POSIX does not."""
+    if not path:
+        return False
+    if IS_WIN:
+        norm = os.path.normcase(path)
+        return any(norm.startswith(os.path.normcase(p))
+                   for p in TRUSTED_PREFIXES)
+    return any(path.startswith(p) for p in TRUSTED_PREFIXES)
+
+
 def is_risky_location(path):
     if not path:
         return False
@@ -1545,8 +1557,15 @@ def _classify_windows(path):
         result["probe_failed"] = True
         return result
     lines = out.splitlines()
-    status = lines[0].strip() if lines else ""
-    signer = lines[1].strip() if len(lines) > 1 else ""
+    return _win_verdict(lines[0].strip() if lines else "",
+                        lines[1].strip() if len(lines) > 1 else "")
+
+
+def _win_verdict(status, signer):
+    """Authenticode (status, signer subject) -> the {trust, team, authority}
+    record. Shared by the single-path probe and the batch prefetch so the two
+    can never drift into disagreeing about what a status means."""
+    result = {"trust": "unknown", "team": None, "authority": None}
     if status == "Valid":
         result["trust"] = ("os-signed" if "Microsoft Windows" in signer
                            else "signed-valid")
@@ -1569,12 +1588,85 @@ def _classify_windows(path):
         # renamed .exe, a corrupt dropper) scored as un-suspicious on Windows
         # while macOS correctly called the same file unsigned. `unknown` is now
         # reserved for the one case that genuinely has no answer: a probe that
-        # failed, which returns above with probe_failed set.
+        # failed, which returns with probe_failed set.
         result["trust"] = "unsigned"
     if signer:
         m = re.search(r"CN=([^,]+)", signer)
         result["authority"] = m.group(1).strip() if m else signer
     return result
+
+
+# One PowerShell round-trip for MANY paths. Paths ride in an env var (the same
+# injection-safe channel the single-path probe uses) separated by newlines,
+# which no Windows filename may contain. [char]10 / [char]9 rather than backtick
+# escapes -- see _WIN_PROC_PS for why a backtick inside a single-quoted string
+# is not an escape.
+_WIN_SIG_BATCH_PS = (
+    "$nl=[char]10;$t=[char]9;"
+    "foreach($p in ($env:AEGIS_SIG_PATHS -split $nl)){"
+    "if(-not $p){continue};"
+    "$s=Get-AuthenticodeSignature -LiteralPath $p -ErrorAction SilentlyContinue;"
+    "$st='';$sub='';"
+    "if($s){$st=[string]$s.Status;if($s.SignerCertificate)"
+    "{$sub=[string]$s.SignerCertificate.Subject}};"
+    "(($p),($st),($sub)) -join $t}")
+
+
+def warm_signature_cache(paths):
+    """Classify many paths in ONE PowerShell start-up and seed the cache.
+
+    Purely an optimization: every verdict it stores is the one the per-path
+    probe would have produced (both go through _win_verdict), and anything it
+    misses or fails on is simply classified individually later. A cold
+    powershell.exe was measured at 21-29s on a real machine, so paying that once
+    per scan instead of once per binary is the difference between a scan and a
+    coffee break. Returns the number of paths it resolved.
+
+    Non-Windows platforms have cheap local classifiers (codesign, dpkg) and no
+    start-up cost worth amortizing, so this is a no-op there."""
+    global _sigcache
+    if not IS_WIN or not paths:
+        return 0
+    if _sigcache is None:
+        _sigcache = load_json(SIGCACHE, {})
+
+    pending = {}
+    for p in paths:
+        if not p or p in pending:
+            continue
+        stat_sig = _sig_stat(p)
+        if stat_sig is None:
+            continue  # missing/unreadable — classify_signature reports it
+        cached = _sigcache.get(p)
+        if cached and cached.get("stat") == stat_sig:
+            continue  # already known and still current
+        pending[p] = stat_sig
+    if not pending:
+        return 0
+
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_SIG_BATCH_PS], timeout=300,
+                     extra_env={"AEGIS_SIG_PATHS": "\n".join(pending)})
+    if rc != 0 or not out:
+        return 0  # fall back to per-path probes; no verdict is invented here
+
+    resolved = 0
+    for line in out.splitlines():
+        parts = line.rstrip("\r").split("\t")
+        if len(parts) < 2:
+            continue
+        path, status = parts[0].strip(), parts[1].strip()
+        signer = parts[2].strip() if len(parts) > 2 else ""
+        stat_sig = pending.get(path)
+        if stat_sig is None or not status:
+            # No status means the cmdlet said nothing about this path — a
+            # non-answer, and non-answers are never cached.
+            continue
+        _sigcache.pop(path, None)
+        _sigcache[path] = {"stat": stat_sig,
+                           "result": _win_verdict(status, signer)}
+        resolved += 1
+    return resolved
 
 
 def _classify_mac(path):
@@ -3583,6 +3675,11 @@ def _typosquats_apple_daemon(name):
 
 # One PowerShell round-trip yields pid/uid-equivalent/exe/argv for every visible
 # process (tasklist gives no command line, and WMIC is deprecated/removed).
+# Set when the process enumeration could not answer this scan. Read by cmd_scan,
+# which turns it into a DEGRADED sensor entry -- an unanswered process table must
+# never be reported as an empty one.
+_PROC_ENUM_FAILED = False
+
 # The separator is built with [char]9 rather than written as a backtick escape.
 # PowerShell only honours backtick escapes inside DOUBLE-quoted strings, so the
 # `t in a single-quoted format string was emitted LITERALLY -- every line came
@@ -3607,6 +3704,7 @@ def _iter_processes():
       windows: one CIM query
     `owner` is the uid string (posix) or DOMAIN\\user (Windows); callers compare
     it against _own_owner() to enforce the same-user boundary."""
+    global _PROC_ENUM_FAILED
     if IS_LINUX:
         try:
             pids = [d for d in os.listdir("/proc") if d.isdigit()]
@@ -3637,9 +3735,20 @@ def _iter_processes():
             yield pid, uid, exe, (argv or exe)
         return
     if IS_WIN:
+        # 180s, not 60s: one CIM query plus a GetOwner round-trip per process
+        # was measured at 41s for 135 processes on an idle machine. A busier or
+        # slower box blows a 60s ceiling, and the failure mode below is why
+        # that matters.
         out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive",
-                          "-Command", _WIN_PROC_PS], timeout=60)
+                          "-Command", _WIN_PROC_PS], timeout=180)
         if rc != 0 or not out:
+            # An empty process table is not a fact about this machine, it is
+            # the absence of one -- and "no processes" reads downstream as
+            # "nothing suspicious is running". Exactly the false-empty this
+            # repo already refuses for sfltool/BTM and the Defender probes.
+            # Record it so the scan reports DEGRADED coverage instead of a
+            # clean bill of health for a sensor that never answered.
+            _PROC_ENUM_FAILED = True
             return
         for line in out.splitlines():
             parts = line.rstrip("\r").split("\t")
@@ -3652,6 +3761,7 @@ def _iter_processes():
         return
     out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
     if rc != 0:
+        _PROC_ENUM_FAILED = True  # same rule on mac: no answer != no processes
         return
     for line in out.splitlines():
         parts = line.split(None, 2)
@@ -3726,7 +3836,14 @@ def _exec_alert(path, trust):
 def check_processes():
     findings = []
     seen_paths = set()
-    for _pid, _owner, comm, _argv in _iter_processes():
+    procs = list(_iter_processes())
+    # Resolve every signature this pass needs in one PowerShell start-up rather
+    # than one per binary (Windows only; a no-op elsewhere). Best-effort: any
+    # path it does not resolve is classified individually below exactly as
+    # before, so a failed prefetch costs speed and never changes a verdict.
+    warm_signature_cache([c for _p, _o, c, _a in procs
+                          if c and not _is_trusted_prefix(c)])
+    for _pid, _owner, comm, _argv in procs:
         if not comm:
             continue
         if IS_WIN:
@@ -3734,11 +3851,7 @@ def check_processes():
                 continue
         elif not comm.startswith("/"):
             continue
-        if IS_WIN:
-            norm = os.path.normcase(comm)
-            if any(norm.startswith(os.path.normcase(p)) for p in TRUSTED_PREFIXES):
-                continue
-        elif any(comm.startswith(p) for p in TRUSTED_PREFIXES):
+        if _is_trusted_prefix(comm):
             continue
         if comm in seen_paths:
             continue
@@ -7191,9 +7304,11 @@ def cmd_scan(quiet=False):
 
 
 def _cmd_scan_locked(quiet=False):
-    global _SIG_PROBE_FAILURES
+    global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED
     ensure_state()
-    _SIG_PROBE_FAILURES = 0  # per-scan; a stale count would mislead every later run
+    # per-scan; a stale count or flag would mislead every later run
+    _SIG_PROBE_FAILURES = 0
+    _PROC_ENUM_FAILED = False
     health = []
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
@@ -7251,6 +7366,13 @@ def _cmd_scan_locked(quiet=False):
     # Re-sort: surface findings (and any corrupt-baseline finding) were appended
     # after gather_all's sort.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
+
+    if _PROC_ENUM_FAILED:
+        health.append({
+            "sensor_id": "process.enumerate", "status": "DEGRADED",
+            "detail": "the process table could not be read this scan; no "
+                      "process or behavioural finding below is complete",
+            "duration_ms": 0, "item_count": 0})
 
     if _SIG_PROBE_FAILURES:
         # Never silent: an operator reading a clean report must be able to tell

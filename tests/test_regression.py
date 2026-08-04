@@ -27,6 +27,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
 
 
+# Cross-platform stand-ins for the POSIX one-liners this fixture used to shell
+# to. `python -c` exists wherever the suite runs; /usr/bin/true and /bin/echo do
+# not exist on Windows, where they silently became "command not found" instead
+# of the successful-but-empty result the stubs are meant to model.
+_NOOP_CMD = [sys.executable, "-c", ""]
+
+
+def _ECHO_CMD(text):
+    return [sys.executable, "-c", "print(%r)" % text]
+
+
 class Sandbox(unittest.TestCase):
     """Base: redirect all aegis state/scan surfaces into a throwaway tmp dir."""
 
@@ -64,8 +75,13 @@ class Sandbox(unittest.TestCase):
             "AEGIS_CONFIG": os.path.join(self.state, "config.json"),
             "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
             "AGENT_SKILL_ROOTS": [],
-            "NETSTAT_CMD": ["/usr/bin/true"],  # rc 0, empty → no outbound findings
-            "WHO_CMD": ["/usr/bin/true"],       # rc 0, empty → no remote sessions
+            # _NOOP_CMD, not /usr/bin/true: on Windows that path does not
+            # exist, so these "rc 0, empty" stubs actually returned rc 127
+            # and the surface was skipped as DEGRADED instead of adopting an
+            # empty snapshot. Same test outcome by a different mechanism,
+            # which is exactly the kind of accident that hides a real one.
+            "NETSTAT_CMD": _NOOP_CMD,   # rc 0, empty → no outbound findings
+            "WHO_CMD": _NOOP_CMD,       # rc 0, empty → no remote sessions
             "XPDB_PATH": os.path.join(self.state, "XPdb-absent"),
             "PERSISTENCE_DIRS": [self.pers],
             "HOT_DIRS": [self.hot],
@@ -99,12 +115,12 @@ class Sandbox(unittest.TestCase):
             # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
             # tests are deterministic; listener tests call the parse/diff
             # helpers directly on fixture data.
-            "LSOF_LISTEN_CMD": ["/usr/bin/true"],
+            "LSOF_LISTEN_CMD": _NOOP_CMD,
             # BTM shells to the SLOW real sfltool dumpbtm (~12s, can wedge >60s
             # under load). Point it at echo → rc 0, non-empty, parses to {} so
             # the surface adopts empty deterministically and fast; BTM-specific
             # tests patch SURFACES / call helpers directly.
-            "BTM_DUMP_CMD": ["/bin/echo", "no items"],
+            "BTM_DUMP_CMD": _ECHO_CMD("no items"),
             "_sigcache": {},
         }
         if hasattr(aegis, "HOSTS_FILE"):
