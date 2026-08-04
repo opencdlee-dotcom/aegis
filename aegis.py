@@ -7292,6 +7292,120 @@ def _benign_note_for(item):
     return notes
 
 
+# --------------------------------------------------------------------------- #
+# MITRE ATT&CK technique attribution — read-time only, never a detection input.
+#
+# Every ID here is either already cited in a comment next to the rule it
+# describes (grep the file for its number) or drawn straight from
+# attack.mitre.org. `aegis.py attck` classifies STORED findings after the
+# fact using fields every finding already carries (category, markers,
+# fingerprint prefix, path) — it never touches a finding() call site, so
+# detection logic, severity and fingerprints are provably unaffected by
+# adding coverage reporting.
+# --------------------------------------------------------------------------- #
+ATTCK_TECHNIQUES = {
+    "T1003": "OS Credential Dumping",
+    "T1014": "Rootkit",
+    "T1036.005": "Masquerading: Match Legitimate Name or Location",
+    "T1053.003": "Scheduled Task/Job: Cron",
+    "T1053.005": "Scheduled Task/Job: Scheduled Task",
+    "T1070.004": "Indicator Removal: File Deletion",
+    "T1070.006": "Indicator Removal: Timestomp",
+    "T1098.004": "Account Manipulation: SSH Authorized Keys",
+    "T1218": "System Binary Proxy Execution",
+    "T1543.001": "Create or Modify System Process: Launch Agent",
+    "T1543.002": "Create or Modify System Process: Systemd Service",
+    "T1543.003": "Create or Modify System Process: Windows Service",
+    "T1543.004": "Create or Modify System Process: Launch Daemon",
+    "T1546.003": "Event Triggered Execution: WMI Event Subscription",
+    "T1546.004": "Event Triggered Execution: Unix Shell Configuration Modification",
+    "T1546.013": "Event Triggered Execution: PowerShell Profile",
+    "T1547.001": "Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder",
+    "T1547.004": "Boot or Logon Autostart Execution: Winlogon Helper DLL",
+    "T1547.006": "Boot or Logon Autostart Execution: Kernel Modules and Extensions",
+    "T1547.013": "Boot or Logon Autostart Execution: XDG Autostart Entries",
+    "T1548.001": "Abuse Elevation Control Mechanism: Setuid and Setgid",
+    "T1556": "Modify Authentication Process",
+    "T1562.001": "Impair Defenses: Disable or Modify Tools",
+    "T1574.006": "Hijack Execution Flow: Dynamic Linker Hijacking",
+}
+
+# Idiom name (as recorded in a finding's `markers`) -> technique(s). Precise:
+# each marker name is only ever set by the one rule that means exactly this.
+_MARKER_TECHNIQUES = {
+    "windows-lolbin-proxy-exec": ("T1218",),
+    "defender-tamper": ("T1562.001",),
+    "amsi-bypass": ("T1562.001",),
+    "sam-hive-dump": ("T1003",),
+    "lsass-dump": ("T1003",),
+    "ld-preload-injection": ("T1574.006",),
+    "kernel-module": ("T1014", "T1547.006"),
+    "defender-exclusion": ("T1562.001",),
+    "timestomp": ("T1070.006",),
+    "name-masquerade": ("T1036.005",),
+}
+
+# category -> technique(s), restricted to categories with exactly ONE meaning.
+# The shared "persistence"/"xpersist" buckets hold several techniques each and
+# are resolved by fingerprint prefix + path/platform in _finding_techniques
+# instead, since the technique depends on WHICH autostart surface fired.
+_CATEGORY_TECHNIQUES = {
+    "wmi": ("T1546.003",),
+    "suid": ("T1548.001",),
+    "self-protection": ("T1562.001",),
+    "kernel-module": ("T1014", "T1547.006"),
+    "defender": ("T1562.001",),
+}
+
+
+def _finding_techniques(f):
+    """Best-effort ATT&CK technique IDs for a stored finding. Layered by
+    specificity: an idiom marker names an exact rule; a category is used only
+    where it maps to one technique; the shared persistence buckets need the
+    fingerprint prefix + path (which surface fired, on which platform) to
+    tell a launchd plist from a Registry Run key from a systemd unit. Returns
+    () rather than guess when nothing matches — an honest gap outranks a
+    wrong label."""
+    out = set()
+    category = f.get("category") or ""
+    for m in f.get("markers") or ():
+        out.update(_MARKER_TECHNIQUES.get(m, ()))
+    out.update(_CATEGORY_TECHNIQUES.get(category, ()))
+    if category == "shell-init":
+        out.add("T1546.013" if IS_WIN else "T1546.004")
+    elif category == "process" and "no longer exists on disk" in (f.get("detail") or ""):
+        out.add("T1070.004")
+    fp = f.get("fingerprint") or ""
+    path = f.get("path") or ""
+    if fp.startswith("cron:"):
+        out.add("T1053.003")
+    elif fp.startswith("xpersist:"):
+        if "authorized_keys" in path:
+            out.add("T1098.004")
+        elif "ld.so.preload" in path or "LD_PRELOAD" in path:
+            out.add("T1574.006")
+        elif "/pam.d/" in path or "sudoers.d" in path:
+            out.add("T1556")
+    elif fp.startswith(("persistence:new:", "persistence:changed:")):
+        if IS_MAC:
+            out.add("T1543.004" if "LaunchDaemons" in path else "T1543.001")
+        elif IS_LINUX:
+            if "/autostart/" in path:
+                out.add("T1547.013")
+            elif "/systemd/" in path or path.endswith(".service"):
+                out.add("T1543.002")
+        elif IS_WIN:
+            if path.startswith(("HKCU\\", "HKLM\\")) and "\\Winlogon\\" in path:
+                out.add("T1547.004")
+            elif path.startswith(("HKCU\\", "HKLM\\", "startup:")):
+                out.add("T1547.001")
+            elif path.startswith("task:"):
+                out.add("T1053.005")
+            elif path.startswith("service:"):
+                out.add("T1543.003")
+    return tuple(sorted(out))
+
+
 def cmd_incident(incident_id, action=None, reason=None):
     try:
         incident_id = int(incident_id)
@@ -7418,6 +7532,60 @@ def cmd_replay(days=30):
         print("\n  false-positive → the rule is wrong; tune or retire it."
               "\n  benign-positive → the rule works; the activity was authorized.")
     print("\nReplay is read-only: no incident was created and nothing was notified.")
+    return 0
+
+
+def cmd_attck(days=180):
+    """ATT&CK technique coverage over recorded findings: for every technique
+    Aegis has detection logic for, whether it has actually fired on this
+    machine within the window (and when), or is wired but quiet. Same
+    read-only event-store query shape as cmd_replay — opens no incident,
+    sends no notification, mutates nothing."""
+    ensure_state()
+    init_event_store()
+    now = _epoch()
+    since = now - int(days) * 86400
+    db = _event_connection()
+    try:
+        rows = db.execute(
+            "SELECT data_json, observed_at FROM events "
+            "WHERE event_type='observation.finding' AND observed_at>=? "
+            "ORDER BY observed_at", (since,)).fetchall()
+    finally:
+        db.close()
+    seen = {}  # technique -> (count, last_seen_epoch)
+    unmapped = 0
+    for row in rows:
+        try:
+            f = json.loads(row["data_json"])
+        except Exception:
+            continue
+        techniques = _finding_techniques(f)
+        if not techniques:
+            unmapped += 1
+            continue
+        for t in techniques:
+            count, last = seen.get(t, (0, 0))
+            seen[t] = (count + 1, max(last, row["observed_at"]))
+    print("# Aegis ATT&CK coverage — last %s days, %d recorded finding event%s\n"
+          % (days, len(rows), "" if len(rows) == 1 else "s"))
+    observed = [t for t in ATTCK_TECHNIQUES if t in seen]
+    quiet = [t for t in ATTCK_TECHNIQUES if t not in seen]
+    print("Observed on this machine (%d):" % len(observed))
+    for t in sorted(observed, key=lambda t: -seen[t][0]):
+        count, last = seen[t]
+        print("  %-12s %-62s %3d hit%-1s last %s" % (
+            t, ATTCK_TECHNIQUES[t][:62], count, "" if count == 1 else "s",
+            datetime.fromtimestamp(last).strftime("%Y-%m-%d")))
+    print("\nWired but quiet in this window (%d):" % len(quiet))
+    for t in sorted(quiet):
+        print("  %-12s %s" % (t, ATTCK_TECHNIQUES[t]))
+    if unmapped:
+        print("\n%d recorded finding%s did not classify to a single technique "
+              "(sensors with no 1:1 technique mapping, e.g. hot-dir drops, "
+              "XProtect harvest, canaries, hardening posture) — not counted "
+              "above, not a coverage gap." % (unmapped, "" if unmapped == 1 else "s"))
+    print("\nRead-only: no incident opened, nothing notified.")
     return 0
 
 
@@ -9378,6 +9546,8 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   replay [days]    backtest the CURRENT correlation logic against recorded
                    history (default 30d). Read-only: opens no incident, sends
                    no notification — run it after changing detection logic
+  attck [days]     ATT&CK technique coverage: what's wired, what's actually
+                   fired on this machine (default 180d). Read-only.
   baseline         reset the known-good persistence baseline to current state
   allow <path>     suppress future alerts for findings matching <path>
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
@@ -9435,6 +9605,13 @@ def main(argv):
             print("usage: aegis.py replay [days]")
             return 1
         return cmd_replay(days)
+    if cmd == "attck":
+        try:
+            days = int(argv[2]) if len(argv) > 2 else 180
+        except ValueError:
+            print("usage: aegis.py attck [days]")
+            return 1
+        return cmd_attck(days)
     if cmd == "baseline":
         return cmd_baseline()
     if cmd == "baseline-unverified":  # installer-only: adopt, never bless

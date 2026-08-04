@@ -12,6 +12,8 @@ syspolicy-deny harvest (#3), timestomp (#8), residual-ASEP coverage (#9),
 confidence axis + routing gate + risk accumulator (#2), and the Bastion/XPdb
 opt-in tier (#10).
 """
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -361,6 +363,85 @@ class TestBastion(Sandbox):
     def test_bastion_cmd_absent_db_returns_2(self):
         aegis.XPDB_PATH = os.path.join(self.tmp, "no-such-xpdb")
         self.assertEqual(aegis.cmd_bastion(), 2)
+
+
+# --------------------------------------------------------------------------- #
+# #11 — ATT&CK technique coverage (aegis.py attck)
+# --------------------------------------------------------------------------- #
+class TestAttckCoverage(Sandbox):
+    def test_marker_based_attribution(self):
+        f = aegis.finding("HIGH", "behavior", "x", "d", "fp1",
+                          markers=["defender-tamper"])
+        self.assertEqual(aegis._finding_techniques(f), ("T1562.001",))
+
+    def test_kernel_module_marker_maps_two_techniques(self):
+        f = aegis.finding("HIGH", "kernel-module", "x", "d", "fp2",
+                          markers=["kernel-module"])
+        self.assertEqual(aegis._finding_techniques(f), ("T1014", "T1547.006"))
+
+    def test_category_only_attribution(self):
+        f = aegis.finding("HIGH", "suid", "x", "d", "fp3")
+        self.assertEqual(aegis._finding_techniques(f), ("T1548.001",))
+
+    def test_shell_init_platform_branch(self):
+        f = aegis.finding("HIGH", "shell-init", "x", "d", "fp4")
+        expect = "T1546.013" if aegis.IS_WIN else "T1546.004"
+        self.assertEqual(aegis._finding_techniques(f), (expect,))
+
+    def test_cron_fingerprint_prefix(self):
+        f = aegis.finding("MEDIUM", "persistence", "x", "d", "cron:user:abc")
+        self.assertEqual(aegis._finding_techniques(f), ("T1053.003",))
+
+    def test_xpersist_authorized_keys(self):
+        f = aegis.finding("HIGH", "persistence", "x", "d", "xpersist:new:p:h",
+                          path=os.path.join(self.tmp, ".ssh", "authorized_keys"))
+        self.assertEqual(aegis._finding_techniques(f), ("T1098.004",))
+
+    def test_xpersist_ld_preload(self):
+        f = aegis.finding("HIGH", "persistence", "x", "d", "xpersist:new:p:h",
+                          path="/etc/ld.so.preload")
+        self.assertEqual(aegis._finding_techniques(f), ("T1574.006",))
+
+    def test_process_deleted_while_running(self):
+        f = aegis.finding(
+            "HIGH", "process", "x",
+            "/tmp/x (adhoc) is running but its executable no longer exists "
+            "on disk (deleted-while-running / memfd exec)", "process:x")
+        self.assertEqual(aegis._finding_techniques(f), ("T1070.004",))
+
+    def test_name_masquerade_marker(self):
+        f = aegis.finding("HIGH", "process", "x", "d", "process:typosquat:x",
+                          markers=["name-masquerade"])
+        self.assertEqual(aegis._finding_techniques(f), ("T1036.005",))
+
+    def test_unmapped_returns_empty(self):
+        f = aegis.finding("MEDIUM", "hot-dir", "x", "d", "hotdir:x")
+        self.assertEqual(aegis._finding_techniques(f), ())
+
+    def _attck_output(self, days=180):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            rc = aegis.cmd_attck(days)
+        return buf.getvalue(), rc
+
+    def test_cmd_attck_reports_observed_and_quiet(self):
+        f = aegis.finding("HIGH", "suid", "New setuid-root binary", "d",
+                          "suid:new:/tmp/x")
+        aegis.record_security_state([f], now=int(time.time()))
+        out, rc = self._attck_output()
+        self.assertEqual(rc, 0)
+        self.assertIn("T1548.001", out)
+        self.assertIn("1 hit", out)
+        # A technique nothing fired for in this run is reported "wired but
+        # quiet", not silently omitted — the point of a coverage report.
+        self.assertIn("T1053.003", out)
+        self.assertIn("Wired but quiet", out)
+
+    def test_cmd_attck_counts_unmapped_separately(self):
+        f = aegis.finding("MEDIUM", "hot-dir", "Unsigned executable", "d",
+                          "hotdir:/tmp/x")
+        aegis.record_security_state([f], now=int(time.time()))
+        out, _ = self._attck_output()
+        self.assertIn("did not classify to a single technique", out)
 
 
 if __name__ == "__main__":
