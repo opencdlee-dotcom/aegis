@@ -157,6 +157,18 @@ PLATFORM = "mac" if IS_MAC else ("windows" if IS_WIN else "linux")
 if IS_WIN:
     import msvcrt  # file locking (fcntl has no Windows port)
     fcntl = None
+    # Every report line carries a severity icon, and findings quote real paths.
+    # A Windows console is UTF-16 under the hood, but the moment stdout is a
+    # pipe or a file Python falls back to the ANSI codepage (cp1252), where a
+    # single icon raises UnicodeEncodeError and takes the whole command with it.
+    # `aegis.py report > out.txt` and any scheduled-task run land in exactly
+    # that case, so pin the streams instead of hoping the console is attached.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # pragma: no cover - already-wrapped stream
+            pass
+    del _stream
 else:
     import fcntl
     msvcrt = None
@@ -958,7 +970,7 @@ def ensure_state():
 
 def load_json(path, default):
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -1029,7 +1041,7 @@ def save_json(path, obj):
     tmp = "%s.tmp.%d.%d" % (path, os.getpid(), time.time_ns())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = -1
             json.dump(obj, f, indent=2, sort_keys=True)
             f.flush()
@@ -1133,7 +1145,14 @@ def run(cmd, timeout=15, extra_env=None):
         if extra_env:
             safe_env.update(extra_env)
         p = subprocess.run(
-            _trusted_command(cmd), capture_output=True, text=True, timeout=timeout,
+            # errors="replace": a single undecodable byte in a tool's output
+            # (a non-ANSI filename in `schtasks`, an accented user in `who`)
+            # must never raise mid-scan and blank out the whole surface. The
+            # codec itself stays the platform default, because that IS what the
+            # system tools emit -- guessing utf-8 here would corrupt legitimate
+            # ANSI/OEM output rather than fix anything.
+            _trusted_command(cmd), capture_output=True, text=True,
+            errors="replace", timeout=timeout,
             check=False, env=safe_env
         )
         return p.stdout, p.stderr, p.returncode
@@ -1220,7 +1239,7 @@ def log_run(msg):
     try:
         ensure_state()
         _rotate_log(RUN_LOG)
-        with open(RUN_LOG, "a") as f:
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
             f.write("%s  %s\n" % (now_iso(), redact_sensitive(msg)))
         os.chmod(RUN_LOG, 0o600)
     except Exception:
@@ -4439,7 +4458,7 @@ def check_supply_chain():
     cutoff = time.time() - _PKG_MAX_AGE_DAYS * 86400
     for mani, mtime in _iter_package_manifests(cutoff):
         try:
-            with open(mani, "r", errors="replace") as fh:
+            with open(mani, "r", encoding="utf-8", errors="replace") as fh:
                 data = json.load(fh)
         except Exception:
             continue
@@ -4494,7 +4513,7 @@ def _sensitive_host(domain):
 
 def check_web_protection():
     try:
-        with open(HOSTS_FILE, "r", errors="replace") as f:
+        with open(HOSTS_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = f
             blocked = set()
             suspicious = set()
@@ -4866,7 +4885,7 @@ def _check_hardening_mac():
 
 def _read_text(path, limit=512 * 1024):
     try:
-        with open(path, "r", errors="replace") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read(limit)
     except Exception:
         return None
@@ -5023,7 +5042,7 @@ def diff_extra_persistence(prior, cur):
 # --- browser extensions -------------------------------------------------------
 def _manifest_name(mf):
     try:
-        with open(mf, "r", errors="replace") as f:
+        with open(mf, "r", encoding="utf-8", errors="replace") as f:
             name = json.load(f).get("name")
         if isinstance(name, str) and not name.startswith("__MSG_"):
             return name
@@ -6964,7 +6983,7 @@ def write_report(findings, first_run, incidents=None, sensor_health=None):
             lines.append("- %s **%s** — %s" % (
                 SEV_ICON[f["severity"]], f["title"], f["detail"]))
     md = "\n".join(lines) + "\n"
-    with open(LATEST_MD, "w") as f:
+    with open(LATEST_MD, "w", encoding="utf-8") as f:
         f.write(md)
     save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings})
     return md
@@ -6995,7 +7014,7 @@ def emit(findings, first_run, adopt=frozenset()):
     allow = set(load_json(ALLOWLIST, []))
     new_high = []
     _rotate_log(FINDINGS_LOG)
-    with open(FINDINGS_LOG, "a") as log:
+    with open(FINDINGS_LOG, "a", encoding="utf-8") as log:
         for f in findings:
             fp = f["fingerprint"]
             if fp in allow:
@@ -7045,7 +7064,7 @@ def load_baseline():
     if not os.path.exists(BASELINE):
         return None, False
     try:
-        with open(BASELINE, "r") as f:
+        with open(BASELINE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return _migrate_baseline(data), False
     except Exception:
@@ -7293,7 +7312,7 @@ def cmd_canary(action="plant"):
             continue
         path = os.path.join(d, CANARY_NAME)
         try:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(CANARY_CONTENT)
             try:  # hide it from casual view (best-effort; not a security control)
                 run(["chflags", "hidden", path], timeout=5)
@@ -7321,7 +7340,7 @@ def cmd_canary(action="plant"):
             no_dir.append(path)  # never create dirs outside ~/.aegis either
             continue
         try:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             state[path] = sha256(path)
         except Exception:
@@ -7344,7 +7363,7 @@ def cmd_canary(action="plant"):
 
 def cmd_report():
     if os.path.exists(LATEST_MD):
-        with open(LATEST_MD) as f:
+        with open(LATEST_MD, encoding="utf-8") as f:
             sys.stdout.write(f.read())
     else:
         print("No report yet. Run: aegis.py scan")
@@ -7845,7 +7864,7 @@ def cmd_status():
         else "off (local-only; set AEGIS_HEARTBEAT_URL to enable)"))
     if os.path.exists(WATCHDOG_ALERT):
         try:
-            with open(WATCHDOG_ALERT) as f:
+            with open(WATCHDOG_ALERT, encoding="utf-8") as f:
                 last = f.read().strip().splitlines()[-1]
         except Exception:
             last = "(unreadable)"
@@ -7882,7 +7901,7 @@ def _vt_api_key():
     if k:
         return k
     try:
-        with open(VT_KEY_FILE) as f:
+        with open(VT_KEY_FILE, encoding="utf-8") as f:
             return f.read().strip() or None
     except Exception:
         return None
@@ -8329,7 +8348,7 @@ def _response_lock():
 
 
 def _strict_json(path):
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         value = json.load(f)
     if not isinstance(value, dict):
         raise ValueError("expected JSON object")
@@ -9374,7 +9393,7 @@ def _install_mac(runtime, mode, interval):
         % (prog_xml, sched,
            _xml_escape(os.path.join(STATE_DIR, "run.out")),
            _xml_escape(os.path.join(STATE_DIR, "run.err"))))
-    with open(SELF_PLIST, "w") as f:
+    with open(SELF_PLIST, "w", encoding="utf-8") as f:
         f.write(plist)
     os.chmod(SELF_PLIST, 0o600)
     uid = os.getuid()
@@ -9430,9 +9449,9 @@ def _install_linux(runtime, mode, interval):
         service = _SYSTEMD_SERVICE % {
             "type": "oneshot", "exec": "%s %s scan" % (py, runtime),
             "restart": ""}
-    with open(os.path.join(unit_dir, "aegis.service"), "w") as f:
+    with open(os.path.join(unit_dir, "aegis.service"), "w", encoding="utf-8") as f:
         f.write(service)
-    with open(os.path.join(unit_dir, "aegis.timer"), "w") as f:
+    with open(os.path.join(unit_dir, "aegis.timer"), "w", encoding="utf-8") as f:
         f.write(_SYSTEMD_TIMER % {"interval": interval})
     _o, err, rc = run(["systemctl", "--user", "daemon-reload"], timeout=30)
     if rc != 0:
@@ -9592,7 +9611,7 @@ def cmd_watchdog():
                "asleep. Verify the agent is running (`launchctl list | grep "
                "aegis`) and re-run install.sh if needed." % human)
         try:
-            with open(WATCHDOG_ALERT, "w") as f:
+            with open(WATCHDOG_ALERT, "w", encoding="utf-8") as f:
                 f.write("%s  %s\n" % (now_iso(), msg))
             os.chmod(WATCHDOG_ALERT, 0o600)
         except Exception:

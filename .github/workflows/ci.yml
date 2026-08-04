@@ -46,7 +46,11 @@ jobs:
   windows:
     name: windows-latest / py${{ matrix.python }}
     runs-on: windows-latest
-    timeout-minutes: 30
+    # The suite is ~20x slower here than on POSIX: a large share of the tests
+    # spawn a process, and on Windows that means a PowerShell start-up each
+    # time. Real, expected, and bounded by the signature stat-cache in
+    # production -- but the job needs room for it.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +66,10 @@ jobs:
       - name: selftest.py (real detection logic on this machine)
         run: python selftest.py
       - name: Live Windows harness (real registry, schtasks, CIM, Authenticode)
+        # `always()`: this harness is the only evidence that the Windows code
+        # works on Windows, so a suite failure must not hide it. It reports its
+        # own pass/fail and still fails the job on its own terms.
+        if: always()
         env:
           AEGIS_WIN_LIVE: "1"
         run: python tests/win_live_harness.py

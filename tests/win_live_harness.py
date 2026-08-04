@@ -105,9 +105,15 @@ _RUNVAL = "AegisLiveHarness"
 # --------------------------------------------------------------------------- #
 section("1. Authenticode (real Get-AuthenticodeSignature)")
 try:
+    import time as _t
+    _t0 = _t.time()
     signed = aegis._classify_windows(_NOTEPAD)
+    _sig_cost = _t.time() - _t0
     check("a Microsoft-signed system binary classifies os-signed",
           signed.get("trust") == "os-signed", repr(signed))
+    note("one uncached signature classification costs %.2fs of PowerShell "
+         "start-up -- the stat-cache is what keeps a warm scan cheap on "
+         "Windows, exactly as it does for codesign on macOS" % _sig_cost)
 
     tmpdir = tempfile.mkdtemp(prefix="aegis_sig_", dir=_SANDBOX)
 
@@ -381,6 +387,23 @@ try:
     for artifact in ("baseline.json", "aegis.db"):
         p = os.path.join(aegis.STATE_DIR, artifact)
         check("scan produced %s" % artifact, os.path.exists(p), p)
+
+    # The report is written and read back through separate handles, and then
+    # printed to a PIPE (not a console) -- the exact combination that made
+    # `scan` die with UnicodeEncodeError before the encoding fix, because the
+    # severity icons are not representable in cp1252.
+    import subprocess
+    self_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "aegis.py")
+    env = dict(os.environ)
+    env["USERPROFILE"] = _SANDBOX
+    env["HOME"] = _SANDBOX
+    p = subprocess.run([sys.executable, self_path, "report"],
+                       capture_output=True, timeout=120, env=env)
+    check("`aegis.py report` survives having its stdout redirected to a pipe "
+          "(severity icons vs the ANSI codepage)", p.returncode == 0,
+          (p.stderr or b"").decode("utf-8", "replace")[-600:]
+          or "%d bytes of report on stdout" % len(p.stdout))
 except Exception:
     check("full-scan block completed", False, traceback.format_exc())
 

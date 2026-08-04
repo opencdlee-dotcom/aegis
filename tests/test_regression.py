@@ -2559,13 +2559,27 @@ class TestPrivacyBoundary(Sandbox):
 
 class TestEventIncidentCore(Sandbox):
     def _rows(self, sql, args=()):
-        with sqlite3.connect(aegis.EVENT_DB) as db:
-            return db.execute(sql, args).fetchall()
+        # `with sqlite3.connect(...)` commits the transaction; it does NOT close
+        # the connection. On POSIX the leak is invisible (an open file can still
+        # be unlinked), but on Windows the still-open handle makes the sandbox's
+        # rmtree fail with WinError 32 -- so close it explicitly.
+        with contextlib.closing(sqlite3.connect(aegis.EVENT_DB)) as db:
+            with db:
+                return db.execute(sql, args).fetchall()
 
     def test_schema_is_idempotent_and_private(self):
         aegis.init_event_store()
         aegis.init_event_store()
-        self.assertEqual(os.stat(aegis.EVENT_DB).st_mode & 0o777, 0o600)
+        if os.name == "posix":
+            # The event DB holds findings, entity paths and the HMAC-signed
+            # audit chain, so on POSIX its mode is asserted, not assumed.
+            # Windows has no POSIX mode: os.chmod there only toggles the
+            # read-only bit, so st_mode reads 0o666 no matter what aegis does.
+            # Confidentiality on Windows comes from the %USERPROFILE% ACL that
+            # ~/.aegis inherits, which is the same trust boundary (owner + the
+            # local administrators, exactly as 0o600 leaves root). Asserting
+            # 0o600 there would be asserting a fiction.
+            self.assertEqual(os.stat(aegis.EVENT_DB).st_mode & 0o777, 0o600)
         tables = {row[0] for row in self._rows(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"events", "signals", "incidents", "sensor_status"}

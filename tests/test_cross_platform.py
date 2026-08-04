@@ -971,5 +971,76 @@ class RegistryIntegrity(unittest.TestCase):
                 aegis._snapshot_persistence_windows()
 
 
+# --------------------------------------------------------------------------- #
+# Text encoding.
+#
+# Found by the first real Windows run: `write_report` opened latest.md in text
+# mode with no encoding, so Python used the locale codec. On Windows that is
+# cp1252, every report line starts with a severity icon, and the icon is not
+# representable -- so `scan` died with UnicodeEncodeError the moment it had
+# anything to report. The tool ran, found the threat, and then crashed instead
+# of telling anyone.
+#
+# The behavioural test below only fails on a machine whose locale codec cannot
+# hold the icon (that is what CI's Windows job is for). The static test pins the
+# whole CLASS on every platform, which is the part that actually stays fixed:
+# any new text-mode open without an explicit encoding is a fresh instance of the
+# same bug on the next Windows box.
+# --------------------------------------------------------------------------- #
+class TextEncodingIsPinned(unittest.TestCase):
+    _SOURCE = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "aegis.py")
+
+    def test_no_text_mode_open_relies_on_the_locale_codec(self):
+        import re
+        offenders = []
+        with open(self._SOURCE, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                # \b never matches inside Popen/urlopen; os.open is a raw fd and
+                # takes no encoding, so it is excluded by name.
+                if not re.search(r"\b(?:os\.fdopen|io\.open|open)\(", line):
+                    continue
+                if re.search(r'"[rwax]b\+?"|\bos\.open\(|encoding=', line):
+                    continue
+                offenders.append("%d: %s" % (lineno, line.strip()))
+        self.assertEqual(offenders, [],
+                         "text-mode open() without encoding= falls back to the "
+                         "locale codec (cp1252 on Windows) and will crash or "
+                         "silently mangle non-ASCII:\n" + "\n".join(offenders))
+
+    def test_report_round_trips_non_ascii_as_utf8(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="aegis_enc_")
+        saved = (aegis.STATE_DIR, aegis.LATEST_MD, aegis.LATEST_JSON)
+        aegis.STATE_DIR = tmp
+        aegis.LATEST_MD = os.path.join(tmp, "latest.md")
+        aegis.LATEST_JSON = os.path.join(tmp, "latest.json")
+        try:
+            f = aegis.finding("MEDIUM", "hot-dir", "Unsigned binary dropped",
+                              "C:\\Users\\Bj\u00f6rn\\Downloads\\caf\u00e9.exe",
+                              "hot:enc:1")
+            md = aegis.write_report([f], first_run=False)
+            with open(aegis.LATEST_MD, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), md)
+            # The icon is the byte sequence cp1252 cannot represent; assert it
+            # actually reached the file rather than being dropped.
+            self.assertIn(aegis.SEV_ICON["MEDIUM"], md)
+        finally:
+            (aegis.STATE_DIR, aegis.LATEST_MD, aegis.LATEST_JSON) = saved
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_run_never_raises_on_undecodable_tool_output(self):
+        # A tool that emits a byte the locale codec cannot decode must degrade
+        # to a replacement character, not blow up the surface that called it.
+        if aegis.IS_WIN:
+            cmd = ["cmd", "/c", "echo", "ok"]
+        else:
+            cmd = ["/bin/sh", "-c", r"printf 'a\377b'"]
+        out, err, rc = aegis.run(cmd, timeout=10)
+        self.assertEqual(rc, 0, "run() failed outright: %r / %r" % (out, err))
+        self.assertTrue(out.strip(), "run() returned no output: %r" % (err,))
+
+
 if __name__ == "__main__":
     unittest.main()
