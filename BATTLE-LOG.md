@@ -7,7 +7,11 @@ ran end-to-end only against an injected fake `winreg`. That caught structural
 defects. It could not catch anything that depends on what real Windows returns.
 
 This pass added CI (the repo had none) and a Windows-only live harness, then
-fixed everything the first real run exposed.
+fixed what real Windows exposed. It took **seven CI runs**, not one: each round
+of fixes let the harness reach further into the code and surface the next
+defect. The two sensors that had never worked (W2, W3) were only reachable once
+the crash in W1 was out of the way, and W6 was only visible once the harness's
+own wrong assumption about catalog signing (below) was corrected.
 
 ## Why a fake registry was never going to be enough
 
@@ -107,6 +111,23 @@ that past the job ceiling and the Windows jobs were cancelled mid-run. Pinning
 real `Get-AuthenticodeSignature` answers `NotSupportedFileFormat`, and
 `_classify_windows` maps that to exactly `unsigned` — same verdict, no
 subprocess.
+
+## Final state (captured, not asserted)
+
+`windows-latest / py3.12`, the run where both Windows jobs went green:
+
+- test suite **339 passed, 137 skipped, 0 failed** (876s);
+- live harness **`checks failed: 0`** — 35 passing checks against the real
+  machine, plus 6 environment notes recording what the runner is (Defender off,
+  Security log unreadable, timing);
+- macOS **476 passed**, `selftest.py` green, 3.9-compatible;
+- Linux 3.9 and 3.12, macOS 3.12 green.
+
+Of the 13 new tests, the ones that pin a defect were each verified to FAIL
+against the pre-fix source before being trusted — the encoding pair, the seven
+in `FoundOnRealWindows`, and the `UnknownError` mapping. The remaining ones are
+positive controls (caching still works; `Valid`/`HashMismatch`/`NotTrusted`/
+`NotSigned` still map unchanged) and are expected to pass both ways.
 
 ## Residual risk
 
