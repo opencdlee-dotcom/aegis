@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # macOS and Linux were already exercised by hand every pass; this makes it
+  # automatic and pins the minimum supported interpreter (3.9), which is the
+  # version the installed agent actually runs under on a stock macOS box and
+  # has historically been where dev-python-only defects hide.
+  posix:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip pytest
+      - name: Test suite
+        run: python -m pytest tests/ -q
+      - name: selftest.py (real detection logic on this machine)
+        run: python selftest.py
+
+  # The point of this file. Until now no line of the Windows code had ever
+  # executed on Windows: the parsers were tested against captured output and the
+  # registry plumbing against an injected fake `winreg`. This job runs the real
+  # thing on a real Windows kernel.
+  windows:
+    name: windows-latest / py${{ matrix.python }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip pytest
+      - name: Test suite
+        run: python -m pytest tests/ -q
+      - name: selftest.py (real detection logic on this machine)
+        run: python selftest.py
+      - name: Live Windows harness (real registry, schtasks, CIM, Authenticode)
+        env:
+          AEGIS_WIN_LIVE: "1"
+        run: python tests/win_live_harness.py
