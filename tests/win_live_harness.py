@@ -117,35 +117,74 @@ try:
 
     tmpdir = tempfile.mkdtemp(prefix="aegis_sig_", dir=_SANDBOX)
 
-    # Tampered: flip one byte in the middle of a validly signed PE. The
-    # Authenticode digest covers everything but the checksum field and the
-    # certificate table (both at known offsets, neither near the midpoint), so
-    # a mid-file edit must produce HashMismatch.
-    tampered = os.path.join(tmpdir, "tampered.exe")
-    shutil.copyfile(_NOTEPAD, tampered)
-    with open(tampered, "r+b") as f:
-        f.seek(0, os.SEEK_END)
-        mid = f.tell() // 2
-        f.seek(mid)
-        b = f.read(1)
-        f.seek(mid)
-        f.write(bytes([b[0] ^ 0xFF]))
-    t = aegis._classify_windows(tampered)
-    check("a tampered copy of a signed binary classifies broken "
-          "(NOT os-signed) -- the Windows tamper gate",
-          t.get("trust") == "broken", repr(t))
+    # The tamper gate needs a binary whose signature is EMBEDDED in the file.
+    # Most Windows system binaries (notepad.exe among them) are signed by
+    # catalog instead: the hash lives in a .cat file, not in the PE, so a copy
+    # loses its catalog association and reports NotSigned before anything is
+    # tampered with. Tampering such a copy proves nothing. Find a genuinely
+    # embedded-signed binary by copying candidates and asking which COPY still
+    # verifies -- python.exe from python.org is the usual winner.
+    signed_copy, signed_src = None, None
+    for cand in (sys.executable,
+                 os.path.join(aegis.WIN_SYSTEMROOT, "System32", "WindowsPowerShell",
+                              "v1.0", "powershell.exe"),
+                 _NOTEPAD):
+        if not cand or not os.path.exists(cand):
+            continue
+        probe = os.path.join(tmpdir, "cand_%d.exe" % len(os.listdir(tmpdir)))
+        shutil.copyfile(cand, probe)
+        verdict = aegis._classify_windows(probe)
+        if verdict.get("trust") in ("os-signed", "signed-valid"):
+            signed_copy, signed_src = probe, cand
+            break
 
+    if signed_copy is None:
+        note("no embedded-signed binary was available on this host (every "
+             "candidate is catalog-signed, and a catalog signature does not "
+             "survive a copy) -- the tamper gate could not be exercised here")
+    else:
+        # Flip one byte in the middle. The Authenticode digest covers
+        # everything but the checksum field and the certificate table, neither
+        # of which is near the midpoint, so this must produce HashMismatch.
+        with open(signed_copy, "r+b") as f:
+            f.seek(0, os.SEEK_END)
+            mid = f.tell() // 2
+            f.seek(mid)
+            b = f.read(1)
+            f.seek(mid)
+            f.write(bytes([b[0] ^ 0xFF]))
+        t = aegis._classify_windows(signed_copy)
+        check("a tampered copy of an embedded-signed binary classifies broken "
+              "-- the Windows tamper gate", t.get("trust") == "broken",
+              "source=%s  verdict=%r" % (signed_src, t))
+        check("suspicious_sig() agrees the tampered binary is suspicious",
+              aegis.suspicious_sig(t.get("trust")) is True,
+              "suspicious_sig(%r) = %r" % (t.get("trust"),
+                                           aegis.suspicious_sig(t.get("trust"))))
+
+    # NotSupportedFileFormat -> unsigned. Deliberately NOT a malformed PE: a
+    # file that starts with MZ but is not a valid image makes the cmdlet error
+    # out, which is a probe failure, not a verdict (asserted separately below).
     unsigned = os.path.join(tmpdir, "unsigned.exe")
-    with open(unsigned, "wb") as f:
-        f.write(b"MZ" + os.urandom(4096))
+    with open(unsigned, "w", encoding="utf-8") as f:
+        f.write("this is not a PE image\n")
     u = aegis._classify_windows(unsigned)
-    check("an unsigned file is never trusted",
+    check("a non-PE file is classified unsigned, never trusted",
           u.get("trust") == "unsigned", repr(u))
 
-    check("suspicious_sig() agrees the tampered binary is suspicious",
-          aegis.suspicious_sig(t.get("trust")) is True,
-          "suspicious_sig(%r) = %r" % (t.get("trust"),
-                                       aegis.suspicious_sig(t.get("trust"))))
+    before = aegis._SIG_PROBE_FAILURES
+    malformed = os.path.join(tmpdir, "malformed.exe")
+    with open(malformed, "wb") as f:
+        f.write(b"MZ" + os.urandom(4096))
+    m = aegis._classify_windows(malformed)
+    if m.get("probe_failed"):
+        check("a probe that reaches no verdict is COUNTED, not silently "
+              "treated as fine", aegis._SIG_PROBE_FAILURES == before + 1,
+              "failures %d -> %d; verdict=%r"
+              % (before, aegis._SIG_PROBE_FAILURES, m))
+    else:
+        note("a malformed PE produced a real verdict (%r) on this host rather "
+             "than a probe failure" % m.get("trust"))
     check("suspicious_sig() does NOT flag the genuine system binary",
           aegis.suspicious_sig(signed.get("trust")) is False,
           "suspicious_sig(%r) = %r" % (signed.get("trust"),

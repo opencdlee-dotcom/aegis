@@ -75,6 +75,7 @@ _POSIX_ONLY_TESTS = frozenset((
     "test_env_injection_escalates_above_the_high_floor",
     # /tmp <-> /private/tmp firmlink canonicalisation
     "test_chain_joins_across_tmp_private_tmp_firmlink",
+    "test_lineage_joins_across_tmp_private_tmp_firmlink",
     "test_same_entity_unifies_firmlink_forms",
     "test_relative_entities_are_ignored",
     # POSIX wrapper launchers (sudo -u, caffeinate, env)
