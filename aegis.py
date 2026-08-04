@@ -9780,6 +9780,19 @@ def _resume_pid(pid):
         return False
 
 
+# The comms freeze must never suspend. Deliberately NOT _PROTECTED_COMMS
+# verbatim: that set carries the generic interpreter names ("python", "python3",
+# "aegis.py", …) as a blunt proxy for "do not kill Aegis itself", which is the
+# right call for an IRREVERSIBLE verb reached by name. Freeze does not need the
+# proxy — it already refuses its own pid and every ancestor structurally, which
+# is strictly more precise — and inheriting it would refuse to suspend any
+# python process at all. Interpreted payloads are a large share of what this
+# tier exists to contain, so that would gut the feature to re-buy protection it
+# already has.
+_FREEZE_NEVER_COMMS = _PROTECTED_COMMS - frozenset((
+    "aegis.py", "python3", "python", "python.exe", "pythonw.exe"))
+
+
 def _process_names(pid):
     """Every plausible name for `pid`, for matching against _PROTECTED_COMMS.
 
@@ -9829,7 +9842,7 @@ def _freeze_refusal(pid, parents=None):
     if not _same_owner(owner):
         return ("pid %d belongs to %s, not you; Aegis only acts on your own "
                 "processes" % (pid_i, owner))
-    protected = _process_names(pid_i) & _PROTECTED_COMMS
+    protected = _process_names(pid_i) & _FREEZE_NEVER_COMMS
     if protected:
         return ("pid %d is a session-critical process (%s)"
                 % (pid_i, sorted(protected)[0]))

@@ -135,7 +135,12 @@ class TestFreeze(ProtectiveSandbox):
         self.assertIn("session-critical", refusal)
 
     def test_freeze_refuses_another_users_process(self):
-        fake = [("4242", "0", "/usr/sbin/notmine", "/usr/sbin/notmine")]
+        # NOT a hard-coded uid 0: CI and containers run the suite AS root, so
+        # "0" would be this process's own owner and the guard would correctly
+        # allow it — a green test asserting nothing. Derive an owner that cannot
+        # be us whoever we are.
+        not_me = str(os.getuid() + 4242) if IS_POSIX else "OTHERDOMAIN\\nobody"
+        fake = [("4242", not_me, "/usr/sbin/notmine", "/usr/sbin/notmine")]
         saved = aegis._iter_processes
         aegis._iter_processes = lambda: iter(fake)
         try:
@@ -144,6 +149,26 @@ class TestFreeze(ProtectiveSandbox):
             aegis._iter_processes = saved
         self.assertIsNotNone(refusal)
         self.assertIn("not you", refusal)
+
+    def test_an_interpreter_is_freezable_even_though_kill_protects_it(self):
+        """_PROTECTED_COMMS carries "python"/"python3"/"aegis.py" as a blunt
+        proxy for "do not kill Aegis itself" — correct for an irreversible verb
+        reached by name, wrong for freeze, which already refuses its own pid and
+        every ancestor structurally. Inheriting the proxy would refuse to
+        suspend ANY python process, and interpreted payloads are a large share
+        of what this tier exists to contain.
+
+        Caught by Linux CI, where the basename is "python"; macOS spells it
+        "Python" and hid the bug locally."""
+        self.assertIn("python", aegis._PROTECTED_COMMS)
+        self.assertNotIn("python", aegis._FREEZE_NEVER_COMMS)
+        # ...while genuinely session-critical names are still refused.
+        for critical in ("Dock", "Finder", "loginwindow", "csrss.exe"):
+            self.assertIn(critical, aegis._FREEZE_NEVER_COMMS)
+
+        p = self._sleeper()
+        self.assertIsNone(aegis._freeze_refusal(p.pid),
+                          "a plain interpreter child should be freezable")
 
     def test_expired_freeze_auto_thaws_fail_open(self):
         """Fail-OPEN is the contract: an unreviewed freeze must release itself
