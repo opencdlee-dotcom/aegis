@@ -46,11 +46,12 @@ jobs:
   windows:
     name: windows-latest / py${{ matrix.python }}
     runs-on: windows-latest
-    # The suite is ~20x slower here than on POSIX: a large share of the tests
-    # spawn a process, and on Windows that means a PowerShell start-up each
-    # time. Real, expected, and bounded by the signature stat-cache in
-    # production -- but the job needs room for it.
-    timeout-minutes: 45
+    # Process spawning is far more expensive here than on POSIX, and the live
+    # harness additionally runs two full scans against the real machine (which
+    # classify real binaries through real PowerShell). Headroom, not a target:
+    # the suite itself should finish in minutes now that fixture files no
+    # longer each cost an Authenticode probe.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

@@ -145,6 +145,23 @@ class Sandbox(unittest.TestCase):
             self._saved["snapshot_persistence"] = aegis.snapshot_persistence
             aegis.snapshot_persistence = _sandboxed_win_persistence
 
+            # Signature classification is the last unpinned live-host source.
+            # On macOS `codesign` is a fast local call, so nobody noticed; on
+            # Windows every classification spawns a powershell.exe, and every
+            # persistence record classifies its program -- so a few hundred
+            # fixture files became a few hundred PowerShell start-ups and the
+            # suite ran for the better part of an hour.
+            #
+            # The pinned verdict is not a fiction: a plist/txt fixture is not a
+            # PE, real Get-AuthenticodeSignature answers NotSupportedFileFormat,
+            # and _classify_windows maps that to exactly "unsigned". Same
+            # verdict, no subprocess. The real probe keeps its coverage in
+            # FoundOnRealWindows and against real binaries (signed, unsigned and
+            # tampered) in tests/win_live_harness.py.
+            self._saved["classify_signature"] = aegis.classify_signature
+            aegis.classify_signature = lambda p: {
+                "trust": "unsigned", "team": None, "authority": None}
+
         self.notifications = []
         self._saved["notify"] = aegis.notify
         aegis.notify = lambda title, msg: self.notifications.append((title, msg))
