@@ -134,6 +134,30 @@ class TestFreeze(ProtectiveSandbox):
         self.assertIsNotNone(refusal, "truncated comm let a critical process through")
         self.assertIn("session-critical", refusal)
 
+    def test_the_guard_walks_the_process_table_exactly_once(self):
+        """_freeze_refusal is called once per descendant during a tree sweep,
+        and on Windows one walk is a CIM query this codebase measured at 41s for
+        135 processes. Doing owner and name lookups as two separate walks turned
+        freezing a small tree into minutes — for a verb whose whole value is
+        landing before the payload finishes. Pinned because the cost is
+        invisible on Linux/macOS, where a walk is cheap."""
+        walks = []
+        rows = [("4242", aegis._own_owner(), "/tmp/x", "/tmp/x --flag")]
+
+        def counting_iter():
+            walks.append(1)
+            return iter(rows)
+
+        saved = aegis._iter_processes
+        aegis._iter_processes = counting_iter
+        try:
+            # parents supplied, so the ancestor check does not enumerate either
+            aegis._freeze_refusal("4242", parents={"4242": "1"})
+        finally:
+            aegis._iter_processes = saved
+        self.assertEqual(1, len(walks),
+                         "the guard walked the process table %d times" % len(walks))
+
     def test_freeze_refuses_another_users_process(self):
         # NOT a hard-coded uid 0: CI and containers run the suite AS root, so
         # "0" would be this process's own owner and the guard would correctly

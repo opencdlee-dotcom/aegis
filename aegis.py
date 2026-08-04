@@ -9793,6 +9793,33 @@ _FREEZE_NEVER_COMMS = _PROTECTED_COMMS - frozenset((
     "aegis.py", "python3", "python", "python.exe", "pythonw.exe"))
 
 
+def _process_owner_and_names(pid):
+    """(owner, names) for `pid` from ONE process-table walk.
+
+    Deliberately not `_process_identity()` + `_process_names()`: those are two
+    full enumerations, and _freeze_refusal is called once per descendant during
+    a tree sweep. On Windows a single enumeration is a CIM query this codebase
+    measured at 41s for 135 processes, so the doubled version turns freezing a
+    small tree into minutes of latency — for a verb whose entire value is that
+    it lands before the payload finishes."""
+    owner, names = None, set()
+    for p, o, exe, argv in _iter_processes():
+        if p != str(pid):
+            continue
+        owner = o
+        if exe:
+            names.add(os.path.basename(exe))
+        if argv:
+            # argv may be prefixed by ps's truncated comm token, so test both
+            # the first and second tokens; it costs nothing and a guard should
+            # over-refuse rather than under-refuse.
+            parts = argv.split()
+            for tok in parts[:2]:
+                names.add(os.path.basename(tok))
+        break
+    return owner, {n for n in names if n}
+
+
 def _process_names(pid):
     """Every plausible name for `pid`, for matching against _PROTECTED_COMMS.
 
@@ -9804,23 +9831,7 @@ def _process_names(pid):
     NOT truncated, so it is the reliable source. Both are returned because
     either one matching is enough to refuse — a guard should over-refuse, never
     under-refuse."""
-    names = set()
-    for p, _owner, exe, argv in _iter_processes():
-        if p != str(pid):
-            continue
-        if exe:
-            names.add(os.path.basename(exe))
-        if argv:
-            # argv here may be prefixed by ps's truncated comm token, so take
-            # the LAST token that still looks like a path/binary head as well as
-            # the first — cheap, and it costs nothing to test both.
-            head = argv.split(None, 1)[0]
-            names.add(os.path.basename(head))
-            parts = argv.split()
-            if len(parts) > 1:
-                names.add(os.path.basename(parts[1]))
-        break
-    return {n for n in names if n}
+    return _process_owner_and_names(pid)[1]
 
 
 def _freeze_refusal(pid, parents=None):
@@ -9836,13 +9847,13 @@ def _freeze_refusal(pid, parents=None):
     if str(pid_i) in _own_ancestors(parents):
         return ("pid %d is an ancestor of Aegis (your shell or terminal); "
                 "suspending it would look identical to a hung machine" % pid_i)
-    owner, comm = _process_identity(pid_i)
+    owner, names = _process_owner_and_names(pid_i)   # ONE table walk, not two
     if owner is None:
         return "no such process: %d" % pid_i
     if not _same_owner(owner):
         return ("pid %d belongs to %s, not you; Aegis only acts on your own "
                 "processes" % (pid_i, owner))
-    protected = _process_names(pid_i) & _FREEZE_NEVER_COMMS
+    protected = names & _FREEZE_NEVER_COMMS
     if protected:
         return ("pid %d is a session-critical process (%s)"
                 % (pid_i, sorted(protected)[0]))
@@ -9855,18 +9866,22 @@ def _freeze_tree(root_pid):
     ORDER is the whole mechanism: the root stops FIRST, because a stopped parent
     cannot fork, which turns an unbounded chase into a converging sweep. Returns
     (frozen_pids, converged)."""
-    parents = _iter_parents()
     frozen, refused = [], []
     if _suspend_pid(root_pid):
         frozen.append(str(root_pid))
     else:
         return [], True
+    # Membership sets alongside the ordered list: the sweep tests every pid on
+    # the machine against these once per pass, and `in list` would make that
+    # quadratic in the size of the frozen set for no reason.
+    frozen_set, refused_set = {str(root_pid)}, set()
     converged = False
     for _pass in range(FREEZE_MAX_PASSES):
         parents = _iter_parents()
         found = set()
         for pid, ppid in parents.items():
-            if ppid in frozen and pid not in frozen and pid not in refused:
+            if ppid in frozen_set and pid not in frozen_set \
+                    and pid not in refused_set:
                 found.add(pid)
         if not found:
             converged = True
@@ -9874,11 +9889,14 @@ def _freeze_tree(root_pid):
         for pid in sorted(found, key=lambda p: int(p) if p.isdigit() else 0):
             if _freeze_refusal(pid, parents) is not None:
                 refused.append(pid)
+                refused_set.add(pid)
                 continue
             if _suspend_pid(pid):
                 frozen.append(pid)
+                frozen_set.add(pid)
             else:
                 refused.append(pid)
+                refused_set.add(pid)
     return frozen, converged
 
 
