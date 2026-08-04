@@ -247,6 +247,12 @@ away. 78 cross-platform tests cover the parsers, the Defender/firewall/BitLocker
 scoring, WMI-subscription and exclusion diffs, the LOLBin/encoded-PowerShell/
 LSASS-dump idioms, and the false-positive guards.
 
+> **Superseded 2026-08-04** — see the first entry in this file. Windows now runs
+> in CI against a real kernel. Reading this paragraph as a standing claim would
+> also mean trusting the confidence in it: those 78 tests were green while three
+> Windows surfaces produced nothing at all, because two of the fixtures were
+> built from the same assumptions as the bugs.
+
 ## Genuine defects found and fixed during the port
 
 1. **Persistence severity under-rated the dominant shape.** Scoring keyed only
