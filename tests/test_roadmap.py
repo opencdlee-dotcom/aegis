@@ -444,5 +444,140 @@ class TestAttckCoverage(Sandbox):
         self.assertIn("did not classify to a single technique", out)
 
 
+# --------------------------------------------------------------------------- #
+# #12 — amfid code-signature-validation-failure harvest
+# --------------------------------------------------------------------------- #
+class TestAmfidHarvest(unittest.TestCase):
+    def test_parse_amfid_denials(self):
+        text = "\n".join([
+            json.dumps({"eventMessage": "code signature is invalid for /tmp/x",
+                        "timestamp": "2026-07-22 09:00"}),
+            json.dumps({"eventMessage": "validated /Applications/Safari OK"}),
+            json.dumps({"eventMessage": "rejecting binary with bad hash"}),
+            "not json at all",
+            "[1,2,3]",  # valid non-object json
+        ])
+        hits = aegis._parse_amfid_denials(text)
+        msgs = [m for m, _ in hits]
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(any("invalid" in m for m in msgs))
+        self.assertTrue(any("rejecting" in m for m in msgs))
+
+    def test_check_amfid_log_emits_medium_low(self):
+        fixture = json.dumps({"eventMessage":
+                              "code signature is invalid for /tmp/x",
+                              "timestamp": "t"})
+        saved = aegis.run
+        try:
+            aegis.run = lambda cmd, timeout=15: (fixture, "", 0)
+            fs = aegis.check_amfid_log()
+            self.assertEqual(len(fs), 1)
+            self.assertEqual(fs[0]["severity"], "MEDIUM")
+            self.assertEqual(fs[0]["confidence"], "low")  # below notify floor
+            self.assertEqual(fs[0]["category"], "amfid")
+        finally:
+            aegis.run = saved
+
+    def test_check_amfid_log_empty_on_failure(self):
+        saved = aegis.run
+        try:
+            aegis.run = lambda cmd, timeout=15: ("", "timeout", 124)
+            self.assertEqual(aegis.check_amfid_log(), [])
+        finally:
+            aegis.run = saved
+
+
+# --------------------------------------------------------------------------- #
+# #13 — opt-in credential-canary tokens (aegis.py canary)
+# --------------------------------------------------------------------------- #
+class TestCanaryTokens(Sandbox):
+    def test_specs_skip_malformed_entries(self):
+        aegis.save_json(aegis.AEGIS_CONFIG, {"canary_tokens": [
+            {"path": os.path.join(self.tmp, "good"), "content": "x"},
+            {"path": "", "content": "x"},
+            {"path": os.path.join(self.tmp, "nocontent")},
+            "not a dict",
+        ]})
+        specs = aegis._canary_token_specs()
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0], (os.path.join(self.tmp, "good"), "x"))
+
+    def test_plant_writes_token_and_registers_for_tamper_check(self):
+        target = os.path.join(self.tmp, "aws_credentials_bak")
+        aegis.save_json(aegis.AEGIS_CONFIG,
+                        {"canary_tokens": [{"path": target,
+                                            "content": "AKIAFAKECANARYKEY"}]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = aegis.cmd_canary("plant")
+        self.assertEqual(rc, 0)
+        with open(target) as f:
+            self.assertEqual(f.read(), "AKIAFAKECANARYKEY")
+        state = aegis.load_json(aegis.CANARY_STATE, {})
+        self.assertIn(target, state)
+        # The whole point: tampering with the token file is caught by the
+        # SAME tripwire as the plain decoy — check_canaries() needed zero
+        # changes because it is already generic over every registered path.
+        with open(target, "w") as f:
+            f.write("tampered")
+        hits = [f for f in aegis.check_canaries() if f.get("path") == target]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "CRITICAL")
+
+    def test_plant_never_overwrites_an_existing_file(self):
+        target = os.path.join(self.tmp, "real_credentials")
+        with open(target, "w") as f:
+            f.write("REAL SECRET")
+        aegis.save_json(aegis.AEGIS_CONFIG,
+                        {"canary_tokens": [{"path": target,
+                                            "content": "AKIAFAKE"}]})
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            rc = aegis.cmd_canary("plant")
+        self.assertEqual(rc, 0)
+        with open(target) as f:
+            self.assertEqual(f.read(), "REAL SECRET")
+        self.assertIn("already exist", buf.getvalue())
+
+    def test_replant_preserves_coverage_for_a_token_already_planted(self):
+        # A second `canary plant` run must not silently DROP tamper-detection
+        # coverage for a token file it planted earlier just because that file
+        # (still holding the same content) is now "already existing" on the
+        # exists-check — that would disarm the tripwire the feature exists
+        # for, with no visible sign anything changed.
+        target = os.path.join(self.tmp, "aws_credentials_bak")
+        aegis.save_json(aegis.AEGIS_CONFIG,
+                        {"canary_tokens": [{"path": target,
+                                            "content": "AKIAFAKE"}]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            aegis.cmd_canary("plant")
+        self.assertIn(target, aegis.load_json(aegis.CANARY_STATE, {}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            aegis.cmd_canary("plant")  # re-plant: target already exists now
+        state = aegis.load_json(aegis.CANARY_STATE, {})
+        self.assertIn(target, state, "token dropped out of CANARY_STATE on replant")
+        hits = [f for f in aegis.check_canaries() if f.get("path") == target]
+        self.assertEqual(hits, [], "replant must not falsely flag its own token")
+
+    def test_plant_skips_missing_parent_dir(self):
+        target = os.path.join(self.tmp, "no_such_dir", "token")
+        aegis.save_json(aegis.AEGIS_CONFIG,
+                        {"canary_tokens": [{"path": target, "content": "x"}]})
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            rc = aegis.cmd_canary("plant")
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(target))
+        self.assertIn("no parent directory", buf.getvalue())
+
+    def test_remove_cleans_up_token_files_too(self):
+        target = os.path.join(self.tmp, "token_to_remove")
+        aegis.save_json(aegis.AEGIS_CONFIG,
+                        {"canary_tokens": [{"path": target, "content": "x"}]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            aegis.cmd_canary("plant")
+        self.assertTrue(os.path.exists(target))
+        with contextlib.redirect_stdout(io.StringIO()):
+            aegis.cmd_canary("remove")
+        self.assertFalse(os.path.exists(target))
+
+
 if __name__ == "__main__":
     unittest.main()

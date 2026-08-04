@@ -5954,6 +5954,69 @@ def check_security_log(window_hours=None):
     return findings
 
 
+# --- Unified-log security harvest (amfid code-signature validation) ----------
+# amfid (Apple Mobile File Integrity) is the kernel's code-signing gatekeeper —
+# every exec/dylib-load is checked against it. A logged FAILURE means the OS
+# refused to trust something's signature: a broken build during dev, or a
+# tamper/injection attempt being blocked in real time. Same unprivileged
+# `log show` mechanism as the syspolicy harvest above (no root, no ES
+# entitlement) — a second free security domain riding the identical pattern.
+_AMFID_DENY_RE = re.compile(
+    r"\b(?:code signature (?:is )?invalid|signature validation failed|"
+    r"failed to validate|bailing out because of restricted entitlements|"
+    r"not valid|rejecting)\b", re.I)
+
+
+def _parse_amfid_denials(ndjson_text):
+    """[(message, timestamp)] of amfid code-signature-validation FAILURE
+    events from `log show --style ndjson` output. Pure/fixture-testable;
+    tolerant of non-object records and non-JSON lines (never raises)."""
+    hits = []
+    for line in (ndjson_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("eventMessage") or ""
+        if not isinstance(msg, str) or not _AMFID_DENY_RE.search(msg):
+            continue
+        hits.append((msg.strip(), ev.get("timestamp") or ""))
+    return hits
+
+
+def check_amfid_log(window_hours=None):
+    """Harvest amfid code-signature-validation FAILURE events from the
+    unified log. Kept at MEDIUM/low-confidence (log+correlation tier, below
+    the notify floor) for the same reason as the syspolicy harvest: the live
+    message format varies by OS build and can't be verified against a real
+    denial in the field here, so it enriches without risking a noisy page.
+    On any log-read failure it degrades to empty (never a storm)."""
+    if window_hours is None:
+        window_hours = 6
+    win = "%dh" % max(1, min(int(window_hours), 48))
+    out, _, rc = run(["log", "show", "--last", win, "--style", "ndjson",
+                      "--predicate", 'process == "amfid"'],
+                     timeout=45)
+    if rc != 0 or not out:
+        return []
+    findings = []
+    for msg, ts in _parse_amfid_denials(out):
+        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]
+        findings.append(finding(
+            "MEDIUM", "amfid", "Code-signature validation failed (amfid)",
+            "amfid rejected a binary/library's signature at %s: %s — the OS "
+            "refused to trust something's code signature; verify it was "
+            "expected (a broken build, or a real tamper attempt)."
+            % (ts, msg[:240]), "amfid:deny:%s" % digest, confidence="low",
+            markers=["amfid-deny"]))
+    return findings
+
+
 # --- Linux: auth log harvest (brute force, new accounts, sudo abuse) ---------
 # The Linux analog of the unified-log harvest. auth.log/secure is usually
 # 640 root:adm, so an unprivileged run often CANNOT read it — that returns None
@@ -6838,6 +6901,7 @@ def gather_all(baseline_snap, current_snap, health=None):
             ("cron", check_cron, ()),
             ("xprotect", check_xprotect, ()),
             ("security-log", check_security_log, ()),
+            ("amfid-log", check_amfid_log, ()),
         ]
     elif IS_LINUX:
         sensors += [
@@ -7177,10 +7241,36 @@ def _cmd_baseline_locked(trust="verified"):
     return 0
 
 
+def _canary_token_specs():
+    """User-configured credential-canary specs: [{"path": ..., "content":
+    ...}, ...] under 'canary_tokens' in ~/.aegis/config.json. Each entry's
+    content is a token the user already generated themselves — e.g. an AWS
+    key or web-bug URL from canarytokens.org, or a self-hosted instance —
+    pasted into config by hand. Aegis makes NO network call to create,
+    register, or arm a token; it only plants the bytes it's given. This is
+    the local counterpart to the read-canary tripwire above: a realistic-
+    looking credential in a location a stealer's harvester actually scans
+    (~/.aws/, ~/.ssh/), whose EXFILTRATION is what alerts (via the token
+    provider, entirely outside Aegis's view), while local tamper/deletion
+    still alerts through the same check_canaries() path as any other decoy.
+    Malformed entries are skipped, never raise."""
+    specs = []
+    for item in (_aegis_config().get("canary_tokens") or []):
+        if not isinstance(item, dict):
+            continue
+        path, content = item.get("path"), item.get("content")
+        if not (isinstance(path, str) and path and isinstance(content, str)
+                and content):
+            continue
+        specs.append((os.path.expanduser(path), content))
+    return specs
+
+
 def cmd_canary(action="plant"):
-    """Plant / remove ransomware canary (honeypot) files. Opt-in remediation-
-    adjacent capability: this is the ONLY path by which Aegis writes outside
-    ~/.aegis, and only on explicit user command."""
+    """Plant / remove ransomware canary (honeypot) files, plus any configured
+    credential-canary tokens. Opt-in remediation-adjacent capability: this is
+    the ONLY path by which Aegis writes outside ~/.aegis, and only on
+    explicit user command."""
     ensure_state()
     if action == "remove":
         state = load_json(CANARY_STATE, {})
@@ -7212,11 +7302,43 @@ def cmd_canary(action="plant"):
             state[path] = sha256(path)
         except Exception:
             continue
+    old_state = load_json(CANARY_STATE, {})
+    exists, no_dir = [], []
+    for path, content in _canary_token_specs():
+        if os.path.exists(path):
+            if path in old_state:
+                # We planted this on an earlier run and it's still there:
+                # carry its recorded hash forward untouched. Re-running plant
+                # must never DROP tamper-detection coverage for a token just
+                # because the file we wrote last time still exists — that
+                # would silently disarm the tripwire the whole feature exists
+                # to provide.
+                state[path] = old_state[path]
+            else:
+                exists.append(path)  # a real file we never planted — leave alone
+            continue
+        if not os.path.isdir(os.path.dirname(path)):
+            no_dir.append(path)  # never create dirs outside ~/.aegis either
+            continue
+        try:
+            with open(path, "w") as f:
+                f.write(content)
+            state[path] = sha256(path)
+        except Exception:
+            continue
     save_json(CANARY_STATE, state)
     _record_canary_watermark()
     print("Planted %d canary file(s). Aegis will alert CRITICAL if any is "
           "modified or deleted (ransomware / bulk-tamper tripwire).\n"
           "Remove with: aegis.py canary remove" % len(state))
+    if exists:
+        print("%d configured canary_token path(s) already exist and were left "
+              "untouched (Aegis never overwrites a real file): %s"
+              % (len(exists), ", ".join(exists)))
+    if no_dir:
+        print("%d configured canary_token path(s) have no parent directory "
+              "and were skipped (Aegis never creates directories for this): %s"
+              % (len(no_dir), ", ".join(no_dir)))
     return 0
 
 
@@ -7278,6 +7400,7 @@ SENSOR_BENIGN_NOTES = {
     "hardening": "A deliberately disabled firewall or Remote Login you enabled.",
     "canary": "A backup/indexing tool touching the decoy file, or your own edit.",
     "self-protection": "Re-running install.sh or editing the trust store by hand.",
+    "amfid": "A locally-built/self-signed dev binary or a broken update mid-install.",
 }
 
 
@@ -9553,7 +9676,12 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
                    the scan path stays local-only regardless)
-  canary [remove]  plant (or remove) ransomware canary/honeypot files
+  canary [remove]  plant (or remove) ransomware canary/honeypot files, plus
+                   any OPT-IN credential-canary tokens configured as
+                   "canary_tokens": [{"path": "...", "content": "..."}] in
+                   ~/.aegis/config.json — content you already generated
+                   yourself (e.g. at canarytokens.org); Aegis makes no
+                   network call to create/arm one, only plants the bytes
   watch [secs]     change-driven monitor: rescan seconds after a watched path
                    changes (kqueue on macOS, short-cycle polling elsewhere) +
                    a full scan every [secs] (default 600) as a floor.
