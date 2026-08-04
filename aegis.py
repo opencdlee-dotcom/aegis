@@ -2990,6 +2990,11 @@ def _snapshot_persistence_windows():
     protected trees. Registry enumeration uses stdlib winreg (no subprocess)."""
     import winreg
     snap = {}
+    # Collected first, finished last: _finish_persist_record classifies the
+    # program's signature, and on Windows each of those is a powershell.exe
+    # start-up. Gathering the whole set lets ONE batch resolve them all --
+    # identical records, one subprocess instead of one per autostart entry.
+    pending = []
     hives = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
 
     def _reg_values(hive, subkey):
@@ -3018,7 +3023,7 @@ def _snapshot_persistence_windows():
             rec["run_at_load"] = True
             args = _win_split_cmd(_expand_win_env(val))
             prog = args[0] if args else None
-            snap[key] = _finish_persist_record(rec, prog, args)
+            pending.append((key, rec, prog, args))
 
     # 2. Winlogon Shell/Userinit — one healthy value each; a deviation is how
     # a stealer wedges itself before the desktop (T1547.004).
@@ -3032,7 +3037,7 @@ def _snapshot_persistence_windows():
         rec["run_at_load"] = True
         args = _win_split_cmd(_expand_win_env(val))
         prog = args[0] if args else None
-        snap[key] = _finish_persist_record(rec, prog, args)
+        pending.append((key, rec, prog, args))
 
     # 3. Startup folders — dropped .lnk/.exe/script files.
     for d in PERSISTENCE_DIRS:
@@ -3055,7 +3060,7 @@ def _snapshot_persistence_windows():
                 # hostile-idiom scorer the argv path uses
                 body = _read_text(path, limit=64 * 1024) or ""
                 args = [body[:4096]] if body else None
-            snap["startup:" + path] = _finish_persist_record(rec, path, args)
+            pending.append(("startup:" + path, rec, path, args))
 
     # 4. Non-Microsoft scheduled tasks (T1053.005) — one schtasks call.
     out, _, rc = run(["schtasks", "/query", "/fo", "csv", "/v"], timeout=60)
@@ -3066,7 +3071,7 @@ def _snapshot_persistence_windows():
             rec["run_at_load"] = True
             args = _win_split_cmd(_expand_win_env(cmd))
             prog = args[0] if args else None
-            snap[key] = _finish_persist_record(rec, prog, args)
+            pending.append((key, rec, prog, args))
 
     # 5. Services whose binary lives OUTSIDE the protected trees (a service
     # image in %AppData%/%TEMP% is the malware shape; system32 services are
@@ -3096,9 +3101,12 @@ def _snapshot_persistence_windows():
                 key = "service:" + svc
                 rec = _persist_record(label=key)
                 rec["run_at_load"] = True
-                snap[key] = _finish_persist_record(rec, prog, args)
+                pending.append((key, rec, prog, args))
     except OSError:
         pass
+    warm_signature_cache([prog for _k, _r, prog, _a in pending if prog])
+    for key, rec, prog, args in pending:
+        snap[key] = _finish_persist_record(rec, prog, args)
     return snap
 
 
@@ -4311,9 +4319,48 @@ def _hot_elf_finding(path, st, kind):
         markers=(["timestomp"] if ts_reason else None))]
 
 
+def _warm_hot_dir_signatures(cutoff):
+    """Resolve the hot-dir executables' signatures in one batch before the scan
+    loop classifies them one at a time.
+
+    Deliberately a LOOSE approximation of the loop's own filters rather than a
+    copy of them: this only decides what to prefetch, so over-including costs a
+    slot in a batch that was already being sent, and under-including just leaves
+    the loop to classify that file itself. Nothing here can change a verdict —
+    which is why it is safe to keep it simple instead of mirroring the timestomp
+    and bundle rules exactly."""
+    if not IS_WIN:
+        return  # only Windows pays a subprocess per classification
+    paths = []
+    for d in HOT_DIRS:
+        try:
+            entries = os.listdir(d)
+        except Exception:
+            continue
+        for name in entries[:2000]:
+            path = os.path.join(d, name)
+            try:
+                st = os.stat(path)
+            except Exception:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            # Generous on time: ctime/birthtime catch a backdated drop that the
+            # loop's timestomp rule would also keep.
+            recent = max(st.st_mtime, st.st_ctime,
+                         getattr(st, "st_birthtime", 0) or 0)
+            if recent < cutoff:
+                continue
+            if _executable_kind(path) is None:
+                continue
+            paths.append(path)
+    warm_signature_cache(paths)
+
+
 def check_hot_dirs(max_age_days=14):
     findings = []
     cutoff = time.time() - max_age_days * 86400
+    _warm_hot_dir_signatures(cutoff)
     for d in HOT_DIRS:
         try:
             entries = os.listdir(d)

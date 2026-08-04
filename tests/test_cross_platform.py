@@ -1321,6 +1321,95 @@ class SignatureBatchPrefetch(unittest.TestCase):
         self.assertEqual(0, aegis.warm_signature_cache(["C:\\a\\x.exe"]))
         self.assertEqual([], calls, "a warm cache must cost no subprocess")
 
+    def test_the_windows_persistence_snapshot_batches_its_classifications(self):
+        # The snapshot classifies every autostart entry's program. One
+        # PowerShell start-up apiece is the whole cost of a first scan, so the
+        # snapshot must resolve them as a set, not one at a time.
+        import shutil
+        import sys as _sys
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="aegis_persbatch_")
+        saved = (aegis.PERSISTENCE_DIRS, aegis._WIN_RUN_KEYS,
+                 aegis.TRUSTED_PREFIXES, aegis.RISKY_PREFIXES, aegis.sha256)
+        # Same injection the live-plumbing class uses; an empty tree makes every
+        # hive lookup miss, leaving the startup folder as the only source.
+        prior_winreg = _sys.modules.get("winreg")
+        _sys.modules["winreg"] = _FakeWinreg({})
+        try:
+            progs = []
+            for i in range(6):
+                p = os.path.join(tmp, "boot%d.exe" % i)
+                with open(p, "wb") as fh:
+                    fh.write(b"MZ\x00\x00")
+                progs.append(p)
+            aegis.PERSISTENCE_DIRS = [tmp]
+            aegis._WIN_RUN_KEYS = []       # registry is unreachable in-process
+            aegis.RISKY_PREFIXES = (tmp,)
+            aegis.TRUSTED_PREFIXES = ("C:\\Windows\\",)
+            aegis.sha256 = lambda p: "deadbeef"
+
+            batched, singles = [], []
+
+            def _run(cmd, timeout=15, extra_env=None):
+                env = extra_env or {}
+                if "AEGIS_SIG_PATHS" in env:
+                    paths = env["AEGIS_SIG_PATHS"].split("\n")
+                    batched.append(len(paths))
+                    return ("".join("%s\tNotSigned\t\n" % q for q in paths),
+                            "", 0)
+                if "AEGIS_SIG_PATH" in env:
+                    singles.append(env["AEGIS_SIG_PATH"])
+                    return ("NotSigned\n\n", "", 0)
+                return ("", "", 1)     # schtasks etc. -- nothing to enumerate
+            aegis.run = _run
+
+            snap = aegis._snapshot_persistence_windows()
+            self.assertEqual(6, len(snap), snap)
+            self.assertEqual([6], batched,
+                             "six startup entries must resolve in ONE batch")
+            self.assertEqual([], singles,
+                             "nothing should fall back to a per-path probe "
+                             "once the batch has answered")
+        finally:
+            (aegis.PERSISTENCE_DIRS, aegis._WIN_RUN_KEYS,
+             aegis.TRUSTED_PREFIXES, aegis.RISKY_PREFIXES,
+             aegis.sha256) = saved
+            if prior_winreg is None:
+                _sys.modules.pop("winreg", None)
+            else:
+                _sys.modules["winreg"] = prior_winreg
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_hot_dir_prefetch_batches_its_executables(self):
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="aegis_hotbatch_")
+        saved = aegis.HOT_DIRS
+        try:
+            for i in range(4):
+                with open(os.path.join(tmp, "drop%d.exe" % i), "wb") as fh:
+                    fh.write(b"MZ\x90\x00" + b"\x00" * 64)
+            # A non-executable must not consume a slot.
+            with open(os.path.join(tmp, "notes.txt"), "w") as fh:
+                fh.write("hello")
+            aegis.HOT_DIRS = [tmp]
+
+            seen = []
+
+            def _run(cmd, timeout=15, extra_env=None):
+                env = extra_env or {}
+                paths = env.get("AEGIS_SIG_PATHS", "").split("\n")
+                seen.append(len(paths))
+                return ("".join("%s\tNotSigned\t\n" % q for q in paths), "", 0)
+            aegis.run = _run
+
+            aegis._warm_hot_dir_signatures(0)
+            self.assertEqual([4], seen,
+                             "four dropped PEs in one batch, text file excluded")
+        finally:
+            aegis.HOT_DIRS = saved
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_prefetch_is_a_no_op_off_windows(self):
         aegis.IS_WIN, aegis.IS_LINUX = False, True
         aegis.run, calls = self._counting_run(lambda env: ("", "", 0))
