@@ -557,6 +557,38 @@ class TestClipboardGrammar(unittest.TestCase):
             self.assertIsNone(tier, "%r matched %s" % (benign, hits))
 
 
+class TestWindowsProcessControlPrototypes(unittest.TestCase):
+    """The Win64 handle-width contract, asserted as source structure because a
+    macOS/Linux runner cannot execute the call.
+
+    ctypes defaults restype to C int (32 bits) while a Win64 HANDLE is a 64-bit
+    pointer, so an undeclared OpenProcess silently truncates its handle and then
+    hands the truncated value to NtSuspendProcess and CloseHandle at the wrong
+    width. Small handle values survive by luck — which is exactly what makes it
+    a defect that passes review and fails on someone else's machine."""
+
+    def test_handle_types_are_declared_not_left_to_ctypes_defaults(self):
+        import inspect
+        src = inspect.getsource(aegis._win_suspend_resume)
+        self.assertIn("restype = ctypes.c_void_p", src,
+                      "OpenProcess must declare a pointer-width restype")
+        self.assertIn("argtypes = (ctypes.c_void_p,)", src,
+                      "handle arguments must be declared pointer-width")
+        self.assertIn("c_long", src, "NTSTATUS must be a signed long")
+        # NTSTATUS success is >= 0, not == 0: informational statuses are
+        # non-negative and must not be read as failure.
+        self.assertIn(">= 0", src)
+
+    def test_both_verbs_route_through_the_same_prototyped_helper(self):
+        """A second hand-rolled ctypes call site is how the width bug comes
+        back, so suspend and resume must share one declaration."""
+        import inspect
+        for fn in (aegis._suspend_pid, aegis._resume_pid):
+            src = inspect.getsource(fn)
+            self.assertIn("_win_suspend_resume", src)
+            self.assertNotIn("windll", src)
+
+
 class TestClipboardPlatformWiring(unittest.TestCase):
     """The per-OS clipboard plumbing, asserted without touching a real
     clipboard. These are the paths a macOS dev cannot exercise locally, which is

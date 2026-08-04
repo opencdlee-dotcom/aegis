@@ -9747,13 +9747,7 @@ def _suspend_pid(pid):
             import ctypes
             # PROCESS_SUSPEND_RESUME (0x0800) is granted to the caller for its
             # OWN user's processes; no admin token is involved.
-            h = ctypes.windll.kernel32.OpenProcess(0x0800, False, int(pid))
-            if not h:
-                return False
-            try:
-                return ctypes.windll.ntdll.NtSuspendProcess(h) == 0
-            finally:
-                ctypes.windll.kernel32.CloseHandle(h)
+            return _win_suspend_resume(pid, "NtSuspendProcess")
         import signal as _signal
         os.kill(int(pid), _signal.SIGSTOP)
         return True
@@ -9761,18 +9755,46 @@ def _suspend_pid(pid):
         return False
 
 
+def _win_suspend_resume(pid, ntdll_func):
+    """Suspend or resume a same-user pid through ntdll, with the ctypes
+    prototypes declared explicitly.
+
+    Declaring argtypes/restype is not ceremony here. ctypes defaults a function's
+    restype to C `int` (32-bit), but a Win64 HANDLE is a 64-bit pointer — so the
+    handle from OpenProcess is silently truncated, and the truncated value is
+    then passed back to NtSuspendProcess and CloseHandle at the wrong width.
+    Small handle values survive that by luck, which is precisely what makes it a
+    bug that ships: it works on the developer's box and fails on someone's.
+    c_void_p pins the width; NTSTATUS is a signed LONG where < 0 is failure."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    k32.CloseHandle.restype = wintypes.BOOL
+
+    fn = getattr(ntdll, ntdll_func)
+    fn.argtypes = (ctypes.c_void_p,)
+    fn.restype = ctypes.c_long          # NTSTATUS
+
+    PROCESS_SUSPEND_RESUME = 0x0800
+    handle = k32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+    if not handle:
+        return False
+    try:
+        return fn(handle) >= 0
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _resume_pid(pid):
     """Release one suspended pid. True on success."""
     try:
         if IS_WIN:
-            import ctypes
-            h = ctypes.windll.kernel32.OpenProcess(0x0800, False, int(pid))
-            if not h:
-                return False
-            try:
-                return ctypes.windll.ntdll.NtResumeProcess(h) == 0
-            finally:
-                ctypes.windll.kernel32.CloseHandle(h)
+            return _win_suspend_resume(pid, "NtResumeProcess")
         import signal as _signal
         os.kill(int(pid), _signal.SIGCONT)
         return True
