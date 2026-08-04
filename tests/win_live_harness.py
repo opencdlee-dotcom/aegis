@@ -194,6 +194,62 @@ except Exception:
 
 
 # --------------------------------------------------------------------------- #
+# 1b. Batch signature prefetch against real PowerShell.
+#
+# This needs its OWN assertion and cannot ride on the scan below. The prefetch
+# is deliberately fail-soft: if its script is broken, warm_signature_cache()
+# returns 0, every path falls back to the per-path probe, and every other check
+# in this file still passes. The fallback that makes the optimization safe also
+# makes a broken one invisible — so prove it positively, or it is unproven.
+#
+# The risk is concrete rather than theoretical: this is the same kind of
+# embedded PowerShell where a backtick escape silently killed the process query.
+# --------------------------------------------------------------------------- #
+section("1b. Batch signature prefetch (one PowerShell for many binaries)")
+try:
+    import time as _t2
+    sys32 = os.path.join(aegis.WIN_SYSTEMROOT, "System32")
+    batch_paths = [os.path.join(sys32, n) for n in
+                   ("notepad.exe", "cmd.exe", "where.exe", "hostname.exe",
+                    "tasklist.exe", "whoami.exe")]
+    batch_paths = [p for p in batch_paths if os.path.exists(p)]
+    aegis._sigcache = {}  # force a cold resolve of every path
+
+    t0 = _t2.time()
+    resolved = aegis.warm_signature_cache(batch_paths)
+    batch_cost = _t2.time() - t0
+
+    check("the batch script ran against real PowerShell and resolved every "
+          "path in ONE start-up", resolved == len(batch_paths),
+          "resolved %d of %d in %.1fs" % (resolved, len(batch_paths), batch_cost))
+
+    cached = [p for p in batch_paths if p in (aegis._sigcache or {})]
+    check("every resolved path landed in the cache", len(cached) == len(batch_paths),
+          "%d/%d cached" % (len(cached), len(batch_paths)))
+
+    # The verdicts must be real, not placeholders: these are Microsoft binaries.
+    trusts = {p: (aegis._sigcache or {}).get(p, {}).get("result", {}).get("trust")
+              for p in batch_paths}
+    check("the batched verdicts are real signature answers, not defaults",
+          all(t in ("os-signed", "signed-valid") for t in trusts.values()),
+          "\n".join("%s -> %s" % (os.path.basename(p), t)
+                    for p, t in trusts.items()))
+
+    # And they must equal what the single-path probe says for the same file.
+    probe = aegis._classify_windows(batch_paths[0])
+    batched = (aegis._sigcache or {})[batch_paths[0]]["result"]
+    check("batch and single-path probe agree on the same real binary",
+          probe.get("trust") == batched.get("trust")
+          and probe.get("authority") == batched.get("authority"),
+          "single=%r  batch=%r" % (probe, batched))
+
+    note("prefetch resolved %d binaries in %.1fs; the same work as separate "
+         "probes costs one PowerShell start-up each" % (resolved, batch_cost))
+except Exception:
+    check("batch prefetch block completed", False, traceback.format_exc())
+
+
+# --------------------------------------------------------------------------- #
 # 2. CIM process enumeration — real Win32_Process + GetOwner.
 # --------------------------------------------------------------------------- #
 section("2. Process enumeration (real Get-CimInstance Win32_Process)")
