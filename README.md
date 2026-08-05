@@ -642,6 +642,17 @@ still caught by the anchors in the root-owned log store.** That last test is the
 difference between this design and the unprivileged Tripwire/AIDE clones that
 die because the attacker rewrites the baseline.
 
+The **delegate/session tier** now carries positive controls too — `assay` grew
+six lanes covering the agent-surface imperative detector, agent exec targets,
+session theft, extension capability gain, the `glean` atom threshold, and writ
+enforcement. Each asserts **both** poles, because a control that only feeds
+hostile input passes against a detector hardwired to say yes, and one that only
+feeds benign input passes against a dead one. That is not hypothetical: writing
+the exec-target lane is what exposed a branch the code could not reach, where a
+config whose target went from **absent to present** — the cheapest way to arm an
+agent config without editing a watched file — was silently never reported. See
+[BATTLE-LOG.md](BATTLE-LOG.md).
+
 One pre-existing defect surfaced while building it, and it was far larger than
 the guard that exposed it. macOS `ps` truncates the `comm` column to 16
 characters **when `args` is requested in the same call** — exactly how
