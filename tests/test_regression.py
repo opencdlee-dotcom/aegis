@@ -364,21 +364,28 @@ class TestAgentSurfaceTruncationReportedOnOneShotScan(Sandbox):
     coverage AFTER the surface walk."""
 
     def test_truncation_finding_is_emitted_on_a_single_scan(self):
+        # Force a REAL truncating agent-surface walk. Stubbing
+        # snapshot_agent_surface does NOT work: the SURFACES table captured the
+        # real function object at import, so _scan_surfaces calls the real walker
+        # regardless of a monkeypatch on the module name. Point the config roots
+        # at a small dir and drop the file cap so the genuine walk truncates on
+        # ANY machine — a stub-based version passed only on a dev box that
+        # happened to exceed the real cap, and failed in CI's clean sandbox.
+        root = os.path.join(self.tmp, "agentroot")
+        os.makedirs(root)
+        for i in range(3):
+            with open(os.path.join(root, "cfg%d.json" % i), "w") as fh:
+                fh.write("{}")
+        saved_roots = aegis.AGENT_CONFIG_ROOTS
+        saved_cap = aegis._AGENT_SCAN_FILE_CAP
+        aegis.AGENT_CONFIG_ROOTS = [root]
+        aegis._AGENT_SCAN_FILE_CAP = 1          # any real walk now truncates
         aegis._AGENT_SCAN_TRUNCATED[0] = False   # fresh-process starting state
-
-        def truncating_walk():
-            # Stand in for a walk that hit _AGENT_SCAN_FILE_CAP: sets the flag
-            # (as _agent_config_files does) and returns an empty, silently-adopted
-            # snapshot so no OTHER agent-surface finding is produced.
-            aegis._AGENT_SCAN_TRUNCATED[0] = True
-            return {}
-
-        saved = aegis.snapshot_agent_surface
-        aegis.snapshot_agent_surface = truncating_walk
         try:
             aegis.cmd_scan(quiet=True)
         finally:
-            aegis.snapshot_agent_surface = saved
+            aegis.AGENT_CONFIG_ROOTS = saved_roots
+            aegis._AGENT_SCAN_FILE_CAP = saved_cap
             aegis._AGENT_SCAN_TRUNCATED[0] = False
         with open(aegis.LATEST_JSON) as fh:
             data = json.load(fh)
