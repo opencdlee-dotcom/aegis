@@ -1,3 +1,122 @@
+# Aegis — agent surface, session theft, and a detector that never fired (2026-08-04)
+
+The previous pass added the protective tier. This one started as a feature pass
+— cover the AI-agent trust surface and session/cookie theft, neither of which
+had a single line of coverage — and turned up a defect in the tier shipped one
+commit earlier.
+
+## The defect this pass exists to have found
+
+| # | Sev | Defect | Before | After |
+|---|-----|--------|--------|-------|
+| A1 | **HIGH** | `_latch_intact()` referenced `stat_mod`, a name that does not exist anywhere in the file (the module imports `stat`, and the correct name is used two lines below). On macOS the reference raised `NameError` **into the function's own `except Exception: return None`**, so it answered "unknown" on every call. The flagship protective-tier signal — "a latch was cleared with no authorized `unlatch`", the one described as attack-defined evidence — had its HIGH branch made **unreachable on the primary platform**. Worse than silent: every latched path emitted a permanent `INFO` "latched surface could not be checked", so the mechanism produced a steady nag instead of a signal, training dismissal of exactly the category most worth reading. | `_latch_intact()` on a real `chflags uchg` file returned `None`; `check_latches()` could only ever emit INFO | returns `True` for an applied latch and `False` for a cleared one, verified against a real immutable file; `check_latches()` emits the HIGH finding |
+
+**The honest-unknown path swallowed a coding error.** This tool is careful, on
+purpose, never to report "clean" when it means "could not tell" — and that
+discipline is right. But an `except Exception: return None` cannot distinguish
+*the platform would not answer* from *this function is broken*, and it reports
+both as the honest-sounding one. A defensive default made a hard failure look
+like a soft limit. Where the cost of that confusion is a dead detector, the
+broad `except` needs to be narrow enough that a `NameError` still crashes.
+
+## Why no test caught it
+
+There was no positive control for the latch detector. `assay` existed and had
+six lanes; none of them exercised `_latch_intact`. The tier's own tests applied
+and released latches and asserted on the *state file*, never on the function
+that reads the *filesystem*.
+
+Two lanes were added — `latch-cleared` and `decoy-read` — and the first asserts
+**both poles in one lane**: that an applied latch reads intact AND that a
+cleared one reads cleared. Either assertion alone is passable by a function
+hardwired to a constant, which is precisely the failure mode being pinned. The
+`deadfall` coverage gate then refuses to arm any standing order whose lane has
+not passed within its half-life, so an automated response can never be bound to
+a detector in this state.
+
+## What the machine said that the fixtures could not
+
+Four further defects were found only by running the new code against this
+machine rather than against a fixture. The log's standing lesson holds: a
+simulation inherits its author's model of the system.
+
+| # | Defect | How it surfaced |
+|---|--------|-----------------|
+| A2 | `_automation_targets_live_profile()` captured the `--user-data-dir` value with `[^\s]+`. The real macOS profile root is `~/Library/Application Support/Google/Chrome` — **it contains spaces** — so the capture truncated at "Application" and classified a live-profile attack as a harmless scratch run. Failed **open**, on the single case the sensor exists to catch. | a hand-written case using the real path, not a synthetic one |
+| A3 | `_resolve_exec_target()` treated any argument containing a path separator as the script. `@modelcontextprotocol/server-foo` is an npm **scope spec**, not a path, so every `npx`-based MCP server — most of them — resolved to nothing and was never hashed. | printing resolved targets for the machine's actual 158 exec entries; 105 were unresolved |
+| A4 | The credential-surface table hardcoded Chrome's `Default/` profile. Real installs use `Profile 2`, `Profile 15`, `Profile 22`… so `cauterize` found **zero** cookie stores and printed a confident, tidy, incomplete plan. The most valuable credential class in the current threat model was absent while the output looked finished. | running `cauterize` on a real home directory and noticing what was missing |
+| A5 | The semantic imperative detector matched bare adverbs and fired on this repo's own instruction files — "route silently", "never report a result you didn't watch happen", and a legitimate "Do not tell the user **to run** `codex plugin marketplace add`". | scoring the machine's 306 real agent files and reading every hit |
+
+A5 is the calibration lesson in miniature. Concealment had to be redefined to
+name *who* is kept in the dark: "silently" is a writing style, "without telling
+the user" is an instruction to deceive the person the agent works for, and only
+the second has no legitimate form. The `(?!\s+to\s+\w)` lookahead that
+separates "don't tell the user **about** X" from "don't tell the user **to do**
+X" exists because a real file needed it.
+
+## Measured, not assumed
+
+- **`atime` is dead as a read sensor.** The obvious cookie-jar sensor — watch
+  the jar for reads — was designed, then discarded on evidence: on this APFS
+  volume the first read advanced `atime` and the **second did not**.
+  `EVFILT_VNODE` has no read flag, so there is no unprivileged fallback.
+  Building it would have shipped a detector that silently never fires — the same
+  failure as A1, chosen deliberately this time. Coverage went instead to the
+  paths attackers moved to after App-Bound Encryption: a browser driven against
+  its own live profile.
+- **Agent-config churn is ~19 changes/week** across this operator's three main
+  repos (244 in 90 days). A naive content-hash diff would emit ~19 alerts a week
+  and be muted within a fortnight. So plain edits are silent, and only a new
+  exec entry, a changed **resolved target**, or a **newly gained** semantic
+  imperative alerts — with git provenance separating an edit you typed from an
+  imperative that arrived in a `git pull` from a remote you do not control.
+- **The new snapshots cost 0.26s.** `surface.btm` costs 30s (pre-existing
+  `sfltool` timeout), which is now the dominant scan cost and is not this pass's
+  to fix, but is recorded here so it is not mistaken for one.
+
+## Also corrected
+
+- **`unlatch`'s human check was satisfiable by automation.** It gated on
+  `sys.stdin.isatty() and sys.stdout.isatty()` and reasoned that "a background
+  script has no tty and cannot read the code off our stdout". That is true of a
+  plain subprocess and **false of anything that allocates a pty** — `expect`,
+  `script`, `ssh -t`, an AI agent's shell tool. Such a wrapper passes both
+  checks, reads the challenge off the pty master, and types it back. Note the
+  obvious fix does not work either: `/dev/tty` fails identically, because a pty
+  *is* a controlling terminal. The channels must differ — the code now goes to a
+  GUI dialog and the answer comes from the terminal, and where no out-of-band
+  channel exists the weaker guarantee is recorded as `channel=tty-only` rather
+  than claimed as equivalent.
+- **Two comments asserted a constraint that does not exist**, saying inotify has
+  no stdlib binding so event-driven watch is macOS-only. `ctypes` is stdlib;
+  `inotify_init1` and `ReadDirectoryChangesW` are both reachable with zero
+  dependencies. Polling on Linux/Windows is an unpaid implementation cost, not a
+  platform limit. Corrected in place rather than deleted, because a limitation
+  written down as structural stops being re-examined.
+- **The "no new privileged parser" invariant was broader than its own
+  justification.** The Norton/Symantec CVE-2016-2208 parser was dangerous
+  because it ran as SYSTEM: a bug in it *escalated*. A parser at the same
+  privilege as the file's owner escalates nothing. Restated as **never parse
+  untrusted input above the privilege its author already holds** — which keeps
+  untrusted binaries out of scope and puts the operator's own config files in.
+
+## Residual
+
+- `deadfall` cannot fire anything; dispatch is deliberately unwired so the
+  interlocks land and get tested first. A test asserts this, so wiring it later
+  requires changing that test on purpose.
+- `guard` refuses nothing and covers interactive shells only. Win+R and
+  GUI-launched payloads are explicitly out of scope, stated rather than implied.
+- `writ` enforcement is default-off; while off, `writ_covers()` returns False
+  and scan behaviour is byte-identical.
+- The agent-surface walk is file-capped and hit its cap on this machine, which
+  is reported as a LOW partial-coverage finding rather than absorbed.
+- Three `credential+egress` instruction files remain flagged on this machine.
+  All are operator-authored, all are adopted silently at baseline, and none
+  produces an interrupt — but the calibration is a floor, not a proof.
+
+---
+
 # Aegis — protective tier (2026-08-04): pre-commit, contain reversibly, leave a witness
 
 Every prior pass in this log made the detector see more. This one asked a

@@ -137,6 +137,11 @@ class Sandbox(unittest.TestCase):
             "DECOY_FILE": os.path.join(self.state, "decoys.json"),
             "ASSAY_FILE": os.path.join(self.state, "assay.json"),
             "CLIPBOARD_FILE": os.path.join(self.state, "clipboard.json"),
+            "DEADFALL_FILE": os.path.join(self.state, "deadfall.json"),
+            "CAUTERIZE_FILE": os.path.join(self.state, "cauterize.json"),
+            "WRIT_FILE": os.path.join(self.state, "writs.json"),
+            "GUARD_DIR": os.path.join(self.state, "guard"),
+            "GUARD_LOG": os.path.join(self.state, "guard", "observations.jsonl"),
             # _NOOP_CMD, not /usr/bin/true: on Windows that path does not
             # exist, so these "rc 0, empty" stubs actually returned rc 127
             # and the surface was skipped as DEGRADED instead of adopting an

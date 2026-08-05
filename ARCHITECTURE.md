@@ -59,6 +59,9 @@ Three rules keep this honest rather than merely portable:
 | Pre-commit | Latched persistence surfaces (`chflags uchg` / deny-write ACE) and FIFO credential decoys, both placed **before** any attack | Makes the attacker's write fail rather than reporting it afterwards; a cleared latch or a read decoy is attack-defined evidence |
 | Contain | Manual process action, **reversible freeze**, and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
 | Prove detection | Positive-control assay per detector, with an efficacy half-life | Distinguishes "nothing found" from "no longer able to find"; unproven coverage is reported as unproven |
+| Delegate-surface | Agent config discovered by **shape** (a `command`+`args` pair under an agent directory), hashed by **resolved target** rather than by config line, plus a semantic imperative detector for instruction files and git-derived provenance for each added line | An AI agent runs with the operator's full authority and takes instruction from files; an MCP registration is exec-on-start, a hook body is exec-per-tool-call, and a natural-language imperative is an execution primitive with no shell syntax for any grammar to match |
+| Session | Browser automation aimed at the **live** profile (debug port, sideloaded extension, real `--user-data-dir`), plus session-binding posture | Post-App-Bound-Encryption, cookie theft is the browser being driven against itself rather than a jar being copied; live cookies defeat MFA and their revocation belongs to the counterparty |
+| Recover-plan | Dependency-ordered revocation derived from the credential artifacts actually present on disk | The question after a theft is not "what happened" but "which accounts are theirs, in what order do I take them back" — and rotating in the wrong order hands over the reset link |
 | Witness | Hash-chained state anchored into the OS's root-owned log store | An attacker who tampers, or who stops the monitor, cannot do so silently |
 | Recover | Exclusive restore, verified delete, crash recovery, audit | Handles false positives and interrupted response without silent data loss |
 
@@ -196,6 +199,23 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
 - System tools resolve to absolute Apple paths and run with a fixed system PATH.
 - State directory/file modes are `0700`/`0600`; runtime is installed atomically.
 - Automatic scan/watch never calls VirusTotal; manual `vt` sends only a SHA-256.
+- **No parser above the user.** Untrusted input is never parsed at a privilege
+  its author does not already hold. This is the corrected form of the older "no
+  new privileged parser" wording, which was broader than its justification: the
+  Norton/Symantec CVE-2016-2208 parser was dangerous because it ran as SYSTEM, so
+  a bug in it escalated. A parser at the same privilege as the file's owner
+  escalates nothing. Parsing the operator's own JSON/TOML config is therefore
+  in-scope; parsing untrusted binaries is not.
+- **Human authorization must not be satisfiable by automation.** An `isatty()`
+  check is not sufficient — anything that allocates a pty (`expect`, `script`,
+  an agent's shell tool) passes it and can read a code printed to that terminal.
+  The challenge channel and the response channel must therefore be different,
+  and where no out-of-band channel exists the weaker guarantee is *recorded*
+  (`channel=tty-only` in `actions.jsonl`), never claimed as equivalent.
+- **Presence is evidence, never a control input.** Idle/lock state is forgeable
+  by a same-uid process, so it may enrich a finding and must never license an
+  automatic action. Any measurement an attacker can drive is a remote control if
+  an automated decision reads it.
 - Web/phishing posture parses local `/etc/hosts` only; it neither downloads nor
   installs third-party policy and never mistakes invisible DNS/NE coverage for
   confirmed absence.
