@@ -23,7 +23,9 @@ Platform-selected constants are exercised by patching the module's platform
 flags where a pure function reads them.
 """
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1652,6 +1654,83 @@ class TestInotifyAbsentElsewhere(unittest.TestCase):
             self.skipTest("Linux has inotify; this pins the fallback")
         self.assertIsNone(aegis._inotify_libc())
         self.assertEqual((None, 0), aegis._build_watch_inotify())
+
+
+class LinuxInstallQuotingAndIdempotency(unittest.TestCase):
+    """R3-2 + R3-3. _install_linux is called directly (it does not gate on
+    IS_LINUX), with systemctl/loginctl stubbed, so this runs on any host."""
+
+    def _run_install(self, mode):
+        calls = []
+        home = tempfile.mkdtemp(prefix="aegis home ")   # a SPACE in $HOME
+        saved = (aegis.run, aegis.HOME)
+        aegis.HOME = home
+
+        def fake_run(cmd, *a, **k):
+            calls.append(list(cmd))
+            return ("Linger=yes", "", 0)
+
+        aegis.run = fake_run
+        try:
+            runtime = os.path.join(home, ".aegis", "aegis.py")
+            aegis._install_linux(runtime, mode, 600)
+            with open(os.path.join(home, ".config", "systemd", "user",
+                                   "aegis.service")) as _fh:
+                svc = _fh.read()
+        finally:
+            aegis.run, aegis.HOME = saved
+            shutil.rmtree(home, ignore_errors=True)
+        exec_line = [l for l in svc.splitlines()
+                     if l.startswith("ExecStart=")][0]
+        return calls, runtime, exec_line
+
+    def test_execstart_quotes_paths_with_spaces(self):
+        # R3-2: an unquoted ExecStart split on the space in $HOME and systemd
+        # then failed the unit on every trigger; Aegis never ran.
+        _calls, runtime, exec_line = self._run_install("watch")
+        self.assertIn('"%s"' % runtime, exec_line,
+                      "runtime path is not a single quoted argument: %s"
+                      % exec_line)
+
+    def test_install_disables_both_units_before_enabling_target(self):
+        # R3-3: idempotent switch + refresh — a still-running `simple` service
+        # kept executing the OLD ~/.aegis copy, and switching modes left the
+        # previous unit running. Both are stopped+disabled before the target is
+        # enabled.
+        calls, _runtime, _exec = self._run_install("watch")
+        disabled = {c[4] for c in calls
+                    if c[:4] == ["systemctl", "--user", "disable", "--now"]}
+        self.assertEqual({"aegis.service", "aegis.timer"}, disabled)
+        enable_idx = next(i for i, c in enumerate(calls) if "enable" in c)
+        disable_idxs = [i for i, c in enumerate(calls) if "disable" in c]
+        self.assertTrue(all(di < enable_idx for di in disable_idxs),
+                        "disable must precede enable")
+
+
+class ScanDirsHaveNoRealpathAliases(unittest.TestCase):
+    """R3-5. macOS's /tmp is a firmlink to /private/tmp; listing both scanned
+    every physical file twice and emitted two findings for one object."""
+
+    def test_no_scan_dir_list_has_a_realpath_duplicate(self):
+        for name in ("HOT_DIRS", "STAGING_DIRS"):
+            lst = getattr(aegis, name)
+            rps = [os.path.realpath(d) for d in lst]
+            self.assertEqual(len(rps), len(set(rps)),
+                             "%s lists the same physical dir twice: %s"
+                             % (name, lst))
+
+    def test_dedup_collapses_a_real_alias(self):
+        # Platform-agnostic: a symlink is the same aliasing the /tmp firmlink is.
+        d = tempfile.mkdtemp()
+        try:
+            real = os.path.join(d, "real")
+            os.makedirs(real)
+            link = os.path.join(d, "link")
+            os.symlink(real, link)
+            self.assertEqual([real], aegis._dedup_by_realpath([real, link]))
+            self.assertEqual([link], aegis._dedup_by_realpath([link, real]))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

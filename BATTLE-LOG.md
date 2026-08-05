@@ -1,13 +1,15 @@
-# Aegis — a governed battle-test: two loud rounds, ten defects (2026-08-05)
+# Aegis — a governed battle-test: three loud rounds, fifteen defects (2026-08-05)
 
 A single `/battle-test` run under `/fable-mode` governance: right-size, hunt across
 independent lenses, adversarially verify every candidate against the real code before
 it is trusted, fix, regression-pin, re-verify, loop. Siege tier, because this tool
-quarantines, destroys, neutralizes and freezes. Two rounds of hunting both came back
-*loud* — the first found five defects in the newest delegate/session tier, the second
-found five more in the *older core the earlier passes never adversarially hunted*,
-including a CRITICAL bypass of the destructive-action safety rail. Every one was
-verified against the running machine or a traced repro, not asserted from a fixture.
+quarantines, destroys, neutralizes and freezes. Three rounds of hunting all came back
+*loud* — five defects in the newest delegate/session tier, five more in the *older core
+the earlier passes never adversarially hunted* (including a CRITICAL bypass of the
+destructive-action safety rail), and five in the install/watch/txn surfaces on the third
+round — **one of which this very pass introduced with an earlier fix and then caught.**
+Every one was verified against the running machine or a traced repro, not asserted from
+a fixture.
 
 The method that produced the two headline findings is worth stating: **when two pieces
 of code read the same fact, do they agree?** The deadfall dispatch gate and the `assay`
@@ -60,52 +62,72 @@ one-sided test passes against a detector hardwired to one answer.
   inspects the `ps`-call source, which the C4 refactor moved into `_iter_processes_live`;
   assertions kept verbatim, only the inspected symbol follows the code.
 
-## Round 3 — the re-check that ran, and the sweep that did not
+## Round 3 — a third loud round, and a defect this pass created (5)
 
-Round 3 was two jobs: re-check all ten fixes for introduced defects, and sweep the
-surfaces the first two rounds never touched (the event-driven watch loop, the
-install/scheduler lifecycle, the quarantine transaction state machine, the
-heartbeat/watchdog). The automated fan-out hit this session's rate limit before any
-lens returned, so the **fix re-check was completed inline instead — and came back
-clean**: the R2-5 flag regex has no catastrophic backtracking (a 40k-character input
-redacts in ~4 ms); R2-2's case-fold does not over-protect a benign nested path
-(`/tmp/SystemLog.txt`, `~/Documents` stay quarantinable) and its fs-probe caches
-correctly; R2-4's fingerprint helpers handle a missing-fingerprint event and an empty
-set without crashing or mis-reattaching; R2-3's audit gate fails closed by design (a
-kill whose audit cannot be written does not fire — the honest tradeoff the invariant
-chooses); R2-1's relocated coverage sensor still records its health entry.
+Round 3 re-checked all ten fixes and swept the surfaces the first two rounds never
+touched (the watch loop, install/scheduler lifecycle, quarantine transaction machine,
+heartbeat/watchdog). Its automated fan-out first hit the session's rate limit; I
+completed the fix re-check inline and — being honest about the record — **got one
+wrong**: I reported the R2-5 flag regex "clean" because my inline probe used a single
+`--aaaa…` anchor (fast, 4 ms) and never tried the pathological *hyphen-dense* input.
+When the limit reset and the automated sweep actually ran, it found exactly that, plus
+four more. The lesson the log keeps teaching, turned on its author this time: a check
+that only exercises the easy input proves nothing about the hard one.
 
-The **surface-sweep did not run** and is recorded here as unhunted residual, not as a
-clean result — the difference between "nothing found" and "did not look" is the thing
-this log is named for. This pass therefore stops on a **resource bound**, not on two
-consecutive dry rounds: the ten fixes are complete and independently verified, and the
-last-surfaces sweep is owed a follow-up when the limit resets. It is not folded into a
-false convergence claim.
+| # | Sev | Defect | Fix |
+|---|-----|--------|-----|
+| R3-1 | MED | **Introduced by the R2-5 fix.** `_SECRET_FLAG_RE` led with an unbounded `[\w-]*` before the keyword, so a hyphen-dense token backtracked O(n²) — a ReDoS reachable through an uncapped agent-config `args` value (measured 18.5 s at 40 KB, minutes at 200 KB), stalling the whole scan synchronously. | bound the prefix `{0,40}` (Python 3.9 has no possessive quantifier) **and** cap the interpolated args at 400 chars; 200 KB now redacts in 0.22 s. Both-pole timing test. |
+| R3-2 | **HIGH** | `_install_linux` wrote an **unquoted** `ExecStart`; systemd splits on whitespace, so any space in `$HOME` or the interpreter path (a named venv/conda env, `/home/john doe`) produced a malformed unit that failed on every trigger — Aegis never ran, no heartbeat, no alert, while the timer reported itself healthily enabled. `_install_mac` (per-`<string>`) and `_install_windows` (quoted) already handled this. | quote each path in the exec line; test asserts a spaced path stays one argument. |
+| R3-3 | MED | `cmd_install` on Linux was not idempotent despite the README promise: re-installing watch mode never restarted the running `simple` service, so a refreshed `~/.aegis/aegis.py` kept running the OLD code; switching modes left the previous unit enabled and running. | stop+disable BOTH units before enabling the target; test asserts the disable calls precede enable. |
+| R3-5 | **HIGH** | macOS `HOT_DIRS`/`STAGING_DIRS` listed both `/tmp` and `/private/tmp` — the same firmlink (`realpath('/tmp') == '/private/tmp'`) — so every real `/tmp` detection was emitted **twice** with two different path fingerprints, inflating signal counts and defeating the RISK_MIN_SIGNALS distinct-signal guard (one physical file could masquerade as multiple corroborating sensors). | `_dedup_by_realpath` collapses aliases at definition (generic, so future symlinked dirs too); one physical file → one finding, pinned. |
+| R3-4 | LOW | `_install_windows`' watch comment claimed the process was "kept alive by the scheduler's restart policy" — the `schtasks /create /sc onlogon` call configures no such policy (that needs the XML task API), so a crashed watch process is not relaunched until the next logon. The comment described resilience the code does not have. | comment corrected to state the gap honestly and point at the mutual watchdog as the real liveness signal. Not shipped blind: no untested XML task change on a platform this pass could not execute. |
+
+One candidate was **refuted** on verification (raised, traced, found not to reach a
+real wrong behaviour) — recorded because a rejected finding is part of an honest count.
+
+## Convergence
+
+Three rounds, three loud: 5 + 5 + 5 = **fifteen** genuine defects (1 CRITICAL, 5 HIGH,
+7 MED, 2 LOW), one of them created and then caught within this same pass. The stop is a
+**hard-cap / diminishing-returns** judgement, not two consecutive dry rounds — stated
+plainly rather than dressed as convergence. Every surface the three rounds targeted has
+now been adversarially hunted at least once; a fourth round is the honest next step if
+this is ever driven to a true dry-dry stop, and the workflow scripts (`bt_round{1,2,3}.mjs`)
+are saved to re-run it.
+
+## Verification (final)
+
+- macOS full suite **651 passed, 3 skipped** (+15 regression pins over the 636 baseline);
+  `selftest.py` 7/7.
+- Every one of the fifteen new tests was run against its pre-fix source and **failed**
+  (assertion failures, plus a few errors where a fix introduces a symbol the test needs).
+- Live-verified this pass: the R2-2 case bypass and its fix; the R3-1 ReDoS (18.5 s →
+  0.22 s) and its fix; the R3-5 double-emit (2 findings → 1); the R3-2 quoted unit text.
+- Cross-platform CI (Linux 3.9/3.12 · macOS · Windows 3.9/3.12) is the gate for the
+  platform-specific fixes (R2-2/R2-3/R3-2/R3-3, C3/C4); driven on the branch's PR.
 
 ## Residual
 
-- The R2-2 case-fold is fail-closed: on the rare mixed-case-sensitivity volume it
-  over-protects (refuses a legitimate quarantine of a case-alias) rather than
-  under-protect. Stated, not implied.
-- R2-4 adds two bounded lookups per FALSE_POSITIVE upsert (a rare path); no measurable
-  cost on the suite.
-- C3/C4/C2 are exercised on macOS/Linux here; the Windows cost they most affect (the
-  ~41s CIM query) is inferred from the file's own prior measurements, not re-measured.
-- **Owed:** the Round 3 sweep of the watch loop, install/scheduler lifecycle, quarantine
-  transaction state machine, and heartbeat/watchdog did not run (session rate limit).
-  Those surfaces carry prior-pass and live-harness coverage but were not adversarially
-  re-hunted this pass; re-run `bt_round3.mjs` after the limit resets before treating them
-  as clean.
+- R2-2's case-fold is fail-closed: on a rare mixed-case-sensitivity volume it
+  over-protects (refuses a legitimate quarantine of a case-alias) rather than under-protect.
+- R2-4 adds two bounded lookups per FALSE_POSITIVE upsert (a rare path); no measurable cost.
+- The Windows ~41 s CIM cost that C2/C3/C4 improve is inferred from the file's own prior
+  measurement, not re-measured here. R3-2/R3-3/R3-4 are Linux/Windows paths verified by
+  unit-level generation and stubbed lifecycle, not on a live foreign kernel this pass —
+  CI and the live harnesses are the backstop.
+- R3-4 leaves a real Windows watch-mode resilience gap (no crash-restart) documented but
+  unfixed, because the fix needs the XML task API and this pass would not ship Windows
+  scheduler code it cannot execute.
 
-## End-state checklist (each box backed by captured output or marked owed)
+## End-state checklist
 
-- ▢ bugs found → fixed: **10/10** (2 HIGH+1 CRITICAL+... see tables), all with a repro that failed before and passes now.
-- ▢ logic errors found → fixed: C5, R2-4 (gate logic), R2-1 (ordering) — fixed + pinned.
-- ▢ edge cases found → tested: every fix has a both-poles regression test; all proven to fail pre-fix.
-- ▢ no unimplemented files/stubs remain: completeness pre-flight was clean at Gate 2 (no TODO/NotImplemented/stub bodies).
-- ▢ security lens run: inline (watchdog binary absent) across both rounds; found + fixed the CRITICAL case-alias bypass, the audit-gap, and the secret-leak.
-- ▢ /spar adversarial-break: run as the adversarial lens each round (Opus/high); Round 3's automated pass was rate-limited and completed inline for the fixes, **owed** for the last surfaces.
-- Verified vs inferred: suite/selftest/live-checks are **verified**; the Windows ~41s figures are **inferred** from prior measurement; the last-surfaces cleanliness is **neither — unhunted**.
+- bugs found → fixed: **15/15**, each with a repro that failed before and passes now.
+- logic errors found → fixed: C5, R2-4, R2-1, R3-3 — fixed + pinned.
+- edge cases found → tested: every fix has a both-poles / linear-timing regression test; all proven to fail pre-fix.
+- no unimplemented files/stubs remain: completeness pre-flight clean at Gate 2.
+- security lens run: inline across all three rounds; fixed the CRITICAL case-alias bypass, the neutralize audit gap, the secret-leak, and the ReDoS.
+- adversarial-break: run as the Opus/high lens each round; Round 3 caught a self-introduced defect — the strongest evidence the loop works.
+- verified vs inferred: suite/selftest/live-checks **verified**; Windows CIM timings **inferred**; nothing claimed clean that was only reasoned about (the R2-5 inline miss is recorded above, not hidden).
 
 ---
 

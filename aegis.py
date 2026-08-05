@@ -330,6 +330,26 @@ else:
                      "Programs", "StartUp"),
     ]
 
+def _dedup_by_realpath(dirs):
+    """Collapse aliases of the same directory to ONE entry, keeping the first
+    spelling. macOS's `/tmp` is a firmlink to `/private/tmp`, so listing both
+    (as these tables did) scanned every physical file TWICE and emitted two
+    findings with different path fingerprints for one object — inflating signal
+    counts and defeating the RISK_MIN_SIGNALS distinct-signal guard. Generic
+    (any symlinked dir), so it also protects future additions."""
+    seen, out = set(), []
+    for d in dirs:
+        try:
+            rp = os.path.realpath(d)
+        except Exception:
+            rp = d
+        if rp in seen:
+            continue
+        seen.add(rp)
+        out.append(d)
+    return out
+
+
 # Directories where a freshly-dropped executable is inherently suspicious.
 if IS_MAC:
     HOT_DIRS = [
@@ -354,6 +374,8 @@ else:
         WIN_TEMP,
         WIN_PUBLIC,
     ]
+# Collapse the /tmp==/private/tmp firmlink (and any other aliased entry).
+HOT_DIRS = _dedup_by_realpath(HOT_DIRS)
 
 # Path prefixes we treat as trusted-by-location.
 #   mac:    Apple-owned, read-only under SIP. /usr/ is deliberately narrowed to
@@ -862,6 +884,8 @@ elif IS_LINUX:
     STAGING_DIRS = ["/tmp", "/var/tmp", "/dev/shm"]
 else:
     STAGING_DIRS = [d for d in (WIN_TEMP, WIN_PUBLIC, WIN_PROGRAMDATA) if d]
+# Same firmlink collapse as HOT_DIRS: one physical file, one finding.
+STAGING_DIRS = _dedup_by_realpath(STAGING_DIRS)
 
 # --- Crypto-wallet integrity (wallet-drainer surface) ------------------------ #
 # 2025 stealers don't just steal — they tamper with installed wallet apps to
@@ -1809,11 +1833,16 @@ _URL_USERINFO_RE = re.compile(r"(https?://[^\s/@:]+:)([^\s/@]+)(@)", re.I)
 # token: `--api-key VALUE`, `--token VALUE`, `--password VALUE`,
 # `--slack-token VALUE`. The `:`/`=` form is _SECRET_ASSIGN_RE's; this is the
 # space-separated convention that MCP/agent configs put in their `args` arrays,
-# which diff_agent_surface interpolates verbatim into a finding's detail. The
-# keyword must sit at the flag's TAIL (next char is whitespace), so `--token-count 5`
-# does not swallow its count.
+# which diff_agent_surface interpolates into a finding's detail. The keyword
+# must sit at the flag's TAIL (next char is whitespace), so `--token-count 5`
+# does not swallow its count. The prefix is BOUNDED (`{0,40}`, not `*`): an
+# unbounded `[\w-]*` backtracks O(n) at each of O(n) hyphen anchors in a
+# hyphen-dense token, giving O(n^2) — a ReDoS reachable through the uncapped
+# agent-config `args` above. Python 3.9 has no possessive quantifier, so a
+# length bound (no credential flag name is >40 chars) is the portable fix; the
+# args interpolation is also length-capped as defence in depth.
 _SECRET_FLAG_RE = re.compile(
-    r"(?i)(--?[\w-]*(?:password|passwd|api[_-]?key|token|secret|cookie|auth))"
+    r"(?i)(--?[\w-]{0,40}(?:password|passwd|api[_-]?key|token|secret|cookie|auth))"
     r"(\s+)(\S+)")
 _TOKEN_SHAPE_RE = re.compile(
     r"(?i)\b(?:sk-(?:live-)?[A-Za-z0-9_-]{12,}|"
@@ -7839,7 +7868,8 @@ def diff_agent_surface(prior, cur):
                         "%s registered a new executable entry: %s %s\nResolved "
                         "target: %s\n%s\nAn MCP server or tool hook runs with "
                         "your full authority every time the agent starts."
-                        % (path, e.get("cmd"), " ".join(e.get("args") or []),
+                        % (path, e.get("cmd"),
+                           (" ".join(e.get("args") or []))[:400],
                            e.get("target") or "(unresolved)",
                            _PROVENANCE_NOTE.get(prov, "")),
                         "agent-surface:newexec:%s:%s" % (path, key),
@@ -13524,14 +13554,20 @@ def _install_linux(runtime, mode, interval):
     py = sys.executable or "/usr/bin/python3"
     unit_dir = os.path.join(HOME, ".config", "systemd", "user")
     os.makedirs(unit_dir, exist_ok=True)
+    # Quote each path: systemd's Exec= grammar splits on whitespace unless a
+    # token is double-quoted, so an unquoted ExecStart broke on any space in
+    # $HOME or the interpreter path (a named venv/conda env, a display-name home
+    # like `/home/john doe`) — the unit then failed on every trigger and Aegis
+    # never actually ran. _install_mac (per-<string> plist elements) and
+    # _install_windows (already-quoted) handle this; Linux now matches.
     if mode == "watch":
         service = _SYSTEMD_SERVICE % {
             "type": "simple",
-            "exec": "%s %s watch %d" % (py, runtime, interval),
+            "exec": '"%s" "%s" watch %d' % (py, runtime, interval),
             "restart": "Restart=always\nRestartSec=10"}
     else:
         service = _SYSTEMD_SERVICE % {
-            "type": "oneshot", "exec": "%s %s scan" % (py, runtime),
+            "type": "oneshot", "exec": '"%s" "%s" scan' % (py, runtime),
             "restart": ""}
     with open(os.path.join(unit_dir, "aegis.service"), "w", encoding="utf-8") as f:
         f.write(service)
@@ -13542,6 +13578,14 @@ def _install_linux(runtime, mode, interval):
         return rc, ("systemctl --user daemon-reload failed: %s\n"
                     "(No user systemd? Run `%s %s scan` from cron instead.)"
                     % ((err or "").strip(), py, runtime))
+    # Idempotent by construction: stop and disable BOTH units first, so
+    # re-installing the same mode restarts the daemon on the just-refreshed
+    # runtime copy (a still-running `simple` service would otherwise keep
+    # executing the OLD ~/.aegis/aegis.py), and switching modes does not leave
+    # the previous mode's unit enabled and running alongside the new one. A unit
+    # that was never enabled returns non-zero here; that is expected and ignored.
+    for _u in ("aegis.service", "aegis.timer"):
+        run(["systemctl", "--user", "disable", "--now", _u], timeout=30)
     unit = "aegis.service" if mode == "watch" else "aegis.timer"
     _o, err, rc = run(["systemctl", "--user", "enable", "--now", unit],
                       timeout=30)
@@ -13570,8 +13614,12 @@ def _install_windows(runtime, mode, interval):
                                "watch %d" % interval if mode == "watch"
                                else "scan")
     if mode == "watch":
-        # One long-running process, started at logon and kept alive by the
-        # scheduler's restart policy.
+        # One long-running process, (re)started at each logon. `schtasks
+        # /create` exposes no restart-on-failure knob (that needs the XML task
+        # API), so if the watch process dies mid-session it is NOT relaunched
+        # until the next logon — a real gap, stated rather than implied. The
+        # mutual watchdog (`aegis.py watchdog`) is the durable liveness signal
+        # that catches a dead monitor here; polling `scan` mode has no such gap.
         cmd = ["schtasks", "/create", "/tn", SELF_WIN_TASK, "/tr", action,
                "/sc", "onlogon", "/rl", "limited", "/f"]
     else:

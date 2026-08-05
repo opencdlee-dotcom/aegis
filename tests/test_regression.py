@@ -2872,6 +2872,21 @@ class TestPrivacyBoundary(Sandbox):
         for benign in ("--token-count 5", "--output-dir /tmp/build"):
             self.assertEqual(benign, aegis.redact_sensitive(benign))
 
+    def test_redaction_is_linear_on_hyphen_dense_input(self):
+        """The _SECRET_FLAG_RE added for space-separated secrets led with an
+        unbounded `[\\w-]*` before the keyword, giving O(n^2) backtracking on a
+        hyphen-dense token — reachable through an uncapped agent-config `args`
+        value, hanging a whole scan for ~18s at 40KB (minutes at 200KB). The
+        bounded prefix (and the args length cap) make it linear."""
+        import time
+        big = "-a" * 60000            # 120 KB; pre-fix this took minutes
+        t0 = time.time()
+        aegis.redact_sensitive(big)
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 3.0,
+                        "redaction showed superlinear blowup (%.1fs) — ReDoS "
+                        "regression in _SECRET_FLAG_RE" % elapsed)
+
 
 class TestEventIncidentCore(Sandbox):
     def _rows(self, sql, args=()):
