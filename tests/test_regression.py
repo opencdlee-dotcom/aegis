@@ -304,6 +304,90 @@ class Sandbox(unittest.TestCase):
 # F1 — signed-interpreter + hostile payload must score >= HIGH (else it never
 # notifies, so the #1 AMOS/Poseidon launchd pattern is invisible).
 # --------------------------------------------------------------------------- #
+class TestProcessSnapshotSharedPerScan(Sandbox):
+    """The process/behavior/session-theft sensors each re-walked the full
+    process table in one scan — a comment even claimed session-theft reused
+    'the process list this scan already collected', which it did not. On Windows
+    each walk is a ~41s CIM query, so three walks tripled the dominant scan cost.
+
+    Two properties, and the SECOND is the safety pin: a shared snapshot that is
+    not rebuilt every scan would make the process sensor go blind across
+    cmd_watch's long-lived loop — a far worse bug than the inefficiency it fixes.
+      (1) one scan performs exactly ONE live walk despite >=3 sensors needing it;
+      (2) a second scan performs a FRESH walk, and the cache is cleared between,
+          so no scan ever reads a stale table."""
+
+    def test_one_live_walk_per_scan_shared_and_rebuilt_each_scan(self):
+        # Restore the REAL process sensors (Sandbox stubs two of the three to []
+        # for determinism); the point of this test is that all three share.
+        for fn in ("check_processes", "check_behavior"):
+            setattr(aegis, fn, self._saved[fn])
+
+        calls = []
+
+        def counting_live():
+            calls.append(1)
+            # A distinct, benign, non-user-writable system path per walk: if the
+            # sensors did NOT share, each would trigger its own walk and the
+            # counter would climb past one within a single scan.
+            n = 1000 + len(calls)
+            return iter([(str(n), aegis._own_owner(),
+                          "/sbin/launchd", "/sbin/launchd")])
+
+        saved_live = aegis._iter_processes_live
+        aegis._iter_processes_live = counting_live
+        try:
+            aegis.gather_all({}, {})
+            self.assertEqual(1, len(calls),
+                             "one scan walked the process table %d times; the "
+                             "three sensors did not share one snapshot"
+                             % len(calls))
+            self.assertIsNone(aegis._PROC_SNAPSHOT,
+                              "the per-scan snapshot was not cleared after the "
+                              "sensor loop — a by-hand command would read stale")
+            aegis.gather_all({}, {})
+            self.assertEqual(2, len(calls),
+                             "the second scan reused a stale snapshot instead of "
+                             "re-walking — the process sensor would go blind "
+                             "across cmd_watch iterations")
+            self.assertIsNone(aegis._PROC_SNAPSHOT)
+        finally:
+            aegis._iter_processes_live = saved_live
+
+
+class TestAgentSurfaceTruncationReportedOnOneShotScan(Sandbox):
+    """The truncation-coverage sensor read _AGENT_SCAN_TRUNCATED as a gather_all
+    sensor, but the ONLY writer (snapshot_agent_surface) runs later in
+    _scan_surfaces — so on a one-shot `aegis.py scan` (fresh process) the reader
+    saw the module-init False and the 'walk hit its file cap' finding was never
+    emitted, exactly the false-clean the sensor exists to prevent. The fix reads
+    coverage AFTER the surface walk."""
+
+    def test_truncation_finding_is_emitted_on_a_single_scan(self):
+        aegis._AGENT_SCAN_TRUNCATED[0] = False   # fresh-process starting state
+
+        def truncating_walk():
+            # Stand in for a walk that hit _AGENT_SCAN_FILE_CAP: sets the flag
+            # (as _agent_config_files does) and returns an empty, silently-adopted
+            # snapshot so no OTHER agent-surface finding is produced.
+            aegis._AGENT_SCAN_TRUNCATED[0] = True
+            return {}
+
+        saved = aegis.snapshot_agent_surface
+        aegis.snapshot_agent_surface = truncating_walk
+        try:
+            aegis.cmd_scan(quiet=True)
+        finally:
+            aegis.snapshot_agent_surface = saved
+            aegis._AGENT_SCAN_TRUNCATED[0] = False
+        with open(aegis.LATEST_JSON) as fh:
+            data = json.load(fh)
+        fps = [x["fingerprint"] for x in data["findings"]]
+        self.assertIn("agent-surface:truncated", fps,
+                      "a truncated one-shot scan reported clean coverage; the "
+                      "reader ran before the writer")
+
+
 class TestHostileArgsSeverity(Sandbox):
     def _sev(self, args, program=None):
         rec = {"label": "x", "program": program or args[0], "args": args,
@@ -1577,6 +1661,33 @@ class TestResponseTier(Sandbox):
         self.assertTrue(aegis._is_protected_path(
             os.path.join(aegis.STATE_DIR, "baseline.json")))
 
+    def test_case_varied_alias_is_refused_on_case_insensitive_fs(self):
+        """CRITICAL bypass: os.path.realpath resolves symlinks but PRESERVES the
+        caller's case, and macOS/Windows filesystems are case-insensitive — so
+        `~/.AEGIS/baseline.json`, `/SYSTEM`, `/USERS/<me>` are the SAME files as
+        their protected canonical forms yet a raw string compare let them slip
+        past the rail. Verified live: cmd_quarantine on the case-varied alias
+        moved Aegis's own baseline away. Both poles, forcing the fs flag so the
+        test is deterministic on a case-sensitive CI host too."""
+        state_alias = os.path.join(aegis.STATE_DIR, "baseline.json").upper()
+        saved = aegis._FS_CASE_INSENSITIVE
+        try:
+            # Case-insensitive fs: the alias resolves to a protected file -> refuse.
+            aegis._FS_CASE_INSENSITIVE = True
+            self.assertTrue(aegis._is_protected_path(state_alias),
+                            "case-varied alias of the state dir bypassed the rail")
+            self.assertTrue(aegis._is_protected_path("/SYSTEM/Library/x"))
+            self.assertTrue(aegis._is_protected_path("/USR/bin/python3"))
+            # A genuinely unrelated path is still NOT over-protected.
+            self.assertFalse(aegis._is_protected_path("/tmp/payload.bin"))
+            # Case-sensitive fs: the alias is a DISTINCT path and correctly not
+            # protected, while the exact-case protected path still is.
+            aegis._FS_CASE_INSENSITIVE = False
+            self.assertFalse(aegis._is_protected_path("/SYSTEM/Library/x"))
+            self.assertTrue(aegis._is_protected_path("/System/Library/x"))
+        finally:
+            aegis._FS_CASE_INSENSITIVE = saved
+
     def test_refuse_home_and_ancestors(self):
         self.assertTrue(aegis._is_protected_path(aegis.HOME))
         self.assertTrue(aegis._is_protected_path("/Users"))
@@ -1632,6 +1743,42 @@ class TestResponseTier(Sandbox):
         man = aegis.load_json(aegis.QUARANTINE_MANIFEST, {})
         self.assertTrue(any(m.get("orig_path") == os.path.realpath(plist)
                             for m in man.values()), man)
+
+    def test_neutralize_kill_is_audited_and_gated(self):
+        """The neutralize kill-chain (_kill_program_instances) SIGKILLed
+        same-user processes with NO actions.jsonl record at all — audit-before-
+        mutation, which cmd_quarantine/cmd_destroy enforce, was absent from the
+        kill step. Both poles: a kill leaves a durable audit record, and a kill
+        whose audit cannot be written does not fire."""
+        import signal as _signal
+        prog = "/tmp/evil-payload-bin"
+        fake = [(str(os.getpid() + 1), aegis._own_owner(), prog, prog + " --run")]
+        killed = []
+        saved_iter, saved_kill = aegis._iter_processes, os.kill
+        aegis._iter_processes = lambda: iter(fake)
+        os.kill = lambda pid, sig: killed.append((pid, sig))
+        try:
+            n = aegis._kill_program_instances(prog)
+            self.assertEqual(1, n, "the matching same-user process was not killed")
+            self.assertTrue(any(s == _signal.SIGKILL for _p, s in killed))
+            with open(aegis.ACTION_LOG) as fh:
+                actions = [json.loads(l) for l in fh if l.strip()]
+            self.assertTrue(
+                any(a.get("action") == "neutralize" and a.get("result") == "kill"
+                    for a in actions),
+                "the SIGKILL left no durable audit record: %s" % actions)
+            # Audit-gate pole: a kill whose audit append fails must NOT happen.
+            killed.clear()
+            saved_log = aegis.log_action
+            aegis.log_action = lambda *a, **k: False
+            try:
+                n2 = aegis._kill_program_instances(prog)
+            finally:
+                aegis.log_action = saved_log
+            self.assertEqual(0, n2)
+            self.assertEqual([], killed, "kill fired despite a failed audit write")
+        finally:
+            aegis._iter_processes, os.kill = saved_iter, saved_kill
 
     # sandbox-exec is not a supported malware boundary --------------------
     def test_sandbox_refuses_to_execute_on_the_host(self):
@@ -2689,6 +2836,41 @@ class TestPrivacyBoundary(Sandbox):
                 path = os.path.join(root, name)
                 with open(path, "rb") as stored:
                     self.assertNotIn(secret.encode(), stored.read(), path)
+
+    def test_space_separated_flag_secrets_and_token_shapes_are_redacted(self):
+        """redact_sensitive required a ':'/'=' delimiter, so the space-separated
+        CLI convention `--api-key VALUE` — exactly what MCP/agent configs put in
+        their `args` arrays, which diff_agent_surface interpolates verbatim into
+        a finding detail — sailed through unredacted, as did Stripe underscore
+        (`sk_live_`) and Slack (`xoxb-`) token shapes and the JSON `"password":`
+        form. Each is the finding() persistence boundary leaking a live secret
+        into findings.jsonl."""
+        # Fixtures are ASSEMBLED FROM FRAGMENTS on purpose: a contiguous
+        # secret-shaped literal in this source (a Stripe `sk_live_…`, a Slack
+        # `xoxb-…`) would trip GitHub push-protection even though these are
+        # synthetic — the scanner matches by shape. The assembled runtime value
+        # still exercises redact_sensitive exactly.
+        stripe = "sk" + "_live_" + "SyntheticExampleValue000000000000"
+        slack = "xoxb" + "-" + "SyntheticExampleTokenValue"
+        hexish = "8f7a2c9e1d4b" + "6f30a5c8e2d7b1f4a6c9"
+        pw = "Sup3rSecretPassphrase"
+        leaks = {
+            "node --api-key " + stripe: stripe,
+            "srv --token " + hexish: hexish,
+            "cli --password " + pw: pw,
+            "bot --slack-token " + slack: slack,
+            '{"password": "hunter2verylongsecret"}': "hunter2verylongsecret",
+        }
+        for text, secret in leaks.items():
+            f = aegis.finding("HIGH", "agent-surface", "New agent exec entry",
+                              "srv registered: %s" % text, "leak:%s" % secret[:6])
+            self.assertNotIn(secret, f["detail"],
+                             "secret survived redaction in finding detail: %r"
+                             % f["detail"])
+            self.assertIn("[REDACTED]", f["detail"])
+        # No over-redaction: a non-credential flag keeps its value.
+        for benign in ("--token-count 5", "--output-dir /tmp/build"):
+            self.assertEqual(benign, aegis.redact_sensitive(benign))
 
 
 class TestEventIncidentCore(Sandbox):

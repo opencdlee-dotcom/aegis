@@ -11,8 +11,10 @@ a notification.
 Each test is named for the property it pins and would FAIL against code that
 did not have it.
 """
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import subprocess
@@ -160,6 +162,45 @@ class TestFreeze(ProtectiveSandbox):
             aegis._iter_processes = saved
         self.assertEqual(1, len(walks),
                          "the guard walked the process table %d times" % len(walks))
+
+    def test_frozen_review_walks_the_process_table_once_for_the_whole_queue(self):
+        """cmd_frozen displayed each pid via _process_identity(), which
+        re-enumerates the whole process table per call — on Windows a ~41s
+        CIM+GetOwner query, inside a loop of up to 12 pids per record, for a
+        command whose entire value is fast, low-friction review. Pinned like the
+        freeze-guard's own single-walk test: the cost is invisible on
+        Linux/macOS and catastrophic on Windows, so only a counter catches a
+        regression back to per-pid enumeration."""
+        rec = {"fid1": {"root": "100", "pids": [str(100 + i) for i in range(12)],
+                        "comm": "payload", "reason": "test",
+                        "ts": aegis._epoch(),
+                        "auto_thaw_at": aegis._epoch() + 3600,
+                        "converged": True}}
+        aegis.save_json(aegis.FROZEN_FILE, rec)
+        walks = []
+
+        def counting_iter():
+            walks.append(1)
+            return iter([("101", aegis._own_owner(), "/tmp/payload",
+                          "/tmp/payload --run")])
+
+        saved = aegis._iter_processes
+        aegis._iter_processes = counting_iter
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                aegis.cmd_frozen()
+        finally:
+            aegis._iter_processes = saved
+        self.assertEqual(1, len(walks),
+                         "cmd_frozen walked the process table %d times for a "
+                         "single 12-pid record (should be exactly one)"
+                         % len(walks))
+        # Output is preserved: a resolved pid shows its comm, an absent one
+        # shows (exited) — the exact _process_identity behaviour, from the map.
+        out = buf.getvalue()
+        self.assertIn("pid 101 payload", out)
+        self.assertIn("(exited)", out)
 
     def test_freeze_refuses_another_users_process(self):
         # NOT a hard-coded uid 0: CI and containers run the suite AS root, so
@@ -563,7 +604,10 @@ class TestMacProcessPathsAreNotTruncated(unittest.TestCase):
 
     def test_ps_is_queried_so_comm_is_never_truncated(self):
         import inspect
-        src = inspect.getsource(aegis._iter_processes)
+        # The `ps` calls live in _iter_processes_live; _iter_processes is now the
+        # thin per-scan cache wrapper over it. Inspect the walker where the
+        # query shape actually is — the P1 property is unchanged, only relocated.
+        src = inspect.getsource(aegis._iter_processes_live)
         self.assertNotIn('"pid=,uid=,comm=,args="', src,
                          "comm and args in ONE ps call truncates comm to 16 "
                          "chars; that is the defect this pins")

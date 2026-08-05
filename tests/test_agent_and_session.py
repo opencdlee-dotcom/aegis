@@ -374,6 +374,38 @@ class TestAgentSurface(AgentSandbox):
         aegis._AGENT_SCAN_TRUNCATED[0] = False
         self.assertEqual([], aegis.check_agent_surface_coverage())
 
+    def test_a_later_complete_walk_clears_a_prior_truncation(self):
+        """The truncation flag is module-level and was never reset — set True on
+        a cap-hit and never cleared. A one-shot `scan` hides it (fresh process),
+        but cmd_watch loops cmd_scan in ONE long-lived process, so a single
+        transient >cap walk (an npm install, a burst of ~/.claude session files)
+        pinned a permanent LOW 'coverage PARTIAL' finding for the daemon's whole
+        uptime even after the walk dropped back under the cap.
+
+        Driven through REAL walks, not by forcing the flag: a genuine truncating
+        walk sets it, and a genuine complete walk must clear it. The setUp reset
+        is deliberately not relied on — that would test the fixture, not the fix.
+        """
+        for i in range(3):
+            self.write("cfg%d.json" % i, "{}\n")
+        saved_cap = aegis._AGENT_SCAN_FILE_CAP
+        try:
+            aegis._AGENT_SCAN_FILE_CAP = 1          # force a real truncation
+            aegis._agent_config_files()
+            self.assertTrue(aegis._AGENT_SCAN_TRUNCATED[0],
+                            "a genuinely capped walk did not flag truncation")
+            self.assertEqual(1, len(aegis.check_agent_surface_coverage()))
+
+            aegis._AGENT_SCAN_FILE_CAP = 100        # now the walk completes
+            aegis._agent_config_files()
+        finally:
+            aegis._AGENT_SCAN_FILE_CAP = saved_cap
+        self.assertFalse(aegis._AGENT_SCAN_TRUNCATED[0],
+                         "a complete walk left the stale truncation flag set")
+        self.assertEqual([], aegis.check_agent_surface_coverage(),
+                         "coverage still reported PARTIAL after a full walk — "
+                         "the permanent-degraded bug in the watch daemon")
+
 
 # --------------------------------------------------------------------------- #
 # Session theft — browser driven against its own live profile
@@ -1068,6 +1100,38 @@ class TestDeadfallDispatch(DeadfallDispatchSandbox):
                              "decoy:atime:/h/.aws/credentials.bak")
         self.assertEqual([], aegis._deadfall_dispatch([weak]))
         self.assertEqual([], self.froze)
+
+    def test_currently_failing_control_with_fresh_last_ok_does_not_fire(self):
+        """The C5 gap. A lane that passed inside its half-life and is FAILING
+        now keeps a fresh `last_ok` with `ok=False` — `cmd_assay` preserves the
+        prior `last_ok` across a failing run on purpose. `check_assay` flags
+        that exact state HIGH ("A positive control is failing"), so the deadfall
+        gate — which lets a verb fire with no human — must refuse it too. The
+        prior tests only ever paired a stale `last_ok` with `ok=False`, so
+        recency alone masked this: an order on a currently-broken detector still
+        fired.
+
+        Both poles, because a gate hardwired to one answer passes a one-sided
+        test: a currently-failing-but-recent control must NOT fire, and an
+        actually-passing recent control MUST."""
+        self._arm(verb="freeze")
+        lane = aegis.DEADFALL_TRIGGERS["decoy-read"][1]
+        aegis.save_json(aegis.ASSAY_FILE,
+                        {lane: {"last_ok": aegis._epoch(), "ok": False}})
+        self.assertFalse(aegis._deadfall_coverage_fresh(lane))
+        self.assertEqual([], aegis._deadfall_dispatch([self._decoy_read(pid="777")]))
+        self.assertEqual([], self.froze)
+        self.assertTrue(any("did NOT fire" in t for t, _b in self.notified),
+                        "a refused standing order was silent; the operator "
+                        "would still believe it was armed")
+        # Positive pole: the same lane actually passing (ok=True) DOES fire, so
+        # the guard is not simply hardwired to refuse.
+        aegis.save_json(aegis.ASSAY_FILE,
+                        {lane: {"last_ok": aegis._epoch(), "ok": True}})
+        self.assertTrue(aegis._deadfall_coverage_fresh(lane))
+        out = aegis._deadfall_dispatch([self._decoy_read(pid="778")])
+        self.assertEqual(1, len(out))
+        self.assertEqual([("778", "deadfall:decoy-read")], self.froze)
 
     def test_cooldown_prevents_refiring_on_the_same_evidence(self):
         """The triggering finding recurs on EVERY scan while the condition

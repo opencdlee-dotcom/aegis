@@ -1799,14 +1799,27 @@ def suspicious_sig(trust):
 
 _SECRET_ASSIGN_RE = re.compile(
     r"(?i)\b(password|passwd|token|api[_-]?key|secret|cookie)\b"
-    r"(\s*[:=]\s*)([^\s&;,]+)")
+    r'("?\s*[:=]\s*"?)([^\s&;,"\']+)')
 _AUTH_RE = re.compile(
     r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)?\s*)([^\s'\"]+)")
 _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:password|passwd|token|api[_-]?key|secret|cookie)=)([^&\s]+)")
 _URL_USERINFO_RE = re.compile(r"(https?://[^\s/@:]+:)([^\s/@]+)(@)", re.I)
+# A credential-bearing CLI flag whose value is the NEXT whitespace-delimited
+# token: `--api-key VALUE`, `--token VALUE`, `--password VALUE`,
+# `--slack-token VALUE`. The `:`/`=` form is _SECRET_ASSIGN_RE's; this is the
+# space-separated convention that MCP/agent configs put in their `args` arrays,
+# which diff_agent_surface interpolates verbatim into a finding's detail. The
+# keyword must sit at the flag's TAIL (next char is whitespace), so `--token-count 5`
+# does not swallow its count.
+_SECRET_FLAG_RE = re.compile(
+    r"(?i)(--?[\w-]*(?:password|passwd|api[_-]?key|token|secret|cookie|auth))"
+    r"(\s+)(\S+)")
 _TOKEN_SHAPE_RE = re.compile(
-    r"(?i)\b(?:sk-(?:live-)?[A-Za-z0-9_-]{12,}|gh[opusr]_[A-Za-z0-9]{20,}|"
+    r"(?i)\b(?:sk-(?:live-)?[A-Za-z0-9_-]{12,}|"
+    r"(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}|"   # Stripe underscore form
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"                  # Slack bot/user/app tokens
+    r"gh[opusr]_[A-Za-z0-9]{20,}|"
     r"AKIA[0-9A-Z]{16})\b")
 
 
@@ -1817,6 +1830,7 @@ def redact_sensitive(value):
     text = str(value)
     text = _AUTH_RE.sub(r"\1[REDACTED]", text)
     text = _SECRET_ASSIGN_RE.sub(r"\1\2[REDACTED]", text)
+    text = _SECRET_FLAG_RE.sub(r"\1\2[REDACTED]", text)
     text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _URL_USERINFO_RE.sub(r"\1[REDACTED]\3", text)
     return _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
@@ -2056,6 +2070,40 @@ def _severity_max(a, b):
     return a if SEV_ORDER.get(a, -1) >= SEV_ORDER.get(b, -1) else b
 
 
+def _event_fingerprints(db, event_ids):
+    """The set of finding fingerprints behind `event_ids` (from each event's
+    stored finding JSON). Used to tell genuine recurrence from new evidence."""
+    if not event_ids:
+        return set()
+    marks = ",".join("?" for _ in event_ids)
+    fps = set()
+    for row in db.execute("SELECT data_json FROM events WHERE id IN (%s)" % marks,
+                          tuple(event_ids)).fetchall():
+        try:
+            fp = json.loads(row["data_json"]).get("fingerprint")
+        except Exception:
+            fp = None
+        if fp:
+            fps.add(fp)
+    return fps
+
+
+def _incident_fingerprints(db, incident_id):
+    """Every finding fingerprint ever attached to `incident_id`."""
+    fps = set()
+    for row in db.execute(
+            "SELECT e.data_json FROM incident_events ie "
+            "JOIN events e ON ie.event_id=e.id WHERE ie.incident_id=?",
+            (incident_id,)).fetchall():
+        try:
+            fp = json.loads(row["data_json"]).get("fingerprint")
+        except Exception:
+            fp = None
+        if fp:
+            fps.add(fp)
+    return fps
+
+
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                      initially_notified=False):
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
@@ -2073,15 +2121,30 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                    "updated_at=? WHERE id=?",
                    (new_sev, new_status, now, now, incident_id))
     else:
-        # FALSE_POSITIVE is a reviewed verdict on this exact correlation key.
-        # Keep later occurrences attached as evidence instead of opening a new
-        # incident every scan. Fingerprints include content hashes for mutable
-        # executables, so a changed object gets a different key and alerts again.
+        # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
+        # a permanent mute on the whole entity. Keep genuinely-recurring evidence
+        # attached (so a dismissed benign event does not re-open every scan), but
+        # a fingerprint this incident has NEVER seen is a different event on the
+        # same entity and must open a fresh incident rather than vanish.
+        #
+        # Signal-kind incidents embed the fingerprint IN their correlation_key, so
+        # a matched key already implies the same fingerprint and the subset test
+        # is always satisfied — behaviour there is unchanged. The gap this closes
+        # is entity-keyed `risk:`/`chain:` incidents, whose keys carry no content
+        # hash and always share their (hardcoded HIGH/CRITICAL) severity, so once
+        # one was dismissed the old code swallowed ALL later evidence on that
+        # entity forever.
         reviewed = db.execute(
             "SELECT * FROM incidents WHERE correlation_key=? AND "
             "status='FALSE_POSITIVE' ORDER BY id DESC LIMIT 1", (key,)).fetchone()
-        if reviewed and SEV_ORDER.get(severity, -1) <= \
-                SEV_ORDER.get(reviewed["severity"], -1):
+        reattach = bool(reviewed) and SEV_ORDER.get(severity, -1) <= \
+            SEV_ORDER.get(reviewed["severity"], -1)
+        if reattach:
+            incoming = _event_fingerprints(db, event_ids)
+            if incoming and not incoming.issubset(
+                    _incident_fingerprints(db, reviewed["id"])):
+                reattach = False
+        if reattach:
             incident_id = reviewed["id"]
             db.execute("UPDATE incidents SET last_seen=?,updated_at=? WHERE id=?",
                        (now, now, incident_id))
@@ -3741,6 +3804,13 @@ def _typosquats_apple_daemon(name):
 # never be reported as an empty one.
 _PROC_ENUM_FAILED = False
 
+# Scan-scoped process-table cache. None => walk live (the default, and every
+# by-hand command). gather_all arms it with ONE walk before the sensor loop and
+# clears it after, so the several sensors that each need the process table share
+# a single enumeration instead of re-walking — on Windows a walk is a ~41s CIM
+# query, so the un-shared form tripled the dominant cost of a scan.
+_PROC_SNAPSHOT = None
+
 # The separator is built with [char]9 rather than written as a backtick escape.
 # PowerShell only honours backtick escapes inside DOUBLE-quoted strings, so the
 # `t in a single-quoted format string was emitted LITERALLY -- every line came
@@ -3758,6 +3828,26 @@ _WIN_PROC_PS = (
 
 
 def _iter_processes():
+    """(pid, owner, exe, argv) rows for every visible process.
+
+    Thin cache wrapper over `_iter_processes_live`. During a scan the table is
+    walked ONCE: gather_all arms `_PROC_SNAPSHOT` before the sensor loop and
+    clears it after, so check_processes / check_behavior /
+    check_browser_automation read one shared snapshot rather than each
+    re-enumerating — three independent walks tripled the dominant cost of a scan
+    on Windows, where one walk is a ~41s CIM query. Outside a scan (by-hand
+    freeze / kill / frozen) the cache is None and every call walks live, so
+    those paths always see the current table, and the snapshot is rebuilt fresh
+    every scan so cmd_watch's long-lived loop never reads a stale one.
+
+    Returns an iterator either way, so `for … in _iter_processes()` and
+    `list(_iter_processes())` are unchanged at every call site."""
+    if _PROC_SNAPSHOT is not None:
+        return iter(_PROC_SNAPSHOT)
+    return _iter_processes_live()
+
+
+def _iter_processes_live():
     """Yield (pid, owner, exe, argv) for every process this user can see.
       mac:     one `ps` call (comm = exec path, args = full argv)
       linux:   /proc directly — works on minimal containers with no procps, and
@@ -6154,12 +6244,23 @@ def _outbound_rows():
     if rc in (124, 127) or not text:
         return []
     out = []
+    # One `ps` per pid, not one per connection ROW. A process with N live
+    # outbound connections shows up on N netstat lines, and the un-cached form
+    # spawned N identical `ps -o comm= -p <pid>` lookups (measured: 55 rows / 23
+    # pids = 32 redundant spawns in one scan). The Linux and Windows branches
+    # above already resolve pid->name from a single batched structure; this is
+    # the macOS/BSD parity fix. Output is byte-identical — each row still gets
+    # the same comm it got before, just resolved once.
+    comm_cache = {}
     for _proc, pid, rip, rport in _parse_netstat_established(text):
         if not pid:
             continue
-        pout, _, prc = run(["ps", "-o", "comm=", "-p", pid], timeout=6)
-        if prc == 0 and pout.strip():
-            out.append((pout.strip(), rip, rport))
+        if pid not in comm_cache:
+            pout, _, prc = run(["ps", "-o", "comm=", "-p", pid], timeout=6)
+            comm_cache[pid] = pout.strip() if prc == 0 else ""
+        comm = comm_cache[pid]
+        if comm:
+            out.append((comm, rip, rport))
     return out
 
 
@@ -7605,6 +7706,14 @@ def _agent_config_files():
     """Every agent config/instruction file worth watching, discovered by shape
     under a bounded set of roots. Hard-capped: a home-wide walk is both a
     performance problem and, on an iCloud-synced tree, an enumeration hazard."""
+    # Recomputed every walk: truncation is a property of THIS enumeration, not a
+    # sticky flag. cmd_watch loops cmd_scan in one long-lived process, so a
+    # single transient >cap walk (an `npm install`, a burst of ~/.claude session
+    # files) would otherwise pin a permanent "coverage PARTIAL" finding for the
+    # daemon's whole uptime — the sibling per-scan health flags are zeroed at
+    # scan top for exactly this reason, and this producer-owned flag needs the
+    # same reset, here at the source so the assay/test paths get it too.
+    _AGENT_SCAN_TRUNCATED[0] = False
     seen = []
     roots = list(AGENT_CONFIG_ROOTS)
     cfg = load_json(os.path.join(STATE_DIR, "config.json"), {})
@@ -8758,10 +8867,16 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("staging", check_staging, ()),
         ("supply-chain", check_supply_chain, ()),
         # Session theft via a browser driven against its own live profile —
-        # the post-App-Bound-Encryption shape. Cheap: it reads the process
-        # list this scan already collected.
+        # the post-App-Bound-Encryption shape. Cheap: it reads the one process
+        # snapshot this scan collects below, shared with the process and
+        # behavior sensors rather than re-walking the table.
         ("session-theft", check_browser_automation, ()),
-        ("agent-surface-coverage", check_agent_surface_coverage, ()),
+        # NB: agent-surface-coverage is deliberately NOT here. It reads the
+        # truncation flag that snapshot_agent_surface sets, and that surface runs
+        # in _scan_surfaces AFTER gather_all — so a reader placed here saw the
+        # PREVIOUS scan's flag (module-init False on a one-shot process) and the
+        # truncation finding was never emitted on a plain `aegis.py scan`. It is
+        # collected in _cmd_scan_locked after _scan_surfaces instead.
         ("canary", check_canaries, ()),
         # Protective-tier sensors. Each returns [] unless its mechanism has been
         # deliberately armed, so a machine that never opts in sees byte-identical
@@ -8790,8 +8905,21 @@ def gather_all(baseline_snap, current_snap, health=None):
         sensors += [
             ("windows-event-log", check_windows_event_log, ()),
         ]
-    for sensor_id, fn, args in sensors:
-        findings += _collect_sensor(sensor_id, fn, health_sink, *args)
+    # ONE process-table walk for the whole sensor loop. Built through the
+    # module-level _iter_processes (cache is None here, so this is a live walk,
+    # and a test that stubs _iter_processes still flows through), then armed so
+    # every sensor below shares it. Forced fresh each call so cmd_watch's
+    # long-lived loop always re-walks; cleared in `finally` so a by-hand command
+    # after the scan sees the current table, and so an exception in any sensor
+    # cannot strand a stale snapshot into the next scan.
+    global _PROC_SNAPSHOT
+    _PROC_SNAPSHOT = None
+    _PROC_SNAPSHOT = list(_iter_processes())
+    try:
+        for sensor_id, fn, args in sensors:
+            findings += _collect_sensor(sensor_id, fn, health_sink, *args)
+    finally:
+        _PROC_SNAPSHOT = None
     # Stamp the human-presence regime once per scan (not per finding — the
     # probe shells out, and paying that per finding would be absurd). This is
     # EVIDENCE ONLY and must stay that way: idle time is forgeable by a
@@ -9027,6 +9155,14 @@ def _cmd_scan_locked(quiet=False):
     surface_findings, baseline = _scan_surfaces(baseline, baseline_corrupt,
                                                 first_run, health=health)
     findings += surface_findings
+
+    # Agent-surface coverage is read HERE, after _scan_surfaces has run the
+    # agent-surface walk that sets _AGENT_SCAN_TRUNCATED — not as a gather_all
+    # sensor, which runs before the walk and so always saw a stale flag (missing
+    # every truncation on a one-shot scan). Collected via _collect_sensor to keep
+    # its sensor-health entry identical to the other sensors.
+    findings += _collect_sensor("agent-surface-coverage",
+                                check_agent_surface_coverage, health)
 
     if baseline_corrupt:
         # Do not silently re-baseline. Surface it loudly and let every current
@@ -10762,39 +10898,81 @@ else:
         "/usr", "/etc", "/var", "/private", "/opt", "/run", HOME))
 
 
+_FS_CASE_INSENSITIVE = None
+
+
+def _fs_case_insensitive():
+    """Whether this filesystem matches paths case-insensitively (the macOS and
+    Windows default). Probed once against paths known to exist, because
+    os.path.realpath does NOT canonicalize case — `/System` and `/SYSTEM` are the
+    same directory on APFS/NTFS but realpath returns them as two distinct
+    strings, which is exactly how a case-varied path slipped past the protected
+    checks below."""
+    global _FS_CASE_INSENSITIVE
+    if _FS_CASE_INSENSITIVE is None:
+        if IS_WIN:
+            _FS_CASE_INSENSITIVE = True
+        else:
+            _FS_CASE_INSENSITIVE = False
+            for probe in (HOME, _SELF_PATH, sys.executable):
+                try:
+                    rp = os.path.realpath(probe)
+                    alt = rp.upper() if rp != rp.upper() else rp.lower()
+                    if alt != rp and os.path.exists(alt) \
+                            and os.path.samefile(rp, alt):
+                        _FS_CASE_INSENSITIVE = True
+                        break
+                except Exception:
+                    continue
+    return _FS_CASE_INSENSITIVE
+
+
+def _cmp_path(p):
+    """A path folded for a protected-path comparison: case-normalized on a
+    case-insensitive filesystem so a case-varied ALIAS of a protected path is
+    still refused, left byte-exact on a case-sensitive one so genuinely distinct
+    Linux paths stay distinct. Fail-closed by design — when the filesystem is
+    case-insensitive we over-match rather than let a destructive verb through."""
+    if IS_WIN:
+        return os.path.normcase(p)
+    return p.lower() if _fs_case_insensitive() else p
+
+
 def _is_protected_path(path):
     """True if `path` must never be quarantined/destroyed. Refuses SIP/system/
     Apple locations (we can't and shouldn't touch them), Aegis's own files, the
     quarantine store itself, $HOME, and any ANCESTOR of $HOME (so a mistyped
-    parent dir can't take the home directory with it)."""
+    parent dir can't take the home directory with it).
+
+    Every comparison goes through _cmp_path so a case-varied alias on a
+    case-insensitive filesystem (`~/.AEGIS/baseline.json`, `/SYSTEM`, `/USERS`)
+    is refused too: os.path.realpath resolves symlinks but preserves the
+    caller's literal case, so a raw string compare let those aliases escape the
+    rail entirely. This also closes the same gap on the shared self/state/HOME
+    checks, which previously used the un-normalized path even on Windows."""
     if not path:
         return True
     rp = os.path.realpath(path)
-    if IS_WIN:
-        rp_cmp = os.path.normcase(rp)
-        if rp_cmp in {os.path.normcase(p) for p in _PROTECTED_EXACT}:
-            return True
-        if any(rp_cmp == os.path.normcase(p.rstrip("\\"))
-               or rp_cmp.startswith(os.path.normcase(p.rstrip("\\")) + os.sep)
-               for p in TRUSTED_PREFIXES):
-            return True
-    else:
-        if rp in _PROTECTED_EXACT:
-            return True
-        if any(rp == p or rp.startswith(p.rstrip("/") + "/")
-               for p in TRUSTED_PREFIXES):
-            return True
+    rpc = _cmp_path(rp)
+    sep = os.sep
+    if rpc in {_cmp_path(p) for p in _PROTECTED_EXACT}:
+        return True
+    strip = "\\" if IS_WIN else "/"
+    if any(rpc == _cmp_path(p.rstrip(strip))
+           or rpc.startswith(_cmp_path(p.rstrip(strip)) + sep)
+           for p in TRUSTED_PREFIXES):
+        return True
     # Aegis's own state, store, and script. Compare against REAL paths so a
     # symlinked ~/.aegis or script location is still covered (same reason as HOME).
-    self_rp = os.path.realpath(_SELF_PATH)
-    state_rp = os.path.realpath(STATE_DIR)
-    if rp == self_rp or rp == state_rp or rp.startswith(state_rp + os.sep):
+    self_rp = _cmp_path(os.path.realpath(_SELF_PATH))
+    state_rp = _cmp_path(os.path.realpath(STATE_DIR))
+    if rpc == self_rp or rpc == state_rp or rpc.startswith(state_rp + sep):
         return True
     # HOME itself, or any ANCESTOR of HOME (e.g. "/Users") — protects the home
     # tree. Compare against the REAL path of HOME so a symlinked/relocated home
     # (networked mount, /var-style indirection) is still covered.
-    home_rp = os.path.realpath(HOME)
-    if rp == home_rp or home_rp.startswith(rp.rstrip("/") + "/"):
+    home_rp = _cmp_path(os.path.realpath(HOME))
+    if rpc == home_rp or home_rp.startswith(rpc.rstrip(sep) + sep):
         return True
     return False
 
@@ -11206,6 +11384,13 @@ def _kill_program_instances(program):
     killed = 0
     for pid, owner, exe, _argv in _iter_processes():
         if not _same_owner(owner) or exe != program or pid == str(os.getpid()):
+            continue
+        # Audit-before-mutation — the same rule cmd_quarantine/cmd_destroy
+        # enforce. A SIGKILL is irreversible, and this shared neutralize
+        # kill-step previously terminated same-user processes with NO
+        # actions.jsonl record at all; if the durable append cannot be written,
+        # the kill does not happen.
+        if not log_action("neutralize", program, "kill", pid=pid, comm=exe):
             continue
         try:
             if IS_WIN:
@@ -11783,6 +11968,18 @@ def cmd_frozen():
         print("Nothing is frozen.")
         return 0
     now = _epoch()
+    # One process-table walk for the WHOLE queue, not one per displayed pid.
+    # _process_identity() re-enumerates from scratch on every call (on Windows a
+    # ~41s CIM+GetOwner query — the file's own measured figure), and this is a
+    # fast-review command whose entire value is low friction. Same comm
+    # derivation as _process_identity, computed once; mirrors the deliberate
+    # single-walk of _process_owner_and_names in the freeze path.
+    proc_comm = {}
+    for p, _owner, exe, argv in _iter_processes():
+        name = os.path.basename(exe) if exe else ""
+        if not name and argv:
+            name = os.path.basename(argv.split(None, 1)[0])
+        proc_comm[p] = name or "?"
     print("# Frozen process trees (%d)\n" % len(state))
     for fid, rec in sorted(state.items(), key=lambda kv: kv[1].get("ts", 0)):
         left = max(0, rec.get("auto_thaw_at", 0) - now)
@@ -11797,7 +11994,7 @@ def cmd_frozen():
                  "" if rec.get("converged", True)
                  else " · SWEEP DID NOT CONVERGE"))
         for pid in rec.get("pids", [])[:12]:
-            _owner, comm = _process_identity(pid)
+            comm = proc_comm.get(str(pid))
             print("        - pid %s %s" % (pid, comm or "(exited)"))
     print("\nRelease: aegis.py thaw <id>   |   Terminate: aegis.py kill <pid>")
     return 0
@@ -13818,11 +14015,25 @@ DEADFALL_VERBS = {
 
 
 def _deadfall_coverage_fresh(lane):
-    """True only if `assay` PROVED this lane within its half-life."""
+    """True only if `assay` PROVED this lane within its half-life AND its most
+    recent run actually passed.
+
+    Recency alone is not proof the control fires right now. `cmd_assay`
+    deliberately PRESERVES a prior `last_ok` across a FAILING run (`last_ok =
+    now if ok else prev.last_ok`) so that `check_assay` can still age a broken
+    lane out by its half-life — which means a lane that passed inside the window
+    and is failing *today* carries a fresh `last_ok` with `ok=False`.
+    `check_assay` flags exactly that state HIGH ("A positive control is
+    failing"). The gate that lets a verb fire WITHOUT a human must be at least
+    as strict as the sensor that merely warns one; otherwise a standing order
+    dispatches on a detector that cannot currently demonstrate it works — the
+    precise thing this gate exists to refuse."""
     state = load_json(ASSAY_FILE, {})
     if not isinstance(state, dict):
         return False
     rec = state.get(lane) or {}
+    if not rec.get("ok"):
+        return False
     last_ok = rec.get("last_ok")
     if not last_ok:
         return False

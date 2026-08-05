@@ -1215,6 +1215,51 @@ class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
         self.assertFalse(aegis._PROC_ENUM_FAILED)
 
 
+class OutboundRowsBatchesPsByPid(unittest.TestCase):
+    """The macOS/BSD outbound branch spawned one `ps -o comm= -p <pid>` per
+    connection ROW. A process with N live outbound connections appears on N
+    netstat lines, so a browser with 8 connections spawned 8 identical lookups
+    (measured: 55 rows / 23 pids = 32 redundant spawns per scan). The Linux and
+    Windows branches already resolve pid->name from one batched structure; this
+    pins the macOS parity fix — one `ps` per unique pid, output unchanged."""
+
+    def setUp(self):
+        self._saved = (aegis.run, aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX,
+                       aegis._parse_netstat_established)
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = False, True, False
+
+    def tearDown(self):
+        (aegis.run, aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX,
+         aegis._parse_netstat_established) = self._saved
+
+    def test_one_ps_per_pid_not_per_row(self):
+        rows = [("proc", "500", "1.1.1.1", "443"),
+                ("proc", "500", "1.1.1.2", "443"),
+                ("proc", "500", "1.1.1.3", "443"),
+                ("proc", "600", "2.2.2.2", "80"),
+                ("proc", "600", "2.2.2.3", "80")]
+        aegis._parse_netstat_established = lambda text: iter(rows)
+        ps_calls = []
+
+        def fake_run(cmd, *a, **k):
+            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "ps":
+                ps_calls.append(cmd[-1])          # the pid argument
+                return ("browser\n", "", 0)
+            return ("netstat-nonempty", "", 0)    # the NETSTAT_CMD call
+
+        aegis.run = fake_run
+        out = aegis._outbound_rows()
+        # 2 unique pids -> exactly 2 ps spawns, not 5 (one per row).
+        self.assertEqual(2, len(ps_calls),
+                         "ps spawned %d times for 2 unique pids across 5 rows"
+                         % len(ps_calls))
+        # Output is unchanged: every row still resolves to its comm.
+        self.assertEqual(5, len(out))
+        self.assertTrue(all(r[0] == "browser" for r in out))
+        self.assertEqual({"1.1.1.1", "1.1.1.2", "1.1.1.3", "2.2.2.2", "2.2.2.3"},
+                         {r[1] for r in out})
+
+
 class SignatureBatchPrefetch(unittest.TestCase):
     """One PowerShell start-up for many binaries instead of one apiece.
 

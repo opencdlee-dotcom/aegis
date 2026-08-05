@@ -1,3 +1,114 @@
+# Aegis — a governed battle-test: two loud rounds, ten defects (2026-08-05)
+
+A single `/battle-test` run under `/fable-mode` governance: right-size, hunt across
+independent lenses, adversarially verify every candidate against the real code before
+it is trusted, fix, regression-pin, re-verify, loop. Siege tier, because this tool
+quarantines, destroys, neutralizes and freezes. Two rounds of hunting both came back
+*loud* — the first found five defects in the newest delegate/session tier, the second
+found five more in the *older core the earlier passes never adversarially hunted*,
+including a CRITICAL bypass of the destructive-action safety rail. Every one was
+verified against the running machine or a traced repro, not asserted from a fixture.
+
+The method that produced the two headline findings is worth stating: **when two pieces
+of code read the same fact, do they agree?** The deadfall dispatch gate and the `assay`
+sensor both read a lane's state from `assay.json` and disagreed (R1/C5). The protected-path
+guard and the filesystem both name the same directory and disagreed about its case (R2-2).
+
+## Round 1 — the delegate/session tier (5)
+
+| # | Sev | Defect | Fix |
+|---|-----|--------|-----|
+| C5 | **HIGH** | `_deadfall_coverage_fresh()` — the gate that lets a pre-authorized reversible verb **fire with no human** — checked only that a lane's `last_ok` was recent, never that its most recent run *passed*. `cmd_assay` preserves a prior `last_ok` across a failing run so `check_assay` can age a broken lane out slowly, which means a lane failing *today* still carries a fresh `last_ok` with `ok=False` — a state `check_assay` flags HIGH "positive control is failing" while the dispatch gate called it PROVEN. So a standing order would auto-fire `freeze`/`latch` on a detector that cannot currently demonstrate it works, the exact thing the gate exists to refuse. | gate also requires `rec['ok']`; both-pole test |
+| C2 | **HIGH** | `cmd_frozen()` re-walked the whole process table once per displayed pid (nested loop; ~41s CIM query each on Windows) — the anti-pattern its sibling `_process_owner_and_names` was written to avoid. | one `{pid:comm}` map from a single walk; ≤1-walk test |
+| C1 | MED | `_AGENT_SCAN_TRUNCATED` set on a cap-hit, never reset → permanent false "coverage PARTIAL" for the whole uptime of the `cmd_watch` daemon after one transient spike. | reset at the producer's top; truncate-then-clean test |
+| C3 | MED | `_outbound_rows()` macOS branch spawned one `ps` per connection row (measured 32 redundant/scan); Linux/Windows already batch. | per-pid memo, byte-identical output; spawn-count test |
+| C4 | MED | Three sensors each re-walked the table per scan, and a comment *claimed* session-theft reused the collected list — it did not (the signature comment-vs-code defect). | one scan-scoped snapshot, shared and rebuilt-fresh each scan; comment made true; two-assertion pin (shared + fresh-per-scan) |
+
+## Round 2 — the older core the prior passes never hunted (5)
+
+| # | Sev | Defect | Fix |
+|---|-----|--------|-----|
+| R2-2 | **CRITICAL** | `_is_protected_path()` compared paths case-sensitively, but macOS/Windows filesystems are case-insensitive and `os.path.realpath` preserves the caller's case. Verified live: `/SYSTEM`, `/USR`, `~/.AEGIS/baseline.json`, even `/USERS/<me>` all resolve to real protected files yet returned **False** — so a destructive verb (`quarantine`/`destroy`/`neutralize`) could act on Aegis's own trust store, `/System`, or the home tree through a case-varied alias. The one rail the whole response tier stands on. | a case-fold comparison (`_cmp_path`) gated on a one-time `_fs_case_insensitive()` probe — folds on case-insensitive volumes, exact on case-sensitive Linux, fail-closed; also closes the same gap on the shared self/state/HOME checks; live-verified + both-pole test |
+| R2-3 | **HIGH** | `_kill_program_instances()` — the shared neutralize kill step — SIGKILLed same-user processes with **no `actions.jsonl` record at all**, violating the tool's own audit-before-mutation invariant that `cmd_quarantine`/`cmd_destroy` enforce. | gated `log_action` before the kill (no audit ⇒ no kill); both-pole test |
+| R2-4 | **HIGH** | Dismissing one `risk`/`chain` incident silently swallowed **all future evidence on that entity, forever**. Those incidents are entity-keyed with no content hash and hardcoded HIGH/CRITICAL severity, so the FALSE_POSITIVE reattachment gate (whose comment claims content-hash keys protect it — true only for `signal` incidents) always matched. A benign-positive on `/opt/x` blinded the tool to a real later attack there. | reattach only evidence whose **fingerprints** the incident already saw; a genuinely new fingerprint opens a fresh incident. Universal (signal keys already embed the fp, so unchanged there); both-pole test (recurrence stays suppressed, new evidence alerts) |
+| R2-5 | **HIGH** | `redact_sensitive()` required a `:`/`=` delimiter, so the space-separated CLI form `--api-key VALUE` — exactly what MCP/agent-config `args` arrays carry, and what `diff_agent_surface` interpolates verbatim into a finding detail — leaked to `findings.jsonl`, as did the JSON `"password":` form and `sk_live_`/`xoxb-` token shapes. A security tool writing live secrets into its own logs. | new `_SECRET_FLAG_RE` (flag-tail anchored, so `--token-count 5` is untouched) + quote-tolerant assign regex + added token shapes; leak/preserve/no-over-redact test |
+| R2-1 | LOW | The agent-surface coverage sensor (a `gather_all` reader) ran **before** its only writer (`snapshot_agent_surface` in `_scan_surfaces`), so on a one-shot `aegis.py scan` the truncation flag was always the stale module-init `False` and the "walk hit its cap" finding was never emitted — the C1 fix's own goal, unmet for the primary manual invocation. | read coverage after `_scan_surfaces`; one-shot-scan truncation test |
+
+## Why the tests could not fail before, and the discipline that fixes the class
+
+The recurring lesson, three more times: **a fixture inherits its author's model of the
+system; only the system disagrees.** C5's dispatch tier had a test literally named
+"unproven coverage refuses to fire," but its fixture coupled staleness with `ok=False`,
+so the `ok` half was never exercised. R2-2's rail had tests for `/System` and `$HOME` —
+all in canonical case, so the case-alias never appeared. R2-4's reattachment had a
+comment asserting an invariant (content-hash keys) that held for one incident kind and
+was silently false for two others. Each new test asserts **both poles**, because a
+one-sided test passes against a detector hardwired to one answer.
+
+## Verification actually performed
+
+- macOS full suite **646 passed, 3 skipped** (was 636; +10 regression pins).
+- Every one of the ten new tests was run against the **pre-fix** source and **failed**
+  (assertion failures, plus a few errors where a fix introduces a new symbol the test
+  needs — e.g. `_iter_processes_live`, `_FS_CASE_INSENSITIVE`, or an audit file that
+  pre-fix code never writes) — so none is a tautology that passes either way.
+- R2-2's bypass and its fix were **verified live** against this machine's real filesystem
+  (`/SYSTEM`, `~/.AEGIS`, `/USERS/<me>` refused after the fix; a genuine `/tmp` payload
+  still quarantinable).
+- `selftest.py` 7/7.
+- One pre-existing test needed a forced, called-out update: the P1 comm-truncation pin
+  inspects the `ps`-call source, which the C4 refactor moved into `_iter_processes_live`;
+  assertions kept verbatim, only the inspected symbol follows the code.
+
+## Round 3 — the re-check that ran, and the sweep that did not
+
+Round 3 was two jobs: re-check all ten fixes for introduced defects, and sweep the
+surfaces the first two rounds never touched (the event-driven watch loop, the
+install/scheduler lifecycle, the quarantine transaction state machine, the
+heartbeat/watchdog). The automated fan-out hit this session's rate limit before any
+lens returned, so the **fix re-check was completed inline instead — and came back
+clean**: the R2-5 flag regex has no catastrophic backtracking (a 40k-character input
+redacts in ~4 ms); R2-2's case-fold does not over-protect a benign nested path
+(`/tmp/SystemLog.txt`, `~/Documents` stay quarantinable) and its fs-probe caches
+correctly; R2-4's fingerprint helpers handle a missing-fingerprint event and an empty
+set without crashing or mis-reattaching; R2-3's audit gate fails closed by design (a
+kill whose audit cannot be written does not fire — the honest tradeoff the invariant
+chooses); R2-1's relocated coverage sensor still records its health entry.
+
+The **surface-sweep did not run** and is recorded here as unhunted residual, not as a
+clean result — the difference between "nothing found" and "did not look" is the thing
+this log is named for. This pass therefore stops on a **resource bound**, not on two
+consecutive dry rounds: the ten fixes are complete and independently verified, and the
+last-surfaces sweep is owed a follow-up when the limit resets. It is not folded into a
+false convergence claim.
+
+## Residual
+
+- The R2-2 case-fold is fail-closed: on the rare mixed-case-sensitivity volume it
+  over-protects (refuses a legitimate quarantine of a case-alias) rather than
+  under-protect. Stated, not implied.
+- R2-4 adds two bounded lookups per FALSE_POSITIVE upsert (a rare path); no measurable
+  cost on the suite.
+- C3/C4/C2 are exercised on macOS/Linux here; the Windows cost they most affect (the
+  ~41s CIM query) is inferred from the file's own prior measurements, not re-measured.
+- **Owed:** the Round 3 sweep of the watch loop, install/scheduler lifecycle, quarantine
+  transaction state machine, and heartbeat/watchdog did not run (session rate limit).
+  Those surfaces carry prior-pass and live-harness coverage but were not adversarially
+  re-hunted this pass; re-run `bt_round3.mjs` after the limit resets before treating them
+  as clean.
+
+## End-state checklist (each box backed by captured output or marked owed)
+
+- ▢ bugs found → fixed: **10/10** (2 HIGH+1 CRITICAL+... see tables), all with a repro that failed before and passes now.
+- ▢ logic errors found → fixed: C5, R2-4 (gate logic), R2-1 (ordering) — fixed + pinned.
+- ▢ edge cases found → tested: every fix has a both-poles regression test; all proven to fail pre-fix.
+- ▢ no unimplemented files/stubs remain: completeness pre-flight was clean at Gate 2 (no TODO/NotImplemented/stub bodies).
+- ▢ security lens run: inline (watchdog binary absent) across both rounds; found + fixed the CRITICAL case-alias bypass, the audit-gap, and the secret-leak.
+- ▢ /spar adversarial-break: run as the adversarial lens each round (Opus/high); Round 3's automated pass was rate-limited and completed inline for the fixes, **owed** for the last surfaces.
+- Verified vs inferred: suite/selftest/live-checks are **verified**; the Windows ~41s figures are **inferred** from prior measurement; the last-surfaces cleanliness is **neither — unhunted**.
+
+---
+
 # Aegis — the same class again: a branch that could not be reached (2026-08-05)
 
 The previous pass was named for a detector that never fired. This one went
