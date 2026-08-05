@@ -5377,6 +5377,177 @@ def _chromium_exts(root):
     return out
 
 
+# --- extension CAPABILITY grading -------------------------------------------
+#
+# The browserext surface answers "which extensions exist" and diffs that set.
+# It does not answer "what can they do", and after App-Bound Encryption that is
+# the question that matters: an extension holding `cookies` plus broad host
+# access reads your session cookies as plaintext through Chrome's own API,
+# touching no jar and spawning no process. Nothing in the argv sensor sees it,
+# because there is no new process to see.
+#
+# Deliberately a SEPARATE sensor rather than extra fields on the browserext
+# snapshot: changing that snapshot's value shape would invalidate every
+# existing baseline and re-alert the whole extension inventory on upgrade.
+#
+# `debugger` is graded highest and on its own. chrome.debugger IS the DevTools
+# protocol — an extension holding it can do from inside the browser exactly
+# what `--remote-debugging-port` does from outside, which is the technique the
+# session-theft sensor exists for.
+_EXT_CAPS = {
+    "debugger": ("CRITICAL",
+                 "chrome.debugger is the DevTools protocol from inside the "
+                 "browser — it can read every cookie and every page as "
+                 "plaintext. Almost nothing legitimately needs it."),
+    "nativeMessaging": ("MEDIUM",
+                        "can hand data to a local executable outside the "
+                        "browser sandbox."),
+    "cookies": ("HIGH", "can read your session cookies directly."),
+    "webRequest": ("MEDIUM", "can observe (and with blocking, alter) traffic."),
+}
+_EXT_BROAD_HOST = ("<all_urls>", "*://*/*", "http://*/*", "https://*/*",
+                   "*://*/", "http://*/", "https://*/")
+
+
+def _ext_manifests():
+    """Yield (label, manifest_dict) for every installed Chromium extension.
+
+    Parsing the operator's OWN browser config at the operator's own privilege
+    — in scope under the corrected 'never parse above the user' rule, and it
+    adds no escalation surface."""
+    for root, kind in BROWSER_EXT_ROOTS:
+        if kind != "chromium" or not os.path.isdir(root):
+            continue
+        try:
+            profiles = os.listdir(root)
+        except Exception:
+            continue
+        for prof in profiles:
+            extdir = os.path.join(root, prof, "Extensions")
+            try:
+                ids = os.listdir(extdir)
+            except Exception:
+                continue
+            for extid in ids:
+                if extid.startswith(".") or extid == "Temp":
+                    continue
+                try:
+                    vers = sorted(os.listdir(os.path.join(extdir, extid)))
+                except Exception:
+                    continue
+                for v in vers:
+                    mp = os.path.join(extdir, extid, v, "manifest.json")
+                    if not os.path.isfile(mp):
+                        continue
+                    txt = _read_text(mp, limit=512 * 1024)
+                    if not txt:
+                        continue
+                    try:
+                        man = json.loads(txt)
+                    except Exception:
+                        continue
+                    if isinstance(man, dict):
+                        yield ("%s/%s" % (os.path.basename(root), extid), man)
+                    break
+
+
+def snapshot_ext_caps():
+    """{label: {"name":…, "caps":[…], "broad":bool}} for installed extensions.
+
+    A baseline-diffed SURFACE, not a per-scan sensor, and that choice is the
+    difference between a usable signal and a dismissed one. Measured on this
+    machine, grading capabilities produced 29 findings — 8 HIGH and 1 CRITICAL
+    — on the first run, every one of them a legitimately installed extension
+    doing its job. A permanent CRITICAL for software you installed on purpose
+    is how you teach someone to stop reading the alerts.
+
+    Capability is POSTURE. The event worth interrupting for is an extension
+    that GAINS `debugger`, or a new extension arriving with it — which is
+    exactly what a first-sight-adopting diff reports and a per-scan sensor
+    cannot express."""
+    snap = {}
+    for label, man in _ext_manifests():
+        try:
+            name = man.get("name") or label
+            if not isinstance(name, str) or name.startswith("__MSG_"):
+                name = label
+            perms = []
+            for key in ("permissions", "optional_permissions"):
+                v = man.get(key)
+                if isinstance(v, list):
+                    perms += [str(x) for x in v]
+            hosts = []
+            hp = man.get("host_permissions")
+            if isinstance(hp, list):
+                hosts += [str(x) for x in hp]
+            # MV2 put match patterns in `permissions` beside API names.
+            hosts += [p for p in perms if "://" in p or p == "<all_urls>"]
+            broad = any(h in _EXT_BROAD_HOST or h.endswith("://*/*")
+                        for h in hosts)
+            caps = sorted(c for c in _EXT_CAPS if c in perms)
+            if not caps:
+                continue
+            snap[label] = {"name": name[:80], "caps": caps, "broad": broad}
+        except Exception:
+            continue
+    return snap
+
+
+def _ext_cap_finding(label, rec, gained, is_new):
+    """Grade the capabilities an extension has GAINED (or arrived with)."""
+    broad = rec.get("broad")
+    worst, why = None, []
+    for cap in gained:
+        sev, reason = _EXT_CAPS[cap]
+        # cookies/webRequest matter only with broad host access — an extension
+        # with `cookies` scoped to a site it owns is doing its job.
+        if cap in ("cookies", "webRequest") and not broad:
+            sev = "LOW"
+        if worst is None or SEV_ORDER[sev] > SEV_ORDER[worst]:
+            worst = sev
+        why.append("%s — %s" % (cap, reason))
+    if worst is None:
+        return None
+    return finding(
+        worst, "extension-capability",
+        "New browser extension can reach session data" if is_new
+        else "Browser extension GAINED a session-reaching permission",
+        "%s (%s)%s now holds: %s\n%s\nAn extension needs no process and touches "
+        "no file to take a session, so no other sensor here will see it work. "
+        "If you did not install or update this deliberately, remove it."
+        % (rec.get("name"), label,
+           " with access to ALL sites" if broad else "",
+           ", ".join(gained), "\n".join(why)),
+        "extension-capability:%s:%s" % (label, ",".join(gained)),
+        path=label, confidence="high" if "debugger" in gained else "medium",
+        markers=["extension-capability", "session-theft"])
+
+
+def diff_ext_caps(prior, cur):
+    findings = []
+    prior = prior or {}
+    for label, rec in cur.items():
+        try:
+            old = prior.get(label)
+            caps = set(rec.get("caps") or [])
+            if old is None:
+                f = _ext_cap_finding(label, rec, sorted(caps), True)
+            else:
+                gained = caps - set(old.get("caps") or [])
+                # A narrow->broad host widening is itself the escalation, even
+                # with no new API permission.
+                if not gained and rec.get("broad") and not old.get("broad"):
+                    gained = caps
+                if not gained:
+                    continue
+                f = _ext_cap_finding(label, rec, sorted(gained), False)
+            if f:
+                findings.append(f)
+        except Exception:
+            continue
+    return findings
+
+
 def _firefox_exts(root):
     out = {}
     try:
@@ -7826,6 +7997,264 @@ def diff_session_binding(prior, cur):
     return _diff_map(prior, cur, new_fn, changed_fn)
 
 
+# --------------------------------------------------------------------------- #
+# Glean — Apple's own threat intel, already on this disk, never used.
+#
+# XProtect.yara is ~1MB, 451 rules, root-owned and world-readable, and macOS
+# applies it only at FIRST LAUNCH of a quarantined file. It never retro-scans
+# what is already resident, never re-scans after a definition update, and never
+# tells you which family Apple just learned about. That gap — a rule that
+# arrives AFTER the file did — is exactly where an already-infected machine
+# lives, and it is the one axis XProtect structurally cannot cover.
+#
+# This is an ATOM EXTRACTOR, not a YARA engine: rule names and literal `$`
+# strings only, conditions skipped entirely. The matcher is a flat, size-capped,
+# non-recursive byte-substring scan with NO format parsing — stated as a hard
+# constraint rather than an aspiration, because "parse the attacker's file" is
+# how a security tool becomes the vulnerability.
+#
+# Privilege note under the corrected invariant: the corpus is a root-owned file
+# READ at user privilege (no escalation), and the scan targets are files the
+# operator already owns. Nothing is parsed above the privilege its author holds.
+# --------------------------------------------------------------------------- #
+
+XPROTECT_YARA = ("/Library/Apple/System/Library/CoreServices/XProtect.bundle"
+                 "/Contents/Resources/XProtect.yara")
+_GLEAN_MAX_FILE = 32 * 1024 * 1024      # never read an unbounded blob
+_GLEAN_MIN_ATOM = 6                     # shorter atoms collide with everything
+_GLEAN_MAX_FILES = 3000
+
+# A rule must declare at least this many literal atoms, and ALL of them must be
+# present, before a match is reported. This is not a tuning knob — it is the
+# threshold that makes the feature shippable at all, and it was set by
+# measurement rather than by taste.
+#
+# Matching on ANY single atom (the obvious implementation, and the first one
+# written here) flagged 81 of 97 known-good system and Homebrew binaries — an
+# 84% false-positive rate — because a lone atom is often a Mach-O section name
+# or a common code sequence shared by every Go or Python binary. It reported
+# /opt/homebrew/bin/node as malware.
+#
+# Requiring >=3 atoms with ALL present measured 0 of those same 97. The reason
+# it works is that a real YARA condition is usually "all of them" or "N of
+# them"; matching a SUBSET of atoms while skipping the condition is not a
+# weaker version of the rule, it is a different and much looser rule.
+_GLEAN_MIN_RULE_ATOMS = 3
+
+
+def _yara_unescape(s):
+    """Decode the escape forms YARA string literals actually use."""
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n == "x" and i + 3 < len(s):
+                try:
+                    out.append(int(s[i + 2:i + 4], 16))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append({"n": 10, "t": 9, "r": 13, "\\": 92, '"': 34}.get(n,
+                                                                        ord(n)))
+            i += 2
+            continue
+        out.extend(c.encode("utf-8", "replace"))
+        i += 1
+    return bytes(out)
+
+
+_YARA_RULE_RE = re.compile(r"^\s*(?:private\s+|global\s+)*rule\s+([A-Za-z0-9_.]+)",
+                           re.M)
+_YARA_ATOM_RE = re.compile(r'^\s*\$[A-Za-z0-9_]*\s*=\s*"((?:[^"\\]|\\.)*)"', re.M)
+
+
+def xprotect_atoms(path=None):
+    """{rule_name: [atom_bytes, …]} from Apple's corpus. {} if unreadable."""
+    path = path or XPROTECT_YARA
+    text = _read_text(path, limit=8 * 1024 * 1024)
+    if not text:
+        return {}
+    out = {}
+    # Split on rule boundaries so atoms attach to the rule that declared them.
+    bounds = [(m.start(), m.group(1)) for m in _YARA_RULE_RE.finditer(text)]
+    for idx, (start, name) in enumerate(bounds):
+        end = bounds[idx + 1][0] if idx + 1 < len(bounds) else len(text)
+        atoms = []
+        for m in _YARA_ATOM_RE.finditer(text, start, end):
+            raw = _yara_unescape(m.group(1))
+            if len(raw) >= _GLEAN_MIN_ATOM:
+                atoms.append(raw)
+        if atoms:
+            out[name] = atoms
+    return out
+
+
+def snapshot_xprotect_corpus():
+    """The rule-NAME set of Apple's corpus. Diffing this across updates yields
+    a dated, offline intel delta: the malware families Apple learned about
+    since your last scan, with no cloud lookup and no API key."""
+    if not IS_MAC or not os.path.isfile(XPROTECT_YARA):
+        return None                      # absent, not degraded, off macOS
+    atoms = xprotect_atoms()
+    if not atoms:
+        return None
+    return {"rules": sorted(atoms), "count": len(atoms)}
+
+
+def diff_xprotect_corpus(prior, cur):
+    """New families are INFO, never an alert — Apple shipping rules is routine.
+    The value is the durable dated record plus the prompt to retro-hunt."""
+    if not isinstance(prior, dict) or not isinstance(cur, dict):
+        return []
+    added = sorted(set(cur.get("rules") or []) - set(prior.get("rules") or []))
+    if not added:
+        return []
+    return [finding(
+        "INFO", "xprotect-corpus", "Apple added malware signatures",
+        "XProtect gained %d rule(s) since the last scan: %s%s\nmacOS applies "
+        "these only at first launch of a quarantined file — it never re-scans "
+        "what is already on disk. Retro-hunt the new families against the "
+        "files Aegis already tracks:\n  aegis.py glean new"
+        % (len(added), ", ".join(added[:8]),
+           " …and %d more" % (len(added) - 8) if len(added) > 8 else ""),
+        "xprotect-corpus:added:%s" % hashlib.sha256(
+            ",".join(added).encode()).hexdigest()[:12],
+        confidence="high", markers=["xprotect-corpus"])]
+
+
+def _glean_targets():
+    """The bounded file set to retro-hunt: what Aegis already tracks, not the
+    disk. Hundreds of files, not millions."""
+    seen, out = set(), []
+    roots = list(HOT_DIRS) + list(STAGING_DIRS or [])
+    for d in roots:
+        try:
+            for name in sorted(os.listdir(d))[:400]:
+                p = os.path.join(d, name)
+                if p in seen or os.path.islink(p) or not os.path.isfile(p):
+                    continue
+                seen.add(p)
+                out.append(p)
+                if len(out) >= _GLEAN_MAX_FILES:
+                    return out
+        except Exception:
+            continue
+    # Every program a persistence item points at.
+    try:
+        base = load_json(BASELINE, {}) or {}
+        for rec in (base.get("persistence") or {}).values():
+            p = rec.get("program") if isinstance(rec, dict) else None
+            if p and p not in seen and os.path.isfile(p):
+                seen.add(p)
+                out.append(p)
+    except Exception:
+        pass
+    return out[:_GLEAN_MAX_FILES]
+
+
+def cmd_glean(mode="new"):
+    """Retro-hunt Apple's signature atoms over the files Aegis already tracks."""
+    if not IS_MAC:
+        print("glean: XProtect's corpus is macOS-only. Absent here, not broken.")
+        return 0
+    if not os.path.isfile(XPROTECT_YARA):
+        print("glean: no XProtect corpus at %s" % XPROTECT_YARA)
+        return 1
+    ensure_state()
+    atoms = xprotect_atoms()
+    if not atoms:
+        print("glean: could not extract atoms from the corpus.")
+        return 1
+    base = load_json(BASELINE, {}) or {}
+    prior = (base.get("xprotect_corpus") or {}).get("rules") or []
+    if mode == "new" and prior:
+        families = sorted(set(atoms) - set(prior))
+        if not families:
+            print("No new XProtect families since the last baseline. "
+                  "Use `aegis.py glean all` to hunt the whole corpus.")
+            return 0
+    else:
+        families = sorted(atoms)
+    targets = _glean_targets()
+    print("# Aegis glean — retro-hunt")
+    print("  families:  %d%s" % (len(families),
+                                 " (new since last baseline)"
+                                 if mode == "new" and prior else " (full corpus)"))
+    print("  files:     %d (hot/staging dirs + persistence programs)\n"
+          % len(targets))
+    # Only rules with enough atoms to be discriminating; see the constant.
+    probes = [(fam, atoms[fam]) for fam in families
+              if len(atoms[fam]) >= _GLEAN_MIN_RULE_ATOMS]
+    skipped = len(families) - len(probes)
+    if skipped:
+        print("  skipped:   %d family(ies) with fewer than %d literal atoms — "
+              "too few to match on without evaluating the rule's condition\n"
+              % (skipped, _GLEAN_MIN_RULE_ATOMS))
+    hits = 0
+    vendor, untrusted = [], []
+    for p in targets:
+        try:
+            if os.path.getsize(p) > _GLEAN_MAX_FILE:
+                continue
+            with open(p, "rb") as f:
+                blob = f.read(_GLEAN_MAX_FILE)   # flat bytes; never parsed
+        except Exception:
+            continue
+        # ALL atoms of a rule, not any — see _GLEAN_MIN_RULE_ATOMS.
+        matched = sorted(fam for fam, ats in probes
+                         if all(a in blob for a in ats))
+        if not matched:
+            continue
+        hits += 1
+        # Grade by who vouches for the binary. Measured: the two survivors of
+        # the atom-threshold fix on this machine were Microsoft AutoUpdate and
+        # Zoom's updater, both matching a GENERIC downloader rule. Raising the
+        # threshold further would have hidden them and also hidden real
+        # Developer-ID-signed malware (RustBucket shipped behind a hijacked
+        # cert), so the answer is to grade rather than to suppress: vendor-
+        # signed matches are listed, and the unsigned ones are counted
+        # separately as the set actually worth a human's attention.
+        try:
+            trust = (classify_signature(p) or {}).get("trust", "unknown")
+        except Exception:
+            trust = "unknown"
+        if trust in ("apple", "app-store", "developer-id", "os-signed",
+                     "os-managed"):
+            vendor.append((p, matched, trust))
+        else:
+            untrusted.append((p, matched, trust))
+        log_action("glean", p, "match", families=",".join(matched[:6]),
+                   trust=trust)
+    for label, rows in (("UNSIGNED / AD-HOC — look at these", untrusted),
+                        ("vendor-signed (context, not an alarm)", vendor)):
+        if not rows:
+            continue
+        print("\n== %s ==" % label)
+        for p, matched, trust in rows:
+            print("  [%s] %s\n        families: %s"
+                  % (trust, p, ", ".join(matched[:6])))
+    print("\n%d file(s) matched: %d unsigned/ad-hoc, %d vendor-signed."
+          % (hits, len(untrusted), len(vendor)))
+    if untrusted:
+        print("A match means Apple's OWN signature atoms are all present in a "
+              "file already resident here — which XProtect itself would never "
+              "tell you, because it only scans at first launch of a "
+              "quarantined file. Confirm before acting: aegis.py vt <path>")
+    if vendor:
+        print("Vendor-signed matches are usually a GENERIC rule (a shared "
+              "downloader or packer idiom), not a compromise. They are shown "
+              "rather than hidden because a hijacked Developer-ID cert is a "
+              "real technique — but start with the unsigned list.")
+    if not hits:
+        print("No matches. This proves only that these atom sets are absent — "
+              "the conditions those rules would apply were NOT evaluated, so "
+              "this is weaker than an XProtect scan, not a replacement for one.")
+    return 0
+
+
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
 # Baseline-diffed surfaces. Portable ones run everywhere; a surface with no
 # meaning on a platform is simply ABSENT from its registry rather than reported
@@ -7845,9 +8274,11 @@ SURFACES = [
     # MCP registration AND Aegis's baseline breaks the hash chain).
     ("agent_surface", snapshot_agent_surface, diff_agent_surface),
     ("session_binding", snapshot_session_binding, diff_session_binding),
+    ("ext_caps", snapshot_ext_caps, diff_ext_caps),
 ]
 if IS_MAC:
     SURFACES += [
+        ("xprotect_corpus", snapshot_xprotect_corpus, diff_xprotect_corpus),
         ("loginhooks", snapshot_loginhooks, diff_loginhooks),
         ("profiles", snapshot_profiles, diff_profiles),
         ("btm", snapshot_btm, diff_btm),
@@ -8142,6 +8573,65 @@ def check_canaries():
     return findings
 
 
+# Which writ scope governs each baseline-diffed surface. A surface with no
+# entry falls back to "persistence", so a newly added surface is governed by
+# default rather than silently ungoverned — the failure that would otherwise
+# grow a hole every time someone adds a sensor.
+_SURFACE_WRIT_SCOPE = {
+    "shellrc": "shellrc",
+    "browserext": "browserext",
+    "ide_ext": "browserext",
+    "listeners": "listeners",
+    "agent_surface": "agent_surface",
+    "agent_skills": "agent_surface",
+}
+
+
+def _apply_writ(findings, surface_key):
+    """Mark changes that happened with NO open writ.
+
+    This is the call site that makes `writ enforce on` mean something. Without
+    it the command existed, the state file was written, and the documentation
+    claimed unauthorized changes would be reported — while `writ_covers()` had
+    no callers at all and enforcement changed exactly nothing.
+
+    While enforcement is OFF, `writ_covers()` returns False for every scope and
+    this function returns its input unchanged, so a machine that never opts in
+    sees byte-identical findings."""
+    data = load_json(WRIT_FILE, {})
+    if not isinstance(data, dict) or not data.get("enforcing"):
+        return findings
+    scope = _SURFACE_WRIT_SCOPE.get(surface_key, "persistence")
+    out = []
+    for f in findings:
+        try:
+            if writ_covers(scope):
+                # Authorized: keep the record, drop it below the notify floor.
+                f["severity"] = "INFO"
+                f["writ"] = "covered"
+            else:
+                f["writ"] = "unauthorized"
+                f["markers"] = sorted(set((f.get("markers") or []) +
+                                          ["unauthorized-change"]))
+                if SEV_ORDER.get(f["severity"], 0) < SEV_ORDER["HIGH"]:
+                    f["severity"] = "HIGH"
+                f["title"] = "UNAUTHORIZED CHANGE — %s" % f["title"]
+                f["detail"] = (
+                    "%s\n\nNo writ was open for scope '%s' when this changed. "
+                    "Under writ enforcement that is reportable regardless of "
+                    "how benign the change looks: a validly-signed, notarized "
+                    "item installed with no declared window is exactly as "
+                    "interesting as an unsigned one, because the finding is "
+                    "the ABSENCE of a record only a human at a terminal can "
+                    "create. If this was you, open a writ before the next "
+                    "change: aegis.py writ open \"why\" 20 %s"
+                    % (f["detail"], scope, scope))
+        except Exception:
+            pass
+        out.append(f)
+    return out
+
+
 def _scan_surfaces(baseline, corrupt, first_run, health=None):
     """Diff every extra surface; silently adopt any not yet in the baseline.
     Returns (findings, baseline). Persists the baseline when an EXISTING install
@@ -8185,11 +8675,11 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             # be blessed as known-good). Diff against empty to surface it, then
             # record so it does not re-alert next scan.
             if key in _NEVER_ADOPT_LIVE:
-                findings += diff_fn({}, cur)
+                findings += _apply_writ(diff_fn({}, cur), key)
             baseline[key] = cur
             dirty = True
         else:
-            findings += diff_fn(prior, cur)
+            findings += _apply_writ(diff_fn(prior, cur), key)
     if dirty and not first_run:
         save_json(BASELINE, baseline)
     return findings, baseline
@@ -13208,6 +13698,26 @@ preexec_functions+=(_aegis_preexec)
 '''
 
 
+_GUARD_BASH = r'''# Aegis guard (observe-only). Sourced from ~/.aegis/guard/guard.bash
+# bash has no bracketed-paste widget, so paste provenance is weaker here than
+# under zsh: readline handles the paste and the shell never learns it was one.
+# What IS available is the READLINE bracketed-paste setting plus a DEBUG trap,
+# and a timing tell — a multi-line command line assembled faster than a human
+# types. Reported honestly: AEGIS_PASTED is only set when we can actually tell,
+# and left unset (not 0) when we cannot, so "unknown" never renders as "typed".
+_aegis_preexec() {
+  [ -n "${COMP_LINE:-}" ] && return          # completion, not execution
+  [ "$BASH_COMMAND" = "$PROMPT_COMMAND" ] && return
+  case "$BASH_COMMAND" in
+    _aegis_*) return ;;
+  esac
+  command "${AEGIS_PY:-python3}" "${AEGIS_BIN}" guard observe -- "$BASH_COMMAND" \
+      >/dev/null 2>&1 &
+}
+trap '_aegis_preexec' DEBUG
+'''
+
+
 def _guard_paths():
     return (os.path.join(GUARD_DIR, "guard.zsh"),
             os.path.join(GUARD_DIR, "guard.bash"))
@@ -13219,14 +13729,24 @@ def cmd_guard(action="status", rest=None):
     zsh_p, bash_p = _guard_paths()
 
     if action == "install":
-        with open(zsh_p, "w", encoding="utf-8") as f:
-            f.write(_GUARD_ZSH)
-        os.chmod(zsh_p, 0o600)
-        print("Wrote %s\n" % zsh_p)
-        print("Add this ONE line to your ~/.zshrc (Aegis does not edit your "
-              "rc files itself — a security tool that rewrites your shell "
-              "startup is indistinguishable from the thing it watches for):\n")
-        print('  AEGIS_BIN="%s" source "%s"\n' % (_SELF_PATH, zsh_p))
+        for path, body in ((zsh_p, _GUARD_ZSH), (bash_p, _GUARD_BASH)):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.chmod(path, 0o600)
+        print("Wrote %s\n      %s\n" % (zsh_p, bash_p))
+        print("Add ONE line to the rc file for the shell you actually use "
+              "(Aegis does not edit your rc files itself — a security tool "
+              "that rewrites your shell startup is indistinguishable from the "
+              "thing it watches for):\n")
+        print('  ~/.zshrc :  AEGIS_BIN="%s" source "%s"' % (_SELF_PATH, zsh_p))
+        print('  ~/.bashrc:  AEGIS_BIN="%s" source "%s"\n'
+              % (_SELF_PATH, bash_p))
+        print("Paste provenance differs by shell, and the difference is real:\n"
+              "  zsh  — the bracketed-paste widget tells us a region arrived by\n"
+              "         PASTE. Ground truth, no clipboard access, nothing stored.\n"
+              "  bash — no such widget. Commands are observed via a DEBUG trap\n"
+              "         and paste provenance is simply UNKNOWN rather than\n"
+              "         guessed. 'unknown' is never rendered as 'typed'.\n")
         print("Then: aegis.py latch on   — so the guard body is latched and "
               "its removal becomes attack-defined evidence.\n")
         print("This is OBSERVE-ONLY. It refuses nothing. Run it for 60 days, "
@@ -13239,7 +13759,11 @@ def cmd_guard(action="status", rest=None):
         cmdline = " ".join(rest or [])
         if not cmdline:
             return 0
-        pasted = os.environ.get("AEGIS_PASTED") == "1"
+        # Tri-state on purpose. zsh can prove a paste; bash cannot, and an
+        # unset variable there means UNKNOWN, not "typed". Collapsing unknown
+        # to False would let the weaker shell quietly manufacture reassurance.
+        raw = os.environ.get("AEGIS_PASTED")
+        pasted = True if raw == "1" else (False if raw == "0" else None)
         hostile = _hostile_content(cmdline)
         try:
             tier, _grammar_hits = clipboard_grammar(cmdline)
@@ -13250,7 +13774,7 @@ def cmd_guard(action="status", rest=None):
         # for the same reason: password managers put secrets here.
         if not hostile and not tier:
             return 0
-        rec = {"ts": now_iso(), "pasted": bool(pasted), "tier": tier,
+        rec = {"ts": now_iso(), "pasted": pasted, "tier": tier,
                "hostile": hostile,
                "cmd": redact_sensitive(cmdline[:400])}
         try:
@@ -13413,6 +13937,16 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    to the paths that incident touched. Reads NO secret bytes —
                    presence and stat() only. At a calm time it doubles as an
                    exposure score.
+  glean [new|all]  retro-hunt Apple's OWN XProtect signature atoms over the
+                   files Aegis already tracks. macOS applies that corpus only
+                   at first launch of a quarantined file — it never re-scans
+                   what is already resident, so a rule that arrives AFTER the
+                   file did is a permanent blind spot. `new` hunts only the
+                   families Apple added since your last baseline (a dated,
+                   offline intel delta; no cloud, no API key). An atom
+                   extractor, NOT a YARA engine: rule conditions are never
+                   evaluated, so a match is weaker than an XProtect scan and
+                   is graded by signature trust rather than reported flat.
   presence         report the human-presence regime (idle / locked / absent).
                    Evidence only: idle time is forgeable by a same-uid process,
                    so this enriches findings and never licenses an action.
@@ -13576,6 +14110,8 @@ def main(argv):
         if rest and rest[0] == "--":
             rest = rest[1:]
         return cmd_guard(argv[2] if len(argv) > 2 else "status", rest)
+    if cmd == "glean":
+        return cmd_glean(argv[2] if len(argv) > 2 else "new")
     if cmd == "presence":
         regime, idle, locked = presence()
         print("regime: %s\nidle:   %s\nlocked: %s"

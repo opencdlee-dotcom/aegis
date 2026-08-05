@@ -100,6 +100,56 @@ X" exists because a real file needed it.
   untrusted input above the privilege its author already holds** — which keeps
   untrusted binaries out of scope and puts the operator's own config files in.
 
+## Second pass — the wiring, and a feature that measured its way to shippable
+
+Four items were finished after the first commit; two of them were features that
+existed only on paper.
+
+| # | Defect | Evidence |
+|---|--------|----------|
+| A6 | **`writ_covers()` had zero call sites.** The command wrote state, the HELP text and README both claimed an unauthorized change would report as HIGH — and enforcement changed nothing at all. A documented behaviour with no implementation is worse than a missing feature, because it is believed. | `grep writ_covers aegis.py` returned the definition and nothing else |
+| A7 | **`guard install` computed a bash path and never wrote it.** `bash_p` was a dead variable. bash also has no bracketed-paste widget, so paste provenance there is genuinely UNKNOWN — and the code was collapsing unknown to `False`, letting the weaker shell manufacture reassurance. Now tri-state. | dead local; `pasted` was `== "1"` |
+| A8 | **Extension capability was ungraded.** An extension holding `cookies` + all-sites, or `debugger`, reads sessions through Chrome's own API — no process to see, no file touched, invisible to every other sensor here. | `grep host_permissions` → nothing |
+| A9 | **Glean shipped as a false-positive generator and was measured back to shippable.** | below |
+
+### The glean calibration, in numbers
+
+The obvious implementation — match if ANY of a rule's literal atoms appears —
+was written, run against this machine, and produced **46 matches**, including
+`/opt/homebrew/bin/node`, two Python interpreters, GoogleUpdater and a Steam
+binary. Against a known-good corpus of 97 system and Homebrew binaries it
+flagged **81 of 97 — an 84% false-positive rate.**
+
+The cause is not a tuning problem. A YARA rule's condition is usually *all of
+them* or *N of them*; matching a SUBSET while skipping the condition is not a
+weaker version of that rule, it is a different and far looser one. A lone atom
+is frequently a Mach-O section name or a code idiom every Go binary shares.
+
+Requiring a rule to declare **≥3 atoms with ALL present** measured **0 of the
+same 97**, and dropped the live run from 46 matches to 2 while running ten times
+faster (102s → 10s).
+
+The two survivors — Microsoft AutoUpdate and Zoom's updater, both matching one
+generic downloader rule — were then handled by **grading rather than
+suppressing**. Raising the threshold again would have hidden them and also
+hidden real Developer-ID-signed malware, since a hijacked cert is an established
+technique. So matches are split into an unsigned/ad-hoc list (the one worth a
+human's attention: **0 files here**) and a vendor-signed list shown as context.
+
+This is the same decision the atime experiment forced earlier in the pass, one
+rung further along: measure the thing, and let the measurement decide whether it
+ships, in what form, or at all.
+
+### Deliberately not built
+
+Event-driven watch on Linux/Windows. The comments asserting it was impossible
+were wrong and have been corrected — `ctypes` is stdlib, `inotify_init1` and
+`ReadDirectoryChangesW` are both reachable. But writing kernel-interface code
+that cannot be executed on the machine writing it is precisely this log's
+standing lesson in reverse, and the gap it closes is latency (5s poll →
+sub-second), not coverage. Recorded as unbuilt work with the constraint
+corrected, rather than shipped blind.
+
 ## Residual
 
 - `deadfall` cannot fire anything; dispatch is deliberately unwired so the

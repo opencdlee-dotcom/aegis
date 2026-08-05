@@ -332,7 +332,9 @@ and MAC recomputed defeats all local checks and is still caught by the anchors.
 | `presence` | Human-presence regime (active / idle / absent / locked). | **Evidence only** — forgeable by a same-uid process, so it never gates an action. |
 | `guard [install\|status]` | **Observe-only** pre-exec check in your own shell. | Learns "pasted vs typed" from the terminal's bracketed-paste protocol, so no clipboard content is ever read or stored. |
 | `deadfall [arm\|list\|disarm]` | Pre-authorized **reversible** response, behind three refusals. | **Dispatch is deliberately not wired.** The interlocks ship and get tested first. |
-| `writ [open\|list\|enforce]` | Declare a change window before changing the machine. | **Enforcement is default-off**; while off, `writ_covers()` returns False and behaviour is byte-identical. |
+| `writ [open\|list\|enforce]` | Declare a change window before changing the machine. Enforced, an uncovered change becomes `UNAUTHORIZED CHANGE` at HIGH minimum; a covered one drops to INFO. | **Enforcement is default-off**; while off, `writ_covers()` returns False and behaviour is byte-identical. |
+| **ext_caps** *(surface)* | Grades browser extensions by **capability**, not just existence: `debugger` (the DevTools protocol from *inside* the browser), `cookies`/`webRequest` paired with all-sites host access, `nativeMessaging`. | A baseline-diffed surface, not a per-scan sensor — see below. |
+| `glean [new\|all]` | Retro-hunts Apple's own XProtect atoms over the files Aegis already tracks, and diffs the corpus across updates for a dated **offline** intel delta. | macOS-only; absent elsewhere, not degraded. |
 
 **Two design notes worth stating, because both were found by running the code
 against a real machine rather than a fixture:**
@@ -363,9 +365,32 @@ against a real machine rather than a fixture:**
 - **The agent-surface walk is file-capped** and reports a `LOW` finding when it
   truncates. Partial coverage is announced, never absorbed.
 - **`guard` refuses nothing, by construction**, and covers interactive shells
-  only — Win+R and GUI-launched payloads are explicitly out of scope.
+  only — Win+R and GUI-launched payloads are explicitly out of scope. Paste
+  provenance is *proven* under zsh (bracketed paste) and **unknown** under bash,
+  which has no such widget — recorded as unknown rather than as "typed".
 - **`deadfall` cannot currently fire anything.** That is the shipped state, not
   an oversight.
+- **`glean` never evaluates a rule's condition.** It matches literal atoms only,
+  requires a rule to declare **≥3** of them with **all** present, and grades
+  hits by signature trust. The threshold is not taste — matching on any single
+  atom flagged **81 of 97** known-good system/Homebrew binaries (it reported
+  `/opt/homebrew/bin/node` as malware); ≥3-and-all measured **0 of 97**. A
+  `glean` miss therefore proves only that those atom sets are absent, and is
+  strictly weaker than an XProtect scan rather than a replacement for one.
+- **Extension capability is posture, not an event.** Grading it per-scan
+  produced 29 findings — 8 HIGH and 1 CRITICAL — on the author's machine, every
+  one a legitimately installed extension. A permanent CRITICAL for software you
+  installed on purpose is how a tool teaches you to stop reading it, so
+  capability is baselined and only a *gain* (an extension acquiring `debugger`,
+  or widening to all-sites) is reported.
+- **Event-driven watch on Linux/Windows is still unbuilt.** The comments
+  claiming it was impossible were wrong and are corrected, but `ctypes`-based
+  `inotify`/`ReadDirectoryChangesW` is deliberately **not** shipped here rather
+  than written blind: this file's own hardest lesson is that a simulation
+  inherits its author's model of the system, and kernel-interface code that
+  cannot be executed on the machine writing it is exactly that risk. Polling
+  remains the shipped behaviour there, and it is a latency gap, not a coverage
+  gap.
 
 **Honest limits of this tier:**
 
