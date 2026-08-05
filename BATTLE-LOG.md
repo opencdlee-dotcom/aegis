@@ -1,4 +1,4 @@
-# Aegis — a governed battle-test: three loud rounds, fifteen defects (2026-08-05)
+# Aegis — a governed battle-test: three loud rounds, sixteen defects (2026-08-05)
 
 A single `/battle-test` run under `/fable-mode` governance: right-size, hunt across
 independent lenses, adversarially verify every candidate against the real code before
@@ -85,10 +85,26 @@ that only exercises the easy input proves nothing about the hard one.
 One candidate was **refuted** on verification (raised, traced, found not to reach a
 real wrong behaviour) — recorded because a rejected finding is part of an honest count.
 
+### R3-6 — the re-check found the ReDoS the ReDoS fix missed
+
+Because R3-1 proved my own fixes can introduce defects, I ran a focused adversarial
+re-check of all five Round 3 fixes before shipping. Four were clean. The fifth surfaced
+**R3-6 (MED):** `redact_sensitive` *still* had an O(n²) ReDoS — in `_AUTH_RE`, whose two
+`\s*` runs around the optional `bearer|basic` re-partition a long whitespace value in
+O(n) ways and backtrack O(n²) when the value group fails at EOF or a quote
+(`authorization=` + 40 000 spaces → 9.5 s, measured). It is *pre-existing* — R3-1 did not
+touch it — but R3-1's stated job was to de-ReDoS that exact function, so leaving a second
+quadratic in it made the fix incomplete. Bounded the whitespace (`\s{0,20}`) like R3-1;
+200 KB now redacts in 0.006 s, all real `Authorization:` header forms unchanged. The
+regression test now pins **both** vectors. The lesson compounds R3-1's: fixing one ReDoS
+in a function is not fixing *the function* — a per-pattern check would have caught this,
+a per-symptom check ("is `_SECRET_FLAG_RE` fast now?") did not.
+
 ## Convergence
 
-Three rounds, three loud: 5 + 5 + 5 = **fifteen** genuine defects (1 CRITICAL, 5 HIGH,
-7 MED, 2 LOW), one of them created and then caught within this same pass. The stop is a
+Three rounds plus a fix-re-check, all loud: 5 + 5 + 5 + 1 = **sixteen** genuine defects
+(1 CRITICAL, 5 HIGH, 8 MED, 2 LOW), two of them ReDoS in the same redaction function —
+one created this pass, one pre-existing, both closed. The stop is a
 **hard-cap / diminishing-returns** judgement, not two consecutive dry rounds — stated
 plainly rather than dressed as convergence. Every surface the three rounds targeted has
 now been adversarially hunted at least once; a fourth round is the honest next step if
@@ -99,7 +115,7 @@ are saved to re-run it.
 
 - macOS full suite **651 passed, 3 skipped** (+15 regression pins over the 636 baseline);
   `selftest.py` 7/7.
-- Every one of the fifteen new tests was run against its pre-fix source and **failed**
+- Every one of the new/extended tests was run against its pre-fix source and **failed**
   (assertion failures, plus a few errors where a fix introduces a symbol the test needs).
 - Live-verified this pass: the R2-2 case bypass and its fix; the R3-1 ReDoS (18.5 s →
   0.22 s) and its fix; the R3-5 double-emit (2 findings → 1); the R3-2 quoted unit text.
@@ -121,7 +137,7 @@ are saved to re-run it.
 
 ## End-state checklist
 
-- bugs found → fixed: **15/15**, each with a repro that failed before and passes now.
+- bugs found → fixed: **16/16**, each with a repro that failed before and passes now.
 - logic errors found → fixed: C5, R2-4, R2-1, R3-3 — fixed + pinned.
 - edge cases found → tested: every fix has a both-poles / linear-timing regression test; all proven to fail pre-fix.
 - no unimplemented files/stubs remain: completeness pre-flight clean at Gate 2.

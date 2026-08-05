@@ -1824,8 +1824,15 @@ def suspicious_sig(trust):
 _SECRET_ASSIGN_RE = re.compile(
     r"(?i)\b(password|passwd|token|api[_-]?key|secret|cookie)\b"
     r'("?\s*[:=]\s*"?)([^\s&;,"\']+)')
+# Whitespace is BOUNDED (`\s{0,20}`, not `\s*`): the two `\s*` runs either side
+# of the optional `(?:bearer|basic)?` are adjacent, so an unbounded pair
+# re-partitions a long whitespace run O(n) ways and, when the trailing value
+# group fails (EOF, or a quote), backtracks O(n^2) — the same ReDoS class R3-1
+# fixed in _SECRET_FLAG_RE, still live here in the same redact_sensitive. A real
+# Authorization header has at most a couple of spaces, so a bound loses nothing.
 _AUTH_RE = re.compile(
-    r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)?\s*)([^\s'\"]+)")
+    r"(?i)(authorization\s{0,20}[:=]\s{0,20}(?:bearer|basic)?\s{0,20})"
+    r"([^\s'\"]+)")
 _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:password|passwd|token|api[_-]?key|secret|cookie)=)([^&\s]+)")
 _URL_USERINFO_RE = re.compile(r"(https?://[^\s/@:]+:)([^\s/@]+)(@)", re.I)

@@ -2872,20 +2872,28 @@ class TestPrivacyBoundary(Sandbox):
         for benign in ("--token-count 5", "--output-dir /tmp/build"):
             self.assertEqual(benign, aegis.redact_sensitive(benign))
 
-    def test_redaction_is_linear_on_hyphen_dense_input(self):
-        """The _SECRET_FLAG_RE added for space-separated secrets led with an
-        unbounded `[\\w-]*` before the keyword, giving O(n^2) backtracking on a
-        hyphen-dense token — reachable through an uncapped agent-config `args`
-        value, hanging a whole scan for ~18s at 40KB (minutes at 200KB). The
-        bounded prefix (and the args length cap) make it linear."""
+    def test_redaction_is_linear_on_adversarial_input(self):
+        """redact_sensitive must stay linear on every adversarial shape, because
+        it runs synchronously inside a scan on uncapped inputs (a finding detail,
+        a subprocess stderr). Two O(n^2) ReDoS vectors were closed:
+          * _SECRET_FLAG_RE's unbounded `[\\w-]*` prefix on a hyphen-dense token
+            (reachable via an agent-config `args` value) — ~18s at 40KB;
+          * _AUTH_RE's adjacent `\\s*` runs around the optional bearer/basic, on
+            an `authorization:` + long-whitespace value — ~9.5s at 40KB.
+        Both are bounded now; each 120-200KB case must finish well under a second."""
         import time
-        big = "-a" * 60000            # 120 KB; pre-fix this took minutes
-        t0 = time.time()
-        aegis.redact_sensitive(big)
-        elapsed = time.time() - t0
-        self.assertLess(elapsed, 3.0,
-                        "redaction showed superlinear blowup (%.1fs) — ReDoS "
-                        "regression in _SECRET_FLAG_RE" % elapsed)
+        cases = [
+            "-a" * 60000,                                  # _SECRET_FLAG_RE vector
+            "authorization=" + " " * 120000,               # _AUTH_RE, EOF variant
+            "authorization: " + " " * 120000 + '"tail"',   # _AUTH_RE, quote variant
+        ]
+        for payload in cases:
+            t0 = time.time()
+            aegis.redact_sensitive(payload)
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 3.0,
+                            "redaction showed superlinear blowup (%.1fs) on %r… "
+                            "— ReDoS regression" % (elapsed, payload[:20]))
 
 
 class TestEventIncidentCore(Sandbox):
