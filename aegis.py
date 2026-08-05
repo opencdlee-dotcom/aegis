@@ -3811,20 +3811,46 @@ def _iter_processes():
                 continue
             yield pid.strip(), owner.strip(), exe.strip(), (argv.strip() or exe.strip())
         return
-    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
+    # TWO ps calls, joined on pid, and the reason is not stylistic.
+    #
+    # `ps -axo pid=,uid=,comm=,args=` truncates the comm COLUMN to 16 characters
+    # — but only because `args` is requested alongside it. Asked for on its own,
+    # comm is the full path (measured: 119 characters, intact). The single-call
+    # form therefore returned an executable path that DOES NOT EXIST for 305 of
+    # 642 processes on the author's machine (47%), and every consumer downstream
+    # scored that truncated string: classify_signature() on a path that isn't
+    # there answers `missing`, and is_risky_location() answers False for a
+    # binary genuinely running out of a risky directory. The process sensor was
+    # grading a prefix.
+    #
+    # comm cannot be split off as a token when it shares a line with args (a
+    # path may contain spaces), which is exactly why the original collapsed them
+    # into one call. Keeping them in SEPARATE calls removes the ambiguity: comm
+    # is the whole remainder of its line, argv is the whole remainder of its own.
+    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm="], timeout=15)
     if rc != 0:
         _PROC_ENUM_FAILED = True  # same rule on mac: no answer != no processes
         return
+    exes = {}
     for line in out.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3:
             continue
-        pid, uid, rest = parts
-        # `comm` is the full exec path and may contain spaces, so it cannot be
-        # split off as a token; argv[0] repeats it, making `rest` usable as both
-        # the argv string and (via its head) the exec path.
-        exe = rest.split(None, 1)[0]
-        yield pid, uid, exe, rest
+        pid, uid, comm = parts[0], parts[1], parts[2].strip()
+        exes[pid] = (uid, comm)
+
+    aout, _, arc = run(["ps", "-axo", "pid=,args="], timeout=15)
+    argvs = {}
+    if arc == 0:
+        for line in aout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                argvs[parts[0]] = parts[1].strip()
+    # A failed argv call is NOT a reason to drop the process table: exec path,
+    # owner and the same-user boundary all still hold without argv. The argv
+    # sensors simply see nothing rather than seeing something wrong.
+    for pid, (uid, comm) in exes.items():
+        yield pid, uid, comm, (argvs.get(pid) or comm)
 
 
 def _own_owner():

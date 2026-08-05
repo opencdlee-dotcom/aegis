@@ -38,6 +38,45 @@ def _ECHO_CMD(text):
     return [sys.executable, "-c", "print(%r)" % text]
 
 
+def ps_fixture(rows):
+    """A fake `run` answering BOTH ps calls `_iter_processes()` makes on macOS.
+
+    `rows` are `(pid, uid, comm, args)` tuples — structured rather than a
+    pre-joined line, because the two columns cannot be recovered from one
+    string once `comm` itself contains a space (an attacker copying osascript
+    to "/tmp/Sys Update" is a case this suite deliberately covers).
+
+    There are two calls because asking macOS `ps` for `comm` and `args`
+    together truncates the comm COLUMN to 16 characters, which made the sensor
+    grade a prefix. A fixture that answered only the old single-call shape
+    would keep passing while exercising nothing.
+    """
+    rows = list(rows)
+
+    def fake_run(cmd, timeout=15, extra_env=None):
+        if list(cmd[:2]) != ["ps", "-axo"]:
+            return "", "", 0
+        fmt = cmd[2] if len(cmd) > 2 else ""
+        if "args=" in fmt and "uid=" not in fmt:
+            body = "\n".join("%s %s" % (p, a) for p, _u, _c, a in rows)
+        else:
+            body = "\n".join("%s %s %s" % (p, u, c) for p, u, c, _a in rows)
+        return body + "\n", "", 0
+    return fake_run
+
+
+def ps_rows(legacy):
+    """Parse legacy `"pid uid comm args"` fixture strings into ps_fixture
+    tuples. Only valid where `comm` has no space; give tuples directly when it
+    does."""
+    out = []
+    for line in legacy:
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            out.append(tuple(parts))
+    return out
+
+
 class Sandbox(unittest.TestCase):
     """Base: redirect all aegis state/scan surfaces into a throwaway tmp dir."""
 
@@ -413,9 +452,8 @@ class TestRiskyLocations(Sandbox):
         # canned `ps` + forced-adhoc classifier: a /usr/local process must be
         # flagged (pre-fix it was short-circuited as trusted and never checked).
         saved_run, saved_cls = aegis.run, aegis.classify_signature
-        aegis.run = lambda cmd, timeout=15, extra_env=None: (
-            ("1234 501 /usr/local/bin/evil /usr/local/bin/evil\n", "", 0)
-            if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
+        aegis.run = ps_fixture([("1234", "501", "/usr/local/bin/evil",
+                                 "/usr/local/bin/evil")])
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
                                               "authority": None}
         try:
@@ -979,15 +1017,16 @@ class TestArgvSignals(Sandbox):
 # N15 — check_behavior: same-user filtering + never flags Aegis itself.
 # --------------------------------------------------------------------------- #
 class TestCheckBehavior(Sandbox):
-    def _run_with_ps(self, ps_rows):
+    def _run_with_ps(self, rows):
         # Sandbox stubs check_behavior to []; restore the real one and feed it a
         # canned process table via a stubbed aegis.run.
         real_check = self._saved["check_behavior"]
         saved_run = aegis.run
+        fixture = ps_fixture(ps_rows(rows))
 
-        def fake_run(cmd, timeout=15):
-            if cmd[:2] == ["ps", "-axo"]:
-                return "\n".join(ps_rows), "", 0
+        def fake_run(cmd, timeout=15, extra_env=None):
+            if list(cmd[:2]) == ["ps", "-axo"]:
+                return fixture(cmd, timeout)
             return saved_run(cmd, timeout)
         aegis.run = fake_run
         try:
@@ -2196,9 +2235,7 @@ class TestOptHomebrewRisky(Sandbox):
 
     def _procs(self, procs):
         saved_run, saved_cls = aegis.run, aegis.classify_signature
-        aegis.run = lambda cmd, timeout=15, extra_env=None: (
-            ("\n".join(procs) + "\n", "", 0)
-            if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
+        aegis.run = ps_fixture(ps_rows(procs))
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
                                               "authority": None}
         aegis._sigcache = {}
@@ -2227,13 +2264,17 @@ class TestBehaviorCommSpace(Sandbox):
     PHISH = ('osascript -e display dialog "System update needs your password" '
              'default answer "" with hidden answer')
 
-    def _run_with_ps(self, ps_rows):
+    def _run_with_ps(self, rows):
+        # Structured (pid, uid, comm, args) tuples, not joined strings: this
+        # class exists precisely because `comm` may contain a space, and a
+        # joined line cannot be split back into the two columns.
         real = self._saved["check_behavior"]
         saved_run = aegis.run
+        fixture = ps_fixture(rows)
 
-        def fake_run(cmd, timeout=15):
-            if cmd[:2] == ["ps", "-axo"]:
-                return ("\n".join(ps_rows) + "\n", "", 0)
+        def fake_run(cmd, timeout=15, extra_env=None):
+            if list(cmd[:2]) == ["ps", "-axo"]:
+                return fixture(cmd, timeout)
             return saved_run(cmd, timeout)
         aegis.run = fake_run
         try:
@@ -2244,16 +2285,19 @@ class TestBehaviorCommSpace(Sandbox):
     def test_space_free_path_is_critical_control(self):
         uid = str(os.getuid())
         fs = self._run_with_ps(
-            ["  888 %s /usr/bin/osascript %s" % (uid, self.PHISH)])
+            [("888", uid, "/usr/bin/osascript",
+              "/usr/bin/osascript " + self.PHISH)])
         self.assertTrue(any(f["category"] == "behavior"
                             and f["severity"] == "CRITICAL" for f in fs), fs)
 
     def test_spaced_exec_path_still_flagged(self):
         # byte-identical hostile argv, but the executable path has a space
-        # (attacker copied osascript to "/tmp/Sys Update").
+        # (attacker copied osascript to "/tmp/Sys Update"). Splitting comm off
+        # a shared line would shear it at the space — the defect this pins.
         uid = str(os.getuid())
         fs = self._run_with_ps(
-            ['  889 %s /tmp/Sys Update /tmp/Sys Update %s' % (uid, self.PHISH)])
+            [("889", uid, "/tmp/Sys Update",
+              "/tmp/Sys Update " + self.PHISH)])
         self.assertTrue(any(f["category"] == "behavior" for f in fs), fs)
 
 

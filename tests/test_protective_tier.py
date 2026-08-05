@@ -547,6 +547,70 @@ class TestClipboardGrammar(unittest.TestCase):
             self.assertIsNone(tier, "%r matched %s" % (benign, hits))
 
 
+@unittest.skipUnless(sys.platform == "darwin", "macOS ps column semantics")
+class TestMacProcessPathsAreNotTruncated(unittest.TestCase):
+    """macOS `ps` truncates the comm COLUMN to 16 characters when `args` is
+    requested in the same call — and `_iter_processes()` did exactly that.
+
+    Measured on the author's machine before the fix: **305 of 642 processes**
+    reported an executable path that does not exist on disk. Every consumer
+    downstream graded that prefix — `classify_signature()` answers `missing`
+    for a path that isn't there, and `is_risky_location()` answers False for a
+    binary genuinely running out of a risky directory. The process sensor, one
+    of the tool's headline detections, was scoring a truncation.
+
+    Asked for on its own, comm is the full path. Hence two calls."""
+
+    def test_ps_is_queried_so_comm_is_never_truncated(self):
+        import inspect
+        src = inspect.getsource(aegis._iter_processes)
+        self.assertNotIn('"pid=,uid=,comm=,args="', src,
+                         "comm and args in ONE ps call truncates comm to 16 "
+                         "chars; that is the defect this pins")
+        self.assertIn('"pid=,uid=,comm="', src)
+        self.assertIn('"pid=,args="', src)
+
+    def test_reported_exe_paths_actually_exist_on_this_machine(self):
+        """The empirical assertion, run against the real machine rather than a
+        fixture — a fixture would have inherited the same wrong assumption the
+        original code made, which is how this survived so long."""
+        missing = total = 0
+        for _pid, _owner, exe, _argv in aegis._iter_processes():
+            if not exe or not exe.startswith("/"):
+                continue  # ps legitimately reports bare names for some daemons
+            total += 1
+            if not os.path.exists(exe):
+                missing += 1
+        if total < 20:
+            self.skipTest("process table too small to be meaningful")
+        # Pre-fix this ratio was ~47%. Allow generous headroom for processes
+        # that genuinely exit mid-enumeration; the point is that truncation is
+        # no longer systematic.
+        self.assertLess(missing / float(total), 0.15,
+                        "%d of %d absolute exe paths do not exist — comm looks "
+                        "truncated again" % (missing, total))
+
+    def test_a_long_path_survives_the_join(self):
+        """A synthetic table whose comm is far longer than 16 characters must
+        come back whole."""
+        long_path = "/tmp/" + ("a" * 60) + "/payload-binary"
+        fake = ("1234 501 %s\n" % long_path, "", 0)
+        fake_argv = ("1234 %s --flag\n" % long_path, "", 0)
+
+        def fake_run(cmd, timeout=15, extra_env=None):
+            fmt = cmd[2] if len(cmd) > 2 else ""
+            return fake_argv if ("args=" in fmt and "uid=" not in fmt) else fake
+
+        saved = aegis.run
+        aegis.run = fake_run
+        try:
+            rows = list(aegis._iter_processes())
+        finally:
+            aegis.run = saved
+        self.assertEqual(1, len(rows), rows)
+        self.assertEqual(long_path, rows[0][2])
+
+
 class TestSandboxCoversEveryStatePath(unittest.TestCase):
     """Every module-level path under ~/.aegis must be redirected by the shared
     Sandbox, or the suite writes to the developer's real state directory.

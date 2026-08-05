@@ -22,15 +22,29 @@ reach for, not that Aegis acquired judgement.
 
 | # | Sev | Defect | Before | After |
 |---|-----|--------|--------|-------|
-| P1 | **HIGH** | macOS `ps` truncates the `comm` column to 16 characters **when `args` is requested in the same call** — which is exactly how `_iter_processes()` queries it. `/System/…/CoreServices/Dock.app/Contents/MacOS/Dock` arrives as `/System/Library/`, so `_process_identity()` basenames it to nothing matching `_PROTECTED_COMMS`. The session-critical guard silently matched nothing for any exec path over 16 chars. | Dock's `comm` resolved to `'?'`; guard would **not** have refused it | freeze matches on the untruncated `argv[0]` as well; verified on-host before/after against the live Dock pid |
+| P1 | **CRITICAL** | macOS `ps` truncates the `comm` column to 16 characters **when `args` is requested in the same call** — exactly how `_iter_processes()` queried it. This was found via the freeze guard (`/System/…/MacOS/Dock` arrives as `/System/Library/`, so `_PROTECTED_COMMS` matched nothing), but the guard was the *smallest* consumer. `check_processes()` — the headline "unsigned binary running from a user-writable path" sensor — grades that same field. **305 of 642 processes (47%) reported an exec path that does not exist on disk.** `classify_signature()` answers `missing` for a path that isn't there; `is_risky_location()` answers `False` for a binary genuinely running out of a risky directory. The process sensor was scoring a prefix. | 305/642 exec paths nonexistent; a real Mach-O at a 50-char `/tmp` path scored `is_risky_location=False` | asked for on its own, `comm` is the full path (measured intact at 119 chars) — so two `ps` calls joined on pid. After: **21 of 627**, and those remaining are processes for which macOS genuinely reports a bare name or relative path, not truncation |
 
-P1 is pre-existing and **not fully fixed here**. The same truncation still
-degrades `cmd_kill`'s guard and the `exe` field of every macOS process finding —
-a wider blast radius across a sensor 537 tests depend on, which deserves its own
-change rather than being folded into a feature branch. It is recorded here
-because the log's own standing lesson applies to it exactly: a simulation
-inherits its author's model of the system. The tests asserted the guard's
-*logic* and never asked what `ps` actually returns.
+P1 is the finding this pass exists to have produced, and it was **pre-existing** —
+nothing about the protective tier caused it. It surfaced only because a new
+feature happened to depend on the same field, which is the argument for building
+the guard rather than assuming the old one worked.
+
+The log's standing lesson applies exactly. The suite had tests for the process
+sensor, and they passed, because every one of them fed a **canned `ps` line in
+the format the code expected**. The fixture inherited the code's belief about
+what `ps` returns. Only the system disagreed — and it took running against the
+real process table to hear it. The regression test added here therefore asserts
+against the **live** process table (ratio of exec paths that actually exist), not
+against a fixture, precisely so it cannot re-inherit the assumption.
+
+Three existing tests had to be updated with it, and that is worth stating plainly
+rather than burying: they stubbed `aegis.run` to return the single-call `ps`
+shape, so they broke the moment the real call changed. Their assertions were kept
+verbatim; only the canned output shape moved. One of them
+(`test_spaced_exec_path_still_flagged`, for an attacker who copies `osascript` to
+`/tmp/Sys Update`) is materially *better* served by the two-call form, because
+`comm` is now the whole remainder of its own line and can no longer be sheared at
+the space.
 
 ## Defects introduced by this pass and caught before merge
 
@@ -92,8 +106,12 @@ witness in a domain the adversary does not hold.
 
 ## Residual risk
 
-- **P1 is only half-closed.** `cmd_kill`'s guard and the macOS `exe` field still
-  consume a truncated `comm`. Stated above rather than left implicit.
+- **P1 is closed at the source.** `_iter_processes()` now returns untruncated
+  exec paths, so `cmd_kill`'s guard, `check_processes()`, listener attribution
+  and the freeze guard all consume a correct value. The residue is that macOS
+  reports a bare name or relative path for ~3% of processes (`autofsd`,
+  `./externals/node20/bin/node`); that is what `ps` genuinely knows, not a
+  truncation, and those paths are simply not classifiable.
 - **Two Windows paths are implemented and reviewed but never executed.**
   `NtSuspendProcess` (the freeze tests are POSIX-only by construction) and the
   clipboard substitution (the harness never touches a real clipboard). They are

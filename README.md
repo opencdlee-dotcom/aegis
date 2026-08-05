@@ -32,7 +32,7 @@ on Linux is not a coverage gap.
 | **Persistence** | launchd agents/daemons, cron, login hooks, config profiles, background items (BTM) | systemd user+system units, XDG autostart, cron, `/etc/cron.d`, rc.local, profile.d | Run/RunOnce keys, Winlogon Shell/Userinit, Startup folders, scheduled tasks, services outside the protected trees |
 | **"Who vouches for this binary"** | `codesign`: apple / app-store / developer-id / adhoc / unsigned / broken | package-manager ownership: dpkg/rpm/pacman `os-managed` vs `unmanaged` | Authenticode: os-signed / signed-valid / unsigned / broken |
 | **Suspicious-exec rule** | unsigned/ad-hoc/broken in a user-writable path | **structural** — execution from a volatile dir, or a running binary deleted from disk (no ambient signing exists, so "unmanaged" is *not* treated as malicious: every locally built binary is unmanaged) | unsigned/broken in a user-writable path |
-| **Process + argv** | one `ps` call | `/proc` directly (works on minimal containers with no `procps`, and no argv truncation) | one CIM query (`Win32_Process`) |
+| **Process + argv** | two `ps` calls joined on pid — asking for `comm` and `args` together truncates the exec path to 16 chars | `/proc` directly (works on minimal containers with no `procps`, and no argv truncation) | one CIM query (`Win32_Process`) |
 | **Network** | `lsof` listeners, `netstat` outbound | `/proc/net/tcp[6]` listeners + outbound, inode→pid via `/proc/*/fd` | `netstat -ano` listeners + outbound |
 | **Fileless TTPs scored in argv** | `osascript` password phish, `xattr -c`, `hdiutil -nobrowse`, keychain copy, `curl\|bash` | `LD_PRELOAD` injection, `/etc/ld.so.preload` writes, memfd exec, `systemctl enable /tmp/...`, `/etc/shadow` + SSH key access | `powershell -enc`, IEX download cradles, LOLBin proxy exec (mshta/regsvr32/rundll32/certutil), Defender/AMSI tamper, LSASS + SAM-hive dumps, shadow-copy deletion |
 | **OS engine harvest** | XProtect Remediator detections + definition age, Gatekeeper/syspolicy denials | `auth.log`/journal: SSH brute force, new accounts, privileged group adds, root logins | Event log: Defender detections (1116/1117), RTP disabled (5001), account creation (4720), audit-log cleared (1102), PowerShell script blocks (4104) |
@@ -511,7 +511,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**530 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**541 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile
@@ -522,7 +522,7 @@ fingerprint); `/usr/local` and `/private/var/folders` are risky; the signature
 cache invalidates on content change — including a same-size replacement whose
 mtime was restored — and stays bounded.
 
-The **protective tier** adds 40 tests in `tests/test_protective_tier.py`, each
+The **protective tier** adds 51 tests in `tests/test_protective_tier.py`, each
 pinning a property that would otherwise rot silently: a frozen process is proven
 to make no progress and a thawed one to resume (asserted on work the child
 actually performs, not on a process-state string); freeze refuses its own
@@ -537,12 +537,20 @@ still caught by the anchors in the root-owned log store.** That last test is the
 difference between this design and the unprivileged Tripwire/AIDE clones that
 die because the attacker rewrites the baseline.
 
-One guard bug surfaced while building it, and is fixed: macOS `ps` truncates the
-`comm` column to 16 characters **when `args` is requested in the same call**,
-which is exactly how `_iter_processes` queries it — so `/System/…/MacOS/Dock`
-arrived as `/System/Library/` and the session-critical guard matched nothing.
-Verified on-host: the Dock's `comm` resolved to `?`, so the guard would not have
-refused it. Freeze now matches on the untruncated `argv[0]` as well.
+One pre-existing defect surfaced while building it, and it was far larger than
+the guard that exposed it. macOS `ps` truncates the `comm` column to 16
+characters **when `args` is requested in the same call** — exactly how
+`_iter_processes` queried it. Measured on the author's machine: **305 of 642
+processes (47%) reported an executable path that does not exist on disk.** Every
+consumer graded that prefix — `classify_signature()` answers `missing` for a path
+that isn't there, and `is_risky_location()` answers `False` for a binary
+genuinely running from a risky directory, so the **process sensor was scoring a
+truncation**. Asked for on its own, `comm` is the full path (measured intact at
+119 characters), so the fix is two `ps` calls joined on pid. After it, 21 of 627
+— and those remaining are processes for which macOS genuinely reports a bare
+name or a relative path, not truncation. Pinned by a test that runs against the
+real process table rather than a fixture, because a fixture would have inherited
+the same wrong assumption the code did.
 
 The **web-protection + trust-cache tier** adds 8 fail-before/pass-after tests: a
 substantial local hosts denylist is recognized; default hosts files are reported
