@@ -222,7 +222,11 @@ class TestResolveExecTarget(unittest.TestCase):
             "npx", ["-y", "@modelcontextprotocol/server-x"])
         self.assertIsNotNone(
             target, "npx must still resolve when its arg is a package spec")
-        self.assertTrue(target.endswith("npx"))
+        # basename-startswith, not endswith: on Windows `which` resolves to
+        # npx.cmd / npx.exe, so an endswith("npx") assertion was testing the
+        # platform's launcher-suffix convention rather than the resolver.
+        self.assertTrue(os.path.basename(target).lower().startswith("npx"),
+                        target)
 
     def test_command_may_be_a_whole_command_line(self):
         """`command` is frequently 'bash /path/to/hook.sh', not a bare
@@ -239,6 +243,36 @@ class TestResolveExecTarget(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_windows_backslash_paths_survive_the_command_split(self):
+        """Caught by CI on Windows, and it runs everywhere so it stays caught.
+
+        shlex's POSIX mode treats '\\' as an ESCAPE, so
+        `bash C:\\Users\\me\\hook.ps1` came back as
+        'C:Usersmehook.ps1' and resolved to nothing — meaning every Windows
+        agent hook with an absolute path would have gone unhashed, which is
+        precisely the supply-chain case the resolver exists for.
+
+        Asserted against shlex directly rather than through
+        _resolve_exec_target, because the resolver's later steps are
+        filesystem-dependent and this is the platform behaviour that actually
+        differs."""
+        import shlex
+        win = r"bash C:\Users\me\AppData\Local\hook.ps1"
+        mangled = shlex.split(win)                      # the old behaviour
+        self.assertNotIn("\\", mangled[1],
+                         "precondition: POSIX mode is supposed to eat these")
+        kept = [p.strip('"').strip("'")
+                for p in shlex.split(win, posix=False)]  # the fix
+        self.assertEqual(r"C:\Users\me\AppData\Local\hook.ps1", kept[1])
+
+    def test_windows_quoted_path_with_spaces_survives(self):
+        import shlex
+        q = '"C:\\Program Files\\nodejs\\node.exe" "C:\\hooks\\check.js"'
+        kept = [p.strip('"').strip("'")
+                for p in shlex.split(q, posix=False)]
+        self.assertEqual(["C:\\Program Files\\nodejs\\node.exe",
+                          "C:\\hooks\\check.js"], kept)
 
     def test_quoted_interpreter_and_script_resolve_to_the_script(self):
         tmp = tempfile.mkdtemp(prefix="aegis_res_")

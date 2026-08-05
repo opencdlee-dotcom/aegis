@@ -7553,7 +7553,16 @@ def _resolve_exec_target(command, args):
     # never sees the script that actually carries the behaviour.
     parts = []
     try:
-        parts = shlex.split(command)
+        # posix=False on Windows is load-bearing, not a nicety: shlex's POSIX
+        # mode treats "\" as an ESCAPE character, so a perfectly ordinary
+        # `bash C:\Users\me\hook.ps1` came back with its separators eaten and
+        # resolved to nothing. Every Windows agent hook with an absolute path
+        # would have gone unhashed — the exact supply-chain case this resolver
+        # exists for. Non-POSIX mode keeps the quotes in the tokens, so strip
+        # them explicitly.
+        parts = shlex.split(command, posix=not IS_WIN)
+        if IS_WIN:
+            parts = [p.strip('"').strip("'") for p in parts]
     except Exception:
         parts = command.split()
     prog = parts[0] if parts else command
