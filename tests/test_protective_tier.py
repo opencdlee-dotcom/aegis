@@ -51,6 +51,9 @@ class ProtectiveSandbox(unittest.TestCase):
             "ALLOWLIST": os.path.join(self.state, "allowlist.json"),
             "SELFSTATE": os.path.join(self.state, "selfstate.json"),
             "EVENT_DB": os.path.join(self.state, "aegis.db"),
+            "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
+            "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
+                                                "manifest.json"),
         }
         for k, v in overrides.items():
             self._saved[k] = getattr(aegis, k)
@@ -458,19 +461,6 @@ class TestDecoys(ProtectiveSandbox):
 # --------------------------------------------------------------------------- #
 class TestAssay(ProtectiveSandbox):
 
-    def setUp(self):
-        super().setUp()
-        self._saved_q = aegis.QUARANTINE_DIR
-        self._saved_m = aegis.QUARANTINE_MANIFEST
-        aegis.QUARANTINE_DIR = os.path.join(self.state, "quarantine")
-        aegis.QUARANTINE_MANIFEST = os.path.join(self.state, "quarantine",
-                                                 "manifest.json")
-
-    def tearDown(self):
-        aegis.QUARANTINE_DIR = self._saved_q
-        aegis.QUARANTINE_MANIFEST = self._saved_m
-        super().tearDown()
-
     def test_never_uses_eicar(self):
         """Deliberate design decision, pinned so it cannot regress: dropping
         EICAR wakes third-party AV, whose own remediation then trips Aegis's
@@ -555,6 +545,52 @@ class TestClipboardGrammar(unittest.TestCase):
                        "curl -o out.json https://api.example.com/v1/thing", ""):
             tier, hits = aegis.clipboard_grammar(benign)
             self.assertIsNone(tier, "%r matched %s" % (benign, hits))
+
+
+class TestSandboxCoversEveryStatePath(unittest.TestCase):
+    """Every module-level path under ~/.aegis must be redirected by the shared
+    Sandbox, or the suite writes to the developer's real state directory.
+
+    This is not hypothetical. The protective tier added NOTARY_FILE and
+    OBSERVATIONS_DIR and wired both into cmd_scan; the legacy Sandbox predated
+    them, so for one commit every scan-invoking test in the suite appended to
+    the author's actual ~/.aegis — 154 observation snapshots and a 154-link
+    notary chain — while the module docstring promised it 'NEVER touches real
+    state'.
+
+    Maintaining that list by hand is what failed. This derives it from the
+    module instead, so a new state path fails here the moment it is added
+    rather than silently escaping."""
+
+    def test_no_module_state_path_escapes_the_sandbox(self):
+        import test_regression
+
+        real_state = os.path.realpath(aegis.STATE_DIR)
+        # Every module global that is a string path living under STATE_DIR.
+        under_state = set()
+        for name in dir(aegis):
+            if not name.isupper():
+                continue
+            value = getattr(aegis, name)
+            if not isinstance(value, str) or not value:
+                continue
+            if os.path.realpath(value).startswith(real_state + os.sep):
+                under_state.add(name)
+
+        box = test_regression.Sandbox("run")
+        box.setUp()
+        try:
+            covered = set(box._saved)
+        finally:
+            box.tearDown()
+
+        # RUNTIME_SCRIPT is the installed copy of aegis.py itself; the installer
+        # tests assert against it deliberately and never write it during a scan.
+        escaping = under_state - covered - {"RUNTIME_SCRIPT"}
+        self.assertEqual(set(), escaping,
+                         "these ~/.aegis paths are not sandboxed, so any test "
+                         "touching them writes real state: %s"
+                         % sorted(escaping))
 
 
 class TestWindowsProcessControlPrototypes(unittest.TestCase):

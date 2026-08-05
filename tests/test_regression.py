@@ -75,6 +75,29 @@ class Sandbox(unittest.TestCase):
             "AEGIS_CONFIG": os.path.join(self.state, "config.json"),
             "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
             "AGENT_SKILL_ROOTS": [],
+            # Protective-tier state. NOTARY_FILE and OBSERVATIONS_DIR are
+            # written by cmd_scan itself, so omitting them here does not merely
+            # leave a gap — it makes every scan-invoking test in this suite
+            # write into the developer's REAL ~/.aegis, which is exactly the
+            # promise the module docstring makes and must keep. The rest are
+            # only touched by by-hand commands, and are pinned for the same
+            # reason: a sandbox that covers "what writes today" silently rots
+            # the first time something new writes.
+            "NOTARY_FILE": os.path.join(self.state, "notary.jsonl"),
+            "OBSERVATIONS_DIR": os.path.join(self.state, "observations"),
+            # Response-tier state. These were previously sandboxed only inside
+            # TestResponseTier, so any OTHER test that reached log_action() —
+            # and the protective tier's commands all do — appended to the real
+            # ~/.aegis/actions.jsonl. Same class of gap, one rung lower.
+            "ACTION_LOG": os.path.join(self.state, "actions.jsonl"),
+            "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
+            "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
+                                                "manifest.json"),
+            "FROZEN_FILE": os.path.join(self.state, "frozen.json"),
+            "LATCH_FILE": os.path.join(self.state, "latches.json"),
+            "DECOY_FILE": os.path.join(self.state, "decoys.json"),
+            "ASSAY_FILE": os.path.join(self.state, "assay.json"),
+            "CLIPBOARD_FILE": os.path.join(self.state, "clipboard.json"),
             # _NOOP_CMD, not /usr/bin/true: on Windows that path does not
             # exist, so these "rc 0, empty" stubs actually returned rc 127
             # and the surface was skipped as DEGRADED instead of adopting an
@@ -1273,17 +1296,12 @@ class TestResponseTier(Sandbox):
     quarantine dir is touched and nothing on the host is killed (the kill guards
     fire before any signal is sent)."""
 
-    def setUp(self):
-        super().setUp()
-        extra = {
-            "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
-            "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
-                                                "manifest.json"),
-            "ACTION_LOG": os.path.join(self.state, "actions.jsonl"),
-        }
-        for k, v in extra.items():
-            self._saved[k] = getattr(aegis, k)
-            setattr(aegis, k, v)
+    # QUARANTINE_DIR / QUARANTINE_MANIFEST / ACTION_LOG used to be redirected
+    # here. They are in the base Sandbox now, because confining them to this
+    # one class meant every other test that reached log_action() wrote the real
+    # ~/.aegis/actions.jsonl. Re-saving them here would also clobber the base's
+    # record of the ORIGINAL values with the base's sandboxed ones, so tearDown
+    # would "restore" a path into a deleted tmp dir.
 
     def _victim(self, data=b"\x00MALWARE\xffpayload\x10bytes", mode=0o755):
         p = os.path.join(self.tmp, "evil.bin")
