@@ -9977,20 +9977,23 @@ def _watch_paths():
     return list(dict.fromkeys(paths))
 
 
-# --- portable change detection (Linux/Windows) -------------------------------
-# kqueue is macOS-only, so the other platforms poll the SAME path set on a short
-# cycle. Latency is WATCH_POLL_SECS instead of kqueue's sub-second, still one to
-# two orders of magnitude better than the interval-only floor, at a cost of a
-# few hundred stat() calls per cycle.
+# --- portable change detection (the fallback path) ---------------------------
+# Polling the SAME path set on a short cycle. Latency is WATCH_POLL_SECS instead
+# of the sub-second event paths, still one to two orders of magnitude better
+# than the interval-only floor, at a cost of a few hundred stat() calls a cycle.
 #
-# This comment used to justify that by saying "inotify has no stdlib binding"
-# and that using it would mean taking a dependency. That was wrong, and worth
-# correcting rather than deleting: `ctypes` is stdlib, so inotify (Linux) and
-# ReadDirectoryChangesW (Windows) are both reachable with zero dependencies and
-# no loss of auditability. The zero-dependency rule IS load-bearing; it simply
-# never forbade this. Polling here is an unpaid implementation cost, not a
-# platform limit — recorded honestly so the gap stays visible as work rather
-# than being filed away as physics.
+# This is now the fallback rather than the whole story off macOS: kqueue covers
+# macOS and inotify covers Linux (see _build_watch_inotify below), so what polls
+# here is Windows, plus any host where an event source cannot be armed.
+#
+# Kept because the history is the useful part. This comment once justified
+# polling by claiming "inotify has no stdlib binding" and that using it meant
+# taking a dependency. That was simply false — `ctypes` is stdlib — and once
+# the false reason was removed, what remained was an unpaid implementation
+# cost rather than a platform limit. Naming it that way is what made it get
+# built. `ReadDirectoryChangesW` is the same shape and stays unbuilt only
+# until it can be proven on a real Windows kernel, which is the same bar
+# inotify had to clear.
 WATCH_POLL_SECS = 5
 
 
@@ -14369,7 +14372,8 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    yourself (e.g. at canarytokens.org); Aegis makes no
                    network call to create/arm one, only plants the bytes
   watch [secs]     change-driven monitor: rescan seconds after a watched path
-                   changes (kqueue on macOS, short-cycle polling elsewhere) +
+                   changes (kqueue on macOS, inotify on Linux, polling on
+                   Windows) +
                    a full scan every [secs] (default 600) as a floor.
                    Production: aegis.py install watch
   watchdog         dead-man's switch: exit non-zero + alert if the monitor has
