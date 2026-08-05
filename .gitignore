@@ -6,3 +6,6 @@ __pycache__/
 
 # Spar arena (adversarial proof scratch) — promoted proofs land in tests/
 .spar/
+
+# Local agent/editor wiring — contains absolute paths to other local projects.
+.mcp.json

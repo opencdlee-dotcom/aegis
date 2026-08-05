@@ -38,6 +38,45 @@ def _ECHO_CMD(text):
     return [sys.executable, "-c", "print(%r)" % text]
 
 
+def ps_fixture(rows):
+    """A fake `run` answering BOTH ps calls `_iter_processes()` makes on macOS.
+
+    `rows` are `(pid, uid, comm, args)` tuples — structured rather than a
+    pre-joined line, because the two columns cannot be recovered from one
+    string once `comm` itself contains a space (an attacker copying osascript
+    to "/tmp/Sys Update" is a case this suite deliberately covers).
+
+    There are two calls because asking macOS `ps` for `comm` and `args`
+    together truncates the comm COLUMN to 16 characters, which made the sensor
+    grade a prefix. A fixture that answered only the old single-call shape
+    would keep passing while exercising nothing.
+    """
+    rows = list(rows)
+
+    def fake_run(cmd, timeout=15, extra_env=None):
+        if list(cmd[:2]) != ["ps", "-axo"]:
+            return "", "", 0
+        fmt = cmd[2] if len(cmd) > 2 else ""
+        if "args=" in fmt and "uid=" not in fmt:
+            body = "\n".join("%s %s" % (p, a) for p, _u, _c, a in rows)
+        else:
+            body = "\n".join("%s %s %s" % (p, u, c) for p, u, c, _a in rows)
+        return body + "\n", "", 0
+    return fake_run
+
+
+def ps_rows(legacy):
+    """Parse legacy `"pid uid comm args"` fixture strings into ps_fixture
+    tuples. Only valid where `comm` has no space; give tuples directly when it
+    does."""
+    out = []
+    for line in legacy:
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            out.append(tuple(parts))
+    return out
+
+
 class Sandbox(unittest.TestCase):
     """Base: redirect all aegis state/scan surfaces into a throwaway tmp dir."""
 
@@ -75,6 +114,29 @@ class Sandbox(unittest.TestCase):
             "AEGIS_CONFIG": os.path.join(self.state, "config.json"),
             "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
             "AGENT_SKILL_ROOTS": [],
+            # Protective-tier state. NOTARY_FILE and OBSERVATIONS_DIR are
+            # written by cmd_scan itself, so omitting them here does not merely
+            # leave a gap — it makes every scan-invoking test in this suite
+            # write into the developer's REAL ~/.aegis, which is exactly the
+            # promise the module docstring makes and must keep. The rest are
+            # only touched by by-hand commands, and are pinned for the same
+            # reason: a sandbox that covers "what writes today" silently rots
+            # the first time something new writes.
+            "NOTARY_FILE": os.path.join(self.state, "notary.jsonl"),
+            "OBSERVATIONS_DIR": os.path.join(self.state, "observations"),
+            # Response-tier state. These were previously sandboxed only inside
+            # TestResponseTier, so any OTHER test that reached log_action() —
+            # and the protective tier's commands all do — appended to the real
+            # ~/.aegis/actions.jsonl. Same class of gap, one rung lower.
+            "ACTION_LOG": os.path.join(self.state, "actions.jsonl"),
+            "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
+            "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
+                                                "manifest.json"),
+            "FROZEN_FILE": os.path.join(self.state, "frozen.json"),
+            "LATCH_FILE": os.path.join(self.state, "latches.json"),
+            "DECOY_FILE": os.path.join(self.state, "decoys.json"),
+            "ASSAY_FILE": os.path.join(self.state, "assay.json"),
+            "CLIPBOARD_FILE": os.path.join(self.state, "clipboard.json"),
             # _NOOP_CMD, not /usr/bin/true: on Windows that path does not
             # exist, so these "rc 0, empty" stubs actually returned rc 127
             # and the surface was skipped as DEGRADED instead of adopting an
@@ -390,9 +452,8 @@ class TestRiskyLocations(Sandbox):
         # canned `ps` + forced-adhoc classifier: a /usr/local process must be
         # flagged (pre-fix it was short-circuited as trusted and never checked).
         saved_run, saved_cls = aegis.run, aegis.classify_signature
-        aegis.run = lambda cmd, timeout=15, extra_env=None: (
-            ("1234 501 /usr/local/bin/evil /usr/local/bin/evil\n", "", 0)
-            if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
+        aegis.run = ps_fixture([("1234", "501", "/usr/local/bin/evil",
+                                 "/usr/local/bin/evil")])
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
                                               "authority": None}
         try:
@@ -956,15 +1017,16 @@ class TestArgvSignals(Sandbox):
 # N15 — check_behavior: same-user filtering + never flags Aegis itself.
 # --------------------------------------------------------------------------- #
 class TestCheckBehavior(Sandbox):
-    def _run_with_ps(self, ps_rows):
+    def _run_with_ps(self, rows):
         # Sandbox stubs check_behavior to []; restore the real one and feed it a
         # canned process table via a stubbed aegis.run.
         real_check = self._saved["check_behavior"]
         saved_run = aegis.run
+        fixture = ps_fixture(ps_rows(rows))
 
-        def fake_run(cmd, timeout=15):
-            if cmd[:2] == ["ps", "-axo"]:
-                return "\n".join(ps_rows), "", 0
+        def fake_run(cmd, timeout=15, extra_env=None):
+            if list(cmd[:2]) == ["ps", "-axo"]:
+                return fixture(cmd, timeout)
             return saved_run(cmd, timeout)
         aegis.run = fake_run
         try:
@@ -1273,17 +1335,12 @@ class TestResponseTier(Sandbox):
     quarantine dir is touched and nothing on the host is killed (the kill guards
     fire before any signal is sent)."""
 
-    def setUp(self):
-        super().setUp()
-        extra = {
-            "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
-            "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
-                                                "manifest.json"),
-            "ACTION_LOG": os.path.join(self.state, "actions.jsonl"),
-        }
-        for k, v in extra.items():
-            self._saved[k] = getattr(aegis, k)
-            setattr(aegis, k, v)
+    # QUARANTINE_DIR / QUARANTINE_MANIFEST / ACTION_LOG used to be redirected
+    # here. They are in the base Sandbox now, because confining them to this
+    # one class meant every other test that reached log_action() wrote the real
+    # ~/.aegis/actions.jsonl. Re-saving them here would also clobber the base's
+    # record of the ORIGINAL values with the base's sandboxed ones, so tearDown
+    # would "restore" a path into a deleted tmp dir.
 
     def _victim(self, data=b"\x00MALWARE\xffpayload\x10bytes", mode=0o755):
         p = os.path.join(self.tmp, "evil.bin")
@@ -2178,9 +2235,7 @@ class TestOptHomebrewRisky(Sandbox):
 
     def _procs(self, procs):
         saved_run, saved_cls = aegis.run, aegis.classify_signature
-        aegis.run = lambda cmd, timeout=15, extra_env=None: (
-            ("\n".join(procs) + "\n", "", 0)
-            if cmd[:2] == ["ps", "-axo"] else ("", "", 0))
+        aegis.run = ps_fixture(ps_rows(procs))
         aegis.classify_signature = lambda p: {"trust": "adhoc", "team": None,
                                               "authority": None}
         aegis._sigcache = {}
@@ -2209,13 +2264,17 @@ class TestBehaviorCommSpace(Sandbox):
     PHISH = ('osascript -e display dialog "System update needs your password" '
              'default answer "" with hidden answer')
 
-    def _run_with_ps(self, ps_rows):
+    def _run_with_ps(self, rows):
+        # Structured (pid, uid, comm, args) tuples, not joined strings: this
+        # class exists precisely because `comm` may contain a space, and a
+        # joined line cannot be split back into the two columns.
         real = self._saved["check_behavior"]
         saved_run = aegis.run
+        fixture = ps_fixture(rows)
 
-        def fake_run(cmd, timeout=15):
-            if cmd[:2] == ["ps", "-axo"]:
-                return ("\n".join(ps_rows) + "\n", "", 0)
+        def fake_run(cmd, timeout=15, extra_env=None):
+            if list(cmd[:2]) == ["ps", "-axo"]:
+                return fixture(cmd, timeout)
             return saved_run(cmd, timeout)
         aegis.run = fake_run
         try:
@@ -2226,16 +2285,19 @@ class TestBehaviorCommSpace(Sandbox):
     def test_space_free_path_is_critical_control(self):
         uid = str(os.getuid())
         fs = self._run_with_ps(
-            ["  888 %s /usr/bin/osascript %s" % (uid, self.PHISH)])
+            [("888", uid, "/usr/bin/osascript",
+              "/usr/bin/osascript " + self.PHISH)])
         self.assertTrue(any(f["category"] == "behavior"
                             and f["severity"] == "CRITICAL" for f in fs), fs)
 
     def test_spaced_exec_path_still_flagged(self):
         # byte-identical hostile argv, but the executable path has a space
-        # (attacker copied osascript to "/tmp/Sys Update").
+        # (attacker copied osascript to "/tmp/Sys Update"). Splitting comm off
+        # a shared line would shear it at the space — the defect this pins.
         uid = str(os.getuid())
         fs = self._run_with_ps(
-            ['  889 %s /tmp/Sys Update /tmp/Sys Update %s' % (uid, self.PHISH)])
+            [("889", uid, "/tmp/Sys Update",
+              "/tmp/Sys Update " + self.PHISH)])
         self.assertTrue(any(f["category"] == "behavior" for f in fs), fs)
 
 
