@@ -1656,9 +1656,14 @@ class TestInotifyAbsentElsewhere(unittest.TestCase):
         self.assertEqual((None, 0), aegis._build_watch_inotify())
 
 
+@unittest.skipIf(getattr(aegis, "IS_WIN", False),
+                 "exercises the Linux systemd install path, which calls the "
+                 "POSIX-only os.getuid(); _install_linux is never invoked on "
+                 "Windows in production (cmd_install dispatches by platform)")
 class LinuxInstallQuotingAndIdempotency(unittest.TestCase):
     """R3-2 + R3-3. _install_linux is called directly (it does not gate on
-    IS_LINUX), with systemctl/loginctl stubbed, so this runs on any host."""
+    IS_LINUX), with systemctl/loginctl stubbed, so this runs on any POSIX host
+    (macOS/Linux). Skipped on Windows: os.getuid() does not exist there."""
 
     def _run_install(self, mode):
         calls = []
