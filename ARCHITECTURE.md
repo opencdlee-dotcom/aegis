@@ -58,7 +58,7 @@ Three rules keep this honest rather than merely portable:
 | Tune | Typed dismissals (false- vs benign-positive), per-sensor down-weighting, documented benign causes, read-only replay | Keeps the operator trusting the tool: a noisy detector is measurable and correctable instead of being muted wholesale |
 | Pre-commit | Latched persistence surfaces (`chflags uchg` / deny-write ACE) and FIFO credential decoys, both placed **before** any attack | Makes the attacker's write fail rather than reporting it afterwards; a cleared latch or a read decoy is attack-defined evidence |
 | Contain | Manual process action, **reversible freeze**, and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
-| Prove detection | Positive-control assay per detector, with an efficacy half-life | Distinguishes "nothing found" from "no longer able to find"; unproven coverage is reported as unproven |
+| Prove detection | Positive-control assay per detector, with an efficacy half-life; every lane asserts **both** poles, and the delegate/session tier is covered too | Distinguishes "nothing found" from "no longer able to find"; unproven coverage is reported as unproven. A hostile-pole-only lane passes against a detector hardwired to say yes, and a benign-pole-only lane passes against a dead one — so a lane that checks one pole proves nothing |
 | Delegate-surface | Agent config discovered by **shape** (a `command`+`args` pair under an agent directory), hashed by **resolved target** rather than by config line, plus a semantic imperative detector for instruction files and git-derived provenance for each added line | An AI agent runs with the operator's full authority and takes instruction from files; an MCP registration is exec-on-start, a hook body is exec-per-tool-call, and a natural-language imperative is an execution primitive with no shell syntax for any grammar to match |
 | Session | Browser automation aimed at the **live** profile (debug port, sideloaded extension, real `--user-data-dir`), plus session-binding posture | Post-App-Bound-Encryption, cookie theft is the browser being driven against itself rather than a jar being copied; live cookies defeat MFA and their revocation belongs to the counterparty |
 | Recover-plan | Dependency-ordered revocation derived from the credential artifacts actually present on disk | The question after a theft is not "what happened" but "which accounts are theirs, in what order do I take them back" — and rotating in the wrong order hands over the reset link |
@@ -278,10 +278,33 @@ things it *can* do, none of which require privilege:
    something else, so rewriting history or silencing the monitor both leave
    evidence. `notary verify` prints which of the two it actually proved.
 
-The invariant that does **not** move: nothing here fires automatically from a
-heuristic. Every verb is one the operator types after reviewing a finding, on
-the same footing as quarantine/kill/neutralize. What changed is that the
-operator now has reversible verbs available, not that Aegis acquired judgement.
+The invariant that does **not** move: **nothing here fires automatically from a
+heuristic.** What changed is that the operator now has reversible verbs
+available, not that Aegis acquired judgement.
+
+That invariant survives `deadfall`, which is the one path where a verb runs
+without being typed at the moment it runs, so it is worth stating exactly what
+keeps it honest. A standing order is a *pre-commitment*, not an autopilot:
+
+- Its **trigger** is attack-defined, never a score, a threshold, or a
+  composite. A FIFO decoy read and a cleared latch have no benign cause — the
+  decoy's paths are known to nobody but an adversary, and nothing legitimate
+  clears a latch. There is no judgement to get wrong.
+- Its **verb** is reversible and fail-open. `kill`, `quarantine` and `destroy`
+  are refused, permanently, because an irreversible act is exactly the thing
+  that requires a human in the loop at the time it happens.
+- Its **authorization** came from a human at a terminal, behind a one-time code
+  on a channel automation cannot satisfy.
+- Its **coverage** must be PROVEN, re-checked at dispatch and not merely at
+  arm time. This is the gate that would rot if it were checked once: an order
+  bound to a detector that has since gone stale would keep reading as
+  protection while resting on a control nobody has demonstrated since. An
+  unproven detector disarms its own standing order and says so.
+
+So the decision is still the operator's, made deliberately in advance and
+bounded by an expiry; dispatch only carries it out, and leaves an
+`actions.jsonl` record and a notary link when it does. An automatic action that
+left no witness would be the actual violation.
 
 Coverage itself is measured rather than asserted: `assay` challenges each
 detector with an inert, nonce-tagged synthetic stimulus and records what is

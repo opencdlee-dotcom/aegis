@@ -38,7 +38,7 @@ on Linux is not a coverage gap.
 | **OS engine harvest** | XProtect Remediator detections + definition age, Gatekeeper/syspolicy denials | `auth.log`/journal: SSH brute force, new accounts, privileged group adds, root logins | Event log: Defender detections (1116/1117), RTP disabled (5001), account creation (4720), audit-log cleared (1102), PowerShell script blocks (4104) |
 | **OS-unique surface** | XProtect Behavioral (Bastion), agent skills, wallet integrity | **loaded kernel modules** (ring-0 rootkit), **new setuid-root binaries** | **WMI event subscriptions** (fileless persistence), **Defender exclusion changes** |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, firewall, stealth, Remote Login | SELinux/AppArmor enforcement, ufw/firewalld/nftables, sshd exposure + weak sshd settings, LUKS, unattended upgrades | Defender RTP + tamper protection + signature age, firewall profiles, BitLocker |
-| **Change-driven watch** | kqueue (sub-second) + live XProtect log tail | short-cycle poll of the same watched path set | short-cycle poll of the same watched path set |
+| **Change-driven watch** | kqueue (sub-second) + live XProtect log tail | **inotify** via `ctypes` (sub-second), proven against a real kernel | short-cycle poll of the same watched path set |
 | **Background scheduling** | launchd agent | `systemd --user` service + timer | Scheduled Task |
 | **Neutralize kill-chain** | `launchctl bootout` → kill → quarantine | `systemctl --user disable --now` → kill → quarantine | `schtasks /change /disable` → kill → quarantine |
 
@@ -331,7 +331,7 @@ and MAC recomputed defeats all local checks and is still caught by the anchors.
 | `cauterize [incident] [done N]` | The dependency-ordered revocation plan derived from this disk. | Reads **no secret bytes** — presence and `stat()` only. |
 | `presence` | Human-presence regime (active / idle / absent / locked). | **Evidence only** — forgeable by a same-uid process, so it never gates an action. |
 | `guard [install\|status]` | **Observe-only** pre-exec check in your own shell. | Learns "pasted vs typed" from the terminal's bracketed-paste protocol, so no clipboard content is ever read or stored. |
-| `deadfall [arm\|list\|disarm]` | Pre-authorized **reversible** response, behind three refusals. | **Dispatch is deliberately not wired.** The interlocks ship and get tested first. |
+| `deadfall [arm\|list\|disarm]` | Pre-authorized **reversible** response, behind three refusals. | **Now dispatches.** All three gates are re-checked at *fire* time, so an order resting on a decayed detector disarms itself. |
 | `writ [open\|list\|enforce]` | Declare a change window before changing the machine. Enforced, an uncovered change becomes `UNAUTHORIZED CHANGE` at HIGH minimum; a covered one drops to INFO. | **Enforcement is default-off**; while off, `writ_covers()` returns False and behaviour is byte-identical. |
 | **ext_caps** *(surface)* | Grades browser extensions by **capability**, not just existence: `debugger` (the DevTools protocol from *inside* the browser), `cookies`/`webRequest` paired with all-sites host access, `nativeMessaging`. | A baseline-diffed surface, not a per-scan sensor — see below. |
 | `glean [new\|all]` | Retro-hunts Apple's own XProtect atoms over the files Aegis already tracks, and diffs the corpus across updates for a dated **offline** intel delta. | macOS-only; absent elsewhere, not degraded. |
@@ -368,8 +368,18 @@ against a real machine rather than a fixture:**
   only — Win+R and GUI-launched payloads are explicitly out of scope. Paste
   provenance is *proven* under zsh (bracketed paste) and **unknown** under bash,
   which has no such widget — recorded as unknown rather than as "typed".
-- **`deadfall` cannot currently fire anything.** That is the shipped state, not
-  an oversight.
+- **`deadfall` now fires, and the gates moved to dispatch time.** Checking them
+  only when the order was armed would have made the coverage precondition
+  decorative: an order bound 30 days ago to a detector that has since gone
+  stale would keep reading as protection while resting on a control nobody has
+  demonstrated since. So at every dispatch the order must still be unexpired,
+  its verb must still be in the reversible allowlist (removing a verb from that
+  table retroactively disarms every order bound to it), and its assay lane must
+  still be **PROVEN** within its half-life. A trigger that matches while its
+  detector is unproven does not fire and says so. Re-fires for the same
+  evidence are rate-limited, because the triggering finding recurs on *every*
+  scan for as long as the condition holds. Still not a heuristic anywhere: the
+  triggers stay attack-defined and the verbs stay reversible.
 - **`glean` never evaluates a rule's condition.** It matches literal atoms only,
   requires a rule to declare **≥3** of them with **all** present, and grades
   hits by signature trust. The threshold is not taste — matching on any single
@@ -383,14 +393,18 @@ against a real machine rather than a fixture:**
   installed on purpose is how a tool teaches you to stop reading it, so
   capability is baselined and only a *gain* (an extension acquiring `debugger`,
   or widening to all-sites) is reported.
-- **Event-driven watch on Linux/Windows is still unbuilt.** The comments
-  claiming it was impossible were wrong and are corrected, but `ctypes`-based
-  `inotify`/`ReadDirectoryChangesW` is deliberately **not** shipped here rather
-  than written blind: this file's own hardest lesson is that a simulation
-  inherits its author's model of the system, and kernel-interface code that
-  cannot be executed on the machine writing it is exactly that risk. Polling
-  remains the shipped behaviour there, and it is a latency gap, not a coverage
-  gap.
+- **Event-driven watch is now SHIPPED on Linux (`ctypes` inotify); Windows
+  still polls.** The previous entry said this was deliberately unbuilt rather
+  than written blind, because kernel-interface code that cannot be executed on
+  the machine writing it is precisely the risk this project has already paid
+  for once. That objection was answerable rather than permanent: the Linux path
+  is now exercised against a **real Linux kernel** — a real inotify fd, a real
+  write, a real wake, plus the drain that stops a level-triggered fd spinning
+  the loop — and the test **skips** rather than passes anywhere it cannot do
+  that, so a green run on a kernel without inotify can never be mistaken for
+  evidence. `ReadDirectoryChangesW` remains unbuilt on the same reasoning, held
+  to the same bar: it ships when it can be proven on a real Windows kernel, not
+  before. Windows polling stays a latency gap, not a coverage gap.
 
 **Honest limits of this tier:**
 
@@ -550,6 +564,13 @@ A security tool sees everything, so it must be trustworthy *by construction*:
   it through the one normal dedup/notify pipeline (the tail is a *wake source*,
   never a second parser to drift). The tail auto-respawns if it dies and its fd
   is drained on every wake, so a level-triggered read can't busy-spin.
+  **Linux is now event-driven too**, via `ctypes` inotify over the same watched
+  set — same debounce, same rate limit, same interval floor, so the platforms
+  differ in latency and never in what they conclude. Its fd is drained on every
+  wake for the same level-triggered reason, and if nothing can be armed (an
+  empty set, or the per-user watch limit exhausted) it fails over to polling
+  rather than hold an fd that can never wake — which would quietly turn the
+  watch into an interval timer still calling itself event-driven.
 - ✅ **Reputation — SHIPPED** as `aegis.py vt <path|sha256>`: an **opt-in, by-hand**
   VirusTotal lookup (BYO key via `AEGIS_VT_API_KEY` or `~/.aegis/vt_key`). It sends
   **only the sha256, never the file bytes**, and the scan/watch path makes **zero**
@@ -595,7 +616,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**541 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**636 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile

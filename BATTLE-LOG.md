@@ -1,3 +1,88 @@
+# Aegis — the same class again: a branch that could not be reached (2026-08-05)
+
+The previous pass was named for a detector that never fired. This one went
+looking for the *rest* of that class deliberately, by writing the positive
+controls that were missing, and found another one immediately.
+
+The method matters more than the count. The previous defect was found by
+running the code against a real machine; this one was found by asking, for each
+detector shipped in the last release, **what input would prove it fires, and
+what input would prove it stays quiet** — then discovering the first question
+had no answer for one of them.
+
+## The defect
+
+| # | Sev | Defect | Before | After |
+|---|-----|--------|--------|-------|
+| B1 | **HIGH** | `diff_agent_surface()` could not report an agent config whose exec target went from **absent to present**. `_resolve_exec_target()` records an absolute-but-missing target as `(target, None)`, and its own comment promised "if the file later appears the hash changes from None and the diff fires". It did not: the changed-target branch requires **both** `target_sha` values to be truthy, and the old one is `None` in exactly that case, so the branch was unreachable for an appearance. | `diff_agent_surface(target_sha=None → "b"*64)` returned `[]` | returns one HIGH `agent-surface:materialized:` finding; `hash → hash` still returns one, first sighting and steady state still return `[]` |
+
+**What it left open.** Register an MCP entry pointing at a path that does not
+exist yet — silent, and entirely plausible, since plenty of configs name a tool
+you have not installed — then drop the payload there later. The config line
+never changes, so the file's own `sha256` never changes either, and the surface
+stayed quiet through the whole sequence. It is the cheapest way to arm an agent
+config without ever editing a watched file.
+
+**Same shape as A1, different mechanism.** A1 was an exception swallowing a
+`NameError`; B1 is a boolean guard that is unsatisfiable in the case its own
+comment advertises. Neither failed. Neither had a test. Both were branches that
+could not be reached, in a file whose value is that it notices things.
+
+The generalization worth keeping: **a comment describing a case the code cannot
+execute is a defect report that nobody filed.** Both defects were sitting next
+to prose that stated the intended behaviour correctly.
+
+## What was added so the class stops recurring
+
+Six assay lanes, each asserting **both** poles, covering every detector the
+previous release shipped without one:
+
+| Lane | Hostile pole | Benign pole |
+|---|---|---|
+| `agent-imperative` | conceal + credential scores HIGH | "Do not tell the user to run npm install manually" scores nothing — the real-file case the lookahead exists for |
+| `agent-exec-target` | target swapped **and** target materialized both fire | first sighting and steady state stay silent |
+| `session-theft` | debug port on the live profile is CRITICAL | non-browser, browser-without-flag, and an inherited `--type=renderer` all stay silent |
+| `ext-cap-gain` | gaining `debugger` is CRITICAL; narrow → all-sites is a gain | steady state and *narrowing* stay silent |
+| `glean-atoms` | 3 atoms all present matches | one missing does not; below the threshold never matches |
+| `writ-enforcement` | enforcement ON escalates an uncovered change to HIGH | enforcement OFF returns **the same list object** — byte-identical, asserted by identity |
+
+The benign pole is not symmetry for its own sake. A lane that checks only the
+hostile side passes against a detector hardwired to say yes; one that checks
+only the benign side passes against a dead one. `latch-cleared` (A1) is the
+proof: a lane asserting only the intact case would have passed against the
+broken function.
+
+`_glean_rule_matches()` was extracted from `cmd_glean` so its lane challenges
+the **shipped** predicate rather than a copy — a lane that re-implements the
+rule proves only that the copy still works.
+
+## Also shipped this pass
+
+- **`deadfall` dispatch is wired.** The interlocks shipped last release and
+  were tested; the gates now re-evaluate at **fire** time, not merely at arm
+  time. Checking the coverage precondition once would have made it decorative:
+  an order bound 30 days ago to a detector that has since gone stale would keep
+  reading as protection. An unproven detector now disarms its own order and
+  says so. Triggers stay attack-defined, verbs stay reversible, every dispatch
+  leaves an `actions.jsonl` record and a notary link.
+- **Event-driven watch on Linux**, `ctypes` inotify. The previous entry called
+  this deliberately unbuilt rather than written blind, because kernel-interface
+  code that cannot be executed on the machine writing it is the risk this
+  project has already paid for once. That objection was answerable, not
+  permanent: it is now proven against a **real Linux kernel** — real fd, real
+  write, real wake, plus the drain that keeps a level-triggered fd from
+  spinning the loop — and the test **skips** rather than passes where it cannot
+  do that. `ReadDirectoryChangesW` stays unbuilt, held to the same bar.
+
+## Test state
+
+636 tests. macOS `632 passed, 1 skipped`; Linux (container) `513 passed,
+123 skipped`; `selftest.py` 7/7. One caught defect was mine, during this pass:
+`log_action()` takes `target` positionally and the dispatch code passed it again
+as a keyword, which the new tests surfaced immediately.
+
+---
+
 # Aegis — agent surface, session theft, and a detector that never fired (2026-08-04)
 
 The previous pass added the protective tier. This one started as a feature pass

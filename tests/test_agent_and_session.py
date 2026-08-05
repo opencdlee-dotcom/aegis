@@ -37,6 +37,8 @@ class AgentSandbox(unittest.TestCase):
             "STATE_DIR": self.state,
             "ACTION_LOG": os.path.join(self.state, "actions.jsonl"),
             "DEADFALL_FILE": os.path.join(self.state, "deadfall.json"),
+            "DEADFALL_FIRED_FILE": os.path.join(self.state,
+                                                "deadfall_fired.json"),
             "WRIT_FILE": os.path.join(self.state, "writs.json"),
             "CAUTERIZE_FILE": os.path.join(self.state, "cauterize.json"),
             "ASSAY_FILE": os.path.join(self.state, "assay.json"),
@@ -875,6 +877,251 @@ class TestGuardBashProvenanceIsTriState(AgentSandbox):
         with open(aegis.GUARD_LOG, encoding="utf-8") as f:
             rec = json.loads(f.read().splitlines()[0])
         self.assertIsNone(rec["pasted"])
+
+
+class TestAgentExecTargetMaterializes(unittest.TestCase):
+    """A config's exec target going from ABSENT to PRESENT must fire.
+
+    This pins a detector that never fired. `_resolve_exec_target` recorded an
+    absolute-but-missing target as (target, None) and its comment promised
+    "if the file later appears the hash changes from None and the diff fires".
+    It did not: the changed-target branch required BOTH hashes to be truthy,
+    and the old one is None in exactly that case, so the branch was
+    unreachable for the appearance. Nothing failed and no test caught it,
+    because every fixture started from a target that already existed.
+
+    The attack it left open is the cheapest one against an agent config:
+    register an entry pointing at a path that does not exist yet (silent, and
+    plausible — plenty of configs name a tool you have not installed), then
+    drop the payload there later. The config line never changes, so the
+    file-level sha256 never changes either, and the surface stayed quiet."""
+
+    CFG = os.path.join(os.sep, "nonexistent-agent-fixture", ".mcp.json")
+    KEY = "mcpServers.probe|node"
+
+    def _snap(self, target_sha):
+        return {self.CFG: {"sha256": "s", "execs": {self.KEY: {
+            "cmd": "node", "args": [], "target": "/opt/probe/server.js",
+            "target_sha": target_sha}}}}
+
+    def test_target_appearing_under_an_unchanged_config_line_fires(self):
+        out = aegis.diff_agent_surface(self._snap(None), self._snap("b" * 64))
+        self.assertEqual(1, len(out),
+                         "a config entry whose target materialized was "
+                         "silent; that is the whole appearance attack")
+        self.assertEqual("HIGH", out[0]["severity"])
+        self.assertIn("materialized", out[0]["fingerprint"])
+
+    def test_target_swap_still_fires(self):
+        """Control: the branch that always worked must keep working, so the
+        fix above is proven to be an addition and not a rewrite."""
+        out = aegis.diff_agent_surface(self._snap("a" * 64),
+                                       self._snap("b" * 64))
+        self.assertEqual(1, len(out))
+        self.assertEqual("HIGH", out[0]["severity"])
+
+    def test_first_sighting_stays_silent(self):
+        self.assertEqual([], aegis.diff_agent_surface({},
+                                                      self._snap("b" * 64)))
+
+    def test_steady_state_stays_silent(self):
+        self.assertEqual([], aegis.diff_agent_surface(self._snap("b" * 64),
+                                                      self._snap("b" * 64)))
+
+    def test_a_target_that_never_resolved_does_not_fire(self):
+        """None -> None is not an appearance. Without the `oe.get("target")`
+        guard this would fire forever on any entry whose target never exists
+        (a typo'd path), which is how a real signal gets muted wholesale."""
+        self.assertEqual([], aegis.diff_agent_surface(self._snap(None),
+                                                      self._snap(None)))
+
+
+class TestAssayCoversTheDelegateTier(unittest.TestCase):
+
+    def test_every_deadfall_trigger_has_a_real_assay_lane(self):
+        """A trigger bound to a lane that does not exist can never be armed,
+        and would read as an available control that is permanently refused."""
+        lanes = {lane_id for lane_id, _d, _f in aegis._assay_lanes()}
+        for trigger, (_desc, lane) in aegis.DEADFALL_TRIGGERS.items():
+            self.assertIn(lane, lanes,
+                          "trigger %r names assay lane %r, which does not "
+                          "exist" % (trigger, lane))
+
+    def test_every_deadfall_trigger_has_a_fingerprint_binding(self):
+        """An armed trigger with no fingerprint prefix silently never
+        dispatches — armed, expired, and useless, with nothing to show it."""
+        for trigger in aegis.DEADFALL_TRIGGERS:
+            self.assertIn(trigger, aegis._DEADFALL_FINGERPRINTS)
+
+    def test_the_delegate_tier_detectors_are_all_assayed(self):
+        """The surfaces added with the agent/session release each need a
+        positive control. Without one they can rot exactly the way the
+        materialization branch above did: unreachable, and silent about it."""
+        lanes = {lane_id for lane_id, _d, _f in aegis._assay_lanes()}
+        for required in ("agent-imperative", "agent-exec-target",
+                         "session-theft", "ext-cap-gain", "glean-atoms",
+                         "writ-enforcement"):
+            self.assertIn(required, lanes)
+
+    def test_every_lane_passes_against_the_shipped_code(self):
+        """The lanes are only worth their maintenance if they currently hold.
+        A failing lane here means a shipped detector cannot demonstrate it
+        fires — treat it as lost coverage, never as a flaky test."""
+        for lane_id, _desc, fn in aegis._assay_lanes():
+            if lane_id == "quarantine-roundtrip":
+                continue          # touches the real quarantine store; covered
+                                  # end-to-end in test_protective_tier.py
+            self.assertTrue(fn("t" * 16), "assay lane %r failed" % lane_id)
+
+
+class DeadfallDispatchSandbox(AgentSandbox):
+    """AgentSandbox plus a stub for every outward effect dispatch can have.
+
+    Stubbing rather than sandboxing here is deliberate: the property under
+    test is WHICH gate refused, and a real freeze/notify/notary would make the
+    test depend on machinery that has its own suite."""
+
+    def setUp(self):
+        AgentSandbox.setUp(self)
+        self.notified, self.froze, self.latched = [], [], []
+        self._stubs = {}
+        stubs = {
+            "notify": lambda title, body: self.notified.append((title, body)),
+            "cmd_freeze": lambda pid, reason="manual": (
+                self.froze.append((str(pid), reason)) or 0),
+            "cmd_latch": lambda action="on": (
+                self.latched.append(action) or 0),
+            "notary_append": lambda: None,
+        }
+        for name, fn in stubs.items():
+            self._stubs[name] = getattr(aegis, name)
+            setattr(aegis, name, fn)
+
+    def tearDown(self):
+        for name, fn in self._stubs.items():
+            setattr(aegis, name, fn)
+        AgentSandbox.tearDown(self)
+
+    def _arm(self, trigger="decoy-read", verb="freeze", days=30, proven=True):
+        aegis.save_json(aegis.DEADFALL_FILE, {trigger: {
+            "trigger": trigger, "verb": verb, "armed_at": aegis.now_iso(),
+            "expires": aegis._epoch() + int(days * 86400),
+            "channel": "test"}})
+        lane = aegis.DEADFALL_TRIGGERS[trigger][1]
+        stale = 0 if proven else aegis.ASSAY_HALF_LIFE_SECS + 60
+        aegis.save_json(aegis.ASSAY_FILE,
+                        {lane: {"last_ok": aegis._epoch() - stale,
+                                "ok": proven}})
+
+    def _decoy_read(self, pid="4242"):
+        return aegis.finding("CRITICAL", "decoy", "t", "d",
+                             "decoy:read:/h/.aws/credentials.bak", pid=pid)
+
+
+class TestDeadfallDispatch(DeadfallDispatchSandbox):
+
+    def test_nothing_armed_is_byte_identical(self):
+        """A machine that never armed an order must behave exactly as before,
+        including writing no new state file."""
+        self.assertEqual([], aegis._deadfall_dispatch([self._decoy_read()]))
+        self.assertFalse(os.path.exists(aegis.DEADFALL_FIRED_FILE))
+        self.assertEqual([], self.froze)
+        self.assertEqual([], self.notified)
+
+    def test_armed_order_fires_on_its_trigger(self):
+        self._arm(verb="freeze")
+        out = aegis._deadfall_dispatch([self._decoy_read(pid="777")])
+        self.assertEqual(1, len(out))
+        self.assertEqual([("777", "deadfall:decoy-read")], self.froze)
+
+    def test_unproven_coverage_refuses_to_fire(self):
+        """The load-bearing gate. An order armed against a detector whose
+        positive control has since gone stale must NOT fire, and must say so
+        — an armed order on a dead sensor is worse than no order, because it
+        reads as protection."""
+        self._arm(verb="freeze", proven=False)
+        self.assertEqual([], aegis._deadfall_dispatch([self._decoy_read()]))
+        self.assertEqual([], self.froze)
+        self.assertTrue(any("did NOT fire" in t for t, _b in self.notified),
+                        "a refused standing order was silent; the operator "
+                        "would still believe it was armed")
+
+    def test_expired_order_does_not_fire(self):
+        self._arm(verb="freeze", days=-1)
+        self.assertEqual([], aegis._deadfall_dispatch([self._decoy_read()]))
+        self.assertEqual([], self.froze)
+
+    def test_verb_removed_from_the_allowlist_disarms_retroactively(self):
+        """Gate 2 is re-checked at fire time, so narrowing the reversible-verb
+        table disarms every order already bound to a verb it drops."""
+        self._arm(verb="kill")
+        self.assertEqual([], aegis._deadfall_dispatch([self._decoy_read()]))
+        self.assertEqual([], self.froze)
+
+    def test_the_same_sensors_weaker_signal_does_not_fire(self):
+        """`decoy:atime:` is inferential — a second, weaker net for a reader
+        that never blocked. Only the attack-defined `decoy:read:` may drive an
+        automatic verb, which is why the binding is a prefix table and not a
+        category match."""
+        self._arm(verb="freeze")
+        weak = aegis.finding("HIGH", "decoy", "t", "d",
+                             "decoy:atime:/h/.aws/credentials.bak")
+        self.assertEqual([], aegis._deadfall_dispatch([weak]))
+        self.assertEqual([], self.froze)
+
+    def test_cooldown_prevents_refiring_on_the_same_evidence(self):
+        """The triggering finding recurs on EVERY scan while the condition
+        holds, so without a cooldown one attack re-freezes the same tree
+        forever."""
+        self._arm(verb="freeze")
+        aegis._deadfall_dispatch([self._decoy_read()])
+        aegis._deadfall_dispatch([self._decoy_read()])
+        self.assertEqual(1, len(self.froze))
+
+    def test_freeze_with_no_attributable_pid_does_not_claim_containment(self):
+        """A freeze order with no process to freeze has contained NOTHING.
+        Logging that as a success is how a tool starts lying about its own
+        coverage, so it reports the failure instead."""
+        self._arm(verb="freeze")
+        blind = aegis.finding("CRITICAL", "decoy", "t", "d",
+                              "decoy:read:/h/.aws/credentials.bak")
+        out = aegis._deadfall_dispatch([blind])
+        self.assertEqual([], self.froze)
+        self.assertIn("no pid", out[0])
+        self.assertTrue(any("could not contain" in t for t, _b in self.notified))
+
+    def test_latch_verb_reclaims_the_surfaces(self):
+        self._arm(trigger="latch-cleared", verb="latch")
+        cleared = aegis.finding("HIGH", "latch", "t", "d",
+                                "latch:cleared:/h/Library/LaunchAgents")
+        aegis._deadfall_dispatch([cleared])
+        self.assertEqual(["on"], self.latched)
+
+    def test_notify_verb_changes_nothing(self):
+        self._arm(verb="notify")
+        aegis._deadfall_dispatch([self._decoy_read()])
+        self.assertEqual([], self.froze)
+        self.assertEqual([], self.latched)
+        self.assertTrue(self.notified)
+
+    def test_dispatch_failure_cannot_fail_a_scan(self):
+        """A standing order that could raise into cmd_scan would blind the
+        detector that feeds it — the worst possible failure mode for a
+        response tier."""
+        self._arm(verb="freeze")
+
+        def _boom(pid, reason="manual"):
+            raise RuntimeError("freeze exploded")
+
+        aegis.cmd_freeze = _boom
+        with self.assertRaises(RuntimeError):
+            aegis._deadfall_dispatch([self._decoy_read()])
+        # The scan body is what must absorb it. cmd_scan is only a lock
+        # wrapper, so assert against the function that actually dispatches.
+        import inspect
+        src = inspect.getsource(aegis._cmd_scan_locked)
+        self.assertIn("_deadfall_dispatch", src)
+        self.assertIn("deadfall dispatch failed", src)
 
 
 if __name__ == "__main__":

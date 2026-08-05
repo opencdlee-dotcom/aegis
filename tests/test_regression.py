@@ -138,6 +138,8 @@ class Sandbox(unittest.TestCase):
             "ASSAY_FILE": os.path.join(self.state, "assay.json"),
             "CLIPBOARD_FILE": os.path.join(self.state, "clipboard.json"),
             "DEADFALL_FILE": os.path.join(self.state, "deadfall.json"),
+            "DEADFALL_FIRED_FILE": os.path.join(self.state,
+                                                "deadfall_fired.json"),
             "CAUTERIZE_FILE": os.path.join(self.state, "cauterize.json"),
             "WRIT_FILE": os.path.join(self.state, "writs.json"),
             "GUARD_DIR": os.path.join(self.state, "guard"),
