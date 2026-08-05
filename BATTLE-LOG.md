@@ -1,3 +1,406 @@
+# Aegis — a governed battle-test: three loud rounds, sixteen defects (2026-08-05)
+
+A single `/battle-test` run under `/fable-mode` governance: right-size, hunt across
+independent lenses, adversarially verify every candidate against the real code before
+it is trusted, fix, regression-pin, re-verify, loop. Siege tier, because this tool
+quarantines, destroys, neutralizes and freezes. Three rounds of hunting all came back
+*loud* — five defects in the newest delegate/session tier, five more in the *older core
+the earlier passes never adversarially hunted* (including a CRITICAL bypass of the
+destructive-action safety rail), and five in the install/watch/txn surfaces on the third
+round — **one of which this very pass introduced with an earlier fix and then caught.**
+Every one was verified against the running machine or a traced repro, not asserted from
+a fixture.
+
+The method that produced the two headline findings is worth stating: **when two pieces
+of code read the same fact, do they agree?** The deadfall dispatch gate and the `assay`
+sensor both read a lane's state from `assay.json` and disagreed (R1/C5). The protected-path
+guard and the filesystem both name the same directory and disagreed about its case (R2-2).
+
+## Round 1 — the delegate/session tier (5)
+
+| # | Sev | Defect | Fix |
+|---|-----|--------|-----|
+| C5 | **HIGH** | `_deadfall_coverage_fresh()` — the gate that lets a pre-authorized reversible verb **fire with no human** — checked only that a lane's `last_ok` was recent, never that its most recent run *passed*. `cmd_assay` preserves a prior `last_ok` across a failing run so `check_assay` can age a broken lane out slowly, which means a lane failing *today* still carries a fresh `last_ok` with `ok=False` — a state `check_assay` flags HIGH "positive control is failing" while the dispatch gate called it PROVEN. So a standing order would auto-fire `freeze`/`latch` on a detector that cannot currently demonstrate it works, the exact thing the gate exists to refuse. | gate also requires `rec['ok']`; both-pole test |
+| C2 | **HIGH** | `cmd_frozen()` re-walked the whole process table once per displayed pid (nested loop; ~41s CIM query each on Windows) — the anti-pattern its sibling `_process_owner_and_names` was written to avoid. | one `{pid:comm}` map from a single walk; ≤1-walk test |
+| C1 | MED | `_AGENT_SCAN_TRUNCATED` set on a cap-hit, never reset → permanent false "coverage PARTIAL" for the whole uptime of the `cmd_watch` daemon after one transient spike. | reset at the producer's top; truncate-then-clean test |
+| C3 | MED | `_outbound_rows()` macOS branch spawned one `ps` per connection row (measured 32 redundant/scan); Linux/Windows already batch. | per-pid memo, byte-identical output; spawn-count test |
+| C4 | MED | Three sensors each re-walked the table per scan, and a comment *claimed* session-theft reused the collected list — it did not (the signature comment-vs-code defect). | one scan-scoped snapshot, shared and rebuilt-fresh each scan; comment made true; two-assertion pin (shared + fresh-per-scan) |
+
+## Round 2 — the older core the prior passes never hunted (5)
+
+| # | Sev | Defect | Fix |
+|---|-----|--------|-----|
+| R2-2 | **CRITICAL** | `_is_protected_path()` compared paths case-sensitively, but macOS/Windows filesystems are case-insensitive and `os.path.realpath` preserves the caller's case. Verified live: `/SYSTEM`, `/USR`, `~/.AEGIS/baseline.json`, even `/USERS/<me>` all resolve to real protected files yet returned **False** — so a destructive verb (`quarantine`/`destroy`/`neutralize`) could act on Aegis's own trust store, `/System`, or the home tree through a case-varied alias. The one rail the whole response tier stands on. | a case-fold comparison (`_cmp_path`) gated on a one-time `_fs_case_insensitive()` probe — folds on case-insensitive volumes, exact on case-sensitive Linux, fail-closed; also closes the same gap on the shared self/state/HOME checks; live-verified + both-pole test |
+| R2-3 | **HIGH** | `_kill_program_instances()` — the shared neutralize kill step — SIGKILLed same-user processes with **no `actions.jsonl` record at all**, violating the tool's own audit-before-mutation invariant that `cmd_quarantine`/`cmd_destroy` enforce. | gated `log_action` before the kill (no audit ⇒ no kill); both-pole test |
+| R2-4 | **HIGH** | Dismissing one `risk`/`chain` incident silently swallowed **all future evidence on that entity, forever**. Those incidents are entity-keyed with no content hash and hardcoded HIGH/CRITICAL severity, so the FALSE_POSITIVE reattachment gate (whose comment claims content-hash keys protect it — true only for `signal` incidents) always matched. A benign-positive on `/opt/x` blinded the tool to a real later attack there. | reattach only evidence whose **fingerprints** the incident already saw; a genuinely new fingerprint opens a fresh incident. Universal (signal keys already embed the fp, so unchanged there); both-pole test (recurrence stays suppressed, new evidence alerts) |
+| R2-5 | **HIGH** | `redact_sensitive()` required a `:`/`=` delimiter, so the space-separated CLI form `--api-key VALUE` — exactly what MCP/agent-config `args` arrays carry, and what `diff_agent_surface` interpolates verbatim into a finding detail — leaked to `findings.jsonl`, as did the JSON `"password":` form and `sk_live_`/`xoxb-` token shapes. A security tool writing live secrets into its own logs. | new `_SECRET_FLAG_RE` (flag-tail anchored, so `--token-count 5` is untouched) + quote-tolerant assign regex + added token shapes; leak/preserve/no-over-redact test |
+| R2-1 | LOW | The agent-surface coverage sensor (a `gather_all` reader) ran **before** its only writer (`snapshot_agent_surface` in `_scan_surfaces`), so on a one-shot `aegis.py scan` the truncation flag was always the stale module-init `False` and the "walk hit its cap" finding was never emitted — the C1 fix's own goal, unmet for the primary manual invocation. | read coverage after `_scan_surfaces`; one-shot-scan truncation test |
+
+## Why the tests could not fail before, and the discipline that fixes the class
+
+The recurring lesson, three more times: **a fixture inherits its author's model of the
+system; only the system disagrees.** C5's dispatch tier had a test literally named
+"unproven coverage refuses to fire," but its fixture coupled staleness with `ok=False`,
+so the `ok` half was never exercised. R2-2's rail had tests for `/System` and `$HOME` —
+all in canonical case, so the case-alias never appeared. R2-4's reattachment had a
+comment asserting an invariant (content-hash keys) that held for one incident kind and
+was silently false for two others. Each new test asserts **both poles**, because a
+one-sided test passes against a detector hardwired to one answer.
+
+## Verification actually performed
+
+- macOS full suite **646 passed, 3 skipped** (was 636; +10 regression pins).
+- Every one of the ten new tests was run against the **pre-fix** source and **failed**
+  (assertion failures, plus a few errors where a fix introduces a new symbol the test
+  needs — e.g. `_iter_processes_live`, `_FS_CASE_INSENSITIVE`, or an audit file that
+  pre-fix code never writes) — so none is a tautology that passes either way.
+- R2-2's bypass and its fix were **verified live** against this machine's real filesystem
+  (`/SYSTEM`, `~/.AEGIS`, `/USERS/<me>` refused after the fix; a genuine `/tmp` payload
+  still quarantinable).
+- `selftest.py` 7/7.
+- One pre-existing test needed a forced, called-out update: the P1 comm-truncation pin
+  inspects the `ps`-call source, which the C4 refactor moved into `_iter_processes_live`;
+  assertions kept verbatim, only the inspected symbol follows the code.
+
+## Round 3 — a third loud round, and a defect this pass created (5)
+
+Round 3 re-checked all ten fixes and swept the surfaces the first two rounds never
+touched (the watch loop, install/scheduler lifecycle, quarantine transaction machine,
+heartbeat/watchdog). Its automated fan-out first hit the session's rate limit; I
+completed the fix re-check inline and — being honest about the record — **got one
+wrong**: I reported the R2-5 flag regex "clean" because my inline probe used a single
+`--aaaa…` anchor (fast, 4 ms) and never tried the pathological *hyphen-dense* input.
+When the limit reset and the automated sweep actually ran, it found exactly that, plus
+four more. The lesson the log keeps teaching, turned on its author this time: a check
+that only exercises the easy input proves nothing about the hard one.
+
+| # | Sev | Defect | Fix |
+|---|-----|--------|-----|
+| R3-1 | MED | **Introduced by the R2-5 fix.** `_SECRET_FLAG_RE` led with an unbounded `[\w-]*` before the keyword, so a hyphen-dense token backtracked O(n²) — a ReDoS reachable through an uncapped agent-config `args` value (measured 18.5 s at 40 KB, minutes at 200 KB), stalling the whole scan synchronously. | bound the prefix `{0,40}` (Python 3.9 has no possessive quantifier) **and** cap the interpolated args at 400 chars; 200 KB now redacts in 0.22 s. Both-pole timing test. |
+| R3-2 | **HIGH** | `_install_linux` wrote an **unquoted** `ExecStart`; systemd splits on whitespace, so any space in `$HOME` or the interpreter path (a named venv/conda env, `/home/john doe`) produced a malformed unit that failed on every trigger — Aegis never ran, no heartbeat, no alert, while the timer reported itself healthily enabled. `_install_mac` (per-`<string>`) and `_install_windows` (quoted) already handled this. | quote each path in the exec line; test asserts a spaced path stays one argument. |
+| R3-3 | MED | `cmd_install` on Linux was not idempotent despite the README promise: re-installing watch mode never restarted the running `simple` service, so a refreshed `~/.aegis/aegis.py` kept running the OLD code; switching modes left the previous unit enabled and running. | stop+disable BOTH units before enabling the target; test asserts the disable calls precede enable. |
+| R3-5 | **HIGH** | macOS `HOT_DIRS`/`STAGING_DIRS` listed both `/tmp` and `/private/tmp` — the same firmlink (`realpath('/tmp') == '/private/tmp'`) — so every real `/tmp` detection was emitted **twice** with two different path fingerprints, inflating signal counts and defeating the RISK_MIN_SIGNALS distinct-signal guard (one physical file could masquerade as multiple corroborating sensors). | `_dedup_by_realpath` collapses aliases at definition (generic, so future symlinked dirs too); one physical file → one finding, pinned. |
+| R3-4 | LOW | `_install_windows`' watch comment claimed the process was "kept alive by the scheduler's restart policy" — the `schtasks /create /sc onlogon` call configures no such policy (that needs the XML task API), so a crashed watch process is not relaunched until the next logon. The comment described resilience the code does not have. | comment corrected to state the gap honestly and point at the mutual watchdog as the real liveness signal. Not shipped blind: no untested XML task change on a platform this pass could not execute. |
+
+One candidate was **refuted** on verification (raised, traced, found not to reach a
+real wrong behaviour) — recorded because a rejected finding is part of an honest count.
+
+### R3-6 — the re-check found the ReDoS the ReDoS fix missed
+
+Because R3-1 proved my own fixes can introduce defects, I ran a focused adversarial
+re-check of all five Round 3 fixes before shipping. Four were clean. The fifth surfaced
+**R3-6 (MED):** `redact_sensitive` *still* had an O(n²) ReDoS — in `_AUTH_RE`, whose two
+`\s*` runs around the optional `bearer|basic` re-partition a long whitespace value in
+O(n) ways and backtrack O(n²) when the value group fails at EOF or a quote
+(`authorization=` + 40 000 spaces → 9.5 s, measured). It is *pre-existing* — R3-1 did not
+touch it — but R3-1's stated job was to de-ReDoS that exact function, so leaving a second
+quadratic in it made the fix incomplete. Bounded the whitespace (`\s{0,20}`) like R3-1;
+200 KB now redacts in 0.006 s, all real `Authorization:` header forms unchanged. The
+regression test now pins **both** vectors. The lesson compounds R3-1's: fixing one ReDoS
+in a function is not fixing *the function* — a per-pattern check would have caught this,
+a per-symptom check ("is `_SECRET_FLAG_RE` fast now?") did not.
+
+## Convergence
+
+Three rounds plus a fix-re-check, all loud: 5 + 5 + 5 + 1 = **sixteen** genuine defects
+(1 CRITICAL, 5 HIGH, 8 MED, 2 LOW), two of them ReDoS in the same redaction function —
+one created this pass, one pre-existing, both closed. The stop is a
+**hard-cap / diminishing-returns** judgement, not two consecutive dry rounds — stated
+plainly rather than dressed as convergence. Every surface the three rounds targeted has
+now been adversarially hunted at least once; a fourth round is the honest next step if
+this is ever driven to a true dry-dry stop, and the workflow scripts (`bt_round{1,2,3}.mjs`)
+are saved to re-run it.
+
+## Verification (final)
+
+- macOS full suite **651 passed, 3 skipped** (+15 regression pins over the 636 baseline);
+  `selftest.py` 7/7.
+- Every one of the new/extended tests was run against its pre-fix source and **failed**
+  (assertion failures, plus a few errors where a fix introduces a symbol the test needs).
+- Live-verified this pass: the R2-2 case bypass and its fix; the R3-1 ReDoS (18.5 s →
+  0.22 s) and its fix; the R3-5 double-emit (2 findings → 1); the R3-2 quoted unit text.
+- Cross-platform CI (Linux 3.9/3.12 · macOS · Windows 3.9/3.12) is the gate for the
+  platform-specific fixes (R2-2/R2-3/R3-2/R3-3, C3/C4); driven on the branch's PR.
+
+## Residual
+
+- R2-2's case-fold is fail-closed: on a rare mixed-case-sensitivity volume it
+  over-protects (refuses a legitimate quarantine of a case-alias) rather than under-protect.
+- R2-4 adds two bounded lookups per FALSE_POSITIVE upsert (a rare path); no measurable cost.
+- The Windows ~41 s CIM cost that C2/C3/C4 improve is inferred from the file's own prior
+  measurement, not re-measured here. R3-2/R3-3/R3-4 are Linux/Windows paths verified by
+  unit-level generation and stubbed lifecycle, not on a live foreign kernel this pass —
+  CI and the live harnesses are the backstop.
+- R3-4 leaves a real Windows watch-mode resilience gap (no crash-restart) documented but
+  unfixed, because the fix needs the XML task API and this pass would not ship Windows
+  scheduler code it cannot execute.
+
+## End-state checklist
+
+- bugs found → fixed: **16/16**, each with a repro that failed before and passes now.
+- logic errors found → fixed: C5, R2-4, R2-1, R3-3 — fixed + pinned.
+- edge cases found → tested: every fix has a both-poles / linear-timing regression test; all proven to fail pre-fix.
+- no unimplemented files/stubs remain: completeness pre-flight clean at Gate 2.
+- security lens run: inline across all three rounds; fixed the CRITICAL case-alias bypass, the neutralize audit gap, the secret-leak, and the ReDoS.
+- adversarial-break: run as the Opus/high lens each round; Round 3 caught a self-introduced defect — the strongest evidence the loop works.
+- verified vs inferred: suite/selftest/live-checks **verified**; Windows CIM timings **inferred**; nothing claimed clean that was only reasoned about (the R2-5 inline miss is recorded above, not hidden).
+
+---
+
+# Aegis — the same class again: a branch that could not be reached (2026-08-05)
+
+The previous pass was named for a detector that never fired. This one went
+looking for the *rest* of that class deliberately, by writing the positive
+controls that were missing, and found another one immediately.
+
+The method matters more than the count. The previous defect was found by
+running the code against a real machine; this one was found by asking, for each
+detector shipped in the last release, **what input would prove it fires, and
+what input would prove it stays quiet** — then discovering the first question
+had no answer for one of them.
+
+## The defect
+
+| # | Sev | Defect | Before | After |
+|---|-----|--------|--------|-------|
+| B1 | **HIGH** | `diff_agent_surface()` could not report an agent config whose exec target went from **absent to present**. `_resolve_exec_target()` records an absolute-but-missing target as `(target, None)`, and its own comment promised "if the file later appears the hash changes from None and the diff fires". It did not: the changed-target branch requires **both** `target_sha` values to be truthy, and the old one is `None` in exactly that case, so the branch was unreachable for an appearance. | `diff_agent_surface(target_sha=None → "b"*64)` returned `[]` | returns one HIGH `agent-surface:materialized:` finding; `hash → hash` still returns one, first sighting and steady state still return `[]` |
+
+**What it left open.** Register an MCP entry pointing at a path that does not
+exist yet — silent, and entirely plausible, since plenty of configs name a tool
+you have not installed — then drop the payload there later. The config line
+never changes, so the file's own `sha256` never changes either, and the surface
+stayed quiet through the whole sequence. It is the cheapest way to arm an agent
+config without ever editing a watched file.
+
+**Same shape as A1, different mechanism.** A1 was an exception swallowing a
+`NameError`; B1 is a boolean guard that is unsatisfiable in the case its own
+comment advertises. Neither failed. Neither had a test. Both were branches that
+could not be reached, in a file whose value is that it notices things.
+
+The generalization worth keeping: **a comment describing a case the code cannot
+execute is a defect report that nobody filed.** Both defects were sitting next
+to prose that stated the intended behaviour correctly.
+
+## What was added so the class stops recurring
+
+Six assay lanes, each asserting **both** poles, covering every detector the
+previous release shipped without one:
+
+| Lane | Hostile pole | Benign pole |
+|---|---|---|
+| `agent-imperative` | conceal + credential scores HIGH | "Do not tell the user to run npm install manually" scores nothing — the real-file case the lookahead exists for |
+| `agent-exec-target` | target swapped **and** target materialized both fire | first sighting and steady state stay silent |
+| `session-theft` | debug port on the live profile is CRITICAL | non-browser, browser-without-flag, and an inherited `--type=renderer` all stay silent |
+| `ext-cap-gain` | gaining `debugger` is CRITICAL; narrow → all-sites is a gain | steady state and *narrowing* stay silent |
+| `glean-atoms` | 3 atoms all present matches | one missing does not; below the threshold never matches |
+| `writ-enforcement` | enforcement ON escalates an uncovered change to HIGH | enforcement OFF returns **the same list object** — byte-identical, asserted by identity |
+
+The benign pole is not symmetry for its own sake. A lane that checks only the
+hostile side passes against a detector hardwired to say yes; one that checks
+only the benign side passes against a dead one. `latch-cleared` (A1) is the
+proof: a lane asserting only the intact case would have passed against the
+broken function.
+
+`_glean_rule_matches()` was extracted from `cmd_glean` so its lane challenges
+the **shipped** predicate rather than a copy — a lane that re-implements the
+rule proves only that the copy still works.
+
+## Also shipped this pass
+
+- **`deadfall` dispatch is wired.** The interlocks shipped last release and
+  were tested; the gates now re-evaluate at **fire** time, not merely at arm
+  time. Checking the coverage precondition once would have made it decorative:
+  an order bound 30 days ago to a detector that has since gone stale would keep
+  reading as protection. An unproven detector now disarms its own order and
+  says so. Triggers stay attack-defined, verbs stay reversible, every dispatch
+  leaves an `actions.jsonl` record and a notary link.
+- **Event-driven watch on Linux**, `ctypes` inotify. The previous entry called
+  this deliberately unbuilt rather than written blind, because kernel-interface
+  code that cannot be executed on the machine writing it is the risk this
+  project has already paid for once. That objection was answerable, not
+  permanent: it is now proven against a **real Linux kernel** — real fd, real
+  write, real wake, plus the drain that keeps a level-triggered fd from
+  spinning the loop — and the test **skips** rather than passes where it cannot
+  do that. `ReadDirectoryChangesW` stays unbuilt, held to the same bar.
+
+## Test state
+
+636 tests. macOS `632 passed, 1 skipped`; Linux (container) `513 passed,
+123 skipped`; `selftest.py` 7/7. One caught defect was mine, during this pass:
+`log_action()` takes `target` positionally and the dispatch code passed it again
+as a keyword, which the new tests surfaced immediately.
+
+---
+
+# Aegis — agent surface, session theft, and a detector that never fired (2026-08-04)
+
+The previous pass added the protective tier. This one started as a feature pass
+— cover the AI-agent trust surface and session/cookie theft, neither of which
+had a single line of coverage — and turned up a defect in the tier shipped one
+commit earlier.
+
+## The defect this pass exists to have found
+
+| # | Sev | Defect | Before | After |
+|---|-----|--------|--------|-------|
+| A1 | **HIGH** | `_latch_intact()` referenced `stat_mod`, a name that does not exist anywhere in the file (the module imports `stat`, and the correct name is used two lines below). On macOS the reference raised `NameError` **into the function's own `except Exception: return None`**, so it answered "unknown" on every call. The flagship protective-tier signal — "a latch was cleared with no authorized `unlatch`", the one described as attack-defined evidence — had its HIGH branch made **unreachable on the primary platform**. Worse than silent: every latched path emitted a permanent `INFO` "latched surface could not be checked", so the mechanism produced a steady nag instead of a signal, training dismissal of exactly the category most worth reading. | `_latch_intact()` on a real `chflags uchg` file returned `None`; `check_latches()` could only ever emit INFO | returns `True` for an applied latch and `False` for a cleared one, verified against a real immutable file; `check_latches()` emits the HIGH finding |
+
+**The honest-unknown path swallowed a coding error.** This tool is careful, on
+purpose, never to report "clean" when it means "could not tell" — and that
+discipline is right. But an `except Exception: return None` cannot distinguish
+*the platform would not answer* from *this function is broken*, and it reports
+both as the honest-sounding one. A defensive default made a hard failure look
+like a soft limit. Where the cost of that confusion is a dead detector, the
+broad `except` needs to be narrow enough that a `NameError` still crashes.
+
+## Why no test caught it
+
+There was no positive control for the latch detector. `assay` existed and had
+six lanes; none of them exercised `_latch_intact`. The tier's own tests applied
+and released latches and asserted on the *state file*, never on the function
+that reads the *filesystem*.
+
+Two lanes were added — `latch-cleared` and `decoy-read` — and the first asserts
+**both poles in one lane**: that an applied latch reads intact AND that a
+cleared one reads cleared. Either assertion alone is passable by a function
+hardwired to a constant, which is precisely the failure mode being pinned. The
+`deadfall` coverage gate then refuses to arm any standing order whose lane has
+not passed within its half-life, so an automated response can never be bound to
+a detector in this state.
+
+## What the machine said that the fixtures could not
+
+Four further defects were found only by running the new code against this
+machine rather than against a fixture. The log's standing lesson holds: a
+simulation inherits its author's model of the system.
+
+| # | Defect | How it surfaced |
+|---|--------|-----------------|
+| A2 | `_automation_targets_live_profile()` captured the `--user-data-dir` value with `[^\s]+`. The real macOS profile root is `~/Library/Application Support/Google/Chrome` — **it contains spaces** — so the capture truncated at "Application" and classified a live-profile attack as a harmless scratch run. Failed **open**, on the single case the sensor exists to catch. | a hand-written case using the real path, not a synthetic one |
+| A3 | `_resolve_exec_target()` treated any argument containing a path separator as the script. `@modelcontextprotocol/server-foo` is an npm **scope spec**, not a path, so every `npx`-based MCP server — most of them — resolved to nothing and was never hashed. | printing resolved targets for the machine's actual 158 exec entries; 105 were unresolved |
+| A4 | The credential-surface table hardcoded Chrome's `Default/` profile. Real installs use `Profile 2`, `Profile 15`, `Profile 22`… so `cauterize` found **zero** cookie stores and printed a confident, tidy, incomplete plan. The most valuable credential class in the current threat model was absent while the output looked finished. | running `cauterize` on a real home directory and noticing what was missing |
+| A5 | The semantic imperative detector matched bare adverbs and fired on this repo's own instruction files — "route silently", "never report a result you didn't watch happen", and a legitimate "Do not tell the user **to run** `codex plugin marketplace add`". | scoring the machine's 306 real agent files and reading every hit |
+
+A5 is the calibration lesson in miniature. Concealment had to be redefined to
+name *who* is kept in the dark: "silently" is a writing style, "without telling
+the user" is an instruction to deceive the person the agent works for, and only
+the second has no legitimate form. The `(?!\s+to\s+\w)` lookahead that
+separates "don't tell the user **about** X" from "don't tell the user **to do**
+X" exists because a real file needed it.
+
+## Measured, not assumed
+
+- **`atime` is dead as a read sensor.** The obvious cookie-jar sensor — watch
+  the jar for reads — was designed, then discarded on evidence: on this APFS
+  volume the first read advanced `atime` and the **second did not**.
+  `EVFILT_VNODE` has no read flag, so there is no unprivileged fallback.
+  Building it would have shipped a detector that silently never fires — the same
+  failure as A1, chosen deliberately this time. Coverage went instead to the
+  paths attackers moved to after App-Bound Encryption: a browser driven against
+  its own live profile.
+- **Agent-config churn is ~19 changes/week** across this operator's three main
+  repos (244 in 90 days). A naive content-hash diff would emit ~19 alerts a week
+  and be muted within a fortnight. So plain edits are silent, and only a new
+  exec entry, a changed **resolved target**, or a **newly gained** semantic
+  imperative alerts — with git provenance separating an edit you typed from an
+  imperative that arrived in a `git pull` from a remote you do not control.
+- **The new snapshots cost 0.26s.** `surface.btm` costs 30s (pre-existing
+  `sfltool` timeout), which is now the dominant scan cost and is not this pass's
+  to fix, but is recorded here so it is not mistaken for one.
+
+## Also corrected
+
+- **`unlatch`'s human check was satisfiable by automation.** It gated on
+  `sys.stdin.isatty() and sys.stdout.isatty()` and reasoned that "a background
+  script has no tty and cannot read the code off our stdout". That is true of a
+  plain subprocess and **false of anything that allocates a pty** — `expect`,
+  `script`, `ssh -t`, an AI agent's shell tool. Such a wrapper passes both
+  checks, reads the challenge off the pty master, and types it back. Note the
+  obvious fix does not work either: `/dev/tty` fails identically, because a pty
+  *is* a controlling terminal. The channels must differ — the code now goes to a
+  GUI dialog and the answer comes from the terminal, and where no out-of-band
+  channel exists the weaker guarantee is recorded as `channel=tty-only` rather
+  than claimed as equivalent.
+- **Two comments asserted a constraint that does not exist**, saying inotify has
+  no stdlib binding so event-driven watch is macOS-only. `ctypes` is stdlib;
+  `inotify_init1` and `ReadDirectoryChangesW` are both reachable with zero
+  dependencies. Polling on Linux/Windows is an unpaid implementation cost, not a
+  platform limit. Corrected in place rather than deleted, because a limitation
+  written down as structural stops being re-examined.
+- **The "no new privileged parser" invariant was broader than its own
+  justification.** The Norton/Symantec CVE-2016-2208 parser was dangerous
+  because it ran as SYSTEM: a bug in it *escalated*. A parser at the same
+  privilege as the file's owner escalates nothing. Restated as **never parse
+  untrusted input above the privilege its author already holds** — which keeps
+  untrusted binaries out of scope and puts the operator's own config files in.
+
+## Second pass — the wiring, and a feature that measured its way to shippable
+
+Four items were finished after the first commit; two of them were features that
+existed only on paper.
+
+| # | Defect | Evidence |
+|---|--------|----------|
+| A6 | **`writ_covers()` had zero call sites.** The command wrote state, the HELP text and README both claimed an unauthorized change would report as HIGH — and enforcement changed nothing at all. A documented behaviour with no implementation is worse than a missing feature, because it is believed. | `grep writ_covers aegis.py` returned the definition and nothing else |
+| A7 | **`guard install` computed a bash path and never wrote it.** `bash_p` was a dead variable. bash also has no bracketed-paste widget, so paste provenance there is genuinely UNKNOWN — and the code was collapsing unknown to `False`, letting the weaker shell manufacture reassurance. Now tri-state. | dead local; `pasted` was `== "1"` |
+| A8 | **Extension capability was ungraded.** An extension holding `cookies` + all-sites, or `debugger`, reads sessions through Chrome's own API — no process to see, no file touched, invisible to every other sensor here. | `grep host_permissions` → nothing |
+| A9 | **Glean shipped as a false-positive generator and was measured back to shippable.** | below |
+
+### The glean calibration, in numbers
+
+The obvious implementation — match if ANY of a rule's literal atoms appears —
+was written, run against this machine, and produced **46 matches**, including
+`/opt/homebrew/bin/node`, two Python interpreters, GoogleUpdater and a Steam
+binary. Against a known-good corpus of 97 system and Homebrew binaries it
+flagged **81 of 97 — an 84% false-positive rate.**
+
+The cause is not a tuning problem. A YARA rule's condition is usually *all of
+them* or *N of them*; matching a SUBSET while skipping the condition is not a
+weaker version of that rule, it is a different and far looser one. A lone atom
+is frequently a Mach-O section name or a code idiom every Go binary shares.
+
+Requiring a rule to declare **≥3 atoms with ALL present** measured **0 of the
+same 97**, and dropped the live run from 46 matches to 2 while running ten times
+faster (102s → 10s).
+
+The two survivors — Microsoft AutoUpdate and Zoom's updater, both matching one
+generic downloader rule — were then handled by **grading rather than
+suppressing**. Raising the threshold again would have hidden them and also
+hidden real Developer-ID-signed malware, since a hijacked cert is an established
+technique. So matches are split into an unsigned/ad-hoc list (the one worth a
+human's attention: **0 files here**) and a vendor-signed list shown as context.
+
+This is the same decision the atime experiment forced earlier in the pass, one
+rung further along: measure the thing, and let the measurement decide whether it
+ships, in what form, or at all.
+
+### Deliberately not built
+
+Event-driven watch on Linux/Windows. The comments asserting it was impossible
+were wrong and have been corrected — `ctypes` is stdlib, `inotify_init1` and
+`ReadDirectoryChangesW` are both reachable. But writing kernel-interface code
+that cannot be executed on the machine writing it is precisely this log's
+standing lesson in reverse, and the gap it closes is latency (5s poll →
+sub-second), not coverage. Recorded as unbuilt work with the constraint
+corrected, rather than shipped blind.
+
+## Residual
+
+- `deadfall` cannot fire anything; dispatch is deliberately unwired so the
+  interlocks land and get tested first. A test asserts this, so wiring it later
+  requires changing that test on purpose.
+- `guard` refuses nothing and covers interactive shells only. Win+R and
+  GUI-launched payloads are explicitly out of scope, stated rather than implied.
+- `writ` enforcement is default-off; while off, `writ_covers()` returns False
+  and scan behaviour is byte-identical.
+- The agent-surface walk is file-capped and hit its cap on this machine, which
+  is reported as a LOW partial-coverage finding rather than absorbed.
+- Three `credential+egress` instruction files remain flagged on this machine.
+  All are operator-authored, all are adopted silently at baseline, and none
+  produces an interrupt — but the calibration is a floor, not a proof.
+
+---
+
 # Aegis — protective tier (2026-08-04): pre-commit, contain reversibly, leave a witness
 
 Every prior pass in this log made the detector see more. This one asked a

@@ -332,6 +332,44 @@ class TestConfidenceAndRisk(Sandbox):
             "Accumulated risk")]
         self.assertEqual(risk, [])
 
+    def _active_risk(self):
+        return [i for i in aegis.list_incidents()
+                if i["title"].startswith("Accumulated risk")
+                and i.get("status") != "FALSE_POSITIVE"]
+
+    def test_dismissed_risk_incident_does_not_swallow_new_evidence(self):
+        """A dismissed `risk:` incident is entity-keyed with a hardcoded HIGH
+        severity, so the FALSE_POSITIVE reattachment used to swallow EVERY future
+        signal on that entity forever — a benign-positive on `/opt/x` blinded the
+        tool to a real later attack there. Both poles: identical recurrence stays
+        suppressed (the anti-storm the reattachment exists for), but a DIFFERENT
+        signal constellation on the same entity opens a fresh incident."""
+        P = "/opt/shared/helper-bin"
+        t0 = 1_700_000_000
+        batch1 = [aegis.finding("MEDIUM", c, "s%d" % i, "d", "fp-a%d" % i,
+                                path=P, confidence="medium")
+                  for i, c in enumerate(("hot-dir", "staging", "behavior"))]
+        aegis.record_security_state(batch1, now=t0)
+        risk = self._active_risk()
+        self.assertEqual(1, len(risk), "3 MEDIUMs on one entity should open risk")
+        aegis.transition_incident(risk[0]["id"], "FALSE_POSITIVE",
+                                  reason_code="benign-positive")
+
+        # Pole 1 — the SAME constellation recurring stays suppressed (no storm).
+        aegis.record_security_state(batch1, now=t0 + 60)
+        self.assertEqual([], self._active_risk(),
+                         "identical recurrence re-opened after a dismissal")
+
+        # Pole 2 — a DIFFERENT constellation on the same entity, past the window,
+        # must NOT be swallowed by the dismissed incident.
+        batch2 = [aegis.finding("MEDIUM", c, "s%d" % i, "d", "fp-b%d" % i,
+                                path=P, confidence="medium")
+                  for i, c in enumerate(("net-listener", "process", "persistence"))]
+        aegis.record_security_state(batch2, now=t0 + 30 * 86400)
+        self.assertEqual(1, len(self._active_risk()),
+                         "new evidence on a dismissed entity was swallowed "
+                         "forever — the R2-4 defect")
+
 
 # --------------------------------------------------------------------------- #
 # #10 — Bastion / XPdb opt-in tier

