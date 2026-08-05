@@ -3083,12 +3083,12 @@ class TestWhoRemoteLoopbackNotPaged(Sandbox):
 
     def test_numeric_loopback_is_not_remote(self):
         for ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-            line = "charlie  ttys004  Jul 22 10:00 (%s)\n" % ip
+            line = "user  ttys004  Jul 22 10:00 (%s)\n" % ip
             self.assertEqual(aegis._parse_who_remote(line), {},
                              "loopback %s must not be a remote session" % ip)
 
     def test_real_remote_still_detected(self):
-        line = "charlie  ttys004  Jul 22 10:00 (203.0.113.9)\n"
+        line = "user  ttys004  Jul 22 10:00 (203.0.113.9)\n"
         self.assertEqual(aegis._parse_who_remote(line),
                          {"user@203.0.113.9:ttys004": "203.0.113.9"})
 
