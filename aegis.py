@@ -596,8 +596,20 @@ _PIPE_LAUNCH = r"(?:(?:/\S*/)?env\s+(?:-\S+\s+|[\w.]+=\S*\s+)*)?(?:/\S*/)?"
 # (launchd/cron) and file-content scanning (shell rc). Each is a "download-and-
 # run", "reverse shell", or "obfuscated-decode-and-exec" idiom — the live tail of
 # a 2025-era ClickFix / AMOS infection chain.
+#
+# ReDoS DISCIPLINE (siege finding, 2026): every interior "skip to the next token"
+# run is LENGTH-BOUNDED, never a bare `[^\n]*`/`.*`. An unbounded run backtracks
+# O(n) per anchor (a single one is O(n^2); two in series is O(n^3)) over text an
+# attacker controls — full same-user process argv (~100KB on macOS) and 512KB
+# file bodies — so one crafted process/file stalled every scan for minutes. These
+# idioms are INHERENTLY LOCAL (the keyword and its dangerous argument sit within a
+# few dozen chars of each other), so a generous cap (`{0,512}` single, `{0,120}`
+# for the two-run "cubic" shapes) loses no real detection while making every regex
+# linear. Python 3.9 has no atomic groups / possessive quantifiers, so a numeric
+# bound is the portable fix — same technique as _SECRET_FLAG_RE. `_hostile_content`
+# additionally caps its input as defence in depth.
 _HOSTILE_CONTENT_RES = [
-    (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]*\bhttps?://", re.I), "network-fetch"),
+    (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]{0,512}\bhttps?://", re.I), "network-fetch"),
     (re.compile(r"\|\s*" + _PIPE_LAUNCH + r"(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
     # Require a real command boundary after the interpreter (space/EOL) so a `|`
     # INSIDE a quoted regex alternation — e.g. perl/sed `s{(a|node|b)}` — is not
@@ -612,27 +624,44 @@ _HOSTILE_CONTENT_RES = [
                 r"http\.client|httplib|requests\.(?:get|post)|open-uri|Net::HTTP|"
                 r"URI\.open|HTTP::Tiny|LWP::|require\(\s*['\"]https?['\"]|"
                 r"https?\.get\()", re.I), "interp-fetch"),
+    # A fetch nested inside a command substitution that an interpreter EXECUTES —
+    # `bash -c "$(curl …)"`, `eval "$(curl …)"`, `osascript -e "…$(curl …)"` — is
+    # the fileless fetch+exec with no `| sh` pipe to match and nothing on disk
+    # (siege evasion of fileless-fetch-exec). Scoped to an exec context (interp
+    # `-c`/`-e` or `eval`) so a benign VALUE capture — `VERSION=$(curl -s
+    # http://api)` — where the substitution is assigned, not run, does NOT trip it.
+    # An exec sink (see _PIPE_EXEC_IDIOMS): MEDIUM alone, HIGH paired with a fetch.
+    (re.compile(r"(?:\b(?:bash|sh|zsh|dash|ksh)\b[^\n]{0,40}-c|"
+                r"\bosascript\b[^\n]{0,40}-e|\beval\b)"
+                r"[^\n]{0,80}(?:\$\(|`)[^\n)`]{0,256}"
+                r"\b(?:curl|wget|nscurl|fetch)\b[^\n)`]{0,256}https?://", re.I),
+     "cmdsub-fetch-exec"),
+    # `curl … | xargs … sh` — the pipe feeds xargs, which execs the shell; the
+    # fetched bytes still reach an interpreter, just one hop removed from `| sh`
+    # (siege evasion). An exec sink: MEDIUM alone (a benign `find | xargs sh` has
+    # no fetch), HIGH only paired with an upstream fetch.
+    (re.compile(r"\|\s*xargs\b[^\n]{0,120}\b(?:ba|z|d)?sh\b", re.I), "xargs-exec"),
     # exec()/eval() of a string — the exec sink an interpreter one-liner uses to
     # run fetched/decoded bytes in memory. `\s*\(` requires the call form, so it
     # never fires on shell `exec bash` (no paren) or `eval "$(…)"` (a quote, not
     # a paren, follows). An exec idiom (MEDIUM alone); HIGH only with a fetch.
     (re.compile(r"\b(?:exec|eval)\s*\(", re.I), "exec-eval"),
     (re.compile(r"\bbase64\b\s+(?:--?d(?:ecode)?|-D)\b", re.I), "base64-decode"),
-    (re.compile(r"\beval\b[^\n]*\$\(", re.I), "eval-subshell"),
+    (re.compile(r"\beval\b[^\n]{0,512}\$\(", re.I), "eval-subshell"),
     (re.compile(r"/dev/tcp/", re.I), "bash-reverse-shell"),
-    (re.compile(r"\bn(?:c|cat)\b[^\n]*\s-[a-z]*e\b", re.I), "netcat-exec"),
-    (re.compile(r"\bosascript\b[^\n]*do\s+shell\s+script", re.I), "osascript-shell"),
-    (re.compile(r"\bpython[0-9.]*\b[^\n]*-c[^\n]*\bimport\s+(?:os|socket|pty|subprocess)", re.I), "python-oneliner"),
-    (re.compile(r"\b(?:curl|wget)\b[^\n]*\bhttps?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
-    (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]*/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
-    (re.compile(r"display\s+dialog.*hidden\s+answer", re.I | re.S), "osascript-password-phish"),
-    (re.compile(r"\bsecurity\b[^\n]*\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I), "keychain-dump"),
+    (re.compile(r"\bn(?:c|cat)\b[^\n]{0,512}\s-[a-z]*e\b", re.I), "netcat-exec"),
+    (re.compile(r"\bosascript\b[^\n]{0,512}do\s+shell\s+script", re.I), "osascript-shell"),
+    (re.compile(r"\bpython[0-9.]*\b[^\n]{0,120}-c[^\n]{0,120}\bimport\s+(?:os|socket|pty|subprocess)", re.I), "python-oneliner"),
+    (re.compile(r"\b(?:curl|wget)\b[^\n]{0,512}\bhttps?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
+    (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]{0,512}/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
+    (re.compile(r"display\s+dialog.{0,512}hidden\s+answer", re.I | re.S), "osascript-password-phish"),
+    (re.compile(r"\bsecurity\b[^\n]{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I), "keychain-dump"),
     # ClickLock (Group-IB, 2026) coerces a password by killing the very apps a
     # user would open to notice/stop it — Activity Monitor, the menu-bar
     # (SystemUIServer), NotificationCenter (suppresses Gatekeeper warnings),
     # Console. A user practically never scripts killing THESE, so it is a high-
     # signal anti-analysis/coercion tell even outside the tight-loop shape.
-    (re.compile(r"\b(?:killall|pkill)\b[^\n]*\b(?:Activity[ _]?Monitor|"
+    (re.compile(r"\b(?:killall|pkill)\b[^\n]{0,512}\b(?:Activity[ _]?Monitor|"
                 r"SystemUIServer|NotificationCenter|Console|coreauthd)\b", re.I),
      "gui-kill-coercion"),
     # applescript:// URL scheme launches Script Editor pre-loaded with the
@@ -642,46 +671,46 @@ _HOSTILE_CONTENT_RES = [
     # --- Windows-native fileless idioms (the PowerShell half of ClickFix) ----
     # `powershell -enc <base64>` is THE Windows obfuscated-exec primitive; the
     # flag is prefix-matchable (-e/-en/-enc/-encoded…), which attackers exploit.
-    (re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\n]*\s-[eE][a-zA-Z]*\s+"
+    (re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\n]{0,512}\s-[eE][a-zA-Z]*\s+"
                 r"[A-Za-z0-9+/=]{40,}", re.I), "powershell-encoded-command"),
     (re.compile(r"\b(?:IEX|Invoke-Expression)\b", re.I), "powershell-iex"),
     (re.compile(r"\b(?:DownloadString|DownloadFile|DownloadData)\s*\(", re.I),
      "powershell-webclient-download"),
     (re.compile(r"\bInvoke-(?:WebRequest|RestMethod)\b|\b(?:iwr|curl|wget)\b"
-                r"[^\n]*\s-Uri\b", re.I), "powershell-fetch"),
+                r"[^\n]{0,512}\s-Uri\b", re.I), "powershell-fetch"),
     (re.compile(r"\bFromBase64String\s*\(", re.I), "powershell-base64-decode"),
     # Signed-binary proxy execution (T1218): the LOLBins that run attacker code
     # under a Microsoft-signed parent, bypassing naive allowlists.
     (re.compile(r"\b(?:mshta|regsvr32|rundll32|installutil|msbuild|certutil|"
-                r"bitsadmin|wmic|cmstp|msiexec)(?:\.exe)?\b[^\n]*"
+                r"bitsadmin|wmic|cmstp|msiexec)(?:\.exe)?\b[^\n]{0,512}"
                 r"(?:https?://|\\\\|scrobj|javascript:|vbscript:|urlcache|"
                 r"-decode|/i:)", re.I), "windows-lolbin-proxy-exec"),
     # Defender/AMSI/ETW teardown — the universal pre-payload step (T1562.001).
-    (re.compile(r"\b(?:Set-MpPreference|Add-MpPreference)\b[^\n]*"
+    (re.compile(r"\b(?:Set-MpPreference|Add-MpPreference)\b[^\n]{0,512}"
                 r"(?:Disable\w*\s+\$?true|-ExclusionPath)", re.I),
      "defender-tamper"),
     (re.compile(r"\bamsiInitFailed\b|\bAmsiScanBuffer\b", re.I), "amsi-bypass"),
-    (re.compile(r"\b(?:vssadmin|wbadmin)\b[^\n]*\bdelete\b[^\n]*"
+    (re.compile(r"\b(?:vssadmin|wbadmin)\b[^\n]{0,120}\bdelete\b[^\n]{0,120}"
                 r"(?:shadows?|catalog)", re.I), "shadow-copy-deletion"),
-    (re.compile(r"\bbcdedit\b[^\n]*\brecoveryenabled\s+no\b", re.I),
+    (re.compile(r"\bbcdedit\b[^\n]{0,512}\brecoveryenabled\s+no\b", re.I),
      "recovery-disabled"),
     # Windows credential stores (T1003): SAM/SYSTEM hive dump, LSASS dump.
-    (re.compile(r"\breg\b[^\n]*\bsave\b[^\n]*\bhk(?:lm|ey_local_machine)\\+"
+    (re.compile(r"\breg\b[^\n]{0,120}\bsave\b[^\n]{0,120}\bhk(?:lm|ey_local_machine)\\+"
                 r"(?:sam|system|security)\b", re.I), "sam-hive-dump"),
-    (re.compile(r"\b(?:procdump|comsvcs\.dll[^\n]*MiniDump|MiniDumpWriteDump)"
-                r"[^\n]*\blsass\b|\blsass\b[^\n]*\bMiniDump", re.I),
+    (re.compile(r"\b(?:procdump|comsvcs\.dll[^\n]{0,120}MiniDump|MiniDumpWriteDump)"
+                r"[^\n]{0,120}\blsass\b|\blsass\b[^\n]{0,120}\bMiniDump", re.I),
      "lsass-dump"),
     # --- Linux-native persistence/injection idioms --------------------------
     # LD_PRELOAD injection and /etc/ld.so.preload writes (T1574.006).
     (re.compile(r"\bLD_PRELOAD\s*=", re.I), "ld-preload-injection"),
     (re.compile(r"ld\.so\.preload", re.I), "ld-so-preload-write"),
     # A payload installing its own systemd unit / crontab from a script.
-    (re.compile(r"\bsystemctl\b[^\n]*\b(?:enable|start)\b[^\n]*"
+    (re.compile(r"\bsystemctl\b[^\n]{0,120}\b(?:enable|start)\b[^\n]{0,120}"
                 r"(?:/tmp/|/dev/shm/|/var/tmp/)", re.I), "systemd-tmp-unit"),
-    (re.compile(r"\bcrontab\b\s+(?:-\s*)?[^\n]*/(?:tmp|dev/shm|var/tmp)/", re.I),
+    (re.compile(r"\bcrontab\b\s+(?:-\s*)?[^\n]{0,512}/(?:tmp|dev/shm|var/tmp)/", re.I),
      "crontab-tmp-install"),
     # memfd_create + fexecve: the canonical Linux fileless exec (nothing on disk).
-    (re.compile(r"\bmemfd_create\b|/proc/self/fd/\d+\b[^\n]*exec", re.I),
+    (re.compile(r"\bmemfd_create\b|/proc/self/fd/\d+\b[^\n]{0,512}exec", re.I),
      "memfd-fileless-exec"),
     # Linux credential/loot targets: shadow file and SSH private keys.
     (re.compile(r"/etc/shadow\b", re.I), "shadow-file-access"),
@@ -689,7 +718,7 @@ _HOSTILE_CONTENT_RES = [
      "ssh-private-key-access"),
     # History/log wiping — anti-forensics that precedes or follows the payload.
     (re.compile(r"\b(?:history\s+-c|unset\s+HISTFILE|HISTFILE=/dev/null|"
-                r"Clear-History|Remove-Item[^\n]*ConsoleHost_history)", re.I),
+                r"Clear-History|Remove-Item[^\n]{0,512}ConsoleHost_history)", re.I),
      "history-tamper"),
 ]
 
@@ -718,35 +747,37 @@ _DYLD_INJECT_KEYS = ("DYLD_INSERT_LIBRARIES", "DYLD_FRAMEWORK_PATH",
 # High-precision hostile process-argv signals. Each is rare-to-absent in normal
 # use, so a single match is alert-worthy (the Bitdefender-ATC lesson applied via
 # severity tiers: unambiguous → HIGH/CRITICAL, weak/context → MEDIUM won't-notify).
+# Interior "skip to the next token" runs are LENGTH-BOUNDED here too (same ReDoS
+# discipline as _HOSTILE_CONTENT_RES): these run over full same-user argv.
 _HOSTILE_ARGV_RES = [
     # AMOS/Cthulhu core primitive: a fake system password prompt (hidden answer).
-    (re.compile(r"\bosascript\b.*display\s+dialog.*(?:hidden\s+answer|default\s+answer)", re.I | re.S),
+    (re.compile(r"\bosascript\b.{0,512}display\s+dialog.{0,512}(?:hidden\s+answer|default\s+answer)", re.I | re.S),
      "osascript-password-phish", "CRITICAL"),
     # ClickFix validates the phished password locally before proceeding.
     (re.compile(r"\bdscl\b\s+\.?\s+(?:-)?authonly\b", re.I), "dscl-authonly-passcheck", "HIGH"),
     # Provenance strip: defeats Aegis's own quarantine check if we only read xattrs
     # at rest — so we catch the STRIP invocation itself.
-    (re.compile(r"\bxattr\b[^\n]*\s-[a-z]*(?:c|d|dr)\b[^\n]*com\.apple\.quarantine", re.I), "quarantine-strip", "HIGH"),
+    (re.compile(r"\bxattr\b[^\n]{0,120}\s-[a-z]*(?:c|d|dr)\b[^\n]{0,120}com\.apple\.quarantine", re.I), "quarantine-strip", "HIGH"),
     (re.compile(r"\bxattr\b\s+-c\b", re.I), "xattr-clear-all", "HIGH"),
     # Invisible DMG mount (new ClickFix DMG variant, Unit42 2026).
-    (re.compile(r"\bhdiutil\b\s+attach\b[^\n]*-nobrowse\b", re.I), "hdiutil-nobrowse", "HIGH"),
+    (re.compile(r"\bhdiutil\b\s+attach\b[^\n]{0,512}-nobrowse\b", re.I), "hdiutil-nobrowse", "HIGH"),
     # Wipes the TCC privacy DB — resets Aegis's own grants; a tamper signal.
     (re.compile(r"\btccutil\b\s+reset\b", re.I), "tccutil-reset", "HIGH"),
     # Keychain theft residue: copy login.keychain-db out, or dump it.
     (re.compile(r"login\.keychain-db\b", re.I), "keychain-db-access", "HIGH"),
-    (re.compile(r"\bsecurity\b[^\n]*\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I),
+    (re.compile(r"\bsecurity\b[^\n]{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I),
      "keychain-security-dump", "HIGH"),
     # Exfil POST of a staged archive (curl -F file=@/tmp/*.zip … to a remote host).
-    (re.compile(r"\bcurl\b[^\n]*-F\b[^\n]*file=@[^\n]*\.(?:zip|tar|gz)", re.I), "curl-exfil-post", "HIGH"),
+    (re.compile(r"\bcurl\b[^\n]{0,120}-F\b[^\n]{0,120}file=@[^\n]{0,120}\.(?:zip|tar|gz)", re.I), "curl-exfil-post", "HIGH"),
     # TLS-verification-disabled streaming download (curl -k | base64 -d | …).
-    (re.compile(r"\bcurl\b[^\n]*\s-[a-z]*k\b[^\n]*\|\s*(?:base64|gunzip|(?:ba|z)?sh|osascript)", re.I),
+    (re.compile(r"\bcurl\b[^\n]{0,120}\s-[a-z]*k\b[^\n]{0,120}\|\s*(?:base64|gunzip|(?:ba|z)?sh|osascript)", re.I),
      "curl-insecure-pipe", "HIGH"),
     # Fileless staging: nohup curl pulling a payload run in memory.
-    (re.compile(r"\bnohup\b[^\n]*\bcurl\b", re.I), "nohup-curl-fileless", "HIGH"),
+    (re.compile(r"\bnohup\b[^\n]{0,512}\bcurl\b", re.I), "nohup-curl-fileless", "HIGH"),
     # ClickLock (2026) password-coercion / anti-analysis: killing Activity
     # Monitor / SystemUIServer / NotificationCenter / Console. HIGH alone; the
     # tight-loop variant escalates to CRITICAL in _argv_signals (below).
-    (re.compile(r"\b(?:killall|pkill)\b[^\n]*\b(?:Activity[ _]?Monitor|"
+    (re.compile(r"\b(?:killall|pkill)\b[^\n]{0,512}\b(?:Activity[ _]?Monitor|"
                 r"SystemUIServer|NotificationCenter|Console|coreauthd)\b", re.I),
      "gui-kill-coercion", "HIGH"),
     # applescript:// URL-scheme execution (shell-history- and Terminal-warning-
@@ -765,9 +796,9 @@ _KILL_LOOP_RE = re.compile(
 # on a real victim endpoint (where the malware WILL proceed). Lower severity
 # (won't notify): legitimate tools also probe hardware, so this only corroborates.
 _ANTIVM_ARGV_RES = [
-    (re.compile(r"\bsysctl\b[^\n]*hw\.optional\.arm\.FEAT_", re.I), "antivm-cpu-feature-probe"),
-    (re.compile(r"\bsystem_profiler\b[^\n]*SPHardwareDataType", re.I), "antivm-hardware-probe"),
-    (re.compile(r"\bioreg\b[^\n]*(?:VMware|VirtualBox|QEMU|Parallels)", re.I), "antivm-hypervisor-probe"),
+    (re.compile(r"\bsysctl\b[^\n]{0,512}hw\.optional\.arm\.FEAT_", re.I), "antivm-cpu-feature-probe"),
+    (re.compile(r"\bsystem_profiler\b[^\n]{0,512}SPHardwareDataType", re.I), "antivm-hardware-probe"),
+    (re.compile(r"\bioreg\b[^\n]{0,512}(?:VMware|VirtualBox|QEMU|Parallels)", re.I), "antivm-hypervisor-probe"),
 ]
 
 # Apple-signed interpreters/utilities whose OWN path is trusted, so behavioral
@@ -1466,12 +1497,23 @@ def download_provenance(path):
     return (present, agent, origin, trusted)
 
 
+_HOSTILE_SCAN_LIMIT = 65536  # cap untrusted text before regex scanning (below)
+
+
 def _hostile_content(text):
     """Return the list of hostile-pattern names present in a blob of shell/command
     text (empty list = clean). Shared by shell-rc scanning and could back any
-    future text surface."""
+    future text surface.
+
+    The input is length-capped: the callers pass attacker-controlled text (full
+    same-user process argv, 512KB file bodies), and even with the interior
+    quantifiers now bounded, a single pathological line paid a large constant.
+    64KB covers any real command line and the hostile-bearing head of any script;
+    it is defence in depth on top of the per-pattern bounds, not the only guard."""
     if not text:
         return []
+    if len(text) > _HOSTILE_SCAN_LIMIT:
+        text = text[:_HOSTILE_SCAN_LIMIT]
     return sorted({name for rx, name in _HOSTILE_CONTENT_RES if rx.search(text)})
 
 
@@ -3325,7 +3367,11 @@ _INTERPRETERS = frozenset((
     "python", "python2", "python3", "perl", "ruby", "php", "osascript", "node",
 ))
 _INLINE_EXEC_FLAGS = frozenset(("-c", "-e"))
-_FETCH_RE = re.compile(r"\b(?:curl|wget|nscurl)\b.*?https?://", re.I | re.S)
+# Bounded interior run (not `.*?` over re.S): this runs in the check_behavior
+# pre-filter on every same-user process's full argv, so an unbounded lazy scan to
+# EOF at each `curl`/`wget` anchor was O(n^2) over ~100KB argv (siege ReDoS). A
+# fetch keyword and its URL sit within a few hundred chars in any real command.
+_FETCH_RE = re.compile(r"\b(?:curl|wget|nscurl)\b[^\n]{0,512}?https?://", re.I)
 
 # Apple-signed LOLBin launchers that merely WRAP the real payload. A launchd job
 # whose ProgramArguments start with one of these looks benign if you only score
@@ -4121,6 +4167,9 @@ def check_processes():
 _PIPE_EXEC_IDIOMS = frozenset((
     "pipe-to-shell", "pipe-to-interpreter", "osascript-shell", "base64-decode",
     "python-oneliner", "eval-subshell", "exec-eval",
+    # Pipe-free exec sinks that a fetch reaches without `| sh` (siege evasions):
+    # a command-substitution the interpreter executes, and a `| xargs … sh` hop.
+    "cmdsub-fetch-exec", "xargs-exec",
     # Windows equivalents: IEX is the PowerShell exec sink, FromBase64String the
     # decode half of the same download-cradle shape.
     "powershell-iex", "powershell-base64-decode"))
@@ -10928,11 +10977,32 @@ if IS_WIN:
             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
             WIN_PROGRAMDATA, WIN_APPDATA, WIN_LOCALAPPDATA,
             os.path.dirname(HOME), HOME) if p])
+    # Windows child-path (tree) protection is left as-is here; the verified siege
+    # finding was POSIX (realpath-vs-literal + exact-only matching), so the fix is
+    # scoped to it rather than blind-changing Windows behaviour no local run covers.
+    _PROTECTED_TREES = ()
 else:
-    _PROTECTED_EXACT = frozenset((
-        "/", "/Users", "/home", "/root", "/Applications", "/System", "/Library",
-        "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev",
-        "/usr", "/etc", "/var", "/private", "/opt", "/run", HOME))
+    # realpath-canonicalized (like the Windows branch above): `os.path.realpath`
+    # resolves the `/etc`->`/private/etc`, `/var`->`/private/var` symlinks on
+    # macOS, so the literal entries — which the guard compares against a REALPATH'd
+    # candidate — actually match instead of being dead (siege finding).
+    _PROTECTED_EXACT = frozenset(
+        os.path.realpath(p) for p in (
+            "/", "/Users", "/home", "/root", "/Applications", "/System", "/Library",
+            "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev",
+            "/usr", "/etc", "/var", "/private", "/opt", "/run", HOME))
+    # OS-integrity subtrees whose CONTENTS must also be refused, not just the bare
+    # directory node. _PROTECTED_EXACT matched by equality ONLY, so a destructive
+    # verb reached `/Library/LaunchDaemons`, `/etc/sudoers`, `/private/var/db/
+    # dslocal` (siege finding). Deliberately NARROW — only trees holding nothing an
+    # unprivileged operator should ever quarantine — so it never shadows the temp
+    # drop dirs (`/tmp`, `/var/folders`, `/dev/shm`, `/run/user`) or the
+    # app/user-software locations (`/Applications/*`, `/opt/*`, `/usr/local/*`)
+    # that ARE legitimate quarantine targets. realpath'd for the same reason.
+    _PROTECTED_TREES = tuple(sorted({
+        os.path.realpath(p) for p in (
+            "/etc", "/var/db", "/var/root", "/Library",
+            "/boot", "/proc", "/sys", "/lib", "/lib64")}))
 
 
 _FS_CASE_INSENSITIVE = None
@@ -10993,6 +11063,11 @@ def _is_protected_path(path):
     rpc = _cmp_path(rp)
     sep = os.sep
     if rpc in {_cmp_path(p) for p in _PROTECTED_EXACT}:
+        return True
+    # OS-integrity subtrees: refuse the tree, not merely its root node, so a file
+    # UNDER `/etc`, `/var/db`, `/Library`, … is refused too (siege finding).
+    if any(rpc == _cmp_path(t) or rpc.startswith(_cmp_path(t) + sep)
+           for t in _PROTECTED_TREES):
         return True
     strip = "\\" if IS_WIN else "/"
     if any(rpc == _cmp_path(p.rstrip(strip))
@@ -12128,8 +12203,18 @@ def _notary_emit_anchor(seq, head):
 
 
 def _notary_read_anchors(hours=24):
-    """Read anchors back OUT of the platform log store as {seq: head}."""
+    """Read anchors back OUT of the platform log store.
+
+    Returns (anchors, conflicts): `anchors` maps seq -> head, `conflicts` is the
+    set of seqs that appeared with MORE THAN ONE distinct head. A same-uid attacker
+    cannot EDIT a root-owned anchor, but they CAN append a second anchor line for a
+    seq whose head they forged; the old code collapsed duplicates last-wins and so
+    handed _notary_verify the forged head, which then certified a rewritten chain
+    clean (siege finding). The conflict set is the physical evidence — two anchors
+    for one seq — that the collapse discarded. Returns None when the channel is
+    unavailable (distinct from an empty result), preserved for the caller."""
     seen = {}
+    conflicts = set()
     if IS_MAC:
         # `process == "logger"` is an INDEXED predicate; the obvious
         # `eventMessage CONTAINS "AEGIS-ANCHOR"` is a full-text scan of the
@@ -12155,8 +12240,11 @@ def _notary_read_anchors(hours=24):
         return None  # channel unavailable — distinct from "no anchors found"
     for m in re.finditer(r"%s seq=(\d+) head=([0-9a-f]{16,64})" % _NOTARY_MARK,
                          out):
-        seen[int(m.group(1))] = m.group(2)
-    return seen
+        seq, head = int(m.group(1)), m.group(2)
+        if seq in seen and seen[seq] != head:
+            conflicts.add(seq)   # a shadow anchor was appended for this seq
+        seen[seq] = head
+    return seen, conflicts
 
 
 def notary_append():
@@ -12218,11 +12306,27 @@ def _notary_verify():
                             "by something without the local key" % seq)
         prev_head = link.get("head") or prev_head
 
-    anchors = _notary_read_anchors()
-    if anchors is None:
+    res = _notary_read_anchors()
+    if res is None:
         return problems, len(chain), "unavailable"
+    # Tolerate both the real (anchors, conflicts) tuple and a bare {seq: head}
+    # dict (test stubs / any older caller): the conflict signal is additive.
+    if isinstance(res, tuple):
+        anchors, conflicts = res
+    else:
+        anchors, conflicts = res, set()
     if not anchors:
         return problems, len(chain), "none-retained"
+    local_seqs = {link.get("seq") for link in chain if isinstance(link, dict)}
+    int_seqs = {s for s in local_seqs if isinstance(s, int)}
+    max_local = max(int_seqs) if int_seqs else -1
+    # A seq anchored twice with DIFFERENT heads: the attacker could not edit the
+    # genuine root-owned anchor, so they appended a shadow one to mask a rewrite of
+    # this link. The old last-wins collapse hid exactly this (siege finding).
+    for seq in sorted(s for s in conflicts if isinstance(s, int)):
+        problems.append(
+            "seq=%s: the OS log store holds TWO conflicting anchors — a shadow "
+            "anchor was appended to mask a rewrite of this link" % seq)
     matched = 0
     for link in chain:
         if not isinstance(link, dict):
@@ -12236,6 +12340,18 @@ def _notary_verify():
                 "seq=%s: the anchor in the OS log store says head=%s but the "
                 "local chain says head=%s — the local chain was rewritten"
                 % (link.get("seq"), want[:16], (link.get("head") or "?")[:16]))
+    # Tail truncation: the IMMEDIATE successor of the local chain's last link is
+    # anchored in the root-owned store, but the local link is gone — recent
+    # history was dropped (siege finding: a dropped tail showed no sequence gap and
+    # verified clean). Keyed on the CONTIGUOUS successor (max_local+1), never any
+    # higher orphan seq: a chain that legitimately reset to seq=1 after a 10MB log
+    # rotation leaves its in-window pre-rotation anchors carrying far-higher,
+    # non-contiguous seqs, which must not read as truncation.
+    if isinstance(max_local, int) and (max_local + 1) in anchors:
+        problems.append(
+            "seq=%s is anchored in the OS log store but absent from the local "
+            "chain, whose last link is seq=%s — the chain was truncated to drop "
+            "recent history" % (max_local + 1, max_local))
     return problems, len(chain), "ok:%d-anchors-matched" % matched
 
 
@@ -13765,8 +13881,17 @@ def cmd_watchdog():
             os.remove(WATCHDOG_ALERT)
     except Exception:
         pass
+    if not beat:
+        # Reached only when NOT armed (an armed box with no beat is 'stale' above,
+        # and returns 1): a genuinely uninstalled machine. Report that honestly
+        # instead of the old `(age or 0)//60` -> "OK — last heartbeat 0 min ago",
+        # which fabricated a healthy fresh beat where none exists (siege finding).
+        print("Aegis watchdog: no monitor is armed on this machine (no heartbeat, "
+              "launchd agent, or install marker found) — nothing to watch. Run "
+              "install.sh to start the background monitor.")
+        return 0
     print("Aegis watchdog: OK — last heartbeat %d min ago (pid %s)."
-          % ((age or 0) // 60, beat.get("pid", "?")))
+          % (age // 60, beat.get("pid", "?")))
     return 0
 
 
