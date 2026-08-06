@@ -119,24 +119,34 @@ class TestFilelessEvasions(unittest.TestCase):
 @unittest.skipIf(aegis.IS_WIN, "POSIX realpath/symlink semantics")
 class TestProtectedPathTrees(unittest.TestCase):
     def test_os_integrity_trees_are_refused(self):
-        for p in ("/etc", "/etc/hosts", "/etc/sudoers", "/etc/passwd",
-                  "/var/db", "/private/var/db", "/private/var/db/dslocal",
-                  "/Library/LaunchDaemons", "/Library/LaunchAgents/x.plist"):
+        # Protected on macOS AND Linux: /etc, /var/db and /Library are in
+        # _PROTECTED_TREES on both (realpath-canonicalized).
+        refuse = ["/etc", "/etc/hosts", "/etc/sudoers", "/etc/passwd", "/var/db",
+                  "/Library/LaunchDaemons", "/Library/LaunchAgents/x.plist"]
+        if aegis.IS_MAC:
+            # /etc and /var/db are symlinks to /private/* on macOS; the realpath'd
+            # aliases must be refused too. These paths are macOS-specific.
+            refuse += ["/private/var/db", "/private/var/db/dslocal",
+                       "/System/Library/LaunchDaemons"]
+        for p in refuse:
             self.assertTrue(aegis._is_protected_path(p),
                             "%s must be refused (protected system tree)" % p)
 
     def test_sip_and_home_still_protected(self):
-        for p in ("/System/Library/LaunchDaemons", "/usr/bin/ssh", "/Users",
-                  aegis.HOME):
+        for p in ("/usr/bin/ssh", "/Users", aegis.HOME):
             self.assertTrue(aegis._is_protected_path(p), p)
 
     def test_temp_and_app_and_user_files_stay_quarantinable(self):
+        # Quarantinable on every POSIX platform.
         allow = ["/tmp/evil", os.path.realpath(tempfile.gettempdir()) + "/evil",
-                 "/opt/x/mal", "/usr/local/bin/mal",
+                 "/usr/local/bin/mal",
                  os.path.join(aegis.HOME, "Downloads", "evil.dmg"),
                  os.path.join(aegis.HOME, ".ssh", "id_ed25519")]
         if aegis.IS_MAC:
-            allow.append("/Applications/Evil.app")
+            # On macOS /Applications/* and /opt/* are user-installable software,
+            # so they stay quarantinable; on Linux /opt is a trusted (package-
+            # managed) prefix, so it is legitimately protected there instead.
+            allow += ["/Applications/Evil.app", "/opt/x/mal"]
         for p in allow:
             self.assertFalse(aegis._is_protected_path(p),
                              "%s must remain quarantinable" % p)
