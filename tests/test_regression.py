@@ -2766,6 +2766,48 @@ class TestInstaller(unittest.TestCase):
         self.assertTrue(d.get("KeepAlive"))
         self.assertNotIn("StartInterval", d)
 
+    # The README says `bash install.sh` and `aegis.py install` "do the same
+    # thing" on macOS. They did not: the Python port dropped the four resource
+    # keys install.sh has always written, so anyone following the cross-platform
+    # path — including the refresh line `update-check` prints — got a monitor
+    # with no niceness, no low-priority IO, and (in watch mode) no bound on
+    # KeepAlive respawn. Asserting PARITY rather than a hardcoded list is the
+    # point: whichever installer gains a resource key, the other must match.
+    _RESOURCE_KEYS = ("ProcessType", "LowPriorityIO", "Nice", "ThrottleInterval")
+
+    def _install_py(self, *args):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        env["AEGIS_TESTING"] = "1"
+        env["AEGIS_TEST_LAUNCHCTL"] = os.path.join(self.bin, "launchctl")
+        r = subprocess.run([sys.executable, os.path.join(self.repo, "aegis.py"),
+                            "install", *args],
+                           env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        plist = os.path.join(self.home,
+                             "Library/LaunchAgents/com.charlie.aegis.plist")
+        lint = subprocess.run(["plutil", "-lint", plist],
+                              capture_output=True, text=True)
+        self.assertIn("OK", lint.stdout, lint.stdout + lint.stderr)
+        with open(plist, "rb") as f:
+            return plistlib.load(f)
+
+    def test_both_installers_agree_on_the_resource_keys(self):
+        sh = self._install("3600")
+        py = self._install_py("3600")
+        for key in self._RESOURCE_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, sh, "install.sh lost %s" % key)
+                self.assertIn(key, py, "aegis.py install lost %s" % key)
+                self.assertEqual(sh[key], py[key],
+                                 "%s differs between the two installers" % key)
+
+    def test_python_installer_throttles_keepalive_respawn(self):
+        py = self._install_py("watch", "600")
+        self.assertTrue(py.get("KeepAlive"))
+        self.assertEqual(py.get("ThrottleInterval"), 30)
+
     def test_rejects_non_numeric_interval(self):
         env = dict(os.environ)
         env["HOME"] = self.home

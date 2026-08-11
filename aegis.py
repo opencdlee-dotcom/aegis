@@ -14940,6 +14940,17 @@ def _install_mac(runtime, mode, interval):
         '    <key>ProgramArguments</key>\n    <array>\n%s    </array>\n'
         '%s'
         '    <key>RunAtLoad</key>\n    <true/>\n'
+        # Resource politeness, and not cosmetic: a full scan spawns many
+        # short-lived subprocesses for ~a minute, so an un-niced monitor is felt
+        # on a laptop. ThrottleInterval additionally bounds KeepAlive respawn in
+        # watch mode — without it a crash-looping watch is relaunched about once
+        # a second instead of every 30. install.sh has always written these
+        # four; this Python port dropped them, so the two installers disagreed
+        # while the README called them equivalent.
+        '    <key>ProcessType</key>\n    <string>Background</string>\n'
+        '    <key>LowPriorityIO</key>\n    <true/>\n'
+        '    <key>Nice</key>\n    <integer>10</integer>\n'
+        '    <key>ThrottleInterval</key>\n    <integer>30</integer>\n'
         '    <key>StandardOutPath</key>\n    <string>%s</string>\n'
         '    <key>StandardErrorPath</key>\n    <string>%s</string>\n'
         '  </dict>\n</plist>\n'
