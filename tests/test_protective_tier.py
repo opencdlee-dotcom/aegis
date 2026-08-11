@@ -543,6 +543,206 @@ class TestAssay(ProtectiveSandbox):
 
 
 # --------------------------------------------------------------------------- #
+# Assay coverage for the surfaces added in THIS release.
+#
+# Five detectors shipped with no positive control: outbound beacon recurrence,
+# the obfuscated-inline-payload argv scorer, community-intel grading, the
+# Windows COM/IFEO/AppInit diffs, and Sysmon event scoring. An unassayed
+# detector is exactly how the latch bug hid — reachable-looking, permanently
+# silent, and nothing fails.
+#
+# Every test below pins a property of the LANES, not of the detectors (those
+# have their own suites). The load-bearing one is `..._asserts_both_poles`: it
+# swaps the underlying detector for a dead stub AND for a hardwired-yes stub
+# and requires the lane to FAIL against both. A lane that only fed hostile
+# input would survive the hardwired-yes stub, which is the failure mode the
+# README's both-poles rule exists to prevent.
+# --------------------------------------------------------------------------- #
+class TestAssayCoversTheReleaseSurfaces(ProtectiveSandbox):
+
+    REQUIRED = ("beacon-recurrence", "argv-obfuscation", "intel-match",
+                "win-evasion", "sysmon-scoring")
+
+    # lane id -> (detector global, dead stub, hardwired-yes stub)
+    def _vacuity_table(self):
+        def f(sev, cat):
+            return [aegis.finding(sev, cat, "stub", "stub", "stub:%s" % cat)]
+        return {
+            "beacon-recurrence": (
+                "_beacon_recurrence",
+                lambda history, rows: [],
+                lambda history, rows: f("HIGH", "net-beacon")),
+            "argv-obfuscation": (
+                "_obfuscated_payload_signals",
+                lambda argv, idioms: [],
+                lambda argv, idioms: [("obfuscated-inline-payload", "HIGH"),
+                                      ("argv-encoded-loader", "HIGH")]),
+            "intel-match": (
+                "_intel_hash_finding",
+                lambda sha, path, where: None,
+                lambda sha, path, where: f("CRITICAL", "intel")[0]),
+            "win-evasion": (
+                "diff_ifeo",
+                lambda prior, cur: [],
+                lambda prior, cur: f("CRITICAL", "ifeo")),
+            "sysmon-scoring": (
+                "_sysmon_findings",
+                lambda rows: [],
+                lambda rows: f("HIGH", "sysmon")),
+        }
+
+    def setUp(self):
+        ProtectiveSandbox.setUp(self)
+        # The intel lane must be provably independent of the operator's real
+        # feed files: point them at sandbox paths holding junk, and reset the
+        # memo so a leak would show up as a lane failure rather than as a pass
+        # borrowed from whatever is cached.
+        self._intel_saved = {
+            k: getattr(aegis, k) for k in
+            ("INTEL_BAZAAR_FILE", "INTEL_THREATFOX_FILE", "_INTEL_CACHE")}
+        for name in ("INTEL_BAZAAR_FILE", "INTEL_THREATFOX_FILE"):
+            p = os.path.join(self.state, "junk-%s.json" % name.lower())
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write('{"hashes": ["not-a-hash"], "net": {"x": 1}}')
+            setattr(aegis, name, p)
+        aegis._INTEL_CACHE = None
+
+    def tearDown(self):
+        for k, v in self._intel_saved.items():
+            setattr(aegis, k, v)
+        ProtectiveSandbox.tearDown(self)
+
+    def _lane(self, lane_id):
+        lanes = {lid: fn for lid, _d, fn in aegis._assay_lanes()}
+        self.assertIn(lane_id, lanes,
+                      "no positive control for %s" % lane_id)
+        return lanes[lane_id]
+
+    def _asserts_both_poles(self, lane_id):
+        """A lane must fail against a DEAD detector and against a hardwired-yes
+        one. Only a control that feeds both poles can do both."""
+        detector, dead, always = self._vacuity_table()[lane_id]
+        real = getattr(aegis, detector)
+        try:
+            setattr(aegis, detector, dead)
+            self.assertFalse(self._lane(lane_id)("nonce%s" % lane_id),
+                             "%s passed against a DEAD %s — the lane never "
+                             "checks the hostile pole" % (lane_id, detector))
+            setattr(aegis, detector, always)
+            self.assertFalse(self._lane(lane_id)("nonce%s" % lane_id),
+                             "%s passed against a hardwired-yes %s — the lane "
+                             "never checks the benign pole"
+                             % (lane_id, detector))
+        finally:
+            setattr(aegis, detector, real)
+
+    # --- presence + currently holds ---------------------------------------
+    def test_every_new_release_surface_has_a_lane(self):
+        lanes = {lid for lid, _d, _f in aegis._assay_lanes()}
+        for required in self.REQUIRED:
+            self.assertIn(required, lanes,
+                          "detector %r shipped with no positive control"
+                          % required)
+
+    def test_each_new_lane_passes_and_is_nonce_parametric(self):
+        """Passing for one nonce could be a hardcoded fixture; passing for
+        several proves the stimulus is really built from the nonce."""
+        for lane_id in self.REQUIRED:
+            fn = self._lane(lane_id)
+            for nonce in ("0011223344556677", "a" * 16, "f0f0f0f0f0f0f0f0"):
+                self.assertTrue(fn(nonce), "lane %r failed for nonce %r"
+                                % (lane_id, nonce))
+
+    # --- the both-poles rule, enforced per lane ---------------------------
+    def test_beacon_recurrence_lane_asserts_both_poles(self):
+        self._asserts_both_poles("beacon-recurrence")
+
+    def test_argv_obfuscation_lane_asserts_both_poles(self):
+        self._asserts_both_poles("argv-obfuscation")
+
+    def test_intel_match_lane_asserts_both_poles(self):
+        self._asserts_both_poles("intel-match")
+
+    def test_win_evasion_lane_asserts_both_poles(self):
+        self._asserts_both_poles("win-evasion")
+
+    def test_sysmon_scoring_lane_asserts_both_poles(self):
+        self._asserts_both_poles("sysmon-scoring")
+
+    # --- containment: what these lanes must NOT touch ---------------------
+    def test_the_new_lanes_open_no_socket(self):
+        """None of these five surfaces needs the network to be proven, and the
+        intel one would be a live IOC lookup if it did."""
+        import socket
+        real = socket.socket
+
+        def refuse(*a, **k):
+            raise AssertionError("an assay lane opened a socket")
+        try:
+            socket.socket = refuse
+            for lane_id in self.REQUIRED:
+                self.assertTrue(self._lane(lane_id)("5" * 16), lane_id)
+        finally:
+            socket.socket = real
+
+    def test_the_new_lanes_write_no_state(self):
+        """The assay tier writes assay.json and nothing else. A lane that
+        recorded an observation or an incident would make running the
+        self-test change the data the self-test is about."""
+        before = sorted(os.listdir(self.state))
+        for lane_id in self.REQUIRED:
+            self.assertTrue(self._lane(lane_id)("6" * 16), lane_id)
+        self.assertEqual(before, sorted(os.listdir(self.state)))
+        self.assertFalse(os.path.exists(aegis.OBSERVATIONS_DIR))
+
+    def test_the_intel_lane_ignores_the_real_feed_files(self):
+        """It passes with the feed files holding junk, and leaves the memo
+        exactly as it found it — so it can never be a lookup against whatever
+        the operator happens to have downloaded."""
+        self.assertTrue(self._lane("intel-match")("7" * 16))
+        self.assertIsNone(aegis._INTEL_CACHE)
+
+    def test_the_windows_lanes_run_on_this_host_either_way(self):
+        """The author's machine is macOS. These diffs are pure over dicts, so a
+        Windows-gated lane would be a control that is never actually run — the
+        exact shape of unproven coverage the assay tier exists to expose."""
+        saved = aegis.IS_WIN
+        try:
+            for flag in (False, True):
+                aegis.IS_WIN = flag
+                for lane_id in ("win-evasion", "sysmon-scoring"):
+                    self.assertTrue(self._lane(lane_id)("8" * 16),
+                                    "lane %r failed with IS_WIN=%s"
+                                    % (lane_id, flag))
+        finally:
+            aegis.IS_WIN = saved
+
+    def test_the_windows_lanes_restore_the_platform_globals(self):
+        """They must patch the platform flags to grade literal Windows paths —
+        and leaking IS_WIN or a synthetic prefix table into the process would
+        silently re-grade every later sensor in the same run."""
+        watched = ("IS_WIN", "IS_MAC", "IS_LINUX", "TRUSTED_PREFIXES",
+                   "RISKY_PREFIXES")
+        before = {k: getattr(aegis, k) for k in watched}
+        for lane_id in ("win-evasion", "sysmon-scoring"):
+            self.assertTrue(self._lane(lane_id)("9" * 16), lane_id)
+            for k in watched:
+                self.assertEqual(before[k], getattr(aegis, k),
+                                 "lane %r leaked %s" % (lane_id, k))
+
+    def test_the_argv_lane_uses_an_inert_nonce_tagged_blob(self):
+        """No real payload, ever: the encoded stimulus must be built from the
+        nonce at runtime, so nothing resembling a live loader is committed."""
+        import inspect
+        src = inspect.getsource(aegis._assay_lanes)
+        self.assertNotIn("EICAR", src.upper())
+        start = src.index("def lane_argv_obfuscation")
+        body = src[start:src.index("def ", start + 10)]
+        self.assertIn("nonce", body)
+        self.assertIn("AEGIS-ASSAY-INERT", body)
+
+
+# --------------------------------------------------------------------------- #
 # Clipboard interdiction
 # --------------------------------------------------------------------------- #
 class TestClipboardGrammar(unittest.TestCase):
