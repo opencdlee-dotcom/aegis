@@ -29,14 +29,14 @@ on Linux is not a coverage gap.
 
 | Layer | macOS | Linux | Windows |
 |---|---|---|---|
-| **Persistence** | launchd agents/daemons, cron, login hooks, config profiles, background items (BTM) | systemd user+system units, XDG autostart, cron, `/etc/cron.d`, rc.local, profile.d | Run/RunOnce keys, Winlogon Shell/Userinit, Startup folders, scheduled tasks, services outside the protected trees |
+| **Persistence** | launchd agents/daemons, cron, login hooks, config profiles, background items (BTM) | systemd user+system units, XDG autostart, cron, `/etc/cron.d`, rc.local, profile.d | Run/RunOnce keys, Winlogon Shell/Userinit, Startup folders, scheduled tasks, services outside the protected trees — plus the evasion rung: HKCU CLSID COM-server hijacks, IFEO `Debugger`/SilentProcessExit, AppInit_DLLs |
 | **"Who vouches for this binary"** | `codesign`: apple / app-store / developer-id / adhoc / unsigned / broken | package-manager ownership: dpkg/rpm/pacman `os-managed` vs `unmanaged` | Authenticode: os-signed / signed-valid / unsigned / broken |
 | **Suspicious-exec rule** | unsigned/ad-hoc/broken in a user-writable path | **structural** — execution from a volatile dir, or a running binary deleted from disk (no ambient signing exists, so "unmanaged" is *not* treated as malicious: every locally built binary is unmanaged) | unsigned/broken in a user-writable path |
 | **Process + argv** | two `ps` calls joined on pid — asking for `comm` and `args` together truncates the exec path to 16 chars | `/proc` directly (works on minimal containers with no `procps`, and no argv truncation) | one CIM query (`Win32_Process`) |
 | **Network** | `lsof` listeners, `netstat` outbound | `/proc/net/tcp[6]` listeners + outbound, inode→pid via `/proc/*/fd` | `netstat -ano` listeners + outbound |
 | **Fileless TTPs scored in argv** | `osascript` password phish, `xattr -c`, `hdiutil -nobrowse`, keychain copy, `curl\|bash` | `LD_PRELOAD` injection, `/etc/ld.so.preload` writes, memfd exec, `systemctl enable /tmp/...`, `/etc/shadow` + SSH key access | `powershell -enc`, IEX download cradles, LOLBin proxy exec (mshta/regsvr32/rundll32/certutil), Defender/AMSI tamper, LSASS + SAM-hive dumps, shadow-copy deletion |
 | **OS engine harvest** | XProtect Remediator detections + definition age, Gatekeeper/syspolicy denials | `auth.log`/journal: SSH brute force, new accounts, privileged group adds, root logins | Event log: Defender detections (1116/1117), RTP disabled (5001), account creation (4720), audit-log cleared (1102), PowerShell script blocks (4104) |
-| **OS-unique surface** | XProtect Behavioral (Bastion), agent skills, wallet integrity | **loaded kernel modules** (ring-0 rootkit), **new setuid-root binaries** | **WMI event subscriptions** (fileless persistence), **Defender exclusion changes** |
+| **OS-unique surface** | XProtect Behavioral (Bastion), agent skills, wallet integrity | **loaded kernel modules** (ring-0 rootkit), **new setuid-root binaries** | **WMI event subscriptions** (fileless persistence), **Defender exclusion changes**, **Sysmon harvest** where installed (ProcessCreate scored in argv, unsigned driver loads, process tampering) |
 | **Hardening posture** | SIP, Gatekeeper, FileVault, firewall, stealth, Remote Login | SELinux/AppArmor enforcement, ufw/firewalld/nftables, sshd exposure + weak sshd settings, LUKS, unattended upgrades | Defender RTP + tamper protection + signature age, firewall profiles, BitLocker |
 | **Change-driven watch** | kqueue (sub-second) + live XProtect log tail | **inotify** via `ctypes` (sub-second), proven against a real kernel | short-cycle poll of the same watched path set |
 | **Background scheduling** | launchd agent | `systemd --user` service + timer | Scheduled Task |
@@ -97,6 +97,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Persistence watch** | New/changed launchd agents & daemons + cron, each program hashed + signature-classified, diffed vs baseline — **arguments inspected** (`bash -c "curl…\|sh"`, `base64 -d\|sh`, `/dev/tcp`), **DYLD_* injection env flagged**, **an interpreter run against a hidden `$HOME`/tmp script caught** (AMOS `/bin/bash ~/.agent`), and **vendor-label impersonation caught** (a `com.apple.*` / `com.google.*` / `com.microsoft.*` plist whose program isn't signed by that vendor's Team ID — RustBucket's `com.apple.systemupdate` behind a hijacked cert, ClickFix's fake `com.google.keystone`) | The #1 macOS infostealer signal — AMOS/Atomic, Poseidon/Odyssey persist via `LaunchAgents`/`LaunchDaemons` |
 | **Process watch** | Running processes whose executable is unsigned/ad-hoc **and** in a user-writable path | Malware runs ad-hoc-signed binaries from `/tmp`, `~/`, `/Users/Shared` |
 | **Behavioral watch** *(new)* | The full **command line** of every same-user process, scored for the fileless-stealer TTPs: a fake `osascript … display dialog … hidden answer` **password phish** (CRITICAL), `dscl . -authonly` local-password check, `xattr -c/-d com.apple.quarantine` **provenance strip**, `hdiutil attach -nobrowse` **invisible DMG mount**, `tccutil reset`, a `login.keychain-db` copy, a `curl -F file=@/tmp/*.zip` **exfil POST**, and a `curl … \| bash/osascript` **fileless pipeline** | The dominant 2025-26 stealer TTP is fileless — it runs through Apple-signed interpreters (bash/osascript/curl) whose *path* is trusted, so only the argv reveals the attack. This is the biggest coverage gain in this release |
+| **Obfuscated-payload argv** *(new)* | An interpreter's **inline-code flag** (`bash -c`, `python3 -c`, `node -e`, `perl/ruby/osascript -e`, `powershell -Command`) whose code argument carries an **encoded payload**: a ≥100-char base64-alphabet run that really decodes at ≥4.5 bits/char entropy, or an in-process **decode+execute** composition (`eval(Buffer.from(…,'base64'))`, `exec(base64.b64decode(…))`). MEDIUM alone (corroboration); HIGH when a fetch or exec sink co-occurs. The interpreter gate is mandatory, so Electron helpers/JWTs/cloud-CLI opaque argv are structurally out of scope. Measured live: 611 processes, **zero** false positives | The idiom tables above key on known hostile strings — packing the same logic in base64 sheds every one of them. The shape (interpreter + code flag + opaque blob) is the hard-to-vary invariant that catches the family not yet catalogued |
 | **XProtect harvest** *(new)* | Reads Apple's own **XProtect Remediator** detections straight from the unified log (`com.apple.XProtectFramework.PluginAPI`) — a `status != NoThreatDetected` event means Apple's engine found/removed malware (CRITICAL) — plus flags **stale XProtect definitions** (>60 days) | Piggybacks Apple's professionally-maintained, always-updating signature/behavioral engine for free — no entitlement, no cloud. The single highest-value signal a signature-less tool can add |
 | **Hot-dir watch** | Freshly-dropped unsigned Mach-O executables **and `.app` bundles** in Downloads/Desktop/tmp/Shared, tagged with **full download provenance** — not just *whether* a quarantine flag exists but **who** downloaded it and **from what URL**, resolved from the user's own `QuarantineEventsV2` store and the Chrome-family `downloads` table (both same-user-readable, **no Full Disk Access**). A binary with *no* quarantine flag bypassed Gatekeeper (side-loaded via `curl`/`scp`/AirDrop); one from a **trusted origin** (github/apple/brew/npm/pypi…) is demoted to the digest instead of notifying — provenance grades the finding, and because an attacker can supply it, it only ever *lowers* confidence, never severity, and never closes a finding (a timestomped file is never demoted). A fresh signed-but-**unnotarized** app additionally gets Gatekeeper's own `spctl` verdict surfaced (MEDIUM — a normal quarantined launch would refuse it, so one that runs was side-loaded or force-approved) | Catches a payload the moment it lands, before it runs — including the #1 delivery shape, a DMG/ZIP-dragged `.app`, which is a *directory* and invisible to any file-only check |
 | **Staging watch** *(new)* | Documented stealer **loot-staging artifacts** in `/tmp`/`/Users/Shared` — `app.zip` (Atomic), `ledger.zip` (Odyssey/Poseidon), `salmonela.zip` (MacSync), `wid.txt`, `.pass`, `shub_*`, a copied `login.keychain-db` | Smash-and-grab stealers stage loot then exfil in under a minute, leaving no persistence — this catches the residue |
@@ -113,6 +114,7 @@ Runs `aegis.py scan` on an interval and reports/alerts on:
 | **Config profiles** | A newly-installed configuration profile | Adds trusted certs / proxies / MDM control — an adware & DPRK vector |
 | **Extra persistence** | `/etc/crontab`, `/etc/periodic`, StartupItems, `/etc/rc.common` tamper — plus `/etc/hosts` (adware/phishing redirect), `/etc/pam.d` + `/etc/sudoers.d` (auth-chain backdoor, T1556), `sshd_config`, and **`~/.ssh/authorized_keys` / `~/.ssh/config`** (a newly-appearing key = the classic durable-remote-access implant, T1098.004; a `ProxyCommand` hijack runs code on every ssh) | Persistence surfaces beyond `LaunchAgents` and the user crontab |
 | **Network listeners** *(new)* | A **new** process accepting connections *from the network* (non-loopback TCP LISTEN, via `lsof`), baseline-diffed. Unsigned/ad-hoc binary in a user-writable path listening → HIGH (bind-shell / rogue-server shape); anything else → MEDIUM (logged). Loopback dev servers and SIP-pinned Apple daemons are excluded by design — but an Apple-signed *interpreter* serving the network (`python3 -m http.server 0.0.0.0`, `nc -l`) **is** tracked | LuLu-tier *outbound* blocking needs an Apple entitlement; the *listening* side is visible unprivileged, and a reachable listener is rare, durable, and high-signal |
+| **Outbound beacon shape** *(new)* | Outbound can't be baseline-diffed (a browser opens hundreds of ephemeral connections), so each scan's row set is *stored* instead, and the **same (binary, remote ip:port) pair** re-observed in ≥3 distinct scans spanning ≥45 minutes — from a **non-browser** binary outside every trusted prefix that is unsigned/ad-hoc *or* runs from a user-writable path — alerts HIGH. One incident per pair; continued recurrence climbs the occurrence count instead of re-alerting | Interval polling is structurally *good* at exactly one network shape: browser churn disappears between scans, a C2 beacon's endpoint keeps being there — recurrence is the residue |
 | **Browser extensions** | New Chromium-family / Firefox extension appearing | Malicious extensions exfiltrate sessions, cookies, wallet data |
 | **Editor extensions** | New VSCode / Cursor / VSCodium / Windsurf extension | A backdoored editor extension is a live supply-chain vector (Objective-See's *Paradox*, 2025, shipped via a trojanised Cursor extension) |
 | **Background items** *(capability-dependent)* | Where macOS permits `sfltool dumpbtm`, a **new** Login Item / SMAppService background agent is baseline-diffed. A new item with **no Team ID whose URL is in a user-writable path** → HIGH, else MEDIUM. If Apple requires interactive authorization, the sensor reports DEGRADED rather than clean. | Catches the modern persistence path the LaunchAgents-directory scan **cannot see** without pretending the data exists when macOS withholds it |
@@ -176,6 +178,16 @@ python3 aegis.py install 1800            # ...every 30 minutes
 python3 aegis.py install watch           # change-driven + 600s full-scan floor
 python3 aegis.py uninstall               # remove the registration, keep evidence
 
+python3 aegis.py setup                   # guided, idempotent walkthrough of the
+                                         #   OPT-IN tiers (canary/latch/decoys/
+                                         #   guard/heartbeat — the strongest
+                                         #   defenses are dormant until you say
+                                         #   yes; enabled tiers are skipped)
+python3 aegis.py update-check            # is ~/.aegis/aegis.py stale behind this
+                                         #   file? drift → exit 1 + the exact
+                                         #   refresh command (--remote: by-hand
+                                         #   compare against GitHub raw too)
+
 # On macOS `bash install.sh [watch] [interval]` remains available and does the
 # same thing; `aegis.py install` is the cross-platform equivalent.
 ```
@@ -202,6 +214,10 @@ python3 aegis.py replay [days] # backtest the CURRENT correlation logic against
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)
+python3 aegis.py intel update  # OPT-IN community IOC feeds (abuse.ch; no key) —
+                               #   scans then grade their own hashes/ip:ports
+                               #   against the LOCAL copy, offline
+python3 aegis.py intel status  # feed ages + entry counts; stale (>7d) called out
 python3 aegis.py canary        # plant ransomware canary/honeypot files (opt-in)
 python3 aegis.py canary remove # ...and remove them
 python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
@@ -214,6 +230,13 @@ python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
 python3 aegis.py bastion       # macOS only, OPT-IN, needs sudo: surface Apple's
                                #   XProtect Behavioral (Bastion) violations it
                                #   records but never alerts on
+python3 aegis.py rootwatch install
+                               # OPT-IN root witness (macOS/Linux): a <60-line
+                               #   root-owned script on a ROOT schedule that
+                               #   alerts within minutes when the heartbeat dies.
+                               #   Never self-elevates: run without sudo it
+                               #   changes NOTHING and prints the sudo line
+                               #   for you. `status` reports without root
 
 # RESPONSE TIER — opt-in, run by hand on a reviewed finding (never automatic):
 python3 aegis.py quarantine PATH     # atomically confine a file or valid .app bundle
@@ -260,6 +283,31 @@ access). **Re-run `install.sh` after editing `aegis.py`** to refresh the copy.
 scripts the same access. `aegis.py doctor` reports inaccessible coverage as
 degraded rather than clean. Broader access belongs in a future dedicated,
 signed Aegis app whose identity and requested capability can be reviewed.
+
+### Menu-bar status (macOS, optional)
+
+`menubar/aegis-status.30s.py` is an [xbar](https://xbarapp.com)/[SwiftBar](https://swiftbar.app)
+plugin that puts the one-glance verdict in the menu bar, refreshed every 30s:
+**🛡️** heartbeat fresh and no open incidents · **⚠️ N** incidents open (worst
+severity colors the dropdown) · **💀** heartbeat stale past the watchdog
+tolerance — the monitor itself is dead, the one state a dead monitor cannot
+report and the reason the plugin exists. The dropdown shows the last scan time,
+the open incidents (most severe first), degraded sensors, and heartbeat age,
+plus actions to open `~/.aegis/latest.md`, list incidents in Terminal, or scan
+now. **Strictly read-only on Aegis state, by construction:** it opens `aegis.db`
+with SQLite's `mode=ro&immutable=1` (it cannot lock, journal, or modify the
+store), caps every text read, never creates a file, and never touches the
+network — and it is standalone (it never imports `aegis.py`). Missing or corrupt
+state degrades a line, never the plugin; an absent `~/.aegis` renders a calm
+"not installed". Honors `AEGIS_STATE_DIR` for a non-default state dir.
+
+```bash
+# SwiftBar (copies into the plugin folder you chose in SwiftBar's settings):
+cp menubar/aegis-status.30s.py "$(defaults read com.ameba.SwiftBar PluginDirectory)/" && chmod +x "$(defaults read com.ameba.SwiftBar PluginDirectory)/aegis-status.30s.py"
+
+# xbar:
+mkdir -p ~/Library/Application\ Support/xbar/plugins && cp menubar/aegis-status.30s.py ~/Library/Application\ Support/xbar/plugins/ && chmod +x ~/Library/Application\ Support/xbar/plugins/aegis-status.30s.py
+```
 
 ---
 
@@ -320,6 +368,28 @@ killing Aegis) but only **partly forgery-resistant** — an attacker who reads
 chain. What they cannot do is make a *past* anchor say something else. The
 regression suite tests exactly that adversary: a forged chain with every head
 and MAC recomputed defeats all local checks and is still caught by the anchors.
+
+### Root witness — `rootwatch` (opt-in; the one privileged resident)
+
+The watchdog runs at the same uid as the monitor, so the attacker who kills
+Aegis kills the watchdog agent in the same sweep — the notary then makes the
+kill *evident later*, which is honest but slow. `rootwatch` is the opt-in
+answer: a root-owned script of **under 60 lines** (small enough to audit in
+one glance before installing it — that smallness is the security argument, not
+a style choice) on a **root** schedule (`/Library/LaunchDaemons` LaunchDaemon
+on macOS, a system — not `--user` — systemd timer on Linux) that re-reads the
+heartbeat every 10 minutes with the watchdog's own staleness tolerance baked
+in. A dead beat appends a root-owned alert line (`/Library/Application
+Support/Aegis/rootwatch.log` / `/var/log/aegis/rootwatch.log`), notifies your
+session, and writes syslog; a healthy beat exits silently. What root buys is
+exactly one thing: **a witness the same-uid attacker cannot unload, which
+alerts within minutes instead of leaving evidence for later.** What it does
+not buy: it prevents nothing, reads nothing but the one heartbeat file, and
+never writes into `~/.aegis` (a root-owned file there would break Aegis's own
+atomic-replace state writes). Aegis never self-elevates to install it —
+`rootwatch install` run unprivileged mutates nothing and prints the one sudo
+line for you to run yourself. Windows has no rootwatch yet: a SYSTEM
+scheduled task is future work, and the gap is stated rather than implied.
 
 ### Agent surface, session theft, and pre-authorization (added this release)
 
@@ -413,6 +483,8 @@ against a real machine rather than a fixture:**
 - **A source-aware attacker can kill Aegis instead of evading it.** No
   unprivileged tool can prevent that. The notary is the answer: it cannot stop
   the kill, but it makes the kill leave a sequence gap that cannot be backfilled.
+  The opt-in `rootwatch` tier shortens "later" to minutes — a root-scheduled
+  witness the same-uid attacker cannot kill along with the monitor.
 - **`curl … | sh` is never silently rewritten.** It is the documented install
   path for rustup and much else, so the clipboard grammar reports it and stops
   there. Only patterns with no legitimate use (fake password dialogs,
@@ -513,9 +585,11 @@ Not defensible, and not claimed: *"blocks malware."*
 A security tool sees everything, so it must be trustworthy *by construction*:
 - **Local-only on the scan/watch path *by default*** — out of the box the
   automatic monitor never phones home; no telemetry, no cloud. The only
-  network-touching feature you run **by hand** is `aegis.py vt` (VirusTotal
+  network-touching features you run **by hand** are `aegis.py vt` (VirusTotal
   reputation), which needs a key you supply and sends **only a hash, never a
-  file**; with no key the scanner never even imports the networking module.
+  file** — with no key the scanner never even imports the networking module —
+  and `aegis.py intel update`, which *downloads* two public IOC lists and
+  sends nothing at all; the scan only ever reads the local copy.
   The **one** background egress that exists is **off unless you deliberately
   turn it on**: the dead-man's-switch heartbeat (below) POSTs a small redacted
   liveness beat *only* if you set `AEGIS_HEARTBEAT_URL` or a `heartbeat_url` in
@@ -576,6 +650,23 @@ A security tool sees everything, so it must be trustworthy *by construction*:
   **only the sha256, never the file bytes**, and the scan/watch path makes **zero**
   network calls regardless — off by default, so the local-only guarantee stays
   literally true. No key ⇒ the command explains how to add one and does nothing.
+- ✅ **Community IOC intel — SHIPPED** as `aegis.py intel update|status`: an
+  **opt-in, by-hand** fetch of two public abuse.ch exports (MalwareBazaar
+  recent SHA256s, ThreatFox recent IOCs — no key, no account). What leaves the
+  machine: **nothing** (the request carries no payload about this host); what
+  arrives: a public IOC list, normalized and size-bounded under
+  `~/.aegis/intel/`. Scans then grade the sha256 hashes they **already
+  compute** (persistence programs, hot-dir drops) and live outbound `ip:port`
+  rows against the LOCAL copy — an exact hash match or a connection to a
+  listed C2 is CRITICAL with the malware family and first-seen date named.
+  This is `glean`'s doctrine (a dated, offline intel delta) generalized beyond
+  Apple's corpus to every OS. Off by default: with nothing fetched the surface
+  simply doesn't exist (absent, never a degraded sensor), the scan path stays
+  structurally network-free (`urllib` is imported only inside the fetch,
+  exactly like `vt`), and `intel status` calls out a copy staler than 7 days.
+  A failed refresh keeps the prior copy and says so; hostile/garbage feed data
+  parses to nothing rather than raising; the feed's domains/URLs are
+  deliberately not even written to disk — hashes and `ip:port` pairs only.
 - ✅ **Login-Item / SMAppService adapter — SHIPPED** via `sfltool dumpbtm`: when
   Apple exposes the inventory, a new Background Task Management item is diffed
   even without a `~/Library/LaunchAgents` plist. On macOS builds that require an
@@ -616,7 +707,7 @@ Developer-ID/Apple binaries are not over-flagged; `/bin/bash` classifies `apple`
 First-run against this machine correctly baselined 67 persistence items silently
 and flagged the disabled firewall.
 
-The `tests/` regression suite (**651 tests**, stdlib-only, fully sandboxed — never
+The `tests/` regression suite (**812 tests**, stdlib-only, fully sandboxed — never
 touches real `~/.aegis` or fires a notification) pins the fixes from the
 adversarial hardening pass ([BATTLE-LOG.md](BATTLE-LOG.md)) plus the
 research-grounded detection surfaces added since: a signed interpreter + hostile

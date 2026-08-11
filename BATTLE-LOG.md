@@ -1,3 +1,68 @@
+# Aegis — Recall build (2026-08-11, `/doit`: 4 detection surfaces, 4 opt-in tiers, 7 parallel branches)
+
+The prior passes hardened what Aegis already detected. This one answered a
+different question — *what does it structurally fail to see?* — and the honest
+answer was: the rung attackers move to **because** the watched surfaces are
+watched, the residue shapes that only recurrence reveals, the encoded payload no
+idiom table can enumerate, and community intel the tool refused on local-only
+grounds it had already learned to thread. Eight items, seven parallel branches,
+each tests-first with captured fail-before evidence, merged and verified as one.
+
+The build's own headline is a **measurement**, not a feature: the obfuscated-argv
+detector's first draft flagged 2 of 611 live processes — a test harness's own
+`bash -c` argv carrying hex-UUID scratchpad paths at 4.84 bits/char, over the
+4.5 entropy floor. The fix was not a higher threshold (which would blind the
+detector to real payloads) but an **alphabet-purity** rule: `+/` mixed with `-_`
+decodes under no base64 flavour, and that mix is precisely what a UUID path is.
+Re-measured: 0 of 611. The FP class is pinned by test, so the tightening cannot
+silently regress into the threshold it replaced.
+
+| # | Layer added | Shape | Tier |
+|---|-------------|-------|------|
+| 1 | **Windows persistence-evasion rung** | COM hijacking (`HKCU\...\CLSID\*\InprocServer32`/`LocalServer32`, T1546.015) → HIGH on a user-writable target; IFEO `Debugger` + `SilentProcessExit\MonitorProcess` (T1546.012/.008) → **CRITICAL** on an accessibility binary (sethc/utilman/osk/magnify/narrator/displayswitch), HIGH otherwise; AppInit_DLLs (T1546.010) → HIGH. Baseline-diffed, adopted on first sight. The rung an attacker reaches for *because* Run keys, schtasks and Winlogon are already watched. | detection (Windows) |
+| 2 | **Sysmon harvest** | Where the `Microsoft-Windows-Sysmon/Operational` channel exists: EID 1 scored through the **existing** argv machinery (no second grammar to drift), EID 6 unsigned driver → HIGH, EID 25 process tampering → HIGH. Channel absent = sensor **absent**, never DEGRADED — Sysmon not being installed is not a coverage gap. | detection (Windows) |
+| 3 | **Outbound beacon recurrence** | `check_outbound` could not baseline-diff (a browser opens hundreds) and said so; **recurrence keys on the opposite invariant** — browser churn does not survive between scans, a C2 pair does. Same `(binary, ip:port)` live now **and** in ≥3 stored scans spanning ≥45 min, non-browser, non-trusted-prefix, unsigned-or-user-writable → HIGH. Stored in the existing observation store; current-scan presence is required so a vanished binary cannot emit a 45-day zombie. | detection |
+| 4 | **Obfuscated-payload argv** | Gate 1 (mandatory): interpreter **+ inline-code flag** — so Electron/JWT/cloud-CLI argv is structurally out of scope, not merely tuned out. Gate 2: a ≥100-char base64 run at ≥4.5 bits/char that actually **decodes**, or an in-process decode+exec composition. MEDIUM alone (corroboration fodder), HIGH with a fetch idiom. `powershell -enc` defers to the existing rule: one argv, one strongest finding. | detection |
+| 5 | **Community IOC intel** | `intel update|status` — MalwareBazaar + ThreatFox recent exports, no key, **by hand**, `urllib` lazy-imported exactly like `vt`. The scan grades hashes it **already computes** and outbound endpoints against the local sets → CRITICAL with feed, family, first_seen. Pinned by a structural test that runs a full scan with `urlopen`, `create_connection` **and** `getaddrinfo` all replaced with raisers: the local-only guarantee stays literally true, not merely intended. | reputation (opt-in) |
+| 6 | **Root-owned witness (`rootwatch`)** | Closes the gap the README stated and could not fix: a same-uid attacker kills Aegis and its user-level watchdog together, and the notary only makes that evident *later*. The privileged component is a generated **59-line** script — line count and import set **pinned by tests**, because the smallness *is* the security argument — run by a root LaunchDaemon/systemd timer, reading one heartbeat and alerting through a root-owned log, syslog and the user's session. Never `sys.executable` (often a `$HOME` venv, itself an escalation); never writes into `~/.aegis`; non-root invocation mutates nothing and prints one sudo line. | survivability (opt-in, root) |
+| 7 | **`setup` + `update-check`** | The strongest tiers shipped **dormant** — canary, latch, decoy, guard, deadfall all opt-in and therefore off on most installs. `setup` walks them with one benefit-and-cost sentence each, default No, and **orchestrates the existing `cmd_*`** rather than reimplementing them (proven zero-mutation on all-No, idempotent on re-run). `update-check` catches the silent rot the README warned about in prose: the `~/.aegis` runtime copy staling behind an edited repo. | usability |
+| 8 | **Menu-bar status** | `menubar/aegis-status.30s.py` (xbar/SwiftBar, stdlib, never imports `aegis.py`): 🛡️ healthy · ⚠️ N incidents · 💀 **monitor not beating** — the state the plugin exists for. Structurally read-only (`mode=ro&immutable=1`), proven by a full before/after sandbox inventory on **every** invocation across 19 tests; hostile incident text is `|`-sanitized so it cannot forge xbar params. | usability |
+
+## Found while building (not shipped broken)
+
+| Where | Defect | Fix |
+|-------|--------|-----|
+| `SENSOR_BENIGN_NOTES` | **Three benign-cause notes were dead code.** `_benign_note_for()` does an exact dict lookup on the finding *category*, but three notes were keyed on the *surface id* — `browserext`, `ide_ext`, `wallet` — while those sensors emit `browser-ext`, `ide-ext`, `wallet-integrity`. So the incident card's promise ("KNOWN BENIGN CAUSES for the sensors that fired, so triage is a lookup rather than an investigation") silently rendered **nothing** for browser and editor extensions — the two most FP-prone surfaces in the tool, and the exact ones whose notes say "extensions you installed yourself" and "auto-update re-fires this". | keys corrected to the category spelling; per-category test pinning all three (deliberately not a source-regex scraper: these categories are also emitted from multi-line calls with a variable severity, which no regex reads reliably) |
+| `_parse_win_events` contract | The Sysmon harvest initially treated a probe failure as an empty window — the "an unanswered process table is not an empty one" defect this repo has already paid for twice. | non-answer returns `None` and DEGRADES; separate sentinel for "channel readable but read errored"; both poles tested |
+| `_install_mac` vs `install.sh` | **The two macOS installers disagreed, and the README called them equivalent.** `install.sh` has always written `ProcessType=Background`, `LowPriorityIO`, `Nice=10`, `ThrottleInterval=30`; the Python port dropped all four. So anyone following the cross-platform path — including the refresh line `update-check` itself prints — got a monitor that scans un-niced at normal IO priority for ~a minute at a time, and in **watch** mode had no bound on `KeepAlive` respawn (a crash-looping watch relaunches about once a second instead of every 30). Found by diffing the deployed plist before and after refreshing this machine's own agent, which is the only place the two installers' output meets. | four keys restored to `_install_mac`; pinned by a **parity** test (`test_both_installers_agree_on_the_resource_keys`) rather than a hardcoded list, so whichever installer gains a resource key next, the other must match; fail-before captured at 5 failures |
+
+**Guardrails honored:** the scan path still makes **zero** network calls (intel
+is by-hand, and the structural test proves the scan cannot reach the network even
+with feeds present); nothing new fires automatically off a heuristic; the one
+privileged component is opt-in, root-owned, and small enough to audit in a
+glance; every Windows sensor is a pure function over registry/event dicts so it
+is testable on any OS *and* exercised against a real Windows kernel in CI; and
+absent-vs-degraded is respected everywhere (no Sysmon, no intel, no `rootwatch`
+⇒ silent, never a manufactured coverage gap).
+
+**Verified:** full suite green (798 tests at merge, up from 671) on all five CI
+runners including two real Windows kernels; a live end-to-end scan on the
+author's machine (59s cold, 19s warm, one aggregated notification, only true
+positives already known to that machine, **zero** false positives from any new
+detector); the obfuscated-argv 0-of-611 live measurement above; and the intel
+tier exercised against the real fetched corpus (2,098 hashes + 2,715 endpoints
+loaded, sensor status OK, this machine clean, feed files unmodified by the scan).
+
+**One CI defect, and it was a test's fault, not the product's:** both Windows
+jobs failed identically because the `update-check` drift assertions rebuilt their
+expected string from a bare `_SELF_PATH`, while `_refresh_line()` **quotes** the
+path on Windows — correctly, since the reference machine's repo path contains
+both spaces and `&`. The fix makes the test use `_refresh_line()` as its own
+oracle rather than re-deriving its quoting rule, so the mismatch is now
+structurally impossible rather than merely corrected.
+
+---
+
 # Aegis — a governed battle-test: three loud rounds, sixteen defects (2026-08-05)
 
 A single `/battle-test` run under `/fable-mode` governance: right-size, hunt across

