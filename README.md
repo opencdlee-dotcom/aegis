@@ -261,6 +261,31 @@ scripts the same access. `aegis.py doctor` reports inaccessible coverage as
 degraded rather than clean. Broader access belongs in a future dedicated,
 signed Aegis app whose identity and requested capability can be reviewed.
 
+### Menu-bar status (macOS, optional)
+
+`menubar/aegis-status.30s.py` is an [xbar](https://xbarapp.com)/[SwiftBar](https://swiftbar.app)
+plugin that puts the one-glance verdict in the menu bar, refreshed every 30s:
+**🛡️** heartbeat fresh and no open incidents · **⚠️ N** incidents open (worst
+severity colors the dropdown) · **💀** heartbeat stale past the watchdog
+tolerance — the monitor itself is dead, the one state a dead monitor cannot
+report and the reason the plugin exists. The dropdown shows the last scan time,
+the open incidents (most severe first), degraded sensors, and heartbeat age,
+plus actions to open `~/.aegis/latest.md`, list incidents in Terminal, or scan
+now. **Strictly read-only on Aegis state, by construction:** it opens `aegis.db`
+with SQLite's `mode=ro&immutable=1` (it cannot lock, journal, or modify the
+store), caps every text read, never creates a file, and never touches the
+network — and it is standalone (it never imports `aegis.py`). Missing or corrupt
+state degrades a line, never the plugin; an absent `~/.aegis` renders a calm
+"not installed". Honors `AEGIS_STATE_DIR` for a non-default state dir.
+
+```bash
+# SwiftBar (copies into the plugin folder you chose in SwiftBar's settings):
+cp menubar/aegis-status.30s.py "$(defaults read com.ameba.SwiftBar PluginDirectory)/" && chmod +x "$(defaults read com.ameba.SwiftBar PluginDirectory)/aegis-status.30s.py"
+
+# xbar:
+mkdir -p ~/Library/Application\ Support/xbar/plugins && cp menubar/aegis-status.30s.py ~/Library/Application\ Support/xbar/plugins/ && chmod +x ~/Library/Application\ Support/xbar/plugins/aegis-status.30s.py
+```
+
 ---
 
 ## Response tier — act on a finding (opt-in, staged, reversible-by-default)
