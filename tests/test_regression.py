@@ -180,6 +180,19 @@ class Sandbox(unittest.TestCase):
             "CANARY_STATE": os.path.join(self.state, "canaries.json"),
             # vt_key must be sandboxed so no test reads or writes the real key.
             "VT_KEY_FILE": os.path.join(self.state, "vt_key"),
+            # Community-intel artifacts (aegis.py intel …). Pinned so a real
+            # feed the developer fetched into ~/.aegis/intel can never plant
+            # nondeterministic CRITICAL findings into scan-level tests. The
+            # parsed-set cache is reset for the same reason, in both
+            # directions: no test may see the real sets, and no later test may
+            # see a stale sandboxed set (the mtime-keyed cache would otherwise
+            # outlive tearDown's path restore).
+            "INTEL_DIR": os.path.join(self.state, "intel"),
+            "INTEL_BAZAAR_FILE": os.path.join(self.state, "intel",
+                                              "malwarebazaar.json"),
+            "INTEL_THREATFOX_FILE": os.path.join(self.state, "intel",
+                                                 "threatfox.json"),
+            "_INTEL_CACHE": None,
             # The listener surface shells to lsof (live host state). Point it
             # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
             # tests are deterministic; listener tests call the parse/diff
@@ -2280,6 +2293,298 @@ class TestVTReputation(Sandbox):
         self.assertEqual(rc, 0)
         self.assertTrue(seen["url"].endswith(sha), "only the hash is in the URL")
         self.assertEqual(seen["key"], "secret")
+
+
+class _FakeFeedResp:
+    """Minimal urlopen()-shaped response for the intel transport stub."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        return self._payload if n is None or n < 0 else self._payload[:n]
+
+
+# --------------------------------------------------------------------------- #
+# Community IOC intel (`aegis.py intel …`) — the opt-in, by-hand feed layer.
+# Doctrine mirror of the vt tests above: `intel update` is the only half that
+# may touch the network (stubbed here, both feed formats exercised from
+# fixtures), and the scan path only ever GRADES the local copy — proven
+# structurally by running a full scan with the transport booby-trapped to
+# explode. No intel fetched ⇒ the surface is absent, never degraded.
+# --------------------------------------------------------------------------- #
+class TestIntelFeeds(Sandbox):
+    SHA_BAZAAR = "11" * 32
+    SHA_TF = "33" * 32
+    C2 = "185.10.9.3:4444"
+
+    def _bazaar_text(self, sha=None):
+        sha = sha or self.SHA_BAZAAR
+        return (
+            "################################################################\n"
+            "# MalwareBazaar recent malware samples (SHA256 hashes)         #\n"
+            "# Last updated: 2026-08-11 13:43:48 UTC                        #\n"
+            "################################################################\n"
+            "#\n"
+            "# sha256_hash\n"
+            + sha + "\n"
+            + "not-a-hash\n"
+            + sha.upper() + "\n"          # duplicate (case-folded) → one entry
+            + "22" * 32 + "\n")
+
+    def _threatfox_json(self, sha=None, c2=None):
+        """The real export shape: dict of id → list of IOC rows, plus garbage
+        groups/rows that must be skipped, never raised on."""
+        sha = sha or self.SHA_TF
+        return json.dumps({
+            "1872298": [{
+                "ioc_value": c2 or self.C2, "ioc_type": "ip:port",
+                "threat_type": "botnet_cc", "malware": "win.cobalt_strike",
+                "malware_printable": "Cobalt Strike",
+                "first_seen_utc": "2026-08-01 00:00:00",
+                "confidence_level": 100}],
+            "1872299": [{
+                "ioc_value": "j4lpcxth.en-us-slimsounds.example",
+                "ioc_type": "domain", "malware_printable": "ClearFake",
+                "first_seen_utc": "2026-08-11 14:08:51"}],
+            "1872300": [{
+                "ioc_value": sha, "ioc_type": "sha256_hash",
+                "malware_printable": "AMOS",
+                "first_seen_utc": "2026-08-02 12:00:00"}],
+            "1872301": ["garbage", 42, {"ioc_value": 5, "ioc_type": "ip:port"}],
+            "1872302": "not-a-list",
+        })
+
+    def _stub_transport(self, mapping):
+        """Route urlopen by URL fragment to fixture bytes or an exception."""
+        import urllib.request
+
+        def fake_urlopen(req, timeout=0):
+            url = getattr(req, "full_url", req)
+            for frag, payload in mapping.items():
+                if frag in url:
+                    if isinstance(payload, Exception):
+                        raise payload
+                    return _FakeFeedResp(payload)
+            raise AssertionError("unexpected fetch: %s" % url)
+
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", saved)
+
+    def _write_intel(self, hashes_list=(), tf_hashes=None, tf_net=None,
+                     bazaar_fetched=None, tf_fetched=None):
+        aegis.save_json(aegis.INTEL_BAZAAR_FILE, {
+            "feed": "MalwareBazaar", "fetched_at": bazaar_fetched or
+            aegis.now_iso(), "count": len(hashes_list),
+            "hashes": list(hashes_list)})
+        aegis.save_json(aegis.INTEL_THREATFOX_FILE, {
+            "feed": "ThreatFox", "fetched_at": tf_fetched or aegis.now_iso(),
+            "hashes": tf_hashes or {}, "net": tf_net or {}})
+
+    # --- intel update (by-hand fetch; transport always stubbed) -----------
+    def test_update_parses_both_feed_formats(self):
+        self._stub_transport({
+            "bazaar.abuse.ch": self._bazaar_text().encode(),
+            "threatfox.abuse.ch": self._threatfox_json().encode()})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("update"), 0)
+        bz = aegis.load_json(aegis.INTEL_BAZAAR_FILE, None)
+        self.assertIn(self.SHA_BAZAAR, bz["hashes"])
+        self.assertNotIn("not-a-hash", bz["hashes"])
+        self.assertEqual(bz["hashes"].count(self.SHA_BAZAAR), 1,
+                         "duplicate hashes must be folded to one entry")
+        self.assertTrue(bz.get("fetched_at"))
+        tf = aegis.load_json(aegis.INTEL_THREATFOX_FILE, None)
+        self.assertEqual(tf["hashes"][self.SHA_TF]["family"], "AMOS")
+        self.assertEqual(tf["net"][self.C2]["family"], "Cobalt Strike")
+        self.assertEqual(tf["net"][self.C2]["first_seen"],
+                         "2026-08-01 00:00:00")
+        # Privacy posture: hashes and ip:ports only — the feed's domains/URLs
+        # are never written to disk.
+        self.assertNotIn("slimsounds", json.dumps(tf))
+        if os.name == "posix":
+            for p in (aegis.INTEL_BAZAAR_FILE, aegis.INTEL_THREATFOX_FILE):
+                self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_update_failure_keeps_prior_data_and_says_so(self):
+        self._write_intel(hashes_list=[self.SHA_BAZAAR],
+                          tf_net={self.C2: {"family": "Cobalt Strike",
+                                            "first_seen": None}})
+        self._stub_transport({"abuse.ch": OSError("connection refused")})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("update"), 1)
+        self.assertIn("prior", buf.getvalue().lower())
+        bz = aegis.load_json(aegis.INTEL_BAZAAR_FILE, None)
+        self.assertEqual(bz["hashes"], [self.SHA_BAZAAR],
+                         "a failed fetch must never clobber the prior copy")
+        tf = aegis.load_json(aegis.INTEL_THREATFOX_FILE, None)
+        self.assertIn(self.C2, tf["net"])
+
+    def test_garbage_feed_data_never_raises(self):
+        # Bytes that are neither valid text-export nor JSON must fail SOFT:
+        # non-zero exit, message, no artifact written.
+        self._stub_transport({"abuse.ch": b"\x00\xffgarbage{{{"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("update"), 1)
+        self.assertFalse(os.path.exists(aegis.INTEL_BAZAAR_FILE))
+        self.assertFalse(os.path.exists(aegis.INTEL_THREATFOX_FILE))
+        # And the pure parsers never raise on hostile shapes.
+        self.assertEqual(aegis._parse_bazaar_sha256_export("#c\nzz\n\n"), [])
+        self.assertEqual(aegis._parse_threatfox_export(["x", 42, None]),
+                         ({}, {}))
+        self.assertEqual(
+            aegis._parse_threatfox_export(
+                {"1": ["y", {"ioc_value": 5, "ioc_type": "ip:port"}],
+                 "2": "zz", "3": None}),
+            ({}, {}))
+        self.assertEqual(aegis._parse_threatfox_export("a string"), ({}, {}))
+
+    def test_bad_action_prints_usage(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("bogus"), 1)
+        self.assertIn("usage", buf.getvalue())
+
+    # --- scan-path grading (offline, read-only) ----------------------------
+    def _plant_payload_and_persistence(self):
+        payload = os.path.join(self.tmp, "payload.sh")
+        with open(payload, "w") as f:
+            f.write("#!/bin/sh\necho evil\n")
+        rec = aegis._finish_persist_record(
+            aegis._persist_record(label="com.evil.updater"), payload, [payload])
+        saved = aegis.snapshot_persistence
+        aegis.snapshot_persistence = lambda: {"launchd:" + payload: rec}
+        self.addCleanup(setattr, aegis, "snapshot_persistence", saved)
+        return payload, aegis.sha256(payload)
+
+    def _booby_trap_network(self):
+        """The structural guarantee, enforced: ANY python-level network use
+        during the scan raises straight through the test."""
+        import socket
+        import urllib.request
+
+        def boom(*a, **k):
+            raise AssertionError("the scan path touched the network")
+
+        for mod, attr in ((urllib.request, "urlopen"),
+                          (socket, "create_connection"),
+                          (socket, "getaddrinfo")):
+            saved = getattr(mod, attr)
+            setattr(mod, attr, boom)
+            self.addCleanup(setattr, mod, attr, saved)
+
+    def test_scan_with_intel_present_never_touches_network_and_flags_hash(self):
+        payload, sha = self._plant_payload_and_persistence()
+        self._write_intel(hashes_list=[sha],
+                          tf_hashes={sha: {"family": "AMOS",
+                                           "first_seen": "2026-08-02 12:00:00"}})
+        self._booby_trap_network()
+        aegis.cmd_scan(quiet=True)  # must complete — no urlopen, no sockets
+        latest = aegis.load_json(aegis.LATEST_JSON, {})
+        hits = [f for f in latest.get("findings", [])
+                if f["category"] == "intel"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "CRITICAL")
+        self.assertIn("Known-malware hash", hits[0]["title"])
+        self.assertEqual(hits[0].get("sha256"), sha)
+        self.assertIn("AMOS", hits[0]["detail"])
+        self.assertIn("first seen", hits[0]["detail"])
+
+    def test_scan_with_non_matching_intel_stays_silent(self):
+        self._plant_payload_and_persistence()
+        self._write_intel(hashes_list=["44" * 32],
+                          tf_hashes={"55" * 32: {"family": "X",
+                                                 "first_seen": None}})
+        self._booby_trap_network()
+        aegis.cmd_scan(quiet=True)
+        latest = aegis.load_json(aegis.LATEST_JSON, {})
+        self.assertEqual([f for f in latest.get("findings", [])
+                          if f["category"] == "intel"], [])
+
+    def test_no_intel_files_means_surface_absent_not_degraded(self):
+        self._plant_payload_and_persistence()
+        self._booby_trap_network()
+        aegis.cmd_scan(quiet=True)
+        latest = aegis.load_json(aegis.LATEST_JSON, {})
+        self.assertEqual([f for f in latest.get("findings", [])
+                          if f["category"] == "intel"], [])
+        self.assertNotIn("intel", [h["sensor_id"]
+                                   for h in aegis.get_sensor_health()],
+                         "no intel ⇒ no sensor row at all (absent, not "
+                         "degraded)")
+
+    def test_findings_carrying_sha256_are_graded(self):
+        # The hot-dir/app-bundle route: any finding that already carries a
+        # sha256 is graded without re-hashing anything.
+        sha = "55" * 32
+        self._write_intel(tf_hashes={sha: {"family": "AMOS",
+                                           "first_seen": None}})
+        prior = [aegis.finding(
+            "HIGH", "hot-dir", "Unsigned executable in watched folder",
+            "detail", "fp1", sha256=sha, path="/x/y")]
+        fs = aegis.check_intel({}, prior)
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+        self.assertIn("ThreatFox", fs[0]["detail"])
+        # Robustness: malformed records and findings grade to nothing.
+        self.assertEqual(
+            aegis.check_intel({"k": "notadict", "j": {"sha256": None}},
+                              [{}, "x"]), [])
+
+    def test_outbound_connection_to_known_c2_is_critical(self):
+        self._write_intel(tf_net={self.C2: {"family": "Cobalt Strike",
+                                            "first_seen": "2026-08-01"}})
+        saved = aegis._outbound_rows
+        aegis._outbound_rows = lambda: [("/Users/me/payload",
+                                         "185.10.9.3", "4444")]
+        self.addCleanup(setattr, aegis, "_outbound_rows", saved)
+        fs = [f for f in aegis.check_outbound() if f["category"] == "intel"]
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "CRITICAL")
+        self.assertIn("Cobalt Strike", fs[0]["detail"])
+        self.assertEqual(fs[0].get("remote"), "185.10.9.3")
+        self.assertEqual(fs[0].get("port"), "4444")
+        # Control: a non-listed endpoint produces no intel finding.
+        aegis._outbound_rows = lambda: [("/Users/me/payload", "8.8.8.8",
+                                         "443")]
+        self.assertEqual([f for f in aegis.check_outbound()
+                          if f["category"] == "intel"], [])
+
+    # --- intel status -------------------------------------------------------
+    def test_status_reports_ages_counts_and_stale(self):
+        stale_ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                 time.gmtime(time.time() - 10 * 86400))
+        self._write_intel(hashes_list=["22" * 32], bazaar_fetched=stale_ts,
+                          tf_net={self.C2: {"family": "Cobalt Strike",
+                                            "first_seen": None}})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel("status"), 0)
+        out = buf.getvalue()
+        for line in out.splitlines():
+            if "MalwareBazaar" in line:
+                self.assertIn("STALE", line)
+                self.assertIn("1 ", line)  # entry count is reported
+            if "ThreatFox" in line:
+                self.assertNotIn("STALE", line)
+
+    def test_status_with_nothing_fetched_explains_opt_in(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(aegis.cmd_intel(), 0)  # default action = status
+        out = buf.getvalue()
+        self.assertIn("not fetched", out)
+        self.assertIn("intel update", out)
 
 
 # --------------------------------------------------------------------------- #

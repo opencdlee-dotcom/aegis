@@ -251,6 +251,21 @@ ACTION_LOG = os.path.join(STATE_DIR, "actions.jsonl")
 VT_KEY_FILE = os.path.join(STATE_DIR, "vt_key")
 VT_API_URL = "https://www.virustotal.com/api/v3/files/"
 
+# Community IOC intel (`aegis.py intel …`): normalized, size-bounded local
+# artifacts under ~/.aegis/intel, written ONLY by the by-hand `intel update`
+# command (public abuse.ch exports — no key, no account). The scan path READS
+# these files and never fetches them: same doctrine as vt, network I/O exists
+# only inside an explicit by-hand command with urllib lazily imported there.
+INTEL_DIR = os.path.join(STATE_DIR, "intel")
+INTEL_BAZAAR_FILE = os.path.join(INTEL_DIR, "malwarebazaar.json")
+INTEL_THREATFOX_FILE = os.path.join(INTEL_DIR, "threatfox.json")
+INTEL_BAZAAR_URL = "https://bazaar.abuse.ch/export/txt/sha256/recent/"
+INTEL_THREATFOX_URL = "https://threatfox.abuse.ch/export/json/recent/"
+INTEL_STALE_DAYS = 7
+INTEL_MAX_HASHES = 250000   # hard bound on stored/loaded entries (memory cap)
+INTEL_MAX_NET = 50000
+INTEL_MAX_FETCH_BYTES = 32 * 1024 * 1024
+
 # --- Survivability: dead-man's switch + tamper-evidence ---------------------- #
 # A same-uid attacker can SIGKILL Aegis or `launchctl bootout` its agent and
 # blind every layer at once — silently (ATT&CK T1562.001). An unprivileged tool
@@ -6362,7 +6377,11 @@ def check_outbound():
         if key in seen:
             continue
         seen.add(key)
-        f = _outbound_finding(path, rip, rport)
+        # Community intel first (local set lookup): a known-C2 endpoint match
+        # is CRITICAL regardless of the binary's signature; only the rest
+        # falls through to the signature-gated generic scorer.
+        f = _intel_net_finding(path, rip, rport) or \
+            _outbound_finding(path, rip, rport)
         if f:
             findings.append(f)
     return findings
@@ -9006,6 +9025,13 @@ def gather_all(baseline_snap, current_snap, health=None):
             findings += _collect_sensor(sensor_id, fn, health_sink, *args)
     finally:
         _PROC_SNAPSHOT = None
+    # Community-intel grading (see cmd_intel) — a local set lookup over the
+    # hashes the sensors above already computed plus the persistence
+    # snapshot's. Scheduled only when local intel EXISTS: a machine that never
+    # ran `intel update` has no "intel" sensor at all (absent, not degraded).
+    if any(_intel_sets()):
+        findings += _collect_sensor("intel", check_intel, health_sink,
+                                    current_snap, findings)
     # Stamp the human-presence regime once per scan (not per finding — the
     # probe shells out, and paying that per finding would be absurd). This is
     # EVIDENCE ONLY and must stay that way: idle time is forgeable by a
@@ -10007,6 +10033,8 @@ def cmd_status():
         "✓" if _heartbeat_url() else "·", "Off-host heartbeat",
         "configured (out-of-band alerting on)" if _heartbeat_url()
         else "off (local-only; set AEGIS_HEARTBEAT_URL to enable)"))
+    intel_mark, intel_text = _intel_summary()
+    print("  %s %-32s %s" % (intel_mark, "Intel feeds", intel_text))
     if os.path.exists(WATCHDOG_ALERT):
         try:
             with open(WATCHDOG_ALERT, encoding="utf-8") as f:
@@ -10115,6 +10143,325 @@ def cmd_vt(target):
           % (sha, verdict.upper(), mal, susp, total, sha))
     log_run("vt %s -> %s (%d/%d)" % (sha[:16], verdict, mal, total))
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Community IOC intel (`aegis.py intel …`) — glean's doctrine generalized to
+# every OS: a dated, offline intel corpus graded over work the scan ALREADY
+# does. `intel update` is the by-hand fetch half (two public abuse.ch exports;
+# nothing about this machine is in the request and nothing but a public list
+# arrives); the scan half only ever READS the normalized local artifacts. With
+# no fetched intel the surface simply does not exist — never a degraded
+# sensor — and the scan path stays structurally incapable of network I/O.
+# --------------------------------------------------------------------------- #
+
+_INTEL_CACHE = None  # (file stat stamp, sha256→meta, "ip:port"→meta)
+
+
+def _looks_like_ip_port(s):
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", s or ""))
+
+
+def _intel_str(v):
+    """Feed metadata sanitizer: a short non-empty string or nothing — a hostile
+    feed value can't smuggle structures into state files or finding text."""
+    if isinstance(v, str) and v.strip():
+        return v.strip()[:120]
+    return None
+
+
+def _parse_bazaar_sha256_export(text):
+    """Pure parser: MalwareBazaar's plain-text SHA256 export (`#` comment
+    lines, one hash per line) → sorted, case-folded, deduplicated list.
+    Garbage lines are dropped, never raised on."""
+    out = set()
+    for line in (text or "").splitlines():
+        s = line.strip().strip('",')
+        if not s or s.startswith("#"):
+            continue
+        if _looks_like_sha256(s):
+            out.add(s.lower())
+            if len(out) >= INTEL_MAX_HASHES:
+                break
+    return sorted(out)
+
+
+def _parse_threatfox_export(data):
+    """Pure normalizer: ThreatFox's JSON export (dict of id → list of IOC
+    rows) → (sha256→meta, "ip:port"→meta). ONLY hashes and ip:port pairs are
+    kept — the feed's domains/URLs are deliberately not written anywhere (the
+    scan computes nothing they could match, and the privacy posture is to
+    store nothing it doesn't use). Never raises on garbage shapes."""
+    hashes, net = {}, {}
+    if isinstance(data, dict):
+        groups = list(data.values())
+    elif isinstance(data, list):
+        groups = [data]
+    else:
+        return hashes, net
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for row in group:
+            if not isinstance(row, dict):
+                continue
+            val, typ = row.get("ioc_value"), row.get("ioc_type")
+            if not isinstance(val, str) or not isinstance(typ, str):
+                continue
+            meta = {"family": _intel_str(row.get("malware_printable")
+                                         or row.get("malware")),
+                    "first_seen": _intel_str(row.get("first_seen_utc"))}
+            if typ == "sha256_hash" and _looks_like_sha256(val) \
+                    and len(hashes) < INTEL_MAX_HASHES:
+                hashes[val.lower()] = meta
+            elif typ == "ip:port" and _looks_like_ip_port(val) \
+                    and len(net) < INTEL_MAX_NET:
+                net[val] = meta
+    return hashes, net
+
+
+def _intel_sets():
+    """The local IOC sets as (sha256→meta, "ip:port"→meta), each meta
+    {feed, family, first_seen}. Reads LOCAL artifacts only; absent files ⇒
+    empty maps. Memoized on the files' (mtime, size) so one scan — and every
+    lap of cmd_watch's long-lived loop — pays two stat() calls rather than a
+    reparse, while a by-hand `intel update` is picked up on the very next
+    scan. Entry caps and key re-validation bound memory even against a
+    tampered oversize or hand-edited artifact."""
+    global _INTEL_CACHE
+    stamp = []
+    for path in (INTEL_BAZAAR_FILE, INTEL_THREATFOX_FILE):
+        try:
+            st = os.stat(path)
+            stamp.append((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            stamp.append((path, None, None))
+    stamp = tuple(stamp)
+    if _INTEL_CACHE is not None and _INTEL_CACHE[0] == stamp:
+        return _INTEL_CACHE[1], _INTEL_CACHE[2]
+    hashes, net = {}, {}
+
+    def adopt(mapping, target, cap, valid, feed):
+        if not isinstance(mapping, dict):
+            return
+        for key, meta in mapping.items():
+            if len(target) >= cap:
+                return
+            if not (isinstance(key, str) and valid(key)):
+                continue
+            meta = meta if isinstance(meta, dict) else {}
+            target[key.lower()] = {
+                "feed": feed, "family": _intel_str(meta.get("family")),
+                "first_seen": _intel_str(meta.get("first_seen"))}
+
+    doc = load_json(INTEL_BAZAAR_FILE, None)
+    if isinstance(doc, dict) and isinstance(doc.get("hashes"), list):
+        for h in doc["hashes"][:INTEL_MAX_HASHES]:
+            if isinstance(h, str) and _looks_like_sha256(h):
+                hashes[h.lower()] = {"feed": "MalwareBazaar", "family": None,
+                                     "first_seen": None}
+    doc = load_json(INTEL_THREATFOX_FILE, None)
+    if isinstance(doc, dict):
+        # ThreatFox meta wins on overlap: it names the family.
+        adopt(doc.get("hashes"), hashes, INTEL_MAX_HASHES,
+              _looks_like_sha256, "ThreatFox")
+        adopt(doc.get("net"), net, INTEL_MAX_NET,
+              _looks_like_ip_port, "ThreatFox")
+    _INTEL_CACHE = (stamp, hashes, net)
+    return hashes, net
+
+
+def _intel_hash_finding(sha, path, where):
+    if not sha:
+        return None
+    meta = _intel_sets()[0].get(str(sha).lower())
+    if meta is None:
+        return None
+    return finding(
+        "CRITICAL", "intel", "Known-malware hash (community intel)",
+        "%s is byte-identical to a sample on the %s IOC feed (%s, first seen "
+        "%s) — found as %s. An exact corpus hash match is not a heuristic: "
+        "verify the file and quarantine it."
+        % (path or sha, meta["feed"], meta.get("family") or "family "
+           "unrecorded", meta.get("first_seen") or "n/a", where),
+        "intel:hash:%s:%s" % (sha, path or "?"),
+        path=path, sha256=sha, feed=meta["feed"], family=meta.get("family"),
+        first_seen=meta.get("first_seen"), confidence="high",
+        markers=["known-malware"])
+
+
+def _intel_net_finding(path, rip, rport):
+    net = _intel_sets()[1]
+    if not net:
+        return None
+    meta = net.get("%s:%s" % (rip, rport))
+    if meta is None:
+        return None
+    return finding(
+        "CRITICAL", "intel",
+        "Outbound connection to a known C2 (community intel)",
+        "%s holds a live connection to %s:%s, which is on the %s C2/IOC list "
+        "(%s, first seen %s). A current connection to a catalogued C2 "
+        "endpoint is an active-compromise signal regardless of the binary's "
+        "signature." % (path, rip, rport, meta["feed"],
+                        meta.get("family") or "family unrecorded",
+                        meta.get("first_seen") or "n/a"),
+        "intel:net:%s:%s:%s" % (rip, rport, path),
+        path=path, program=path, remote=rip, port=rport, feed=meta["feed"],
+        family=meta.get("family"), first_seen=meta.get("first_seen"),
+        confidence="high", markers=["outbound-exfil", "known-c2"])
+
+
+def check_intel(current_snap, prior_findings=None):
+    """Grade the sha256 values THIS scan already computed — every persistence
+    record's program hash plus any finding that carries one (hot-dir drops,
+    app bundles) — against the local community sets. Nothing is re-hashed and
+    nothing new is read from the filesystem: this is a set lookup over work
+    the scan already did, scheduled by gather_all only when local intel
+    exists."""
+    findings, seen = [], set()
+
+    def grade(sha, path, where):
+        f = _intel_hash_finding(sha, path, where)
+        if f and f["fingerprint"] not in seen:
+            seen.add(f["fingerprint"])
+            findings.append(f)
+
+    for key, rec in sorted((current_snap or {}).items()):
+        if isinstance(rec, dict):
+            grade(rec.get("sha256"), rec.get("program") or key,
+                  "persistence item %s" % (rec.get("label") or key))
+    for prior in (prior_findings or []):
+        if isinstance(prior, dict) and prior.get("sha256"):
+            grade(prior.get("sha256"), prior.get("path"),
+                  "flagged by the %s sensor" % prior.get("category", "?"))
+    return findings
+
+
+def _intel_fetch(url):
+    """Transport for `intel update` ONLY. urllib is imported lazily HERE —
+    exactly like cmd_vt — so the scan path never even loads the networking
+    module. The request carries nothing about this machine."""
+    import urllib.request  # lazy: the scan path never imports urllib
+    req = urllib.request.Request(url, headers={"User-Agent": "aegis-intel"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read(INTEL_MAX_FETCH_BYTES)
+
+
+def _intel_bazaar_doc(raw):
+    hashes = _parse_bazaar_sha256_export(raw.decode("utf-8", "replace"))
+    if not hashes:
+        return None, None
+    doc = {"feed": "MalwareBazaar", "source": INTEL_BAZAAR_URL,
+           "fetched_at": now_iso(), "count": len(hashes), "hashes": hashes}
+    return doc, "%d sample hashes" % len(hashes)
+
+
+def _intel_threatfox_doc(raw):
+    hashes, net = _parse_threatfox_export(
+        json.loads(raw.decode("utf-8", "replace")))
+    if not hashes and not net:
+        return None, None
+    doc = {"feed": "ThreatFox", "source": INTEL_THREATFOX_URL,
+           "fetched_at": now_iso(), "hashes": hashes, "net": net}
+    return doc, "%d hashes, %d ip:ports" % (len(hashes), len(net))
+
+
+def cmd_intel(action="status"):
+    """OPT-IN community IOC layer. `update` is the by-hand fetch half; scans
+    then grade their OWN hashes and outbound rows against the local copy,
+    offline. Anything else prints status."""
+    ensure_state()
+    if action == "update":
+        return _cmd_intel_update()
+    if action == "status":
+        return _cmd_intel_status()
+    print("usage: aegis.py intel [update|status]")
+    return 1
+
+
+def _cmd_intel_update():
+    os.makedirs(INTEL_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(INTEL_DIR, 0o700)
+    except OSError:
+        pass
+    print("# Aegis intel update — public abuse.ch IOC exports (by hand, "
+          "no key)")
+    failures = 0
+    for name, url, path, build in (
+            ("MalwareBazaar", INTEL_BAZAAR_URL, INTEL_BAZAAR_FILE,
+             _intel_bazaar_doc),
+            ("ThreatFox", INTEL_THREATFOX_URL, INTEL_THREATFOX_FILE,
+             _intel_threatfox_doc)):
+        try:
+            doc, desc = build(_intel_fetch(url))
+            if doc is None:
+                # A fetch that "succeeds" but parses to nothing is a format
+                # change or a truncated body — either way, NOT a reason to
+                # clobber a good prior copy with an empty one.
+                raise ValueError("no usable entries parsed (truncated "
+                                 "download or a feed format change)")
+            save_json(path, doc)
+            print("  ✓ %-14s %s" % (name, desc))
+        except Exception as e:
+            failures += 1
+            prior = load_json(path, None)
+            print("  ✗ %-14s failed (%s)%s" % (
+                name, e,
+                " — keeping the prior copy (fetched %s)"
+                % prior.get("fetched_at") if isinstance(prior, dict)
+                else "; no prior copy to fall back on"))
+    log_run("intel update: %d/2 feeds ok" % (2 - failures))
+    return 1 if failures else 0
+
+
+def _cmd_intel_status():
+    print("# Aegis intel — community IOC feeds (local copies; the scan "
+          "never fetches)")
+    fetched = False
+    for name, path in (("MalwareBazaar", INTEL_BAZAAR_FILE),
+                       ("ThreatFox", INTEL_THREATFOX_FILE)):
+        doc = load_json(path, None)
+        if not isinstance(doc, dict):
+            print("  · %-14s not fetched" % name)
+            continue
+        fetched = True
+        age = (time.time() - _epoch(doc.get("fetched_at"))) / 86400.0
+        if name == "MalwareBazaar":
+            counts = "%d sample hashes" % len(doc.get("hashes") or [])
+        else:
+            counts = "%d hashes, %d ip:ports" % (
+                len(doc.get("hashes") or {}), len(doc.get("net") or {}))
+        stale = age > INTEL_STALE_DAYS
+        print("  %s %-14s %s, fetched %.1f days ago%s"
+              % ("✗" if stale else "✓", name, counts, age,
+                 " — STALE (>%dd; run `aegis.py intel update`)"
+                 % INTEL_STALE_DAYS if stale else ""))
+    if not fetched:
+        print("  Opt-in and by-hand: `aegis.py intel update` downloads two "
+              "public abuse.ch\n  IOC exports; scans then grade their own "
+              "hashes and outbound ip:port rows\n  against the local copy — "
+              "offline, nothing about this machine ever sent.")
+    return 0
+
+
+def _intel_summary():
+    """One status-line cell for cmd_status: (mark, text)."""
+    docs = [d for d in (load_json(INTEL_BAZAAR_FILE, None),
+                        load_json(INTEL_THREATFOX_FILE, None))
+            if isinstance(d, dict)]
+    if not docs:
+        return "·", "none fetched (opt-in: aegis.py intel update)"
+    hashes, net = _intel_sets()
+    oldest = max((time.time() - _epoch(d.get("fetched_at"))) / 86400.0
+                 for d in docs)
+    if oldest > INTEL_STALE_DAYS:
+        return "✗", ("%d hashes / %d ip:ports, oldest fetch %.0f days ago — "
+                     "STALE (>%dd; run aegis.py intel update)"
+                     % (len(hashes), len(net), oldest, INTEL_STALE_DAYS))
+    return "✓", ("%d hashes / %d ip:ports, oldest fetch %.1f days ago"
+                 % (len(hashes), len(net), oldest))
 
 
 def cmd_allow(path):
@@ -14756,6 +15103,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
                    the scan path stays local-only regardless)
+  intel [update|status]
+                   OPT-IN community IOC intel (abuse.ch MalwareBazaar +
+                   ThreatFox; no key, no account). `update` fetches the two
+                   PUBLIC exports by hand; scans then grade the hashes they
+                   already compute and outbound ip:port rows against the
+                   LOCAL copy, offline. Nothing fetched ⇒ the surface is
+                   simply absent and the scan path stays network-free
   canary [remove]  plant (or remove) ransomware canary/honeypot files, plus
                    any OPT-IN credential-canary tokens configured as
                    "canary_tokens": [{"path": "...", "content": "..."}] in
@@ -14931,6 +15285,8 @@ def main(argv):
         return cmd_allow(argv[2])
     if cmd == "vt" and len(argv) > 2:
         return cmd_vt(argv[2])
+    if cmd == "intel":
+        return cmd_intel(argv[2] if len(argv) > 2 else "status")
     if cmd == "canary":
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":

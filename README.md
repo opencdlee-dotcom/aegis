@@ -202,6 +202,10 @@ python3 aegis.py replay [days] # backtest the CURRENT correlation logic against
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)
+python3 aegis.py intel update  # OPT-IN community IOC feeds (abuse.ch; no key) —
+                               #   scans then grade their own hashes/ip:ports
+                               #   against the LOCAL copy, offline
+python3 aegis.py intel status  # feed ages + entry counts; stale (>7d) called out
 python3 aegis.py canary        # plant ransomware canary/honeypot files (opt-in)
 python3 aegis.py canary remove # ...and remove them
 python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
@@ -513,9 +517,11 @@ Not defensible, and not claimed: *"blocks malware."*
 A security tool sees everything, so it must be trustworthy *by construction*:
 - **Local-only on the scan/watch path *by default*** — out of the box the
   automatic monitor never phones home; no telemetry, no cloud. The only
-  network-touching feature you run **by hand** is `aegis.py vt` (VirusTotal
+  network-touching features you run **by hand** are `aegis.py vt` (VirusTotal
   reputation), which needs a key you supply and sends **only a hash, never a
-  file**; with no key the scanner never even imports the networking module.
+  file** — with no key the scanner never even imports the networking module —
+  and `aegis.py intel update`, which *downloads* two public IOC lists and
+  sends nothing at all; the scan only ever reads the local copy.
   The **one** background egress that exists is **off unless you deliberately
   turn it on**: the dead-man's-switch heartbeat (below) POSTs a small redacted
   liveness beat *only* if you set `AEGIS_HEARTBEAT_URL` or a `heartbeat_url` in
@@ -576,6 +582,23 @@ A security tool sees everything, so it must be trustworthy *by construction*:
   **only the sha256, never the file bytes**, and the scan/watch path makes **zero**
   network calls regardless — off by default, so the local-only guarantee stays
   literally true. No key ⇒ the command explains how to add one and does nothing.
+- ✅ **Community IOC intel — SHIPPED** as `aegis.py intel update|status`: an
+  **opt-in, by-hand** fetch of two public abuse.ch exports (MalwareBazaar
+  recent SHA256s, ThreatFox recent IOCs — no key, no account). What leaves the
+  machine: **nothing** (the request carries no payload about this host); what
+  arrives: a public IOC list, normalized and size-bounded under
+  `~/.aegis/intel/`. Scans then grade the sha256 hashes they **already
+  compute** (persistence programs, hot-dir drops) and live outbound `ip:port`
+  rows against the LOCAL copy — an exact hash match or a connection to a
+  listed C2 is CRITICAL with the malware family and first-seen date named.
+  This is `glean`'s doctrine (a dated, offline intel delta) generalized beyond
+  Apple's corpus to every OS. Off by default: with nothing fetched the surface
+  simply doesn't exist (absent, never a degraded sensor), the scan path stays
+  structurally network-free (`urllib` is imported only inside the fetch,
+  exactly like `vt`), and `intel status` calls out a copy staler than 7 days.
+  A failed refresh keeps the prior copy and says so; hostile/garbage feed data
+  parses to nothing rather than raising; the feed's domains/URLs are
+  deliberately not even written to disk — hashes and `ip:port` pairs only.
 - ✅ **Login-Item / SMAppService adapter — SHIPPED** via `sfltool dumpbtm`: when
   Apple exposes the inventory, a new Background Task Management item is diffed
   even without a `~/Library/LaunchAgents` plist. On macOS builds that require an
