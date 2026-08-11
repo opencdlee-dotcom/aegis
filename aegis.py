@@ -6353,18 +6353,101 @@ def check_outbound():
     """Record the exfil shape the listener surface is structurally blind to: an
     untrusted binary in a user-writable path holding an ESTABLISHED outbound
     connection. We can't baseline-diff outbound (a browser opens hundreds), so
-    this scores live via _outbound_finding. Best-effort: a non-answer from the
-    platform probe yields no findings."""
+    this scores live via _outbound_finding — and stores each scan's row set so
+    _beacon_recurrence can score the one key interval polling IS good at: the
+    same (binary, remote) pair persisting across scans. Best-effort: a
+    non-answer from the platform probe yields no findings and stores nothing
+    (an empty snapshot would be indistinguishable from a quiet machine)."""
     findings = []
     seen = set()
+    snap_rows = []
     for path, rip, rport in _outbound_rows():
         key = "%s:%s:%s" % (path, rip, rport)
         if key in seen:
             continue
         seen.add(key)
+        # Trust captured at observation time (sigcache makes the re-ask free)
+        # so the stored rows grade without re-classifying long-gone binaries.
+        resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
+        trust = classify_signature(path)["trust"] if resolvable else "unknown"
+        snap_rows.append((path, rip, rport, trust))
         f = _outbound_finding(path, rip, rport)
         if f:
             findings.append(f)
+    if snap_rows:
+        record_observation(BEACON_SENSOR_ID, sorted(snap_rows))
+        findings += _beacon_recurrence(
+            _load_observations(BEACON_SENSOR_ID, BEACON_WINDOW_DAYS), snap_rows)
+    return findings
+
+
+# --- Outbound recurrence (beacon shape) ---------------------------------------
+# The live scorer above is per-scan by necessity — outbound churn defeats a
+# baseline diff. RECURRENCE keys on the opposite invariant: browser churn does
+# not survive between scans, a C2 beacon's (binary, remote ip:port) pair does.
+BEACON_SENSOR_ID = "outbound.snapshot"
+BEACON_MIN_SCANS = 3
+BEACON_MIN_SPAN_SECS = 45 * 60
+BEACON_WINDOW_DAYS = 7
+
+# Browsers (and their helper processes) hold long-lived remote pairs
+# legitimately (push channels, sync), so they are excluded by NAME as well as
+# by trust — a user-installed browser outside a trusted prefix must stay
+# silent. Mirrors _BROWSER_EXE_RE plus the macOS helper-suffix forms.
+_BEACON_BROWSER_RE = re.compile(
+    r"(?:^|[/\\])(?:Google Chrome|Chromium|chrome|brave|Brave Browser|"
+    r"msedge|Microsoft Edge|firefox|Firefox|Safari|Opera|Vivaldi|Arc)"
+    r"(?:\.exe)?(?: Helper(?: \([^/\\]*\))?)?$", re.I)
+
+
+def _beacon_recurrence(history, current_rows):
+    """HIGH findings for the beacon residue shape: a (path, remote ip:port)
+    pair live in THIS scan and already observed in >= BEACON_MIN_SCANS distinct
+    stored scans spanning >= BEACON_MIN_SPAN_SECS, from a non-browser binary
+    outside every trusted prefix whose signature is suspicious OR which runs
+    from a user-writable path. Pure over (ts, rows) snapshots — the platform
+    split already happened in _outbound_rows — so it is testable with synthetic
+    rows everywhere. The fingerprint is the pair, stable across scans: the
+    seen/signal machinery turns continued recurrence into one incident with a
+    climbing occurrence count, never a re-alert storm. Below-threshold
+    recurrence is deliberately not emitted — the live MEDIUM above already
+    feeds risk accumulation."""
+    if not current_rows:
+        return []
+    sightings = {}
+    for ts, rows in history:
+        if not isinstance(rows, (list, tuple)):
+            continue
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            pair = (str(row[0]), str(row[1]), str(row[2]))
+            sightings.setdefault(pair, set()).add(int(ts))
+    findings = []
+    for row in sorted(set(tuple(r) for r in current_rows)):
+        path, rip, rport = str(row[0]), str(row[1]), str(row[2])
+        trust = str(row[3]) if len(row) > 3 else "unknown"
+        stamps = sightings.get((path, rip, rport), ())
+        if len(stamps) < BEACON_MIN_SCANS:
+            continue
+        span = max(stamps) - min(stamps)
+        if span < BEACON_MIN_SPAN_SECS:
+            continue
+        if _is_trusted_prefix(path) or _BEACON_BROWSER_RE.search(path):
+            continue
+        if not (suspicious_sig(trust) or is_risky_location(path)):
+            continue
+        findings.append(finding(
+            "HIGH", "net-beacon",
+            "Persistent outbound connection (beacon shape)",
+            "%s [%s] has held a connection to %s:%s in %d scans spanning "
+            "%.1f hours. Ephemeral outbound churn does not survive between "
+            "scans; the same non-browser binary re-observed at the same "
+            "remote endpoint is the residue an interval C2 beacon leaves."
+            % (path, trust, rip, rport, len(stamps), span / 3600.0),
+            "beacon:%s:%s:%s" % (path, rip, rport), path=path, program=path,
+            remote=rip, port=rport, trust=trust, scan_count=len(stamps),
+            span_secs=span, markers=["outbound-exfil", "beacon"]))
     return findings
 
 
