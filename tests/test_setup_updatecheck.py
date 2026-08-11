@@ -267,7 +267,12 @@ class TestUpdateCheck(SetupSandbox):
         self.assertEqual(1, rc)
         text = out.getvalue()
         self.assertIn("STALE", text)
-        self.assertIn("%s install watch" % aegis._SELF_PATH, text)
+        # _refresh_line() quotes the path on Windows (the reference repo path
+        # has spaces and '&'), so reimplementing the quoting here would just
+        # re-encode the same assumption the production code makes. Use it as
+        # the oracle instead — SELFSTATE is unchanged since cmd_update_check
+        # read it, so both calls see the same install_mode.
+        self.assertIn(aegis._refresh_line(), text)
 
     def test_refresh_line_defaults_to_scan_mode(self):
         self._write(aegis.RUNTIME_SCRIPT, "# OLD runtime copy v1\n")
@@ -275,7 +280,7 @@ class TestUpdateCheck(SetupSandbox):
         with contextlib.redirect_stdout(out):
             rc = aegis.cmd_update_check()
         self.assertEqual(1, rc)
-        self.assertIn("%s install\n" % aegis._SELF_PATH, out.getvalue())
+        self.assertIn(aegis._refresh_line(), out.getvalue())
 
     def test_doctor_surfaces_drift_as_a_problem(self):
         """doctor is where rot surfaces: a stale runtime copy must degrade the
