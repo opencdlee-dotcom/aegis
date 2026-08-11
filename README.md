@@ -214,6 +214,13 @@ python3 aegis.py watchdog      # dead-man's switch: exit non-zero + alert if the
 python3 aegis.py bastion       # macOS only, OPT-IN, needs sudo: surface Apple's
                                #   XProtect Behavioral (Bastion) violations it
                                #   records but never alerts on
+python3 aegis.py rootwatch install
+                               # OPT-IN root witness (macOS/Linux): a <60-line
+                               #   root-owned script on a ROOT schedule that
+                               #   alerts within minutes when the heartbeat dies.
+                               #   Never self-elevates: run without sudo it
+                               #   changes NOTHING and prints the sudo line
+                               #   for you. `status` reports without root
 
 # RESPONSE TIER — opt-in, run by hand on a reviewed finding (never automatic):
 python3 aegis.py quarantine PATH     # atomically confine a file or valid .app bundle
@@ -321,6 +328,28 @@ chain. What they cannot do is make a *past* anchor say something else. The
 regression suite tests exactly that adversary: a forged chain with every head
 and MAC recomputed defeats all local checks and is still caught by the anchors.
 
+### Root witness — `rootwatch` (opt-in; the one privileged resident)
+
+The watchdog runs at the same uid as the monitor, so the attacker who kills
+Aegis kills the watchdog agent in the same sweep — the notary then makes the
+kill *evident later*, which is honest but slow. `rootwatch` is the opt-in
+answer: a root-owned script of **under 60 lines** (small enough to audit in
+one glance before installing it — that smallness is the security argument, not
+a style choice) on a **root** schedule (`/Library/LaunchDaemons` LaunchDaemon
+on macOS, a system — not `--user` — systemd timer on Linux) that re-reads the
+heartbeat every 10 minutes with the watchdog's own staleness tolerance baked
+in. A dead beat appends a root-owned alert line (`/Library/Application
+Support/Aegis/rootwatch.log` / `/var/log/aegis/rootwatch.log`), notifies your
+session, and writes syslog; a healthy beat exits silently. What root buys is
+exactly one thing: **a witness the same-uid attacker cannot unload, which
+alerts within minutes instead of leaving evidence for later.** What it does
+not buy: it prevents nothing, reads nothing but the one heartbeat file, and
+never writes into `~/.aegis` (a root-owned file there would break Aegis's own
+atomic-replace state writes). Aegis never self-elevates to install it —
+`rootwatch install` run unprivileged mutates nothing and prints the one sudo
+line for you to run yourself. Windows has no rootwatch yet: a SYSTEM
+scheduled task is future work, and the gap is stated rather than implied.
+
 ### Agent surface, session theft, and pre-authorization (added this release)
 
 | Command / sensor | What it does | Notes |
@@ -413,6 +442,8 @@ against a real machine rather than a fixture:**
 - **A source-aware attacker can kill Aegis instead of evading it.** No
   unprivileged tool can prevent that. The notary is the answer: it cannot stop
   the kill, but it makes the kill leave a sequence gap that cannot be backfilled.
+  The opt-in `rootwatch` tier shortens "later" to minutes — a root-scheduled
+  witness the same-uid attacker cannot kill along with the monitor.
 - **`curl … | sh` is never silently rewritten.** It is the documented install
   path for rustup and much else, so the clipboard grammar reports it and stops
   there. Only patterns with no legitimate use (fake password dialogs,
