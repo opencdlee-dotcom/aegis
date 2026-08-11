@@ -6573,6 +6573,249 @@ def diff_wmi_subscriptions(prior, cur):
     return _diff_map(prior, cur, new_fn, changed_fn)
 
 
+# --- Windows: COM server hijacking (T1546.015) -------------------------------
+# The rung above Run keys: a per-user CLSID registration whose server DLL/EXE is
+# swapped for a payload runs INSIDE whatever trusted process instantiates that
+# COM object — no autostart entry, no Run key. HKCU wins over HKLM for the same
+# CLSID, so a same-user attacker needs no admin. The event is a NEW or CHANGED
+# server whose target resolves into a user-writable path; a registration that
+# points at an admin-writable install tree (Program Files) is ordinary app churn
+# and stays silent. Baseline-diffed like every other residue surface.
+_COM_CLSID_KEY = r"Software\Classes\CLSID"
+
+
+def _com_target(val):
+    """Resolve a CLSID server value to its program path. InprocServer32 stores a
+    bare DLL path; LocalServer32 stores an EXE command line — both go through the
+    same %VAR% expansion + quote/space splitter the Run-key path uses."""
+    args = _win_split_cmd(_expand_win_env(val))
+    return args[0] if args else None
+
+
+def snapshot_com_hijack():
+    """{clsid\\server: value} for HKCU CLSID InprocServer32/LocalServer32 default
+    values. The CLSID subtree is created lazily by the first per-user COM
+    registration, so its ABSENCE is a real empty ({}); a denied read is a
+    non-answer (None), never adopted as clean."""
+    import winreg
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _COM_CLSID_KEY)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    snap = {}
+    with root:
+        i = 0
+        while True:
+            try:
+                clsid = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                ck = winreg.OpenKey(root, clsid)
+            except OSError:
+                continue
+            with ck:
+                for server in ("InprocServer32", "LocalServer32"):
+                    try:
+                        with winreg.OpenKey(ck, server) as sk:
+                            val, _t = winreg.QueryValueEx(sk, "")
+                    except OSError:
+                        continue
+                    if isinstance(val, str) and val.strip():
+                        snap["%s\\%s" % (clsid, server)] = val
+    return snap
+
+
+def diff_com_hijack(prior, cur):
+    def _risky_target(val):
+        target = _com_target(val)
+        return target if (target and is_risky_location(target)) else None
+
+    def new_fn(key, val):
+        target = _risky_target(val)
+        if not target:
+            return None
+        return finding(
+            "HIGH", "com-hijack", "New COM server hijack point",
+            "The COM registration %s now resolves to %r, a user-writable path. "
+            "A hijacked CLSID server runs inside whatever trusted process "
+            "instantiates the object — persistence with no Run key or task "
+            "(T1546.015). Confirm you installed this." % (key, target),
+            "com-hijack:new:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            path=target, markers=["com-hijack"])
+
+    def changed_fn(key, val, old):
+        target = _risky_target(val)
+        if not target:
+            return None
+        return finding(
+            "HIGH", "com-hijack", "COM server hijack point CHANGED",
+            "The COM registration %s was repointed to %r, a user-writable path "
+            "(was %r). An in-place swap of an existing CLSID server keeps the "
+            "registration familiar while changing the code it runs "
+            "(T1546.015)." % (key, target, old),
+            "com-hijack:changed:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            path=target, markers=["com-hijack"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Windows: IFEO Debugger + SilentProcessExit (T1546.012 / T1546.008) ------
+# An Image File Execution Options "Debugger" value hijacks a target binary: the
+# named debugger launches INSTEAD of the target, with the target as its argument.
+# Aimed at an accessibility binary (sethc.exe et al., reachable from the LOCK
+# SCREEN) it is the classic pre-auth backdoor -> CRITICAL. SilentProcessExit
+# MonitorProcess runs a program when a watched process exits — the same execute-
+# on-event primitive. Writing these needs admin; READING them does not, and a
+# value appearing is the signal regardless of who wrote it.
+_WIN_IFEO_KEY = (r"Software\Microsoft\Windows NT\CurrentVersion"
+                 r"\Image File Execution Options")
+_WIN_SPE_KEY = (r"Software\Microsoft\Windows NT\CurrentVersion"
+                r"\SilentProcessExit")
+_WIN_ACCESSIBILITY_BINS = frozenset((
+    "sethc.exe", "utilman.exe", "osk.exe", "magnify.exe", "narrator.exe",
+    "displayswitch.exe"))
+
+
+def snapshot_ifeo():
+    """{debugger:<image>|monitor:<image>: value} across the two HKLM keys.
+    Either key being absent is a real empty for its half; a denied read of
+    either is a non-answer (None) for the whole surface."""
+    import winreg
+    snap = {}
+
+    def collect(subkey, value_name, prefix):
+        try:
+            root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey)
+        except FileNotFoundError:
+            return True   # key not present = genuinely no entries
+        except OSError:
+            return False  # denied/other = non-answer
+        with root:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, name) as sk:
+                        val, _t = winreg.QueryValueEx(sk, value_name)
+                except OSError:
+                    continue
+                if isinstance(val, str) and val.strip():
+                    snap["%s:%s" % (prefix, name)] = val
+        return True
+
+    ok1 = collect(_WIN_IFEO_KEY, "Debugger", "debugger")
+    ok2 = collect(_WIN_SPE_KEY, "MonitorProcess", "monitor")
+    if not (ok1 and ok2):
+        return None
+    return snap
+
+
+def diff_ifeo(prior, cur):
+    def _sev(key):
+        kind, _, name = key.partition(":")
+        if kind == "debugger" and name.lower() in _WIN_ACCESSIBILITY_BINS:
+            return "CRITICAL"
+        return "HIGH"
+
+    def _label(key):
+        return ("Debugger" if key.startswith("debugger:")
+                else "SilentProcessExit MonitorProcess")
+
+    def new_fn(key, val):
+        _kind, _, name = key.partition(":")
+        return finding(
+            _sev(key), "ifeo", "New IFEO %s hijack" % _label(key),
+            "A %s value for %r appeared: %r. The named program runs in place of "
+            "(or on the exit of) the target — an execute-hijack that needs no "
+            "Run key or task (T1546.012/T1546.008)%s. Confirm this is expected."
+            % (_label(key), name, val,
+               "; the target is an accessibility binary reachable from the "
+               "lock screen — a pre-auth backdoor"
+               if _sev(key) == "CRITICAL" else ""),
+            "ifeo:new:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["ifeo-hijack"])
+
+    def changed_fn(key, val, old):
+        _kind, _, name = key.partition(":")
+        return finding(
+            _sev(key), "ifeo", "IFEO %s hijack CHANGED" % _label(key),
+            "The %s value for %r changed to %r (was %r) — an in-place swap of "
+            "the executed program (T1546.012/T1546.008)."
+            % (_label(key), name, val, old),
+            "ifeo:changed:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["ifeo-hijack"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- Windows: AppInit_DLLs (T1546.010) ---------------------------------------
+# Every DLL listed in AppInit_DLLs is force-loaded into every user-mode process
+# that links user32.dll — a single value that injects code system-wide. It is
+# disabled by default on modern Windows, so a non-empty value appearing (or an
+# existing one changing) is a high-signal event on any machine.
+_WIN_APPINIT_KEYS = [
+    r"Software\Microsoft\Windows NT\CurrentVersion\Windows",
+    r"Software\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows",
+]
+
+
+def snapshot_appinit():
+    """{key: AppInit_DLLs value} for each non-empty value across the native and
+    WOW64 keys. A missing key/value is a real empty; a denied read is a
+    non-answer (None)."""
+    import winreg
+    snap = {}
+    for subkey in _WIN_APPINIT_KEYS:
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        with k:
+            try:
+                val, _t = winreg.QueryValueEx(k, "AppInit_DLLs")
+            except OSError:
+                continue
+            if isinstance(val, str) and val.strip():
+                snap[subkey] = val.strip()
+    return snap
+
+
+def diff_appinit(prior, cur):
+    def new_fn(key, val):
+        return finding(
+            "HIGH", "appinit", "AppInit_DLLs is now set",
+            "AppInit_DLLs under %s is now %r. Every DLL listed here is loaded "
+            "into every user-mode process that links user32 — a system-wide "
+            "code-injection persistence primitive that is disabled by default "
+            "(T1546.010). Confirm you set this." % (key, val),
+            "appinit:new:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["appinit-dll"])
+
+    def changed_fn(key, val, old):
+        return finding(
+            "HIGH", "appinit", "AppInit_DLLs CHANGED",
+            "AppInit_DLLs under %s changed to %r (was %r) — the set of DLLs "
+            "force-loaded into every GUI process was modified (T1546.010)."
+            % (key, val, old),
+            "appinit:changed:%s:%s" % (
+                key, hashlib.sha256(val.encode()).hexdigest()[:16]),
+            markers=["appinit-dll"])
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
 # --- Unified-log security harvest (Gatekeeper / syspolicy denials) ------------
 _SYSPOLICY_DENY_RE = re.compile(
     r"\b(?:denied|blocked|rejected|will not be permitted|gke.*deny)\b", re.I)
@@ -6875,6 +7118,174 @@ def check_windows_event_log():
             "winevent:4625:burst:%d" % (failed_logons // 10),
             markers=["logon-brute-force"]))
     return findings
+
+
+# --- Windows: Sysmon Operational channel harvest -----------------------------
+# Sysmon (Sysinternals) is an OPTIONAL driver that logs high-fidelity telemetry
+# to Microsoft-Windows-Sysmon/Operational. Where it is installed this is a
+# far richer feed than the built-in logs, but it exists on a minority of hosts,
+# so the sensor is REGISTERED ONLY when the channel exists (see _sysmon_sensor):
+# channel absent = Sysmon not installed = sensor ABSENT, not a DEGRADED row for
+# a product that is not there. Kept deliberately narrow — three event IDs whose
+# meaning is unambiguous — riding the same windowed Get-WinEvent shape and the
+# same _parse_win_events `log|id|time|message` contract as the event-log harvest.
+_SYSMON_CHANNEL = "Microsoft-Windows-Sysmon/Operational"
+# The channel's registration key; its presence is how we know Sysmon is
+# installed without shelling out.
+_SYSMON_CHANNEL_KEY = (r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                       r"\WINEVT\Channels\Microsoft-Windows-Sysmon/Operational")
+# EID 1 ProcessCreate (scored, not blanket-reported), 6 driver loaded, 25
+# process tampering. The full (untruncated) message carries the fields we parse.
+_SYSMON_PS = (
+    "try{$evts=Get-WinEvent -FilterHashtable @{"
+    "LogName='Microsoft-Windows-Sysmon/Operational';Id=@(1,6,25);"
+    "StartTime=(Get-Date).AddHours(-6)} -MaxEvents 200 -ErrorAction Stop}"
+    "catch{if($_.Exception.Message -match 'No events were found'){exit 0}"
+    "else{Write-Output 'sysmon-probe=failed';exit 0}};"
+    "foreach($e in $evts){$m=($e.Message -replace '\\s+',' ');"
+    "Write-Output ('Microsoft-Windows-Sysmon/Operational|' + $e.Id + '|' + "
+    "$e.TimeCreated.ToString('o') + '|' + $m)}")
+
+# Sysmon messages are `Field: value Field2: value2 ...` on one line (post the
+# whitespace-collapse above). Field names are CamelCase tokens; a value ends
+# where the next field label begins. Windows paths (`C:\...`) carry a colon but
+# never a `colon-space`, so they are not mistaken for a field boundary.
+_SYSMON_KV_RE = re.compile(r"(?:^|\s)([A-Z][A-Za-z0-9]*):\s")
+
+
+def _parse_sysmon_kv(msg):
+    """Pure parser: a one-line Sysmon message -> {field: value}. Tolerant of
+    junk (never raises); an empty/label-free message yields {}."""
+    if not msg:
+        return {}
+    matches = list(_SYSMON_KV_RE.finditer(msg))
+    kv = {}
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(msg)
+        kv[m.group(1)] = msg[start:end].strip()
+    return kv
+
+
+def _sysmon_eid1(msg, ts):
+    """ProcessCreate: score CommandLine through _argv_signals and Image through
+    is_risky_location; surface ONLY what scores (EID 1 is high-volume)."""
+    kv = _parse_sysmon_kv(msg)
+    image = kv.get("Image") or ""
+    cmd = kv.get("CommandLine") or ""
+    signals = _argv_signals(cmd)
+    risky = is_risky_location(image)
+    if not signals and not risky:
+        return None
+    digest = hashlib.sha256(
+        ("%s\x00%s" % (image, cmd)).encode("utf-8", "replace")).hexdigest()[:16]
+    if signals:
+        sev = max(signals, key=lambda s: SEV_ORDER[s[1]])[1]
+        names = [n for n, _s in signals]
+        detail = ("Sysmon ProcessCreate at %s: %s [%s]"
+                  % (ts, image or cmd, ", ".join(names)))
+        markers = names + ["sysmon-eid1"]
+    else:
+        sev = "MEDIUM"
+        detail = ("Sysmon ProcessCreate at %s: %s ran from a user-writable "
+                  "path (%s)" % (ts, image, cmd[:200]))
+        markers = ["risky-path-exec", "sysmon-eid1"]
+    return finding(sev, "sysmon", "Sysmon process creation", detail,
+                   "sysmon:1:%s" % digest, path=image or None, markers=markers)
+
+
+def _sysmon_eid6(msg, ts):
+    """Driver loaded: an unsigned / not-validly-signed kernel driver is HIGH
+    (ring-0 code with no vouching signature). A validly-signed driver is
+    silent."""
+    kv = _parse_sysmon_kv(msg)
+    driver = kv.get("ImageLoaded") or ""
+    signed = (kv.get("Signed") or "").strip().lower()
+    status = (kv.get("SignatureStatus") or "").strip().lower()
+    if signed == "true" and status == "valid":
+        return None
+    digest = hashlib.sha256(driver.encode("utf-8", "replace")).hexdigest()[:16]
+    return finding(
+        "HIGH", "sysmon", "Sysmon: unsigned driver loaded",
+        "Sysmon logged a driver load at %s: %s (Signed=%s, SignatureStatus=%s)"
+        " — an unsigned or invalidly-signed kernel driver runs in ring 0 and "
+        "can hide from every userland check." % (
+            ts, driver, kv.get("Signed") or "?",
+            kv.get("SignatureStatus") or "?"),
+        "sysmon:6:%s" % digest, path=driver or None,
+        markers=["unsigned-driver", "sysmon-eid6"])
+
+
+def _sysmon_eid25(msg, ts):
+    """Process tampering (image replacement / process hollowing) — HIGH."""
+    kv = _parse_sysmon_kv(msg)
+    image = kv.get("Image") or ""
+    ttype = kv.get("Type") or ""
+    digest = hashlib.sha256(
+        ("%s\x00%s" % (image, ttype)).encode("utf-8", "replace")).hexdigest()[:16]
+    return finding(
+        "HIGH", "sysmon", "Sysmon: process tampering",
+        "Sysmon reported process tampering at %s: %s (Type: %s) — image "
+        "replacement / hollowing runs code the on-disk file no longer reflects."
+        % (ts, image, ttype or "?"),
+        "sysmon:25:%s" % digest, path=image or None,
+        markers=["process-tampering", "sysmon-eid25"])
+
+
+_SYSMON_SCORERS = {"1": _sysmon_eid1, "6": _sysmon_eid6, "25": _sysmon_eid25}
+
+
+def _sysmon_findings(rows):
+    """Pure: parsed `_parse_win_events` rows -> findings, deduped by fingerprint.
+    Unknown event IDs are ignored (the harvest asks only for 1/6/25, but a
+    stray row must never fabricate a finding)."""
+    findings = []
+    seen = set()
+    for _log, eid, ts, msg in rows:
+        scorer = _SYSMON_SCORERS.get(eid)
+        if not scorer:
+            continue
+        f = scorer(msg, ts)
+        if not f or f["fingerprint"] in seen:
+            continue
+        seen.add(f["fingerprint"])
+        findings.append(f)
+    return findings
+
+
+def check_sysmon_log():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _SYSMON_PS], timeout=120)
+    # Non-zero exit (timeout, missing PowerShell, blocked policy) is a
+    # non-answer. So is the explicit sentinel the probe emits when Get-WinEvent
+    # failed for a reason OTHER than "no events" — the channel was there and the
+    # read did not succeed, which is DEGRADED, not clean. A clean run with no
+    # matching events in the window is a real empty ([]).
+    if rc != 0:
+        return None
+    if "sysmon-probe=failed" in (out or ""):
+        return None
+    return _sysmon_findings(_parse_win_events(out))
+
+
+def _sysmon_sensor():
+    """Register the Sysmon harvest ONLY where the Operational channel exists
+    (Sysmon installed). Channel absent = product not installed = sensor absent,
+    exactly like a launchd check on Linux — never a DEGRADED row for a tool that
+    is not there. When the channel key cannot be READ (denied), absence cannot
+    be proven, so we register and let check_sysmon_log degrade honestly."""
+    try:
+        import winreg
+    except Exception:
+        return []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _SYSMON_CHANNEL_KEY):
+            pass
+    except FileNotFoundError:
+        return []
+    except OSError:
+        pass  # denied/other: cannot prove absence -> register
+    return [("sysmon-log", check_sysmon_log, ())]
 
 
 # --- Auth sessions (remote login / screen sharing) ---------------------------
@@ -8544,6 +8955,9 @@ else:
          diff_win_exclusions),
         ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
          diff_wmi_subscriptions),
+        ("win_com_hijack", snapshot_com_hijack, diff_com_hijack),
+        ("win_ifeo", snapshot_ifeo, diff_ifeo),
+        ("win_appinit", snapshot_appinit, diff_appinit),
     ]
 
 # Surfaces whose first-sight items are LIVE risks, not installed-residue: they
@@ -8991,6 +9405,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         sensors += [
             ("windows-event-log", check_windows_event_log, ()),
         ]
+        sensors += _sysmon_sensor()  # only where the Sysmon channel exists
     # ONE process-table walk for the whole sensor loop. Built through the
     # module-level _iter_processes (cache is None here, so this is a live walk,
     # and a test that stubs _iter_processes still flows through), then armed so
