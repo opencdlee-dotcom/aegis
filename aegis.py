@@ -133,8 +133,10 @@ USAGE  -> aegis.py [install [watch] [secs]|uninstall]
                     neutralize <target>]
 """
 
+import base64
 import json
 import errno
+import math
 import os
 import plistlib
 import re
@@ -4215,6 +4217,138 @@ _UNAMBIGUOUS_HIGH_IDIOMS = frozenset((
     "crontab-tmp-install",
 ))
 
+# --------------------------------------------------------------------------- #
+# Obfuscated inline-code payloads — the family-you-haven't-seen-yet catch.
+# Every idiom above keys on a KNOWN hostile string; the same logic shipped
+# base64-/base85-packed inside `bash -c` / `node -e` / `python3 -c` matches
+# none of them. The hard-to-vary structural invariant is the SHAPE: an
+# interpreter told to execute inline code (gate 1, mandatory) whose code
+# argument is a long opaque blob or an in-process decode+execute composition
+# (gate 2). Gate 1 keeps arbitrary processes out of entropy scoring —
+# Electron helpers, JWTs and cloud CLIs legitimately carry giant opaque argv.
+# --------------------------------------------------------------------------- #
+
+# Gate 1: interpreter + code-execution flag. Bounded interior runs throughout
+# (the ReDoS discipline above); flag-skip loops are repetition-capped, never
+# `*`. Shell `-c` accepts a cluster (`-lc`); the powershell alternation
+# matches every `-e/-en/-enc/-EncodedCommand` prefix and `-c/-Command`, while
+# `-ExecutionPolicy` (whose VALUE is not code) fails it and is skipped by the
+# bounded gap instead.
+_INLINE_CODE_FLAG_RES = (
+    re.compile(r"(?:^|[\s/])(?:ba|z|da|k)?sh\s+"
+               r"(?:-{1,2}[\w-]{1,12}\s+){0,3}-[a-zA-Z]{0,8}c\s+", re.I),
+    re.compile(r"(?:^|[\s/])python[0-9.]{0,6}(?:\.exe)?\s+"
+               r"(?:-[a-zA-Z]{1,3}\s+){0,3}-c\s+", re.I),
+    re.compile(r"(?:^|[\s/])node(?:\.exe)?\s+"
+               r"(?:--?[\w-]{1,24}(?:=\S{0,64})?\s+){0,4}(?:-e|--eval)\s+",
+               re.I),
+    re.compile(r"(?:^|[\s/])(?:perl|ruby)[0-9.]{0,4}\s+"
+               r"(?:-[a-zA-Z0-9]{1,10}\s+){0,3}-[a-zA-Z]{0,4}e\s+", re.I),
+    re.compile(r"(?:^|[\s/])osascript\s+(?:-l\s+[\w.]{1,24}\s+)?-e\s+", re.I),
+    re.compile(r"(?:^|[\s/\\])(?:powershell|pwsh)(?:\.exe)?\s+[^\n]{0,200}?"
+               r"\s-(?:e(?:c|n[a-zA-Z]{0,12})?|c(?:ommand)?)\s+", re.I),
+)
+
+# Gate 2a: >=100 chars of pure base64/base64url alphabet ('=' only as trailing
+# padding, so a `VAR=<blob>` assignment cannot glue a low-entropy prefix onto
+# the run). 100 is tuned to reality: a one-stage loader is rarely under ~75
+# raw bytes, while no flag value/version string/path on a measured live table
+# reaches it with entropy to spare (see _BLOB_MIN_ENTROPY).
+_B64_BLOB_RE = re.compile(r"[A-Za-z0-9+/_-]{100,}={0,2}")
+# bits/char: random base64 ~5.8, base64-of-text ~5.3; the benign ceiling is
+# camelCase flag values ~4.3, paths/English runs ~4.0. 4.5 splits the gap.
+_BLOB_MIN_ENTROPY = 4.5
+# Gate 2b: in-process decode markers _hostile_content has no idiom for
+# (python/ruby/perl; the JS half deliberately REUSES the supply-chain tables
+# _PKG_JS_DECODE_RES below — same vectors, different surface). Shell-level
+# `base64 -d` / FromBase64String are already idioms and stay theirs.
+_ARGV_DECODE_RE = re.compile(
+    r"\b(?:base64\.(?:standard_|urlsafe_)?b(?:16|32|64|85)decode|b64decode|"
+    r"a2b_base64|bytes\.fromhex|codecs\.decode|Base64\.(?:urlsafe_)?decode64|"
+    r"decode_base64|unpack\s*\(\s*['\"]m)", re.I)
+# The supply-chain Buffer.from regex bounds its interior run at 80 chars —
+# right for a package script, but an argv blob IS the call's first argument
+# and routinely exceeds it. Decoupled co-occurrence (Buffer.from + an encoding
+# literal, both required) spans any blob length without an unbounded run.
+_ARGV_JS_BUFFER_RE = re.compile(r"\bBuffer\.from\s*\(", re.I)
+_ARGV_ENC_LITERAL_RE = re.compile(r"['\"](?:base64|hex)['\"]", re.I)
+_ARGV_EXEC_MARK_RE = re.compile(
+    r"\b(?:exec|eval)\s*\(|\bnew\s+Function\s*\(|"
+    r"require\s*\(\s*['\"]child_process['\"]|\bos\.system\s*\(|"
+    r"\bsubprocess\b|\b__import__\s*\(|\bsystem\s*\(|"
+    r"\bInvoke-Expression\b|\bIEX\b", re.I)
+# Exec sinks that RUN code (escalation set for a co-occurring blob):
+# decode-only members excluded so `echo <blob> | base64 -d > file` — decode
+# with no execution — cannot escalate itself.
+_ARGV_EXEC_SINKS = _PIPE_EXEC_IDIOMS - frozenset(
+    ("base64-decode", "powershell-base64-decode"))
+
+
+def _shannon_bits(s):
+    """Shannon entropy of `s` in bits/char (0.0 for empty)."""
+    if not s:
+        return 0.0
+    n = float(len(s))
+    ent = 0.0
+    for c in set(s):
+        p = s.count(c) / n
+        ent -= p * math.log(p, 2)
+    return ent
+
+
+def _b64_decodable(run):
+    """Does `run` actually base64-decode? Trimmed to a 4-multiple (a ps-joined
+    argv can shear trailing chars). A run is std-alphabet OR urlsafe, never
+    both: '+/' and '-_' mixed together decodes under no base64 flavor — and
+    that mix is exactly the shape of a high-entropy PATH (UUID/hash dirs mix
+    '/' separators with '-'), the one benign string class measured to clear
+    the entropy floor on a live process table."""
+    head = run[:len(run) - len(run) % 4]
+    if not head:
+        return False
+    std = "+" in head or "/" in head
+    url = "-" in head or "_" in head
+    if std and url:
+        return False
+    try:
+        base64.b64decode(head, altchars=b"-_" if url else None, validate=True)
+        return True
+    except Exception:
+        return False
+
+
+def _obfuscated_payload_signals(argv, idioms):
+    """[(name, severity)] for an interpreter running OBFUSCATED inline code
+    (`idioms` = this argv's _hostile_content hits, computed by the caller).
+    Gate 1 is mandatory: no code-execution flag, no scoring. Gate 2: the code
+    argument carries a long high-entropy base64-alphabet blob that really
+    decodes ("obfuscated-inline-payload"), or composes an in-process decode
+    with an exec call ("argv-encoded-loader" — the argv twin of the supply-
+    chain js-encoded-loader). MEDIUM alone, below the notify floor; HIGH only
+    when the argv also fetches, or the blob feeds a recognized exec sink."""
+    starts = [m.end() for m in
+              (rx.search(argv) for rx in _INLINE_CODE_FLAG_RES) if m]
+    if not starts:
+        return []
+    code = argv[min(starts):][:_HOSTILE_SCAN_LIMIT]
+    blob = any(_shannon_bits(run) >= _BLOB_MIN_ENTROPY and _b64_decodable(run)
+               for run in _B64_BLOB_RE.findall(code))
+    loader = bool((_ARGV_DECODE_RE.search(code)
+                   or any(rx.search(code) for rx, _n in _PKG_JS_DECODE_RES)
+                   or (_ARGV_JS_BUFFER_RE.search(code)
+                       and _ARGV_ENC_LITERAL_RE.search(code)))
+                  and _ARGV_EXEC_MARK_RE.search(code))
+    if not blob and not loader:
+        return []
+    fetch = bool(idioms & _FETCH_IDIOMS) or bool(_FETCH_RE.search(argv))
+    sev = "HIGH" if fetch or (blob and idioms & _ARGV_EXEC_SINKS) else "MEDIUM"
+    out = []
+    if blob:
+        out.append(("obfuscated-inline-payload", sev))
+    if loader:
+        out.append(("argv-encoded-loader", sev))
+    return out
+
 
 def _argv_signals(argv):
     """Return [(name, severity)] for hostile patterns in a live process's argv
@@ -4242,6 +4376,13 @@ def _argv_signals(argv):
     # never benign); the fetch/pipe idioms alone stay MEDIUM (benign-installer FP).
     for name in idioms:
         add(name, "HIGH" if name in _UNAMBIGUOUS_HIGH_IDIOMS else "MEDIUM")
+    # Obfuscated inline payload — skipped when powershell-encoded-command
+    # already fired: that idiom IS this shape on Windows and is already HIGH,
+    # so re-scoring the same blob would double-report one argv and
+    # destabilize its fingerprint.
+    if "powershell-encoded-command" not in idioms:
+        for name, sev in _obfuscated_payload_signals(argv, idioms):
+            add(name, sev)
     for rx, name in _ANTIVM_ARGV_RES:
         if rx.search(argv):
             add(name, "MEDIUM")
