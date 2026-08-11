@@ -489,6 +489,27 @@ class TestTriageWorkflow(Sandbox):
         self.assertTrue(notes)
         self.assertTrue(any("persistence" in n for n in notes))
 
+    def test_every_benign_note_is_keyed_on_a_reachable_category(self):
+        """_benign_note_for does an EXACT dict lookup on the finding category,
+        so a note keyed on a SURFACE id instead is dead code that renders for
+        nobody. Three were: "browserext", "ide_ext" and "wallet" — the surface
+        ids — while the categories those sensors actually emit are
+        "browser-ext", "ide-ext" and "wallet-integrity". The two extension
+        surfaces are the most false-positive-prone ones in the tool, so the
+        notes that never rendered were exactly the notes triage needed most.
+
+        Pinned per-category rather than by scraping finding() call sites: the
+        categories are also emitted from multi-line calls with a variable
+        severity, which no source regex reads reliably.
+        """
+        for category in ("browser-ext", "ide-ext", "wallet-integrity"):
+            with self.subTest(category=category):
+                inc = self._one_incident(category=category)
+                notes = aegis._benign_note_for(aegis.incident_detail(inc))
+                self.assertTrue(
+                    any(category in n for n in notes),
+                    "no benign-cause note rendered for %r" % category)
+
     def test_chronically_dismissed_sensor_is_down_weighted(self):
         now = int(time.time())
         db = aegis._event_connection()
