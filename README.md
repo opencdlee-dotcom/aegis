@@ -178,6 +178,16 @@ python3 aegis.py install 1800            # ...every 30 minutes
 python3 aegis.py install watch           # change-driven + 600s full-scan floor
 python3 aegis.py uninstall               # remove the registration, keep evidence
 
+python3 aegis.py setup                   # guided, idempotent walkthrough of the
+                                         #   OPT-IN tiers (canary/latch/decoys/
+                                         #   guard/heartbeat — the strongest
+                                         #   defenses are dormant until you say
+                                         #   yes; enabled tiers are skipped)
+python3 aegis.py update-check            # is ~/.aegis/aegis.py stale behind this
+                                         #   file? drift → exit 1 + the exact
+                                         #   refresh command (--remote: by-hand
+                                         #   compare against GitHub raw too)
+
 # On macOS `bash install.sh [watch] [interval]` remains available and does the
 # same thing; `aegis.py install` is the cross-platform equivalent.
 ```

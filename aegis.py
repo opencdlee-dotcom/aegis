@@ -10549,6 +10549,24 @@ def cmd_doctor():
           ("✓" if state_mode == 0o700 else "?", state_mode))
     if state_mode != 0o700:
         problems.append("state permissions")
+    # Runtime-copy drift is rot, and doctor is where rot surfaces: the
+    # background monitor executes ~/.aegis/aegis.py, not this file, so a stale
+    # copy means every scheduled scan silently runs OLD code.
+    rt = _runtime_copy_status()
+    if rt == "drift":
+        print("  ✗ runtime copy               STALE — refresh: %s"
+              % _refresh_line())
+        problems.append("runtime copy stale")
+    elif rt == "unknown":
+        print("  ? runtime copy               could not be hashed "
+              "(unknown, not clean)")
+        problems.append("runtime copy unknown")
+    elif rt == "in-sync":
+        print("  ✓ runtime copy               in sync with this file")
+    elif rt == "self":
+        print("  ✓ runtime copy               running the installed copy")
+    else:
+        print("  · runtime copy               not installed (manual runs only)")
     for path in (os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")):
         try:
             iterator = os.scandir(path)
@@ -14506,6 +14524,342 @@ def cmd_uninstall():
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# update-check — the runtime copy silently stales behind the repo.
+#
+# `install` copies aegis.py to ~/.aegis/aegis.py and schedules THAT copy (the
+# TCC reasoning is above _install_runtime_copy). The README warns "re-run
+# install after editing aegis.py", but a warning nobody re-reads is not a
+# control: every repo edit silently forks this file from what the background
+# monitor actually executes. This makes the drift detectable — by hand here,
+# and on every `doctor` run, where rot is supposed to surface.
+# --------------------------------------------------------------------------- #
+
+def _runtime_copy_status():
+    """Compare the INVOKED aegis.py against the installed runtime copy.
+
+    Returns 'not-installed' (no runtime copy), 'self' (this IS the runtime
+    copy — nothing independent to compare), 'in-sync', 'drift', or 'unknown'
+    (hashing failed; never reported as clean)."""
+    src = os.path.realpath(_SELF_PATH)
+    if not os.path.exists(RUNTIME_SCRIPT):
+        return "not-installed"
+    if os.path.realpath(RUNTIME_SCRIPT) == src:
+        return "self"
+    a, b = sha256(src), sha256(RUNTIME_SCRIPT)
+    if not a or not b:
+        return "unknown"
+    return "in-sync" if a == b else "drift"
+
+
+def _refresh_line():
+    """The exact command that refreshes the runtime copy — preserving the
+    recorded install mode, so pasting it never silently downgrades a
+    watch-mode install to scan mode. Quoted for pasting as-is: the reference
+    machine's repo path contains both spaces and '&'."""
+    mode = load_json(SELFSTATE, {}).get("install_mode")
+    py = sys.executable or "python3"
+    src = os.path.realpath(_SELF_PATH)
+    pair = ('"%s" "%s"' % (py, src) if IS_WIN
+            else "%s %s" % (shlex.quote(py), shlex.quote(src)))
+    return "%s install%s" % (pair, " watch" if mode == "watch" else "")
+
+
+def _git_origin_url(repo_dir):
+    """`git remote get-url origin` for repo_dir, falling back to reading the
+    config file directly where git is not on run()'s restricted PATH
+    (Windows). One level of `gitdir:` indirection (worktrees) is followed."""
+    out, _e, rc = run(["git", "-C", repo_dir, "remote", "get-url", "origin"],
+                      timeout=15)
+    if rc == 0 and (out or "").strip():
+        return (out or "").strip().splitlines()[0].strip()
+    gd = os.path.join(repo_dir, ".git")
+    try:
+        if os.path.isfile(gd):
+            with open(gd, encoding="utf-8") as f:
+                head = f.read().strip()
+            if not head.startswith("gitdir:"):
+                return None
+            gd = os.path.normpath(os.path.join(
+                repo_dir, head.split(":", 1)[1].strip()))
+            common = os.path.join(gd, "commondir")
+            if os.path.isfile(common):
+                with open(common, encoding="utf-8") as f:
+                    gd = os.path.normpath(os.path.join(gd, f.read().strip()))
+        section = None
+        with open(os.path.join(gd, "config"), encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("["):
+                    section = s.lower()
+                elif (section == '[remote "origin"]'
+                        and s.lower().startswith("url")):
+                    _k, sep, v = s.partition("=")
+                    if sep:
+                        return v.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _github_raw_url():
+    """Canonical GitHub raw URL for THIS file, derived from the invoked
+    checkout's `origin` remote. None when there is no GitHub origin — the
+    remote check refuses to guess a URL."""
+    origin = _git_origin_url(os.path.dirname(os.path.realpath(_SELF_PATH)))
+    m = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$",
+                  origin or "")
+    if not m:
+        return None
+    return ("https://raw.githubusercontent.com/%s/%s/HEAD/aegis.py"
+            % (m.group(1), m.group(2)))
+
+
+def cmd_update_check(remote=False):
+    """Is the installed runtime copy stale behind the invoked aegis.py?
+    Drift → exit 1 with the exact refresh command; in sync or not installed →
+    exit 0. `--remote` additionally compares this file against the repo's
+    canonical GitHub raw copy — a BY-HAND network call (lazy urllib, the `vt`
+    pattern); the scan path never reaches this code."""
+    status = _runtime_copy_status()
+    rc = 0
+    if status == "not-installed":
+        print("No runtime copy installed at %s — nothing to drift "
+              "(`aegis.py install` registers the background monitor)."
+              % RUNTIME_SCRIPT)
+    elif status == "self":
+        print("This IS the installed runtime copy (%s); run update-check "
+              "from the repo checkout to compare the two." % RUNTIME_SCRIPT)
+    elif status == "in-sync":
+        print("Runtime copy is in sync: %s matches this file (sha256)."
+              % RUNTIME_SCRIPT)
+    elif status == "unknown":
+        print("Could not hash both copies — drift is UNKNOWN, not clean "
+              "(check permissions on %s)." % RUNTIME_SCRIPT)
+        rc = 1
+    else:  # drift
+        print("STALE: %s does not match this file — the background monitor "
+              "is running OLD code.\nRefresh it:\n  %s"
+              % (RUNTIME_SCRIPT, _refresh_line()))
+        rc = 1
+    if not remote:
+        return rc
+    url = _github_raw_url()
+    if not url:
+        print("\n--remote: no GitHub `origin` remote found for %s — remote "
+              "comparison skipped rather than guessed."
+              % os.path.dirname(os.path.realpath(_SELF_PATH)))
+        return rc or 2
+    print("\n--remote: fetching %s\n(the canonical copy of this file; that "
+          "URL is the ONLY request made, and nothing about this machine is "
+          "sent)" % url)
+    import urllib.request  # lazy: only this by-hand flag branch loads networking
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = resp.read()
+    except Exception as e:
+        print("--remote: fetch failed (%s) — remote comparison is unknown, "
+              "not clean." % e)
+        return rc or 2
+    local = sha256(os.path.realpath(_SELF_PATH))
+    if local and hashlib.sha256(data).hexdigest() == local:
+        print("--remote: this file matches the GitHub HEAD copy.")
+        return rc
+    print("--remote: this file DIFFERS from the GitHub HEAD copy — local "
+          "edits, or the repo moved ahead (`git pull` in the checkout, then "
+          "re-run install).")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
+# setup — guided walkthrough of the OPT-IN tiers.
+#
+# The strongest defenses in this file (canary, latch, decoys, guard, the
+# watchdog pairing, the off-host heartbeat) are opt-in and therefore DORMANT
+# on most installs — a documented tier nobody turned on protects nobody.
+# `setup` walks them once: one honest sentence of benefit-and-cost each,
+# default No. It ORCHESTRATES the existing commands and never reimplements
+# one — a yes runs exactly what typing the individual command would have run,
+# so there is no second code path to drift. Idempotent: a tier already on is
+# detected from the same state the status/scan paths read, shown as enabled,
+# and skipped.
+# --------------------------------------------------------------------------- #
+
+def _setup_stdio_is_interactive():
+    """setup's tty gate, split out so the suite can drive the walkthrough with
+    a scripted harness. This is a UX refusal (a walkthrough nobody is reading
+    is cron-log noise), NOT a security gate: everything setup can invoke is an
+    ordinary by-hand command a script could already call directly. The gate
+    that must resist automation (`unlatch`) keeps its own out-of-band
+    challenge regardless of how it is reached."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _ask_yn(question):
+    """One y/n prompt, default No; EOF/interrupt is No (opt-IN means opt-in)."""
+    try:
+        return input("%s [y/N] " % question).strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _ask_line(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def cmd_setup():
+    """Guided, idempotent walkthrough of the opt-in tiers (block comment
+    above). Refuses a non-tty caller with the same posture as unlatch."""
+    if not _setup_stdio_is_interactive():
+        print("refuse: setup is an interactive walkthrough and needs a real "
+              "terminal — run it from a shell, not a script.")
+        return 1
+    ensure_state()
+    print("# Aegis setup — the opt-in tiers, one honest question each.\n"
+          "# Everything below is OFF by default and stays off unless you say "
+          "yes;\n# each yes runs exactly the command you could type yourself, "
+          "nothing more.\n")
+
+    st = load_json(SELFSTATE, {})
+    if st.get("installed"):
+        print("[enabled] background monitor — installed (%s mode)."
+              % (st.get("install_mode") or "scan"))
+    else:
+        print("Background monitor: registers a scheduled `scan` for this OS "
+              "(launchd / systemd --user / Task Scheduler); costs one "
+              "background job and a few seconds of CPU per interval.")
+        if _ask_yn("  install the background monitor?"):
+            watch = _ask_yn("  use watch mode (change-driven; rescans within "
+                            "seconds of a file touch, full scan as a floor)?")
+            mode = "watch" if watch else "scan"
+            raw = _ask_line("  full-scan interval in seconds [default %d]: "
+                            % (600 if watch else 3600))
+            cmd_install(mode, int(raw) if raw.isdigit() else None)
+
+    if load_json(CANARY_STATE, {}):
+        print("[enabled] canary files — planted "
+              "(`aegis.py canary remove` removes them).")
+    else:
+        print("Canary files: hidden tripwires in your user dirs whose "
+              "modification or deletion alerts CRITICAL (a near-zero-false-"
+              "positive ransomware signal); costs a few hidden files.")
+        if _ask_yn("  plant canary files?"):
+            cmd_canary("plant")
+
+    if load_json(LATCH_FILE, {}):
+        print("[enabled] latch — persistence surfaces are pre-claimed "
+              "(`aegis.py latch status`).")
+    else:
+        print("Latch: pre-claims the persistence surfaces so a dropper's "
+              "write FAILS (%s); costs running `aegis.py unlatch <path>` "
+              "before a legitimate installer may write there."
+              % ("chflags uchg" if IS_MAC else "a deny-write ACE" if IS_WIN
+                 else "a mode change — a labelled speed bump on Linux"))
+        if _ask_yn("  latch the persistence surfaces?"):
+            cmd_latch("on")
+
+    # Decoys are a POSIX FIFO mechanism; on Windows the surface is absent
+    # (not degraded), so the walkthrough says nothing about it there.
+    if hasattr(os, "mkfifo"):
+        if load_json(DECOY_FILE, {}):
+            print("[enabled] decoys — FIFO honeytokens planted "
+                  "(`aegis.py decoy remove` removes them).")
+        else:
+            print("Decoys: FIFO honeytokens at credential-shaped paths "
+                  "(~/.aws, ~/.ssh) where ANY read is an attacker by "
+                  "construction; costs three fake dotfiles.")
+            if _ask_yn("  plant credential decoys?"):
+                cmd_decoy("plant")
+
+    if os.path.isfile(_guard_paths()[0]):
+        print("[enabled] guard — installed (observe-only; `aegis.py guard "
+              "status` shows what it has seen).")
+    else:
+        print("Guard: an OBSERVE-ONLY pre-exec hook that learns pasted-vs-"
+              "typed from your shell's bracketed paste (the ClickFix shape); "
+              "costs one line you add to your rc file yourself — it refuses "
+              "nothing and Aegis never edits your rc.")
+        if _ask_yn("  write the guard hook files?"):
+            cmd_guard("install")
+
+    # Explained, not performed: a watchdog the monitor registers for itself
+    # dies with it, which is precisely the failure it exists to see.
+    print("\nDead-man's switch: schedule `aegis.py watchdog` from a SECOND, "
+          "independent agent/cron/task so a killed or booted-out monitor "
+          "raises an alarm. Aegis will not register its own watchdog — one "
+          "that dies with its monitor is theater.")
+
+    if _heartbeat_url():
+        print("[enabled] off-host heartbeat — configured (the one background "
+              "egress; a small redacted beat per healthy scan).")
+    else:
+        print("Off-host heartbeat: the ONE background egress, OFF by default "
+              "— given a URL you control, every healthy scan POSTs a small "
+              "redacted liveness beat there, so silence leaves the box even "
+              "when every local sink is being suppressed.")
+        if _ask_yn("  configure a heartbeat URL?"):
+            url = _ask_line("  URL to POST the beat to (https://…): ")
+            if url.startswith(("http://", "https://")):
+                cfg = _aegis_config()
+                cfg = cfg if isinstance(cfg, dict) else {}
+                cfg["heartbeat_url"] = url
+                save_json(AEGIS_CONFIG, cfg)
+                print("  saved heartbeat_url to %s." % AEGIS_CONFIG)
+            elif url:
+                print("  not saved: %r is not an http(s) URL." % url)
+
+    # Tiers that exist only on some builds: probe the module at runtime and
+    # point at them, so this walkthrough never depends on a sibling branch.
+    for fn, pointer in (("cmd_rootwatch", "rootwatch — `aegis.py rootwatch`"),
+                        ("cmd_intel", "intel — `aegis.py intel`")):
+        if callable(globals().get(fn)):
+            print("Also available on this build: %s." % pointer)
+
+    _setup_summary()
+    return 0
+
+
+def _setup_summary():
+    """One-screen posture summary, read from the same state the tier
+    detections above use — never from what this run happened to answer."""
+    st = load_json(SELFSTATE, {})
+    canaries = load_json(CANARY_STATE, {})
+    latches = load_json(LATCH_FILE, {})
+    rows = [
+        ("background monitor",
+         "on (%s mode)" % (st.get("install_mode") or "scan")
+         if st.get("installed") else "off — aegis.py install"),
+        ("canary files", "on (%d planted)" % len(canaries) if canaries
+         else "off — aegis.py canary"),
+        ("latch", "on (%d surfaces)" % len(latches) if latches
+         else "off — aegis.py latch on"),
+    ]
+    if hasattr(os, "mkfifo"):
+        decoys = load_json(DECOY_FILE, {})
+        rows.append(("decoys", "on (%d planted)" % len(decoys) if decoys
+                     else "off — aegis.py decoy plant"))
+    rows.append(("guard", "on (observe-only)"
+                 if os.path.isfile(_guard_paths()[0])
+                 else "off — aegis.py guard install"))
+    rows.append(("off-host heartbeat",
+                 "on" if _heartbeat_url() else "off (local-only)"))
+    rows.append(("watchdog pairing",
+                 "run `aegis.py watchdog` from a second agent/cron/task"))
+    print("\n# Posture after setup")
+    for name, val in rows:
+        print("  %-22s %s" % (name, val))
+    print("\nFull posture any time: aegis.py status   "
+          "(coverage: aegis.py doctor)")
+
+
 def cmd_watchdog():
     """Dead-man's-switch check: is the monitor still beating? Meant to be run by
     a SECOND launchd agent or cron (the unprivileged mutual-watchdog), or by an
@@ -15778,6 +16132,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    Default: a scan every 3600s; `watch` = change-driven
                    monitoring with a [secs] full-scan floor (default 600)
   uninstall        remove that registration (local evidence is kept)
+  setup            guided, idempotent walkthrough of the OPT-IN tiers (monitor,
+                   canary, latch, decoys, guard, watchdog pairing, heartbeat);
+                   default No everywhere, already-enabled tiers are skipped
+  update-check     is the installed runtime copy (~/.aegis/aegis.py) stale
+                   behind this file? drift -> exit 1 + the exact refresh
+                   command; --remote also compares against the repo's GitHub
+                   raw copy (by hand only — the scan path stays offline)
 
  DETECT (default; runs on the scheduled interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
@@ -16000,6 +16361,10 @@ def main(argv):
         return cmd_install(mode, secs)
     if cmd == "uninstall":
         return cmd_uninstall()
+    if cmd == "setup":
+        return cmd_setup()
+    if cmd == "update-check":
+        return cmd_update_check(remote=("--remote" in argv[2:]))
     if cmd == "watchdog":
         return cmd_watchdog()
     if cmd == "bastion":
