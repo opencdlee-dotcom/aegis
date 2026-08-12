@@ -1,3 +1,88 @@
+# Aegis — Battle-Test Log (2026-08-12, `/battle-test` siege — 6 fixes, delegated 4-lens hunt)
+
+Full `/battle-test` run under fable-mode gates. **Tier: siege** (blast-radius ×
+complexity × reversibility → a tool with irreversible response verbs: quarantine
+/ neutralize / kill / destroy). Framing held throughout: *surface failures
+honestly; captured stdout + exit code is the only evidence.* Every oracle was
+derived from README/ARCHITECTURE intent (never from the code under test) and each
+finding independently reproduced before it was trusted. No live launchctl load,
+process kill, quarantine, or notification ever fired — the whole run was
+synthetic inputs + sandboxed state.
+
+## Outcome
+
+**6 genuine defects fixed** (2 HIGH, 3 MEDIUM, 1 LOW/MED) across `aegis.py`, each
+pinned by a permanent fail-before/pass-after regression test
+(`tests/test_battle_20260812.py`, 21 cases). Test state after the pass:
+**846 passed, 4 skipped** (825 baseline → +21 new), `selftest.py` 7/7. The 11
+behavior-change assertions were confirmed to FAIL against the pre-fix `aegis.py`
+(`git stash` + re-run) and pass after. **1 genuine improvement deferred** (F7,
+below) as a dedicated pass rather than bundled. No detection gate was removed.
+
+## Findings (fixed)
+
+| # | Sev | Where | Defect (vs stated intent) | Evidence | Fix |
+|---|-----|-------|---------------------------|----------|-----|
+| F1 | **HIGH** | `_HOSTILE_ARGV_RES` osascript-password-phish (was aegis.py:794) | The single regex `\bosascript\b.{0,512}display dialog.{0,512}(?:hidden\|default) answer` bridges "display dialog" → the answer keyword across the **attacker-controlled dialog message**. Padding the message past ~510 chars makes a *fully-functional* AMOS password phish score **nothing at all** — README claims CRITICAL. | Reproduced: message len ≥520 → `_argv_signals` returns `[]`; short control → CRITICAL. Threshold is exactly the 512 regex cap. | Replaced the bridged regex with `_osascript_phish()` — three ordered, unbounded-distance, linear `.search` token checks (osascript → display dialog → hidden/default answer). No paddable bridge, no ReDoS. Round-2 spar re-attacked with 8 functional variants (padding/reorder/case/whitespace/flags/comments/unicode) → all still CRITICAL. |
+| F2 | **HIGH** | `_SECRET_ASSIGN_RE` / `_SECRET_FLAG_RE` → `redact_sensitive` | `\b` before the keyword never fires next to `_` (underscore is `\w`), so `DB_PASSWORD=`, `API_TOKEN=`, `AWS_SECRET_KEY=` (the dominant env-var secret shape, exactly what a launchd `EnvironmentVariables`/MCP `env` block renders into a finding) were **persisted verbatim** — breaking the "redact before persistence" invariant. `_SECRET_FLAG_RE`'s `(\S+)` value also leaked the tail of a quoted multi-word secret. | `redact_sensitive("DB_PASSWORD=hunter2")` → unchanged; secret survived into `finding()['detail']`. | Treat `_` as a component separator: optional `_`-joined word components may precede/follow the keyword (bounded {0,8}×{1,40}), with `(?<![a-z0-9])`/`(?![a-z0-9])` custom boundaries so `secretary=`/`broken=`/`--token-count 5` stay unmatched (no over-redaction). Value group now consumes a `"…"`/`'…'` quoted run. Verified linear on pathological input. |
+| F3 | **MEDIUM** | `_quarantine_item` / `cmd_restore` / `cmd_destroy` | `qid` from argv was unvalidated: `os.path.join(QUARANTINE_DIR, qid)` silently discards the store when `qid` is absolute (`/tmp/evil`) and `..` walks out. And `cmd_restore` renamed a payload to `txn["original_path"]` with **no `_is_protected_path` refusal** (unlike `cmd_quarantine`/`neutralize`) — an arbitrary-file-drop primitive for a forged/tampered txn. | Reproduced: absolute-`qid` override and `../` escape both resolve outside the store; `cmd_restore` had no protected-dest check. | (a) `_quarantine_item` refuses any qid that isn't a plain basename (the one choke point every store path flows through). (b) Added a `_is_protected_path(dest)` refusal in `cmd_restore` before the exclusive rename — symmetric to `cmd_quarantine` refusing protected sources, so it provably never blocks a legit restore (quarantined items always came from non-protected sources). |
+| F4 | **MEDIUM** | `gui-kill-coercion` (two regexes) + `_KILL_LOOP_RE` | A `killall -0 X` **liveness probe** (signal 0 never terminates) inside a `while` loop was escalated **CRITICAL** identically to a real kill loop — the exact benign supervisor/relaunch pattern the README's carve-out says must not fire. | Reproduced: `while true; do killall -0 SystemUIServer …; done` → `gui-kill-loop-coercion CRITICAL`. | `(?!\s+-0\b)` negative lookahead on both `gui-kill-coercion` regexes and `_KILL_LOOP_RE` excludes signal-0. A coercion kill sends a real terminating signal, so real kill loops still score CRITICAL and `killall Dock` stays clean. |
+| F5 | **MEDIUM** | `_linux_socket_inode_pids` (Linux) | The full `/proc` fd-table walk (list every pid, readlink every fd of every process — O(system-wide open fds)) ran **twice per scan**: once for listeners, once for outbound. No cache, unlike the sibling `_PROC_SNAPSHOT`. Hourly, forever. | Two call sites (`_snapshot_listeners_linux`, `_outbound_rows`) both invoke it; doubled syscall count code-verified. | Scan-scoped `_SOCKET_INODE_SNAPSHOT`, armed once in `gather_all` alongside `_PROC_SNAPSHOT`, cleared in the same `finally` — the established in-codebase idiom. Walk runs once/scan; None outside a scan (by-hand commands walk live). |
+| F6 | **LOW/MED** | `_snapshot_listeners_windows` / `_outbound_rows` (Windows) | Identical `netstat -ano -p tcp` spawned **twice per scan** (listeners + outbound), same args, same timeout. | Two literal duplicate `run([...])` call sites. | Scan-scoped `_NETSTAT_SNAPSHOT` via a shared `_netstat_tcp_rows()` helper that caches the raw `(stdout, rc)` so each caller keeps its own rc interpretation. One spawn/scan. |
+
+## Deferred (genuine, but its own pass)
+
+- **F7 — HIGH-value perf: three macOS `log show` sensors run serially.**
+  `check_xprotect` / `check_security_log` / `check_amfid_log` each spawn a 45s-cap
+  `log show` subprocess sequentially in the sensor loop. The perf lens **measured**
+  4.80s serial → 2.11s concurrent (56% cut, byte-identical output) on this machine.
+  Genuine, but the fix introduces concurrent subprocess orchestration (per-Popen
+  error handling, partial-result semantics) into the scan loop of a security tool —
+  a change that deserves its own reviewed pass, not a bundle. Held on
+  "fewest-moving-parts" grounds; the measurement is recorded here so the follow-up
+  starts from data, not a guess. (It is a latency improvement, not a correctness
+  one — the tool runs hourly.)
+
+## Side-effect safety (how the loop stayed inert)
+
+- Every hunt lens ran on **synthetic in-memory records** (crafted argv, forged
+  txns) or **sandboxed state** (per-test tmp `STATE_DIR`/`QUARANTINE_DIR`); no
+  `_argv_signals`/redaction/quarantine call ever touched the real `~/.aegis`.
+- **Guard self-test (F3):** the regression suite asserts the protected-path
+  refusal actually FIRES (`cmd_restore` on a txn whose `original_path` is a
+  protected path → refused, item stays sealed) and that qid confinement blocks
+  `/tmp/evil` and `../escape`. The conftest real-state backstop (which fails any
+  write aimed at real `~/.aegis`) was green the whole run.
+- No `launchctl bootout`, `os.kill`, `shutil.rmtree`, or `notify` on a real
+  target was ever executed.
+
+## Stop-gate (why the loop ended)
+
+Round 1 (4-lens delegated hunt — correctness, perf/workflow, security-inline,
+adversarial) → 6 genuine findings, all fixed, regression-pinned, and verified
+(846 green, selftest 7/7, fail-before proven). Round 2 (spar confirming re-hunt)
+→ F1 fix confirmed padding-proof against 8 functional variants, **and** two fresh
+README claims attacked (deleted-binary structural HIGH; Linux argv-TTP
+severities) — both HELD with mutation-validated oracles. **Dry.** One clean
+confirming dry round after the fix round; a full second 4-lens sweep was judged
+low-yield for a target with 3+ prior battle-test passes now surgically hardened
+and fully green — reported honestly rather than run to pad the count. Well under
+the siege 6-round cap.
+
+## Residual risk / hardening notes (not fixed — logged)
+
+- **`ld-so-preload-write` argv idiom is quote-evadable** (`echo … > /etc/ld.so.pre""load`
+  splits the literal in captured argv). NOT a gap: `/etc/ld.so.preload` is in
+  `EXTRA_PERSIST_FILES`, so the rootkit *write itself* is caught by the persistence
+  file sensor independent of argv obfuscation — defense-in-depth working. Flagged
+  as a future argv quote-normalization hardening, not a proven miss.
+- **F7 latency** (above) remains until its dedicated pass.
+- Base64/stdin-delivered osascript phish (`… | base64 -d | osascript -`) puts the
+  dialog text on stdin, not argv, so no argv detector sees it — but that shape
+  trips the fetch+pipe-exec idioms separately. Out of the argv-phish claim's scope.
+
+---
+
 # Aegis — Recall build (2026-08-11, `/doit`: 4 detection surfaces, 4 opt-in tiers, 7 parallel branches)
 
 The prior passes hardened what Aegis already detected. This one answered a
