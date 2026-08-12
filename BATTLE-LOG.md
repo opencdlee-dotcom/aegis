@@ -53,6 +53,36 @@ result depended on whether the developer had re-installed since their last edit 
 a test consulting live host state, which is the failure the harness exists to
 prevent. It is now in the `Sandbox` override list.
 
+**The worst one, and I caused it: a test killed the live monitor.** Chasing a
+`launchctl` last-exit-status of 2 on the operator's own machine turned up the
+loaded launchd job pointing at
+`/var/folders/.../T/aegis_inst_*/h & me/.aegis/aegis.py watch 600` — a
+`TestInstaller` **sandbox tmp path**. A test that runs `aegis.py install` in a
+subprocess had executed a **real** `launchctl bootstrap` against the live GUI
+domain, because `_install_mac` (unlike `install.sh`, which substitutes a stub
+launchctl under `AEGIS_TESTING`) drove `launchctl` unconditionally. Teardown
+then deleted the tmp dir, so the squatting job ran `python3 <deleted-path>` →
+exit 2, its stderr routed to the same deleted dir → **125 failed scheduled
+runs, the operator's real monitor dead for ~2h, and not one signal in the real
+`run.err`.** This session's own new watch-mode parity test was the trigger that
+made it fire again. The class is identical to the test-residue defect above —
+a test escaping its sandbox into real state — one layer lower: the OS job
+registry instead of the SQLite store.
+
+The fix is a guard at the one chokepoint every service-control call already
+shares, `run()`: under `AEGIS_TESTING` a `launchctl`/`systemctl`/`schtasks`/
+`loginctl` verb is routed to the test's stub, or **refused** (rc 2) if none was
+supplied — so a test that forgets the stub fails loudly instead of mutating the
+machine. Pinned two ways: a stub that *logs its calls* proves `aegis.py install`
+drives the stub and never `/bin/launchctl` (and that the path it tries to load
+is the sandbox, never a real one), and a direct test that `run()` refuses a
+service-control verb with no stub. Fail-before confirmed the leak — and doing so
+re-leaked a job, which was cleaned up; the guard now makes that impossible.
+Verified after the whole suite runs under BOTH runners: the live launchd job
+still points at the real `~/.aegis`, and the real event DB is byte-identical
+(md5) — the "changed mtime" that first looked like a leak was the live agent's
+own scan during the test window, not a test.
+
 **CI "wedge" — corrected twice, and the second correction is the true one.**
 The first correction (above, in an earlier version of this entry) diagnosed a
 "post-job stall" from the run's `updated_at` looking frozen at ~24 minutes

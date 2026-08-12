@@ -1225,10 +1225,41 @@ def _trusted_command(cmd):
     return normalized
 
 
+# Service-control verbs mutate the OS's PERSISTENT job registry (launchd /
+# systemd / Task Scheduler). A test that runs `aegis.py install` in a
+# subprocess reaches these for real unless stopped, and one did: it left a live
+# launchd job squatting the real `com.charlie.aegis` label, pointed at a
+# since-deleted test sandbox, which failed 125 scheduled runs and killed the
+# operator's actual monitor for hours. install.sh already guards this by
+# substituting a stub launchctl under AEGIS_TESTING; the Python installer did
+# not, so the guard now lives at the one chokepoint every call site shares.
+_SERVICE_CONTROL_VERBS = frozenset(
+    ("launchctl", "systemctl", "schtasks", "loginctl"))
+
+
+def _service_control_guard(cmd):
+    """Under AEGIS_TESTING, never let a service-control verb touch the real job
+    registry: route it to the test's stub, or REFUSE loudly if none was given
+    (a test that forgets the stub fails, rather than mutating the machine).
+    Returns the possibly-rewritten cmd, or a (stdout, stderr, rc) refusal."""
+    if not cmd or os.environ.get("AEGIS_TESTING") != "1":
+        return cmd, None
+    if os.path.basename(str(cmd[0])) not in _SERVICE_CONTROL_VERBS:
+        return cmd, None
+    stub = os.environ.get("AEGIS_TEST_LAUNCHCTL")
+    if stub:
+        return [stub] + list(cmd[1:]), None
+    return None, ("", "refused: service-control verb %r under AEGIS_TESTING "
+                  "with no AEGIS_TEST_LAUNCHCTL stub" % (cmd[0],), 2)
+
+
 def run(cmd, timeout=15, extra_env=None):
     """Run a command, return (stdout, stderr, rc). Never raises. extra_env
     entries are added to the restricted environment — the injection-safe way to
     hand attacker-influenced strings (paths, titles) to PowerShell."""
+    cmd, refusal = _service_control_guard(cmd)
+    if refusal is not None:
+        return refusal
     try:
         if IS_WIN:
             # SystemRoot is load-bearing on Windows (WinSock/CryptoAPI fail

@@ -2873,6 +2873,45 @@ class TestInstaller(unittest.TestCase):
         self.assertTrue(py.get("KeepAlive"))
         self.assertEqual(py.get("ThrottleInterval"), 30)
 
+    def test_python_install_never_touches_the_real_service_manager(self):
+        """The defect this pins cost the operator a dead monitor for hours:
+        `aegis.py install` in a sandbox ran a REAL `launchctl bootstrap`,
+        leaving a live job squatting the real label pointed at a tmp dir that
+        teardown then deleted — 125 failed scheduled runs. install.sh guarded
+        this via a stub launchctl under AEGIS_TESTING; the Python installer did
+        not. Proof: with the stub in place the install still succeeds, and the
+        stub — not the real launchctl — is what got invoked. The stub records
+        each call, so we can assert the real binary was never reached."""
+        # A stub that LOGS its args, so we can prove it (not /bin/launchctl) ran.
+        log = os.path.join(self.tmp, "launchctl-calls.log")
+        stub = os.path.join(self.bin, "launchctl")
+        with open(stub, "w") as f:
+            f.write('#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' % log)
+        os.chmod(stub, 0o755)
+        self._install_py("3600")            # runs aegis.py install in a subproc
+        self.assertTrue(os.path.exists(log),
+                        "installer bypassed the stub and hit real launchctl")
+        calls = open(log).read()
+        self.assertIn("bootstrap", calls,
+                      "installer should have driven the (stubbed) launchctl")
+        # And the sandbox path must be what it tried to load — never a real one.
+        self.assertIn(self.home, calls)
+
+    def test_run_refuses_service_control_without_a_stub_under_testing(self):
+        """The backstop for a test that forgets the stub: rather than mutate
+        the real job registry, run() refuses the verb. This is what makes the
+        guard safe by default instead of safe-if-remembered."""
+        saved = dict(os.environ)
+        os.environ["AEGIS_TESTING"] = "1"
+        os.environ.pop("AEGIS_TEST_LAUNCHCTL", None)
+        try:
+            out, err, rc = aegis.run(["launchctl", "bootout", "gui/501/x"])
+            self.assertEqual(rc, 2)
+            self.assertIn("refused", err)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
     # (installer parity continues below; the real-state guard's own test lives
     # in TestRealStateGuard at the end of this file.)
 
