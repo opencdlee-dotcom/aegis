@@ -30,18 +30,36 @@ below) as a dedicated pass rather than bundled. No detection gate was removed.
 | F5 | **MEDIUM** | `_linux_socket_inode_pids` (Linux) | The full `/proc` fd-table walk (list every pid, readlink every fd of every process — O(system-wide open fds)) ran **twice per scan**: once for listeners, once for outbound. No cache, unlike the sibling `_PROC_SNAPSHOT`. Hourly, forever. | Two call sites (`_snapshot_listeners_linux`, `_outbound_rows`) both invoke it; doubled syscall count code-verified. | Scan-scoped `_SOCKET_INODE_SNAPSHOT`, armed once in `gather_all` alongside `_PROC_SNAPSHOT`, cleared in the same `finally` — the established in-codebase idiom. Walk runs once/scan; None outside a scan (by-hand commands walk live). |
 | F6 | **LOW/MED** | `_snapshot_listeners_windows` / `_outbound_rows` (Windows) | Identical `netstat -ano -p tcp` spawned **twice per scan** (listeners + outbound), same args, same timeout. | Two literal duplicate `run([...])` call sites. | Scan-scoped `_NETSTAT_SNAPSHOT` via a shared `_netstat_tcp_rows()` helper that caches the raw `(stdout, rc)` so each caller keeps its own rc interpretation. One spawn/scan. |
 
-## Deferred (genuine, but its own pass)
+## Follow-up (`/doit`, same day) — the deferred item + the hardening note, done
 
-- **F7 — HIGH-value perf: three macOS `log show` sensors run serially.**
-  `check_xprotect` / `check_security_log` / `check_amfid_log` each spawn a 45s-cap
-  `log show` subprocess sequentially in the sensor loop. The perf lens **measured**
-  4.80s serial → 2.11s concurrent (56% cut, byte-identical output) on this machine.
-  Genuine, but the fix introduces concurrent subprocess orchestration (per-Popen
-  error handling, partial-result semantics) into the scan loop of a security tool —
-  a change that deserves its own reviewed pass, not a bundle. Held on
-  "fewest-moving-parts" grounds; the measurement is recorded here so the follow-up
-  starts from data, not a guess. (It is a latency improvement, not a correctness
-  one — the tool runs hourly.)
+Both items this run first deferred were then implemented under `/doit`, on the same
+branch, each regression-pinned and fail-before-proven:
+
+- **F7 (MEDIUM perf) — three macOS `log show` sensors now run concurrently.**
+  `check_xprotect` / `check_security_log` / `check_amfid_log` each shell out to an
+  independent 45s-cap `log show` over a disjoint predicate; run serially in the
+  sensor loop they cost ~the sum of three I/O waits (**measured 4.80s**). Now
+  prewarmed **concurrently** once per scan into a scan-scoped `_LOG_SHOW_CACHE`
+  (the same arm-once/clear-in-`finally` idiom as F5/F6), which the three sensors
+  read via a shared `_log_show(predicate)` — **measured 2.11s** (56% cut,
+  byte-identical output). Concurrency reuses `run()` verbatim (all its path/env/
+  timeout hardening), one thread per command; `run()` is stateless, so it is
+  thread-safe. Predicates are named once (`_PRED_XPROTECT`/`_PRED_SYSPOLICY`/
+  `_PRED_AMFID`) so the prewarm and the sensors can't drift. No predicate, parser,
+  or severity changed — only *when* each subprocess starts. Pinned by
+  `TestLogShowScanCache` (prewarm covers all three, sensors hit the cache and
+  route by predicate, unarmed→live, argv byte-unchanged).
+- **H1 (hardening) — `ld-so-preload-write` argv idiom is now quote-tolerant.**
+  Round-2 spar noted the plain `ld\.so\.preload` literal is shell-quote-evadable
+  (`/etc/ld.so.pre""load` writes the file while splitting the substring). The
+  idiom now allows optional quote chars between every character
+  (`"['\"]*".join(re.escape(c) for c in "ld.so.preload")`) — coverage strictly
+  widens (a verbatim match still matches; benign text like `ldconfig` does not).
+  Defense in depth on top of the persistence file sensor that already catches the
+  write. Pinned by `TestLdSoPreloadQuoteTolerant`.
+
+Test state after the follow-up: **853 passed, 4 skipped** (846 → +7 new regression
+cases for F7/H1), `selftest.py` 7/7. Nothing now remains deferred from this siege.
 
 ## Side-effect safety (how the loop stayed inert)
 
@@ -69,17 +87,16 @@ low-yield for a target with 3+ prior battle-test passes now surgically hardened
 and fully green — reported honestly rather than run to pad the count. Well under
 the siege 6-round cap.
 
-## Residual risk / hardening notes (not fixed — logged)
+## Residual risk / notes
 
-- **`ld-so-preload-write` argv idiom is quote-evadable** (`echo … > /etc/ld.so.pre""load`
-  splits the literal in captured argv). NOT a gap: `/etc/ld.so.preload` is in
-  `EXTRA_PERSIST_FILES`, so the rootkit *write itself* is caught by the persistence
-  file sensor independent of argv obfuscation — defense-in-depth working. Flagged
-  as a future argv quote-normalization hardening, not a proven miss.
-- **F7 latency** (above) remains until its dedicated pass.
+- **`ld-so-preload-write` argv quote-evasion — now fixed** (H1 above). Was defense-
+  in-depth only (the write is also caught by the persistence file sensor); the argv
+  idiom is now quote-tolerant as well.
+- **F7 latency — now fixed** (above): the macOS `log show` cluster runs concurrently.
 - Base64/stdin-delivered osascript phish (`… | base64 -d | osascript -`) puts the
   dialog text on stdin, not argv, so no argv detector sees it — but that shape
   trips the fetch+pipe-exec idioms separately. Out of the argv-phish claim's scope.
+  (Unchanged — genuinely outside what an argv detector can see.)
 
 ---
 

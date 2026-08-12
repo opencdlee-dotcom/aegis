@@ -23,6 +23,11 @@ Findings pinned here:
      (listeners + outbound); now a scan-scoped cache.
   F6 Windows netstat TCP table: `netstat -ano -p tcp` was spawned twice per scan
      (listeners + outbound); now a scan-scoped cache.
+  F7 macOS unified-log harvest: the three independent `log show` sensors (xprotect
+     / syspolicy / amfid) ran serially in the sensor loop; now prewarmed
+     CONCURRENTLY once per scan into a cache the sensors read (measured 4.8s->2.1s).
+  H1 ld-so-preload-write argv idiom: a plain `ld\\.so\\.preload` literal was
+     quote-evadable (`/etc/ld.so.pre""load`); now quote-tolerant (coverage widens).
 """
 import contextlib
 import io
@@ -333,6 +338,107 @@ class TestNetstatScanCache(unittest.TestCase):
         finally:
             aegis.run = real_run
         self.assertEqual(spawns["n"], 1)
+
+
+# --------------------------------------------------------------------------- #
+# F7 — the three macOS `log show` harvests run once, concurrently, per scan.
+# --------------------------------------------------------------------------- #
+class TestLogShowScanCache(unittest.TestCase):
+    def tearDown(self):
+        aegis._LOG_SHOW_CACHE = None
+
+    def _spy(self):
+        calls = []
+
+        def spy_run(cmd, timeout=15, extra_env=None):
+            if cmd[:2] == ["log", "show"]:
+                calls.append(cmd[cmd.index("--predicate") + 1])
+            return ("OUT::" + cmd[cmd.index("--predicate") + 1], "", 0)
+
+        return calls, spy_run
+
+    def test_prewarm_covers_all_three_predicates(self):
+        calls, spy_run = self._spy()
+        real = aegis.run
+        aegis.run = spy_run
+        try:
+            cache = aegis._prewarm_log_show()
+        finally:
+            aegis.run = real
+        # One spawn per distinct predicate; cache holds all three, keyed by argv.
+        self.assertEqual(sorted(calls), sorted(aegis._LOGSHOW_PREDICATES))
+        self.assertEqual(len(cache), 3)
+
+    def test_sensors_hit_cache_and_route_by_predicate(self):
+        calls, spy_run = self._spy()
+        real = aegis.run
+        aegis.run = spy_run
+        try:
+            aegis._LOG_SHOW_CACHE = aegis._prewarm_log_show()
+            calls.clear()
+            o_xp, rc_xp = aegis._log_show(aegis._PRED_XPROTECT)
+            o_sp, _ = aegis._log_show(aegis._PRED_SYSPOLICY)
+            o_am, _ = aegis._log_show(aegis._PRED_AMFID)
+        finally:
+            aegis.run = real
+        self.assertEqual(calls, [], "armed cache must not re-spawn log show")
+        self.assertEqual(rc_xp, 0)
+        # Each predicate's cached output is distinct (keyed on full argv, not a
+        # shared/first-writer-wins entry).
+        self.assertEqual(len({o_xp, o_sp, o_am}), 3)
+        self.assertIn(aegis._PRED_XPROTECT, o_xp)
+
+    def test_unarmed_cache_runs_live(self):
+        calls, spy_run = self._spy()
+        real = aegis.run
+        aegis.run = spy_run
+        try:
+            aegis._LOG_SHOW_CACHE = None
+            aegis._log_show(aegis._PRED_AMFID)
+        finally:
+            aegis.run = real
+        self.assertEqual(calls, [aegis._PRED_AMFID])
+
+    def test_log_show_argv_is_unchanged(self):
+        # The refactor must build the exact command the sensors used before.
+        seen = {}
+        real = aegis.run
+
+        def capture(cmd, timeout=15, extra_env=None):
+            seen["cmd"] = cmd
+            seen["timeout"] = timeout
+            return ("", "", 0)
+
+        aegis.run = capture
+        try:
+            aegis._LOG_SHOW_CACHE = None
+            aegis._log_show(aegis._PRED_SYSPOLICY)
+        finally:
+            aegis.run = real
+        self.assertEqual(seen["cmd"], [
+            "log", "show", "--last", "6h", "--style", "ndjson",
+            "--predicate", 'subsystem == "com.apple.syspolicy"'])
+        self.assertEqual(seen["timeout"], 45)
+
+
+# --------------------------------------------------------------------------- #
+# H1 — the ld.so.preload argv idiom is tolerant of shell quote-splitting.
+# --------------------------------------------------------------------------- #
+class TestLdSoPreloadQuoteTolerant(unittest.TestCase):
+    def _hit(self, argv):
+        return any(name == "ld-so-preload-write" and rx.search(argv)
+                   for rx, name in aegis._HOSTILE_CONTENT_RES)
+
+    def test_verbatim_still_matches(self):
+        self.assertTrue(self._hit("echo x > /etc/ld.so.preload"))
+
+    def test_quote_split_is_caught(self):
+        self.assertTrue(self._hit('echo x > /etc/ld.so.pre""load'))
+        self.assertTrue(self._hit("sh -c 'printf x > /etc/ld.so.pr\"\"eload'"))
+
+    def test_benign_text_not_flagged(self):
+        self.assertFalse(self._hit("echo hello world"))
+        self.assertFalse(self._hit("ldconfig -p | grep libssl"))
 
 
 if __name__ == "__main__":
