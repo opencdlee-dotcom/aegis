@@ -701,7 +701,7 @@ _HOSTILE_CONTENT_RES = [
     # (SystemUIServer), NotificationCenter (suppresses Gatekeeper warnings),
     # Console. A user practically never scripts killing THESE, so it is a high-
     # signal anti-analysis/coercion tell even outside the tight-loop shape.
-    (re.compile(r"\b(?:killall|pkill)\b[^\n]{0,512}\b(?:Activity[ _]?Monitor|"
+    (re.compile(r"\b(?:killall|pkill)\b(?!\s+-0\b)[^\n]{0,512}\b(?:Activity[ _]?Monitor|"
                 r"SystemUIServer|NotificationCenter|Console|coreauthd)\b", re.I),
      "gui-kill-coercion"),
     # applescript:// URL scheme launches Script Editor pre-loaded with the
@@ -743,7 +743,14 @@ _HOSTILE_CONTENT_RES = [
     # --- Linux-native persistence/injection idioms --------------------------
     # LD_PRELOAD injection and /etc/ld.so.preload writes (T1574.006).
     (re.compile(r"\bLD_PRELOAD\s*=", re.I), "ld-preload-injection"),
-    (re.compile(r"ld\.so\.preload", re.I), "ld-so-preload-write"),
+    # Quote-tolerant: a shell can split the literal with empty quote pairs
+    # (`/etc/ld.so.pre""load`) to dodge a plain substring match while still
+    # writing the file, so allow optional quote chars between every character.
+    # Coverage only widens (a verbatim `ld.so.preload` still matches); this is
+    # defence in depth — the write itself is also caught by the persistence file
+    # sensor (/etc/ld.so.preload is in EXTRA_PERSIST_FILES).
+    (re.compile("['\"]*".join(re.escape(c) for c in "ld.so.preload"), re.I),
+     "ld-so-preload-write"),
     # A payload installing its own systemd unit / crontab from a script.
     (re.compile(r"\bsystemctl\b[^\n]{0,120}\b(?:enable|start)\b[^\n]{0,120}"
                 r"(?:/tmp/|/dev/shm/|/var/tmp/)", re.I), "systemd-tmp-unit"),
@@ -791,8 +798,13 @@ _DYLD_INJECT_KEYS = ("DYLD_INSERT_LIBRARIES", "DYLD_FRAMEWORK_PATH",
 # discipline as _HOSTILE_CONTENT_RES): these run over full same-user argv.
 _HOSTILE_ARGV_RES = [
     # AMOS/Cthulhu core primitive: a fake system password prompt (hidden answer).
-    (re.compile(r"\bosascript\b.{0,512}display\s+dialog.{0,512}(?:hidden\s+answer|default\s+answer)", re.I | re.S),
-     "osascript-password-phish", "CRITICAL"),
+    # NOTE: scored by _osascript_phish() (called from _argv_signals), not by a
+    # single bridged regex. A `\bosascript\b.{0,512}display dialog.{0,512}answer`
+    # form is defeated by padding the dialog's (attacker-controlled) message text
+    # past the 512-char bridge — the structural invariant (osascript + display
+    # dialog + hidden/default answer) stays intact while the CRITICAL signal
+    # vanishes. Ordered, unbounded-distance token checks restore the invariant
+    # without a paddable gap, and are each linear (no ReDoS).
     # ClickFix validates the phished password locally before proceeding.
     (re.compile(r"\bdscl\b\s+\.?\s+(?:-)?authonly\b", re.I), "dscl-authonly-passcheck", "HIGH"),
     # Provenance strip: defeats Aegis's own quarantine check if we only read xattrs
@@ -817,7 +829,11 @@ _HOSTILE_ARGV_RES = [
     # ClickLock (2026) password-coercion / anti-analysis: killing Activity
     # Monitor / SystemUIServer / NotificationCenter / Console. HIGH alone; the
     # tight-loop variant escalates to CRITICAL in _argv_signals (below).
-    (re.compile(r"\b(?:killall|pkill)\b[^\n]{0,512}\b(?:Activity[ _]?Monitor|"
+    # `(?!\s+-0\b)` excludes a signal-0 liveness probe (`killall -0 X`) — a
+    # non-terminating existence check used by benign supervisor/relaunch loops,
+    # which the README carve-out says must not be flagged. A coercion kill sends
+    # a real terminating signal, so it never carries `-0`.
+    (re.compile(r"\b(?:killall|pkill)\b(?!\s+-0\b)[^\n]{0,512}\b(?:Activity[ _]?Monitor|"
                 r"SystemUIServer|NotificationCenter|Console|coreauthd)\b", re.I),
      "gui-kill-coercion", "HIGH"),
     # applescript:// URL-scheme execution (shell-history- and Terminal-warning-
@@ -825,12 +841,40 @@ _HOSTILE_ARGV_RES = [
     (re.compile(r"\bapplescript://", re.I), "applescript-url-scheme", "HIGH"),
 ]
 
+# AMOS/Cthulhu fake-password-prompt primitive, scored as ORDERED token presence
+# rather than one bridged regex (see the note in _HOSTILE_ARGV_RES). Each token
+# must appear after the previous one, at any distance — so the attacker-controlled
+# dialog message can no longer pad the CRITICAL signal away. Three plain .search()
+# calls are each linear over argv (no backtracking bridge, no ReDoS).
+_PHISH_OSASCRIPT_RE = re.compile(r"\bosascript\b", re.I)
+_PHISH_DISPLAY_DIALOG_RE = re.compile(r"display\s+dialog", re.I)
+_PHISH_ANSWER_RE = re.compile(r"(?:hidden|default)\s+answer", re.I)
+
+
+def _osascript_phish(argv):
+    """True if argv is an osascript fake-password prompt (display dialog + a
+    hidden/default answer field), independent of how much message text separates
+    the tokens. Ordered, unbounded-distance, linear — the padding-proof form."""
+    m = _PHISH_OSASCRIPT_RE.search(argv)
+    if not m:
+        return False
+    m = _PHISH_DISPLAY_DIALOG_RE.search(argv, m.end())
+    if not m:
+        return False
+    return _PHISH_ANSWER_RE.search(argv, m.end()) is not None
+
+
 # A tight loop wrapped around a GUI-kill: the ClickLock coercion primitive (kill
 # Activity Monitor / Dock / Terminal every ~0.2s for hours until a password is
 # typed). "No legitimate use case" (Group-IB), so the loop+kill COMBINATION is a
 # short-circuit CRITICAL — it must not have to wait for risk accumulation.
+# The `(?!-0\b)` guard excludes a signal-0 liveness probe (`killall -0 X`, which
+# never terminates the target): a `while true; do killall -0 X || open X; done`
+# supervisor/relaunch loop is the benign pattern the README carve-out protects,
+# and a coercion kill necessarily SENDS a terminating signal (no `-0`).
 _KILL_LOOP_RE = re.compile(
-    r"\b(?:while|until|repeat|for)\b.{0,80}?\b(?:killall|pkill)\b", re.I | re.S)
+    r"\b(?:while|until|repeat|for)\b.{0,80}?\b(?:killall|pkill)\b(?!\s+-0\b)",
+    re.I | re.S)
 
 # Anti-VM / sandbox / geo gates run BEFORE the payload — an early-warning signal
 # on a real victim endpoint (where the malware WILL proceed). Lower severity
@@ -890,6 +934,75 @@ _ARGV_WATCH_RE = re.compile(
 # professionally-maintained engine finding malware: the single highest-value
 # signal a free tool can surface, because it inherits Apple's signature pipeline.
 XPROTECT_SUBSYSTEM = "com.apple.XProtectFramework.PluginAPI"
+
+# The three unified-log harvest sensors — XProtect detections, syspolicy/
+# Gatekeeper denials, amfid signature failures — each shell out to an independent
+# `log show --style ndjson` over a DISJOINT predicate. Run one-at-a-time in the
+# sensor loop they cost ~the sum of three I/O-bound subprocess waits; there is no
+# data dependency between them, so they are prewarmed CONCURRENTLY once per scan
+# (see _prewarm_log_show / gather_all) into _LOG_SHOW_CACHE, keyed by the exact
+# argv. Each sensor still calls _log_show, which returns the cached (out, rc) when
+# the scan prewarmed it and runs live otherwise (a by-hand command, or a window
+# the prewarm didn't cover). Only WHEN each subprocess starts changes — same
+# command, same parsing, same severities. Predicates are named once here so the
+# prewarm and the sensors can never drift apart.
+_PRED_XPROTECT = ('subsystem == "%s" AND category == "XPEvent.structured"'
+                  % XPROTECT_SUBSYSTEM)
+_PRED_SYSPOLICY = 'subsystem == "com.apple.syspolicy"'
+_PRED_AMFID = 'process == "amfid"'
+_LOGSHOW_PREDICATES = (_PRED_XPROTECT, _PRED_SYSPOLICY, _PRED_AMFID)
+_LOG_SHOW_CACHE = None
+
+
+def _log_show_window(window_hours):
+    if window_hours is None:
+        window_hours = 6  # default cadence-sized window; capped 1..48h
+    return "%dh" % max(1, min(int(window_hours), 48))
+
+
+def _log_show(predicate, window_hours=None, timeout=45):
+    """Run — or read the scan-cached result of — one `log show --style ndjson`
+    over `predicate`. Returns (stdout, rc). The cache is populated once per scan
+    by _prewarm_log_show; outside a scan (cache None, or a window not prewarmed)
+    this runs live, so a by-hand call still works unchanged."""
+    argv = ["log", "show", "--last", _log_show_window(window_hours),
+            "--style", "ndjson", "--predicate", predicate]
+    if _LOG_SHOW_CACHE is not None:
+        hit = _LOG_SHOW_CACHE.get(tuple(argv))
+        if hit is not None:
+            return hit
+    out, _, rc = run(argv, timeout=timeout)
+    return (out, rc)
+
+
+def _prewarm_log_show(window_hours=None):
+    """Launch the scan's independent `log show` harvests concurrently and return
+    a {argv-tuple: (out, rc)} cache. Each is an I/O-bound subprocess wait with no
+    cross-dependency, so concurrent dispatch turns sum-of-waits into max-of-waits
+    with byte-identical results (measured on-host: 4.8s serial -> 2.1s). Reuses
+    run() verbatim — all its path/env/timeout hardening — one thread per command;
+    run() is stateless, so this is safe."""
+    import threading
+    win = _log_show_window(window_hours)
+    results = {}
+    lock = threading.Lock()
+
+    def _one(pred):
+        argv = ["log", "show", "--last", win, "--style", "ndjson",
+                "--predicate", pred]
+        out, _, rc = run(argv, timeout=45)
+        with lock:
+            results[tuple(argv)] = (out, rc)
+
+    threads = [threading.Thread(target=_one, args=(p,), daemon=True)
+               for p in _LOGSHOW_PREDICATES]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=50)  # run() self-caps at 45s; this join is only a backstop
+    return results
+
+
 XPROTECT_BUNDLES = [
     "/Library/Apple/System/Library/CoreServices/XProtect.bundle",
     "/var/protected/xprotect/XProtect.bundle",
@@ -1934,8 +2047,24 @@ def suspicious_sig(trust):
 # --------------------------------------------------------------------------- #
 
 
+# The keyword is often one `_`-delimited COMPONENT of a SCREAMING_SNAKE env-var
+# name — `DB_PASSWORD`, `AWS_SECRET_KEY`, `API_TOKEN` — the dominant real-world
+# shape, and exactly what a launchd `EnvironmentVariables` dict or an MCP server's
+# `env` block renders into a finding detail. A bare `\b(keyword)\b` never fires
+# there: `_` is a \w char, so there is no word boundary between `_` and the
+# keyword on either side (`AWS_SECRET_KEY` fails the trailing `\b` too, before
+# `_KEY`), and those secrets reached persistence verbatim. So instead of `\b`,
+# treat `_` as a component separator: optional `_`-joined word components may
+# precede/follow the keyword (folded into group 1 so the value still redacts),
+# with `(?<![a-z0-9])`/`(?![a-z0-9])` custom boundaries that admit `_` and
+# non-word chars but NOT a letter/digit — so `secretary=x` (keyword `secret`
+# followed by a LETTER) stays unmatched, no over-redaction. The component counts
+# are bounded ({0,8} × {1,40}) per the file's ReDoS discipline, and each `_` is a
+# hard split point so the nested quantifier can't backtrack super-linearly.
 _SECRET_ASSIGN_RE = re.compile(
-    r"(?i)\b(password|passwd|token|api[_-]?key|secret|cookie)\b"
+    r"(?i)(?<![a-z0-9])"
+    r"((?:[a-z0-9]{1,40}_){0,8}(?:password|passwd|token|api[_-]?key|secret|cookie)"
+    r"(?:_[a-z0-9]{1,40}){0,8})(?![a-z0-9])"
     r'("?\s*[:=]\s*"?)([^\s&;,"\']+)')
 # Whitespace is BOUNDED (`\s{0,20}`, not `\s*`): the two `\s*` runs either side
 # of the optional `(?:bearer|basic)?` are adjacent, so an unbounded pair
@@ -1963,7 +2092,13 @@ _URL_USERINFO_RE = re.compile(r"(https?://[^\s/@:]+:)([^\s/@]+)(@)", re.I)
 # args interpolation is also length-capped as defence in depth.
 _SECRET_FLAG_RE = re.compile(
     r"(?i)(--?[\w-]{0,40}(?:password|passwd|api[_-]?key|token|secret|cookie|auth))"
-    r"(\s+)(\S+)")
+    r"(\s+)("
+    # A QUOTED value is one token even with spaces: `--password "a b c"` must
+    # redact the whole run, not just up to the first space (a bare `\S+` leaked
+    # the `b c"` tail). Quoted forms first, then the unquoted single token.
+    r'"[^"]*"|'
+    r"'[^']*'|"
+    r"\S+)")
 _TOKEN_SHAPE_RE = re.compile(
     r"(?i)\b(?:sk-(?:live-)?[A-Za-z0-9_-]{12,}|"
     r"(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}|"   # Stripe underscore form
@@ -4443,6 +4578,11 @@ def _argv_signals(argv):
     for rx, name, sev in _HOSTILE_ARGV_RES:
         if rx.search(argv):
             add(name, sev)
+    # Fake-password-prompt phish: ordered token check, padding-proof (see
+    # _osascript_phish). Kept out of _HOSTILE_ARGV_RES because its match is not
+    # a single-regex bridge.
+    if _osascript_phish(argv):
+        add("osascript-password-phish", "CRITICAL")
     idioms = set(_hostile_content(argv))
     fetch = idioms & _FETCH_IDIOMS
     execp = idioms & _PIPE_EXEC_IDIOMS
@@ -4541,13 +4681,8 @@ def check_xprotect(window_hours=None):
 
     # (a) Harvest detection events from the unified log since the last scan.
     #     Bound the window so `log show` stays cheap (≈1.5s for 2h on-host).
-    if window_hours is None:
-        window_hours = 6  # default cadence-sized window; capped below
-    win = "%dh" % max(1, min(int(window_hours), 48))
-    out, _, rc = run(["log", "show", "--last", win, "--style", "ndjson",
-                      "--predicate",
-                      'subsystem == "%s" AND category == "XPEvent.structured"'
-                      % XPROTECT_SUBSYSTEM], timeout=45)
+    #     Shared with the scan's concurrent prewarm via _log_show.
+    out, rc = _log_show(_PRED_XPROTECT, window_hours)
     if rc == 0 and out:
         for line in out.splitlines():
             line = line.strip()
@@ -6260,10 +6395,23 @@ def _parse_proc_net_tcp(text):
     return rows
 
 
+# Scan-scoped {socket-inode: pid} cache. Both the listener snapshot and the
+# outbound check need this full /proc fd-table walk (list every pid, readlink
+# every fd of every process — O(system-wide open fds)); without a cache it ran
+# TWICE per scan. Armed once in gather_all alongside _PROC_SNAPSHOT and cleared
+# in the same finally; None outside a scan so by-hand commands walk live.
+_SOCKET_INODE_SNAPSHOT = None
+
+
 def _linux_socket_inode_pids():
     """{socket-inode: pid} from /proc/<pid>/fd. Other users' processes are
     unreadable without root — that is the honest unprivileged boundary, and a
-    listener we cannot attribute is still reported (with an unknown path)."""
+    listener we cannot attribute is still reported (with an unknown path).
+
+    Scan-scoped: within one gather_all the walk runs once (see
+    _SOCKET_INODE_SNAPSHOT); outside a scan the cache is None and it walks live."""
+    if _SOCKET_INODE_SNAPSHOT is not None:
+        return _SOCKET_INODE_SNAPSHOT
     out = {}
     try:
         pids = [d for d in os.listdir("/proc") if d.isdigit()]
@@ -6338,8 +6486,25 @@ def _parse_netstat_listen_windows(text):
     return rows
 
 
-def _snapshot_listeners_windows():
+# Scan-scoped (stdout, rc) of `netstat -ano -p tcp` (Windows). Both the listener
+# snapshot and the outbound check parse this same full TCP-table dump, and without
+# a cache each spawned its own identical netstat per scan. Armed once in gather_all
+# (see _NETSTAT_SNAPSHOT), cleared in the same finally; None ⇒ live spawn.
+_NETSTAT_SNAPSHOT = None
+
+
+def _netstat_tcp_rows():
+    """Raw (stdout, rc) of `netstat -ano -p tcp`. Cached scan-scoped so it runs
+    ONCE per scan; each caller keeps its own rc interpretation (listeners treat
+    any nonzero rc as a non-answer; outbound only 124/127)."""
+    if _NETSTAT_SNAPSHOT is not None:
+        return _NETSTAT_SNAPSHOT
     out, _, rc = run(["netstat", "-ano", "-p", "tcp"], timeout=30)
+    return (out, rc)
+
+
+def _snapshot_listeners_windows():
+    out, rc = _netstat_tcp_rows()
     if rc != 0 or not out:
         return None  # non-answer: netstat always prints a header when it runs
     pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
@@ -6547,7 +6712,7 @@ def _outbound_rows():
             out.append((path, rip, rport))
         return out
     if IS_WIN:
-        text, _, rc = run(["netstat", "-ano", "-p", "tcp"], timeout=30)
+        text, rc = _netstat_tcp_rows()
         if rc in (124, 127) or not text:
             return []
         pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
@@ -7179,12 +7344,7 @@ def check_security_log(window_hours=None):
     floor): the live message format varies by OS build and can't be verified
     against a real denial in the field here, so it enriches without risking a
     noisy page. On any log-read failure it degrades to empty (never a storm)."""
-    if window_hours is None:
-        window_hours = 6
-    win = "%dh" % max(1, min(int(window_hours), 48))
-    out, _, rc = run(["log", "show", "--last", win, "--style", "ndjson",
-                      "--predicate", 'subsystem == "com.apple.syspolicy"'],
-                     timeout=45)
+    out, rc = _log_show(_PRED_SYSPOLICY, window_hours)
     if rc != 0 or not out:
         return []
     findings = []
@@ -7241,12 +7401,7 @@ def check_amfid_log(window_hours=None):
     message format varies by OS build and can't be verified against a real
     denial in the field here, so it enriches without risking a noisy page.
     On any log-read failure it degrades to empty (never a storm)."""
-    if window_hours is None:
-        window_hours = 6
-    win = "%dh" % max(1, min(int(window_hours), 48))
-    out, _, rc = run(["log", "show", "--last", win, "--style", "ndjson",
-                      "--predicate", 'process == "amfid"'],
-                     timeout=45)
+    out, rc = _log_show(_PRED_AMFID, window_hours)
     if rc != 0 or not out:
         return []
     findings = []
@@ -9764,14 +9919,32 @@ def gather_all(baseline_snap, current_snap, health=None):
     # long-lived loop always re-walks; cleared in `finally` so a by-hand command
     # after the scan sees the current table, and so an exception in any sensor
     # cannot strand a stale snapshot into the next scan.
-    global _PROC_SNAPSHOT
+    global _PROC_SNAPSHOT, _SOCKET_INODE_SNAPSHOT, _NETSTAT_SNAPSHOT, \
+        _LOG_SHOW_CACHE
     _PROC_SNAPSHOT = None
     _PROC_SNAPSHOT = list(_iter_processes())
+    # Same one-walk-per-scan discipline for the two other tables that more than
+    # one sensor consumes: the Linux /proc socket-inode map (listeners+outbound)
+    # and the Windows netstat TCP table (listeners+outbound). Each was gathered
+    # twice per scan; arm once here, share below, clear in finally.
+    _SOCKET_INODE_SNAPSHOT = None
+    _SOCKET_INODE_SNAPSHOT = _linux_socket_inode_pids() if IS_LINUX else None
+    _NETSTAT_SNAPSHOT = None
+    _NETSTAT_SNAPSHOT = _netstat_tcp_rows() if IS_WIN else None
+    # macOS: the three independent `log show` harvests (xprotect / syspolicy /
+    # amfid) have no cross-dependency, so run them CONCURRENTLY once up front
+    # instead of serially inside the sensor loop (measured 4.8s -> 2.1s on-host).
+    # The sensors read this cache via _log_show; same commands, same output.
+    _LOG_SHOW_CACHE = None
+    _LOG_SHOW_CACHE = _prewarm_log_show() if IS_MAC else None
     try:
         for sensor_id, fn, args in sensors:
             findings += _collect_sensor(sensor_id, fn, health_sink, *args)
     finally:
         _PROC_SNAPSHOT = None
+        _SOCKET_INODE_SNAPSHOT = None
+        _NETSTAT_SNAPSHOT = None
+        _LOG_SHOW_CACHE = None
     # Community-intel grading (see cmd_intel) — a local set lookup over the
     # hashes the sensors above already computed plus the persistence
     # snapshot's. Scheduled only when local intel EXISTS: a machine that never
@@ -11736,6 +11909,18 @@ def _response_tombstone_dir():
 
 
 def _quarantine_item(qid):
+    # qid indexes INTO the store and must never address anything outside it. It is
+    # always generated as a plain `TIMESTAMP-digest` basename (see cmd_quarantine),
+    # but restore/destroy take it straight from argv — so confine it here, the one
+    # choke point every store path flows through. os.path.join(store, qid) silently
+    # DISCARDS `store` when qid is absolute (`/tmp/evil`), and `..` walks out of the
+    # store; either would let a forged/attacker-planted txn drive restore/destroy
+    # against a location of the attacker's choosing. A non-basename qid is a store
+    # escape, refused (not resolved) — callers load the txn under try/except and
+    # report it as an unknown id.
+    if not qid or qid in (os.curdir, os.pardir) or qid != os.path.basename(qid) \
+            or (os.altsep and os.altsep in qid) or os.sep in qid:
+        raise ValueError("unsafe quarantine id: %r" % (qid,))
     return os.path.join(QUARANTINE_DIR, qid)
 
 
@@ -12383,6 +12568,18 @@ def cmd_restore(qid):
             print("error: quarantine payload failed integrity verification")
             return 1
         dest = txn["original_path"]
+        # Defence in depth: never restore INTO a protected location. cmd_quarantine
+        # refuses protected SOURCES, so any item legitimately in the store has a
+        # non-protected original_path and this never blocks a real restore — but a
+        # forged/tampered txn could name a protected dest (`~/Library/LaunchAgents`,
+        # a SIP tree), turning restore into an arbitrary-file-drop primitive. Refuse
+        # it symmetrically and leave the item safely sealed in the store.
+        if _is_protected_path(dest):
+            _seal(qid)
+            log_action("restore", dest, "refused-protected-dest", id=qid)
+            print("refuse: restore destination %s is a protected path; item "
+                  "remains quarantined" % dest)
+            return 1
         if os.path.lexists(dest):
             dest = "%s.restored.%s" % (dest, qid)
             n = 1
