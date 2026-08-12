@@ -2591,28 +2591,54 @@ _TOLERANCE_MIN_VERDICTS = 3
 _TOLERANCE_WINDOW = 180 * 86400
 # A trailing :<hex> component of this shape is a content hash, not identity.
 _TOLERANCE_HASH_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
-# Only surfaces whose benign churn is hash-shaped may generalize at all —
-# an allowlist, matching the deadfall discipline, never a blocklist.
+# Version churn is path churn: a vendor's versioned install dir renames on
+# every release (claude-code-2.1.226 -> .228, runner bin.2.336.0, a framework's
+# Versions/3.12), so the same reviewed binary presents a "new" path per update.
+# Dotted version segments are normalized to '#' — but ONLY inside path-like
+# ':'-fields (ones containing '/'). An ip, port, or trust verdict is its own
+# ':'-field with no '/', so endpoints and verdicts stay literal: a new
+# endpoint is a new fact and always alerts. Same precedent the hash-strip set
+# (same path, same trust class, new content); risk-kind incidents remain
+# never-tolerated and the process sensor grades signatures independently.
+_TOLERANCE_VERSION_RE = re.compile(
+    r"(?<![0-9A-Za-z])\d+(?:\.\d+){1,3}(?![0-9A-Za-z])")
+# Only surfaces whose benign churn is hash- or version-shaped may generalize
+# at all — an allowlist, matching the deadfall discipline, never a blocklist.
 _TOLERANCE_CATEGORIES = frozenset((
-    "persistence", "xpersist", "process", "behavior", "agent-surface", "btm"))
+    "persistence", "xpersist", "process", "behavior", "agent-surface", "btm",
+    "net-beacon"))
 # Attack-defined evidence (deadfall's own trigger prefixes plus honeytokens):
 # no verdict history may ever tolerize these.
 _NEVER_TOLERATE_PREFIXES = ("decoy:", "latch:", "canary:")
 
 
 def _tolerance_identity(fingerprint):
-    """The hash-stripped stable identity of a signal fingerprint, or None when
-    no safe generalization exists. Strips exactly ONE trailing content-hash
-    component; a fingerprint with no hash suffix (beacons end in a port, some
-    process rows carry sha None) has nothing to generalize over and the
-    existing exact-key reattach already covers it."""
+    """The stable identity of a signal fingerprint, or None when no safe
+    generalization exists. Two — and only two — mutations generalize: a
+    trailing content-hash component is stripped, and dotted version segments
+    inside path-like fields are normalized. A fingerprint neither touches
+    (beacons at a stable path, some process rows carry sha None) has nothing
+    to generalize over and the existing exact-key reattach already covers it."""
     fp = str(fingerprint or "")
     if not fp or fp.startswith(_NEVER_TOLERATE_PREFIXES):
         return None
     parts = fp.split(":")
-    if len(parts) < 3 or not _TOLERANCE_HASH_RE.match(parts[-1]):
+    if len(parts) < 3:
         return None
-    return ":".join(parts[:-1])
+    changed = False
+    if _TOLERANCE_HASH_RE.match(parts[-1]):
+        parts = parts[:-1]
+        changed = True
+    normalized = []
+    for part in parts:
+        if "/" in part:
+            versionless = _TOLERANCE_VERSION_RE.sub("#", part)
+            changed = changed or (versionless != part)
+            part = versionless
+        normalized.append(part)
+    if not changed or len(normalized) < 2:
+        return None
+    return ":".join(normalized)
 
 
 def _tolerance_memory(db, now):
@@ -4886,14 +4912,58 @@ def check_xprotect(window_hours=None):
     if newest is not None:
         age_days = (time.time() - newest) / 86400.0
         if age_days > XPROTECT_STALE_DAYS:
-            findings.append(finding(
-                "MEDIUM", "xprotect", "XProtect definitions are stale",
-                "XProtect (v%s) last updated %.0f days ago (> %d). Apple ships "
-                "updates roughly monthly; a long gap suggests a broken update "
-                "path or MDM interference. Check Software Update."
-                % (version or "?", age_days, XPROTECT_STALE_DAYS),
-                "xprotect:stale:%s" % (version or "unknown")))
+            # Corpus age alone cannot distinguish the two opposite diagnoses:
+            # a broken update path (fix Software Update / MDM) vs Apple simply
+            # not shipping (nothing to fix locally). The updater's own
+            # heartbeat can: `xprotect version` prints when the OS last
+            # (re)installed the corpus — fresh install of an old corpus proves
+            # the path works.
+            updater_age = _xprotect_updater_age_days()
+            if updater_age is not None and \
+                    updater_age <= _XPROTECT_UPDATER_FRESH_DAYS:
+                findings.append(finding(
+                    "INFO", "xprotect",
+                    "XProtect corpus is old but the update path is alive",
+                    "XProtect (v%s) corpus is %.0f days old (> %d), but the OS "
+                    "updater (re)installed it %.0f day(s) ago — the update "
+                    "path works and Apple has not shipped a newer corpus. "
+                    "Nothing to fix locally."
+                    % (version or "?", age_days, XPROTECT_STALE_DAYS,
+                       updater_age),
+                    "xprotect:stale:%s" % (version or "unknown")))
+            else:
+                findings.append(finding(
+                    "MEDIUM", "xprotect", "XProtect definitions are stale",
+                    "XProtect (v%s) last updated %.0f days ago (> %d). Apple "
+                    "ships updates roughly monthly; a long gap suggests a "
+                    "broken update path or MDM interference. Check Software "
+                    "Update." % (version or "?", age_days, XPROTECT_STALE_DAYS),
+                    "xprotect:stale:%s" % (version or "unknown")))
     return findings
+
+
+_XPROTECT_UPDATER_FRESH_DAYS = 14
+
+
+def _xprotect_updater_age_days():
+    """Days since the OS updater last (re)installed the XProtect corpus, from
+    `xprotect version` (present on modern macOS), or None where unavailable.
+    The 'Installed' stamp is the update MECHANISM's heartbeat, independent of
+    whether the corpus content changed."""
+    out, _, rc = run(["/usr/bin/xprotect", "version"], timeout=6)
+    if rc != 0 or not out:
+        return None
+    m = re.search(r"Installed:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*"
+                  r"\+0000", out)
+    if not m:
+        return None
+    try:
+        installed = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        installed = installed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - installed).total_seconds()
+               / 86400.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -17305,8 +17375,9 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    Acquired tolerance: an identity you have dismissed
                    benign-positive on 3+ distinct incidents re-opens PRE-CLOSED
                    (TOLERATED, evidence kept, no alert) when only its content
-                   hash changed — never on higher severity, a new endpoint, or
-                   attack-defined evidence. `reopen` disputes + revokes it
+                   hash or a version segment in its path changed — never on
+                   higher severity, a new endpoint, or attack-defined
+                   evidence. `reopen` disputes + revokes it
   replay [days]    backtest the CURRENT correlation logic against recorded
                    history (default 30d). Read-only: opens no incident, sends
                    no notification — run it after changing detection logic
