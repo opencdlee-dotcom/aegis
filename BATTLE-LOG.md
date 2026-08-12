@@ -53,13 +53,30 @@ result depended on whether the developer had re-installed since their last edit 
 a test consulting live host state, which is the failure the harness exists to
 prevent. It is now in the `Sandbox` override list.
 
-**CI, corrected:** the wedged Windows jobs were *not* GitHub failing to enforce a
-20-minute timeout — that cap is on the POSIX job; Windows had 60 minutes and was
-24 in. The real fault is that every step reported complete and the job then never
-finalized (no logs uploaded, `updated_at` frozen at start), which is a post-job
-stall no per-step timeout can reach. So the job cap drops 60 → 30 (observed
-healthy run ~13 min) to bound a stall, and per-step caps were added for the
-different hang a blocking probe would cause.
+**CI "wedge" — corrected twice, and the second correction is the true one.**
+The first correction (above, in an earlier version of this entry) diagnosed a
+"post-job stall" from the run's `updated_at` looking frozen at ~24 minutes
+against what was believed to be a 60-minute cap, and cut the job cap to 30 to
+bound it. That diagnosis was itself wrong, proven by the very next run: cutting
+to 30 turned a THIRD occurrence into a hard failure with real logs for the
+first time, and those logs show no stall at all. Every step on both Windows
+jobs genuinely ran to completion — `427 passed, 145 skipped`, zero failures,
+`checks failed: 0` from the live harness — the run simply took ~33 minutes
+wall-clock, longer than either guessed cap. `py3.12`'s `Test suite` step got a
+hard `KeyboardInterrupt` from *its own* 20-minute STEP timeout four seconds
+after printing a clean pass, because that cap was sized on the same stale
+"~13 min" guess as the job cap, taken before this session added the tests
+that made the Windows suite genuinely slower.
+
+The corrected, MEASURED sizing: `Test suite` alone runs ~1176-1206s (~20 min)
+on Windows, the live harness ~681-767s (~12 min) — both re-measured from this
+run's own logs, not guessed. Job cap raised to 45 (real headroom over the
+~33-35 min observed total); step caps to 35/5/25. If the suite keeps growing,
+the fix is to re-measure and resize, not to nudge a constant again. The honest
+residual: neither of the two EARLIER "wedge" reports was ever confirmed against
+logs before being cancelled and rerun — the far more likely explanation for
+both, in light of this, is the same ordinary Windows CI slowness misread as a
+hang, not two separate platform-level freezes.
 
 **Guardrails honored:** the scan path still makes **zero** network calls (intel
 is by-hand, and the structural test proves the scan cannot reach the network even

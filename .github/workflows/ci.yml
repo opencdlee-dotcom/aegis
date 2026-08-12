@@ -48,17 +48,19 @@ jobs:
     runs-on: windows-latest
     # Process spawning is far more expensive here than on POSIX, and the live
     # harness additionally runs two full scans against the real machine (which
-    # classify real binaries through real PowerShell). Headroom, not a target:
-    # the suite itself should finish in minutes now that fixture files no
-    # longer each cost an Authenticode probe.
+    # classify real binaries through real PowerShell).
     #
-    # Cut from 60 to 30 after a run wedged in the wild: both Windows jobs
-    # reported every step complete, then never finalized — no logs uploaded, the
-    # run's own updated_at frozen at its start. That is a stall in the runner's
-    # post-job phase, which no per-step timeout can reach, so the JOB cap is the
-    # only bound on it. Observed healthy duration is ~13 min, so 30 keeps better
-    # than 2x headroom while halving how long a stall can hold a branch.
-    timeout-minutes: 30
+    # This value was cut 60->30 once on a guess ("observed healthy ~13 min")
+    # that turned out to be stale — the suite had grown substantially since
+    # that number was taken and nobody re-measured. The very next run proved
+    # it wrong: py3.12's Test suite step alone measured 1206s (20:06) and got
+    # cut off mid-report by a 20-minute STEP cap sized on the same stale
+    # guess, turning a clean pass (427 passed, 145 skipped, zero failures) into
+    # a reported failure via KeyboardInterrupt. Re-measured from that run's own
+    # logs: Test suite ~1176-1206s, harness ~681-767s. Sized below with real
+    # headroom over MEASURED numbers, not a guess — and if this suite keeps
+    # growing, re-measure again rather than nudge the constant.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -69,19 +71,20 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip pytest
-      # Per-step caps bound the OTHER hang: a single probe blocking forever
-      # (a PowerShell child that never returns, a schtasks call waiting on a
-      # lock). Without them one wedged probe consumes the whole job budget and
-      # the log says only "in progress", which is the least useful failure a CI
-      # run can produce. Each is well above the observed duration for that step.
+      # Per-step caps bound a different hang than the job cap above: a single
+      # probe blocking forever (a PowerShell child that never returns, a
+      # schtasks call waiting on a lock) rather than the whole run simply being
+      # slow. Sized with real headroom over MEASURED durations (see the job
+      # comment) — not the guess that previously turned a clean pass into a
+      # KeyboardInterrupt failure four seconds past an undersized cap.
       - name: Test suite
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: python -m pytest tests/ -q
       - name: selftest.py (real detection logic on this machine)
         timeout-minutes: 5
         run: python selftest.py
       - name: Live Windows harness (real registry, schtasks, CIM, Authenticode)
-        timeout-minutes: 20
+        timeout-minutes: 25
         # `always()`: this harness is the only evidence that the Windows code
         # works on Windows, so a suite failure must not hide it. It reports its
         # own pass/fail and still fails the job on its own terms.
