@@ -107,6 +107,14 @@ class Sandbox(unittest.TestCase):
             "EVENT_DB": os.path.join(self.state, "aegis.db"),
             "SELFSTATE": os.path.join(self.state, "selfstate.json"),
             "SELF_PLIST": os.path.join(self.state, "com.charlie.aegis.plist"),
+            # check_self_protection now compares this against the invoked file
+            # to catch runtime-copy rot. Unsandboxed it pointed at the REAL
+            # ~/.aegis/aegis.py, so every self-protection test's result depended
+            # on whether the developer had re-installed since their last edit —
+            # a test reading live host state, which is the failure this harness
+            # exists to prevent. Sandboxed to a path that does not exist, so the
+            # status is 'not-installed' (silent) unless a test says otherwise.
+            "RUNTIME_SCRIPT": os.path.join(self.state, "aegis.py"),
             # Survivability + new-surface state: sandbox every path a scan may
             # write (heartbeat, hmac key, config, watchdog sentinel) so tests
             # NEVER touch real ~/.aegis, and stub the new host-reading commands
@@ -853,6 +861,63 @@ class TestSelfProtection(Sandbox):
         aegis.save_json(aegis.SELFSTATE, {"findings_size": 50})  # grew, fine
         fps = [x["fingerprint"] for x in aegis.check_self_protection()]
         self.assertFalse(any("truncated" in fp for fp in fps))
+
+    # Runtime-copy rot, found in the wild: the deployed copy sat 18 days behind
+    # and had missed a whole hardening release, with nothing reporting it. All
+    # three poles matter here, because the wrong scoping makes it either useless
+    # (silent where it counts) or intolerable (fires on every scheduled scan).
+    def _stub(self, obj, name, value):
+        # _SELF_PATH/RUNTIME_SCRIPT are not in Sandbox's restore list, so an
+        # addCleanup-based stub is required — a bare assignment would leak the
+        # override into every later test in the run.
+        saved = getattr(obj, name)
+        self.addCleanup(setattr, obj, name, saved)
+        setattr(obj, name, value)
+
+    def _rt(self, text, runtime_text=None):
+        src = os.path.join(self.tmp, "repo-aegis.py")
+        with open(src, "w") as f:
+            f.write(text)
+        self._stub(aegis, "_SELF_PATH", src)
+        rt = os.path.join(self.state, "aegis.py")
+        if runtime_text is not None:
+            with open(rt, "w") as f:
+                f.write(runtime_text)
+        self._stub(aegis, "RUNTIME_SCRIPT", rt)
+        return [x["fingerprint"] for x in aegis.check_self_protection()]
+
+    def test_stale_runtime_copy_is_reported_by_a_scan(self):
+        fps = self._rt("# new code v2\n", runtime_text="# OLD code v1\n")
+        self.assertIn("self:runtime:drift", fps)
+
+    def test_matching_runtime_copy_is_silent(self):
+        fps = self._rt("# same\n", runtime_text="# same\n")
+        self.assertNotIn("self:runtime:drift", fps)
+
+    def test_scheduled_agent_does_not_report_on_itself(self):
+        """The scheduled scan IS the runtime copy. If it reported drift against
+        itself, every agent scan would carry a permanent finding."""
+        rt = os.path.join(self.state, "aegis.py")
+        with open(rt, "w") as f:
+            f.write("# installed copy\n")
+        self._stub(aegis, "_SELF_PATH", rt)
+        self._stub(aegis, "RUNTIME_SCRIPT", rt)
+        fps = [x["fingerprint"] for x in aegis.check_self_protection()]
+        self.assertNotIn("self:runtime:drift", fps)
+
+    def test_no_runtime_copy_installed_is_silent(self):
+        """Manual-only use (never installed) must not nag about a copy the
+        operator deliberately does not have."""
+        fps = self._rt("# code\n")          # no runtime file written
+        self.assertNotIn("self:runtime:drift", fps)
+
+    def test_drift_stays_below_the_notify_floor(self):
+        """Rot is MEDIUM by design: a permanent HIGH for 'you edited the repo'
+        is how a tool trains its operator to ignore HIGHs."""
+        self._rt("# new\n", runtime_text="# old\n")
+        sev = [x["severity"] for x in aegis.check_self_protection()
+               if x["fingerprint"] == "self:runtime:drift"]
+        self.assertEqual(["MEDIUM"], sev)
 
     # F0-in-the-wild: a plist that EXISTS but is invalid XML (a raw '&' from a
     # "…/Work & Projects/…" path) won't survive a reboot — launchd will silently
@@ -2808,6 +2873,52 @@ class TestInstaller(unittest.TestCase):
         self.assertTrue(py.get("KeepAlive"))
         self.assertEqual(py.get("ThrottleInterval"), 30)
 
+    # (installer parity continues below; the real-state guard's own test lives
+    # in TestRealStateGuard at the end of this file.)
+
+    # The four-key check above only catches drift in keys someone thought to
+    # list, which is the same blind spot that let the drift happen: the keys
+    # were lost precisely because nothing enumerated them. Compare the WHOLE
+    # parsed plist instead, so a key added to or dropped from either generator
+    # fails here without anyone updating a list. Two generators for one artifact
+    # is the hazard; this is the one place they meet.
+    #
+    # Two differences are legitimate and normalized rather than ignored:
+    #   ProgramArguments[0] — install.sh hardcodes /usr/bin/python3 (the system
+    #     interpreter launchd should use), while aegis.py install bakes in
+    #     sys.executable (whatever interpreter you ran it with, by design, so
+    #     `update-check`'s refresh line preserves your choice).
+    #   ProgramArguments[1] — both point at the ~/.aegis runtime copy, but the
+    #     tests run them against the same sandboxed HOME, so this already matches;
+    #     it is asserted explicitly rather than normalized away.
+    def _normalized(self, d):
+        out = dict(d)
+        args = list(out.get("ProgramArguments") or ())
+        self.assertGreaterEqual(len(args), 3, args)
+        self.assertEqual(args[1], os.path.join(self.home, ".aegis", "aegis.py"),
+                         "both installers must run the TCC-safe runtime copy")
+        args[0] = "<interpreter>"
+        out["ProgramArguments"] = args
+        return out
+
+    def test_installers_produce_identical_plists_scan_mode(self):
+        sh = self._normalized(self._install("3600"))
+        py = self._normalized(self._install_py("3600"))
+        self.assertEqual(sorted(sh), sorted(py),
+                         "the two installers write different plist KEYS")
+        self.assertEqual(sh, py,
+                         "the two installers write different plist VALUES")
+
+    def test_installers_produce_identical_plists_watch_mode(self):
+        # Watch mode is the shape with the sharper failure: KeepAlive without a
+        # ThrottleInterval respawns a crash-looping monitor about once a second.
+        sh = self._normalized(self._install("watch", "600"))
+        py = self._normalized(self._install_py("watch", "600"))
+        self.assertEqual(sorted(sh), sorted(py),
+                         "the two installers write different plist KEYS")
+        self.assertEqual(sh, py,
+                         "the two installers write different plist VALUES")
+
     def test_rejects_non_numeric_interval(self):
         env = dict(os.environ)
         env["HOME"] = self.home
@@ -3925,6 +4036,107 @@ class TestFilelessEvasionClosure(Sandbox):
 
     def test_benign_interpreter_use_still_clean(self):
         self.assertIsNone(self._sev("/usr/bin/python3 /Users/x/app.py --serve"))
+
+
+# --------------------------------------------------------------------------- #
+# The conftest guard that enforces "the suite never touches real ~/.aegis".
+# It exists because that promise was silently broken once: two synthetic
+# incidents (epoch 1700000000, path /opt/shared/helper-bin) were found months
+# later in the developer's LIVE incident store, one of them a CRITICAL heading
+# a real security tool's alert list. A guard nobody tests is a comment, so this
+# proves it actually refuses — and proves it stays quiet for sandboxed writes.
+#
+# Runner note, stated rather than hidden: the guard is a pytest autouse fixture,
+# so it is active under `pytest tests/` (what CI runs on every push) and NOT
+# under `python -m unittest discover`, which never loads conftest.py. These
+# tests therefore skip under unittest instead of pretending to cover it — and,
+# critically, instead of executing an unguarded real-state write to find out.
+# --------------------------------------------------------------------------- #
+def _guard_active():
+    return getattr(aegis._event_connection, "__name__", "") == "guarded_conn"
+
+
+class TestRealStateGuard(Sandbox):
+    def setUp(self):
+        # Checked at RUN time, not decoration time: the autouse fixture installs
+        # the guard after this module is imported, so a class-level skipUnless
+        # would evaluate against the unpatched function and skip every run.
+        if not _guard_active():
+            self.skipTest("conftest real-state guard is pytest-only; skipped "
+                          "under unittest discover (no conftest.py)")
+        super().setUp()
+
+    def _real(self, *parts):
+        return os.path.join(os.path.expanduser("~"), ".aegis", *parts)
+
+    def test_event_db_write_at_the_real_path_is_refused(self):
+        """The exact vector that leaked: record_security_state -> the event
+        store while EVENT_DB still pointed at the developer's real db."""
+        aegis.EVENT_DB = self._real("aegis.db")
+        with self.assertRaises(AssertionError) as cm:
+            aegis._event_connection()
+        self.assertIn("EVENT_DB", str(cm.exception))
+        self.assertIn("REAL STATE", str(cm.exception))
+
+    def test_save_json_at_the_real_path_is_refused(self):
+        with self.assertRaises(AssertionError) as cm:
+            aegis.save_json(self._real("baseline.json"), {"x": 1})
+        self.assertIn("REAL STATE", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(
+            os.path.expanduser("~"), ".aegis", "baseline.json.tmp")),
+            "a refused write must leave no partial file behind")
+
+    def test_ensure_state_at_the_real_dir_is_refused(self):
+        aegis.STATE_DIR = self._real()
+        with self.assertRaises(AssertionError) as cm:
+            aegis.ensure_state()
+        self.assertIn("STATE_DIR", str(cm.exception))
+
+    def test_residue_reporter_finds_the_historical_record(self):
+        """The other half of the fix: a guard stops NEW residue, but installs
+        that already have some need to see it. Reproduces the exact record found
+        in the live store — epoch 1700000000, CRITICAL, a path that never
+        existed — and requires it to be reported, while a real finding recorded
+        now is not."""
+        t0 = 1_700_000_000          # the tests' hardcoded epoch (2023-11-14)
+        f = aegis.finding("CRITICAL", "hot-dir", "Dropped object later executed",
+                          "d", "fp-residue", path="/opt/shared/helper-bin")
+        aegis.record_security_state([f], now=t0)
+        real = aegis.finding("HIGH", "process", "Suspicious running process",
+                             "d", "fp-real", path="/tmp/x")
+        aegis.record_security_state([real])
+
+        bogus = aegis.implausible_incidents()
+        self.assertTrue(bogus, "residue stamped 2023 was not reported")
+        self.assertTrue(all(b["created_at"] < 1735689600 for b in bogus))
+        titles = " ".join(b["title"] for b in bogus)
+        self.assertIn("Dropped object", titles)
+        self.assertNotIn("Suspicious running process", titles,
+                         "a genuine present-day incident must not be called "
+                         "implausible")
+
+    def test_resolved_residue_stops_being_reported(self):
+        """Reporting must respect the operator's fix: once resolved, residue
+        drops off the list instead of nagging forever."""
+        f = aegis.finding("CRITICAL", "hot-dir", "old", "d", "fp-r2",
+                          path="/opt/shared/helper-bin")
+        aegis.record_security_state([f], now=1_700_000_000)
+        bogus = aegis.implausible_incidents()
+        self.assertEqual(1, len(bogus))
+        aegis.transition_incident(bogus[0]["id"], "RESOLVED")
+        self.assertEqual([], aegis.implausible_incidents())
+
+    def test_sandboxed_writes_are_untouched(self):
+        """The other pole: the guard must not interfere with the sandbox. A
+        guard that refused everything would pass the three tests above and
+        break the whole suite."""
+        aegis.save_json(os.path.join(self.state, "probe.json"), {"ok": True})
+        self.assertEqual({"ok": True},
+                         aegis.load_json(os.path.join(self.state,
+                                                      "probe.json"), None))
+        db = aegis._event_connection()          # sandboxed EVENT_DB
+        db.close()
+        aegis.ensure_state()                    # sandboxed STATE_DIR
 
 
 if __name__ == "__main__":

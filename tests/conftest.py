@@ -21,6 +21,79 @@ import sys
 
 import pytest
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import aegis  # noqa: E402
+
+# --------------------------------------------------------------------------- #
+# The suite promises it "never touches real ~/.aegis". That promise was broken
+# once and nobody could tell: two synthetic incidents (a CRITICAL lineage chain
+# and a HIGH risk roll-up on /opt/shared/helper-bin, stamped with the test's
+# hardcoded epoch 1700000000) were found sitting in the developer's LIVE
+# incident store months later, at the top of a real security tool's alert list.
+# The leak came through _event_connection() while EVENT_DB still pointed at the
+# real path — a sandbox gap, not a bad test.
+#
+# The sandbox fixtures are the primary defence; this is the backstop that makes
+# the promise enforceable rather than aspirational. It wraps the two writers
+# that actually reach durable state and FAILS the test that tries, naming the
+# global that was left unsandboxed. It fires only on a real attempt, so pure
+# read-only tests (most of the suite) are unaffected, and there is no race with
+# the developer's own hourly agent because nothing here inspects the real dir's
+# contents — only the path a write is aimed at.
+# --------------------------------------------------------------------------- #
+_REAL_STATE = os.path.join(os.path.expanduser("~"), ".aegis")
+
+
+def _targets_real_state(path):
+    if not path:
+        return False
+    try:
+        p = os.path.realpath(str(path))
+    except (TypeError, ValueError, OSError):
+        return False
+    return p == _REAL_STATE or p.startswith(_REAL_STATE + os.sep)
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_state_writes():
+    """Refuse any durable write aimed at the developer's real ~/.aegis."""
+    real_conn = aegis._event_connection
+    real_save = aegis.save_json
+    real_ensure = aegis.ensure_state
+    leaked = []
+
+    def _refuse(what, path):
+        leaked.append("%s -> %s" % (what, path))
+        raise AssertionError(
+            "TEST TRIED TO WRITE REAL STATE: %s points at %s. Sandbox that "
+            "global in the test's setUp (see tests/test_regression.py Sandbox)."
+            % (what, path))
+
+    def guarded_conn(*a, **k):
+        if _targets_real_state(aegis.EVENT_DB):
+            _refuse("aegis.EVENT_DB", aegis.EVENT_DB)
+        return real_conn(*a, **k)
+
+    def guarded_save(path, *a, **k):
+        if _targets_real_state(path):
+            _refuse("save_json(path=...)", path)
+        return real_save(path, *a, **k)
+
+    def guarded_ensure(*a, **k):
+        if _targets_real_state(aegis.STATE_DIR):
+            _refuse("aegis.STATE_DIR", aegis.STATE_DIR)
+        return real_ensure(*a, **k)
+
+    aegis._event_connection = guarded_conn
+    aegis.save_json = guarded_save
+    aegis.ensure_state = guarded_ensure
+    try:
+        yield leaked
+    finally:
+        aegis._event_connection = real_conn
+        aegis.save_json = real_save
+        aegis.ensure_state = real_ensure
+
 IS_MAC = sys.platform == "darwin"
 
 # Classes whose assertions are inherently macOS-specific.

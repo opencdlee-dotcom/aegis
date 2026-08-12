@@ -51,7 +51,14 @@ jobs:
     # classify real binaries through real PowerShell). Headroom, not a target:
     # the suite itself should finish in minutes now that fixture files no
     # longer each cost an Authenticode probe.
-    timeout-minutes: 60
+    #
+    # Cut from 60 to 30 after a run wedged in the wild: both Windows jobs
+    # reported every step complete, then never finalized — no logs uploaded, the
+    # run's own updated_at frozen at its start. That is a stall in the runner's
+    # post-job phase, which no per-step timeout can reach, so the JOB cap is the
+    # only bound on it. Observed healthy duration is ~13 min, so 30 keeps better
+    # than 2x headroom while halving how long a stall can hold a branch.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -62,11 +69,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip pytest
+      # Per-step caps bound the OTHER hang: a single probe blocking forever
+      # (a PowerShell child that never returns, a schtasks call waiting on a
+      # lock). Without them one wedged probe consumes the whole job budget and
+      # the log says only "in progress", which is the least useful failure a CI
+      # run can produce. Each is well above the observed duration for that step.
       - name: Test suite
+        timeout-minutes: 20
         run: python -m pytest tests/ -q
       - name: selftest.py (real detection logic on this machine)
+        timeout-minutes: 5
         run: python selftest.py
       - name: Live Windows harness (real registry, schtasks, CIM, Authenticode)
+        timeout-minutes: 20
         # `always()`: this harness is the only evidence that the Windows code
         # works on Windows, so a suite failure must not hide it. It reports its
         # own pass/fail and still fails the job on its own terms.

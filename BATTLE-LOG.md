@@ -36,6 +36,31 @@ silently regress into the threshold it replaced.
 | `_parse_win_events` contract | The Sysmon harvest initially treated a probe failure as an empty window — the "an unanswered process table is not an empty one" defect this repo has already paid for twice. | non-answer returns `None` and DEGRADES; separate sentinel for "channel readable but read errored"; both poles tested |
 | `_install_mac` vs `install.sh` | **The two macOS installers disagreed, and the README called them equivalent.** `install.sh` has always written `ProcessType=Background`, `LowPriorityIO`, `Nice=10`, `ThrottleInterval=30`; the Python port dropped all four. So anyone following the cross-platform path — including the refresh line `update-check` itself prints — got a monitor that scans un-niced at normal IO priority for ~a minute at a time, and in **watch** mode had no bound on `KeepAlive` respawn (a crash-looping watch relaunches about once a second instead of every 30). Found by diffing the deployed plist before and after refreshing this machine's own agent, which is the only place the two installers' output meets. | four keys restored to `_install_mac`; pinned by a **parity** test (`test_both_installers_agree_on_the_resource_keys`) rather than a hardcoded list, so whichever installer gains a resource key next, the other must match; fail-before captured at 5 failures |
 
+## Hardened after the fact — the three defects' *classes*, not just their instances
+
+Fixing a defect and leaving the mechanism that produced it is how the same bug
+returns under a new name. Each of the three above got its class closed:
+
+| Class | Why the instance fix wasn't enough | What closes it |
+|-------|-----------------------------------|----------------|
+| Two generators for one artifact | The four resource keys were restored and pinned by name — but they went missing *because* nothing enumerated them, so a by-name list has the same blind spot that caused the drift. | Compare the **whole parsed plist** from both installers, scan and watch mode, normalizing only the interpreter (legitimately different by design). Proven bidirectionally: dropping a key from `aegis.py` fails it, and adding a key to `install.sh` alone fails it. A future key nobody thought to list cannot drift. |
+| Tests reaching real state | Two synthetic incidents were resolved out of the live store, and the leaking class is sandboxed *today* — but nothing stopped the next sandbox gap from doing it again, and nothing helped an install that already had residue. | A conftest autouse guard wraps `_event_connection`, `save_json` and `ensure_state` and **refuses** any write aimed at the real `~/.aegis`, naming the unsandboxed global. Plus `implausible_incidents()`: an incident stamped before 2026 cannot be real (Aegis did not exist), so `doctor` reports it and hands over the `resolve` line. It **reports, never deletes** — quietly editing the operator's security records would be the worse bug. Runner caveat stated in-source: the guard is a pytest fixture, so it binds `pytest tests/` (what CI runs on every push), and its own tests skip under `unittest discover` rather than run unguarded to find out. |
+| Rot only a human could see | The runtime copy was refreshed and `doctor` reports drift — but `doctor` is precisely the command nobody runs when nothing looks wrong, which is why the monitor sat 18 days behind. | `check_self_protection` now emits the drift finding, so a **scan** reports it. Scoped so the scheduled agent (which *is* the runtime copy) stays silent instead of flagging itself forever, and MEDIUM rather than HIGH because a permanent HIGH for "you edited the repo" is how a tool trains its operator to ignore HIGHs. |
+
+Adding that last check exposed one more of the same shape: `RUNTIME_SCRIPT` was
+never sandboxed, so the moment a sensor read it, **every** self-protection test's
+result depended on whether the developer had re-installed since their last edit —
+a test consulting live host state, which is the failure the harness exists to
+prevent. It is now in the `Sandbox` override list.
+
+**CI, corrected:** the wedged Windows jobs were *not* GitHub failing to enforce a
+20-minute timeout — that cap is on the POSIX job; Windows had 60 minutes and was
+24 in. The real fault is that every step reported complete and the job then never
+finalized (no logs uploaded, `updated_at` frozen at start), which is a post-job
+stall no per-step timeout can reach. So the job cap drops 60 → 30 (observed
+healthy run ~13 min) to bound a stall, and per-step caps were added for the
+different hang a blocking probe would cause.
+
 **Guardrails honored:** the scan path still makes **zero** network calls (intel
 is by-hand, and the structural test proves the scan cannot reach the network even
 with feeds present); nothing new fires automatically off a heuristic; the one

@@ -2783,6 +2783,37 @@ def list_incidents(active_only=True):
         db.close()
 
 
+# Aegis did not exist before 2026, so nothing it recorded can be stamped
+# earlier. This is not an arbitrary cutoff — it is a fact about the program, and
+# it makes one class of corruption legible: a suite run that escaped its sandbox
+# writes incidents stamped with the tests' hardcoded epoch (1700000000 =
+# 2023-11-14). Two such records — a CRITICAL lineage chain and a HIGH risk
+# roll-up on a path that never existed — sat at the top of a live install's
+# alert list for months, indistinguishable from real findings to the operator.
+# A future stamp is impossible for the same reason (nothing schedules an
+# incident), so both directions are reported.
+_AEGIS_EPOCH_FLOOR = 1735689600     # 2026-01-01T00:00:00Z
+
+
+def implausible_incidents(now=None):
+    """Incidents whose creation date cannot be real — test residue, not threats.
+
+    Deliberately reports rather than deletes: these are the operator's security
+    records, and a tool that quietly removed rows from them would be a worse
+    problem than the residue. `incident ID resolve` is the reversible fix.
+    """
+    now = int(time.time()) if now is None else int(now)
+    db = _event_connection()
+    try:
+        rows = db.execute(
+            "SELECT * FROM incidents WHERE created_at < ? OR created_at > ? "
+            "ORDER BY created_at", (_AEGIS_EPOCH_FLOOR, now + 86400)).fetchall()
+        return [r for r in _dict_rows(rows)
+                if r.get("status") in _ACTIVE_INCIDENT_STATES]
+    finally:
+        db.close()
+
+
 def incident_detail(incident_id):
     db = _event_connection()
     try:
@@ -9419,6 +9450,29 @@ def check_self_protection():
                                  if cur_sha is None else "modified out-of-band"),
                 detail,
                 "self:%s:tampered:%s" % (name, (cur_sha or "deleted")[:16])))
+    # Runtime-copy rot. The scheduled agent executes ~/.aegis/aegis.py, so a
+    # stale copy means every scheduled scan runs OLD code — the detections you
+    # believe you have, you do not have. Measured on the author's own machine:
+    # the deployed copy was 18 days behind and had missed an entire hardening
+    # release, and nothing anywhere said so; `doctor` reported it only when run
+    # by hand, which is exactly the command you do not run when nothing looks
+    # wrong. A scan is the thing that runs regularly, so it is where the rot
+    # belongs.
+    #
+    # Scoped to a repo-invoked scan on purpose: the scheduled run IS the runtime
+    # copy, so `_runtime_copy_status()` answers 'self' there and this stays
+    # silent rather than every agent scan reporting on itself. MEDIUM, not HIGH:
+    # it is rot, not an intrusion, and a permanent HIGH for "you edited the repo"
+    # is how a tool teaches its operator to stop reading HIGHs.
+    rt_status = _runtime_copy_status()
+    if rt_status == "drift":
+        findings.append(finding(
+            "MEDIUM", "self-protection",
+            "Background monitor is running OLD code",
+            "%s does not match this file, so every SCHEDULED scan runs an "
+            "older Aegis than the one you are reading. Refresh it: %s"
+            % (RUNTIME_SCRIPT, _refresh_line()),
+            "self:runtime:drift", confidence="high"))
     return findings
 
 
@@ -10645,6 +10699,18 @@ def cmd_doctor():
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
+    bogus = implausible_incidents()
+    if bogus:
+        print("  ! %d incident(s) with an IMPOSSIBLE creation date — almost "
+              "certainly test residue, not a threat:" % len(bogus))
+        for inc in bogus[:5]:
+            print("      #%-5s %-8s %s (created %s)"
+                  % (inc["id"], inc["severity"], inc["title"][:52],
+                     _fmt_epoch(inc["created_at"])))
+        print("      Resolve them so they stop heading your alert list: %s"
+              % " ".join("aegis.py incident %s resolve" % i["id"]
+                         for i in bogus[:5]))
+        problems.append("implausible incidents")
     print("\nDoctor result: %s" % ("DEGRADED" if problems else "OK"))
     return 1 if problems else 0
 
