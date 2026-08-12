@@ -147,7 +147,8 @@ closed incident cannot silently return to containment. An unresolved incident
 gets at most three reminders (about +1 hour, +24 hours, and +72 hours); afterward
 the durable open state is the reminder. A reviewed `FALSE_POSITIVE` suppresses
 only the exact correlation key while retaining later occurrences as evidence;
-a changed content hash gets a new key. A `RESOLVED` threat that recurs opens a
+a changed content hash gets a new key (unless *acquired tolerance*, below, has
+earned the right to pre-close it). A `RESOLVED` threat that recurs opens a
 new incident instead of being silently ignored.
 
 ```text
@@ -169,6 +170,31 @@ recorded separately so the tuning queues and the per-sensor precision feedback
 can tell a broken rule from an expected-but-noisy one. Each incident card also
 prints the documented benign causes for the sensors that fired, so triage is a
 match against a known list rather than an investigation.
+
+### Acquired tolerance
+
+Exact-key suppression cannot absorb the dominant benign churn: a vendor updater
+rewrites the same plist on every release, so the same reviewed identity re-opens
+a fresh HIGH incident per update, forever. Acquired tolerance is the
+identity-level memory over the operator's own verdicts, with immune-system
+guards because they answer the same adversarial pressures:
+
+- Only **human `benign-positive` verdicts teach** — `false-positive` labels tune
+  rules instead, and machine verdicts write no dismissal record, so tolerance
+  can never feed on itself or pollute `backtest` precision.
+- **Antigen-specific**: the identity is the fingerprint minus its trailing
+  content hash, and only categories whose benign churn is hash-shaped are
+  eligible (an allowlist). A beacon's endpoint, a path, a marker set are facts —
+  a new one is a new incident, always.
+- **Repeated exposure required**: three distinct dismissed incidents on the
+  identity inside 180 days, so one hasty dismissal teaches nothing.
+- **Inflammation overrides**: never `CRITICAL`, never above the severity the
+  operator actually reviewed, never for attack-defined evidence (decoys,
+  latches, canaries), and never while any incident on the identity is active.
+- **Visible and disputable**: the incident is still created with its full
+  evidence, closed as `auto-tolerated` citing the precedent count, counted in a
+  footer on the active listing, and one `reopen` both re-alerts and revokes the
+  tolerance (reopening deletes the dismissal rows the count was built on).
 
 `aegis.py replay [days]` re-runs the current correlation logic over recorded
 history in a throwaway in-memory database. It is strictly read-only — no
@@ -224,9 +250,13 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   on a periodic full scan; vnode notification is not treated as a complete log.
 - `doctor` exposes permission and sensor degradation. Three consecutive sensor
   failures open one health incident; recovery resolves it and resets the count.
-- Capability-dependent inventories such as Background Task Management remain
-  DEGRADED when macOS requires interactive authorization; denied data is never
-  interpreted as an empty or clean snapshot.
+- Capability-dependent inventories such as Background Task Management report
+  `PRIVILEGED` when the OS demands interactive admin authorization the
+  background observer cannot synthesize (macOS 26 moved `sfltool dumpbtm`
+  behind `system.privilege.admin`): a named permanent coverage gap — shown in
+  `doctor`/`status` as `i`, never green — that does not escalate to a
+  coverage-degraded incident the way a transient failure (still DEGRADED)
+  does. Denied data is never interpreted as an empty or clean snapshot.
 - Uninstall retains evidence by default. Purge requires the explicit `--purge`.
 
 ## Protective tier (opt-in, by hand)

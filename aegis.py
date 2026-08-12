@@ -2559,6 +2559,128 @@ def _category_dismissal_weights(db, now, window=90 * 86400):
     return weights
 
 
+# --------------------------------------------------------------------------- #
+# ACQUIRED TOLERANCE — identity-level immune memory over typed dismissals.
+#
+# The exact-fingerprint reattach above tolerates *identical* re-observations,
+# and _category_dismissal_weights decays a whole noisy category's risk weight —
+# but nothing in between: a vendor updater that rewrites the same plist monthly
+# presents a new content hash each time, so the SAME reviewed identity re-opens
+# a fresh HIGH incident on every update, forever. That per-identity churn is
+# what actually fills the queue (55 of 55 real triaged incidents here were it).
+#
+# The generalization is deliberately narrow, and every guard is an immunology
+# rule because those rules exist for the same adversarial reason:
+#   · Only HUMAN `benign-positive` verdicts teach (false-positive labels tune
+#     rules instead; machine verdicts never count — no runaway feedback).
+#   · Tolerance is ANTIGEN-SPECIFIC: the identity is the fingerprint minus its
+#     trailing content hash. A beacon's ip:port, a path, a marker set are all
+#     facts — only hash churn generalizes. New endpoint = new incident.
+#   · It takes REPEATED EXPOSURE: >= _TOLERANCE_MIN_VERDICTS distinct dismissed
+#     incidents inside _TOLERANCE_WINDOW, so one hasty dismissal teaches nothing.
+#   · INFLAMMATION OVERRIDES: never CRITICAL, never above the severity the
+#     operator actually reviewed, never for attack-defined fingerprints, and
+#     never while any incident on that identity is active (a `reopen` is a
+#     dispute — it also deletes the dismissal rows the count is built on).
+#   · Tolerated is NOT invisible: the incident is still created with its full
+#     evidence, auto-closed with resolution 'auto-tolerated' citing precedent,
+#     listed under `incidents all`, and one `reopen` revokes the whole thing.
+# --------------------------------------------------------------------------- #
+
+_TOLERANCE_MIN_VERDICTS = 3
+_TOLERANCE_WINDOW = 180 * 86400
+# A trailing :<hex> component of this shape is a content hash, not identity.
+_TOLERANCE_HASH_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
+# Only surfaces whose benign churn is hash-shaped may generalize at all —
+# an allowlist, matching the deadfall discipline, never a blocklist.
+_TOLERANCE_CATEGORIES = frozenset((
+    "persistence", "xpersist", "process", "behavior", "agent-surface", "btm"))
+# Attack-defined evidence (deadfall's own trigger prefixes plus honeytokens):
+# no verdict history may ever tolerize these.
+_NEVER_TOLERATE_PREFIXES = ("decoy:", "latch:", "canary:")
+
+
+def _tolerance_identity(fingerprint):
+    """The hash-stripped stable identity of a signal fingerprint, or None when
+    no safe generalization exists. Strips exactly ONE trailing content-hash
+    component; a fingerprint with no hash suffix (beacons end in a port, some
+    process rows carry sha None) has nothing to generalize over and the
+    existing exact-key reattach already covers it."""
+    fp = str(fingerprint or "")
+    if not fp or fp.startswith(_NEVER_TOLERATE_PREFIXES):
+        return None
+    parts = fp.split(":")
+    if len(parts) < 3 or not _TOLERANCE_HASH_RE.match(parts[-1]):
+        return None
+    return ":".join(parts[:-1])
+
+
+def _tolerance_memory(db, now):
+    """{identity: (distinct_verdicts, max_reviewed_sev_order)} from the
+    operator's own benign-positive dismissals of signal incidents inside the
+    window. Only identities past the verdict floor are returned."""
+    memory = {}
+    try:
+        rows = db.execute(
+            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+            "AND d.correlation_key LIKE 'signal:%'",
+            (now - _TOLERANCE_WINDOW,)).fetchall()
+    except Exception:
+        return memory
+    seen = {}
+    for row in rows:
+        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        if not ident:
+            continue
+        bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
+        bucket["incidents"].add(row["incident_id"])
+        bucket["sev"] = max(bucket["sev"],
+                            SEV_ORDER.get(row["severity"], -1))
+    for ident, bucket in seen.items():
+        if len(bucket["incidents"]) >= _TOLERANCE_MIN_VERDICTS:
+            memory[ident] = (len(bucket["incidents"]), bucket["sev"])
+    return memory
+
+
+def _disputed_identities(db):
+    """Identities with ANY incident currently in an active state. An operator
+    who reopened (or has not yet triaged) an incident on an identity is in
+    dispute with tolerance for it, so tolerance stands down there."""
+    idents = set()
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    for row in db.execute(
+            "SELECT correlation_key FROM incidents WHERE status IN (%s) "
+            "AND correlation_key LIKE 'signal:%%'" % marks,
+            _ACTIVE_INCIDENT_STATES):
+        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        if ident:
+            idents.add(ident)
+    return idents
+
+
+def _auto_tolerate(db, incident_id, verdicts, now):
+    """Close a just-created incident under acquired tolerance. The guard is in
+    the WHERE: only an OPEN incident created THIS pass may be auto-closed, so a
+    reattach to something the operator already saw is never swept from under
+    them. Deliberately writes NO dismissals row — machine verdicts must never
+    feed backtest precision, category down-weighting, or future tolerance."""
+    cur = db.execute(
+        "UPDATE incidents SET status='FALSE_POSITIVE',"
+        "resolution='auto-tolerated',updated_at=?,next_reminder_at=NULL "
+        "WHERE id=? AND status='OPEN' AND created_at=?",
+        (now, incident_id, now))
+    if cur.rowcount:
+        db.execute(
+            "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+            "incident_id,data_json) VALUES(?,?,?,?,?,?)",
+            (now, now, "incident", "incident.lifecycle", incident_id,
+             json.dumps({"from": "OPEN", "to": "FALSE_POSITIVE",
+                         "reason_code": "auto-tolerated",
+                         "prior_verdicts": verdicts})))
+
+
 def _accumulate_risk(db, now, new_ids):
     """Open one 'risk' incident per entity whose recent findings sum past
     RISK_THRESHOLD from ≥ RISK_MIN_SIGNALS DISTINCT signals spanning at least
@@ -2824,15 +2946,31 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # Middle tier: pile-up of weak signals on one entity → one 'risk' incident.
     _accumulate_risk(db, now, new_ids)
 
-    # Every uncorrelated HIGH+ signal still becomes one actionable incident.
+    # Every uncorrelated HIGH+ signal still becomes one actionable incident —
+    # but an identity the operator has repeatedly reviewed as benign-positive
+    # opens pre-closed under acquired tolerance instead of re-alerting.
+    tolerance = _tolerance_memory(db, now)
+    disputed = _disputed_identities(db) if tolerance else frozenset()
     for event_id, f in new_events:
         if f.get("category") in suppressed_categories or event_id in attached \
                 or SEV_ORDER.get(f.get("severity"), -1) \
                 < SEV_ORDER["HIGH"]:
             continue
-        _upsert_incident(db, "signal:" + f["fingerprint"], f["title"],
-                         f["severity"], "signal", now, [event_id],
-                         initially_notified)
+        verdicts = 0
+        if tolerance and f.get("category") in _TOLERANCE_CATEGORIES \
+                and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]:
+            ident = _tolerance_identity(f.get("fingerprint"))
+            if ident and ident not in disputed:
+                count, reviewed_sev = tolerance.get(ident, (0, -1))
+                if count and SEV_ORDER.get(f.get("severity"), -1) \
+                        <= reviewed_sev:
+                    verdicts = count
+        incident_id = _upsert_incident(
+            db, "signal:" + f["fingerprint"], f["title"],
+            f["severity"], "signal", now, [event_id],
+            initially_notified or bool(verdicts))
+        if verdicts:
+            _auto_tolerate(db, incident_id, verdicts, now)
 
 
 def _record_health(db, health, now):
@@ -2842,7 +2980,11 @@ def _record_health(db, health, now):
         detail = redact_sensitive(item.get("detail") or "")[:500]
         prior = db.execute("SELECT * FROM sensor_status WHERE sensor_id=?",
                            (sensor_id,)).fetchone()
-        failed = status != "OK"
+        # PRIVILEGED is neither working nor broken: a named, OS-imposed
+        # permanent coverage gap. It must not escalate to a coverage-degraded
+        # incident (that alarm is for sensors that SHOULD be answering), and it
+        # must not forge last_ok_at (the surface did not answer).
+        failed = status not in ("OK", "PRIVILEGED")
         failures = (prior["consecutive_failures"] if prior else 0) + 1 \
             if failed else 0
         episode = (prior["episode_started_at"] if prior else None)
@@ -2858,7 +3000,7 @@ def _record_health(db, health, now):
                    "item_count=excluded.item_count,detail=excluded.detail,"
                    "consecutive_failures=excluded.consecutive_failures,"
                    "episode_started_at=excluded.episode_started_at",
-                   (sensor_id, status, now, now if not failed else
+                   (sensor_id, status, now, now if status == "OK" else
                     (prior["last_ok_at"] if prior else None),
                     int(item.get("duration_ms") or 0),
                     int(item.get("item_count") or 0), detail, failures, episode))
@@ -2873,11 +3015,14 @@ def _record_health(db, health, now):
                              "Security coverage degraded: %s" % sensor_id,
                              "HIGH", "sensor-health", now, [cur.lastrowid])
         elif not failed:
+            resolution = ("surface is privileged-only on this OS — recorded "
+                          "as a permanent coverage gap, not a sensor failure"
+                          if status == "PRIVILEGED" else "sensor recovered")
             db.execute("UPDATE incidents SET status='RESOLVED',resolution=?,"
                        "updated_at=?,last_seen=?,next_reminder_at=NULL WHERE "
                        "correlation_key=? AND status IN (%s)" %
                        ",".join("?" for _ in _ACTIVE_INCIDENT_STATES),
-                       ("sensor recovered", now, now, "sensor:" + sensor_id) +
+                       (resolution, now, now, "sensor:" + sensor_id) +
                        _ACTIVE_INCIDENT_STATES)
 
 
@@ -6210,6 +6355,24 @@ def diff_wallet(prior, cur):
 # instead of the real (slow) sfltool — the same override pattern as LSOF_LISTEN_CMD.
 BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
 
+# Sentinel a snapshot fn returns when its backing command EXISTS but this OS
+# requires interactive admin authorization that a background observer cannot —
+# and must not — synthesize. Distinct from None (a transient non-answer:
+# timeout, flake) because the two need opposite health handling: a transient
+# failure escalates to a coverage-degraded incident after 3 misses, while an
+# OS-imposed privilege wall is a PERMANENT, precisely-diagnosed condition —
+# alerting on it every scan forever is pure fatigue. It is still surfaced as a
+# PRIVILEGED coverage gap in doctor/status (unknown is never green); it just
+# stops masquerading as a broken sensor.
+SURFACE_PRIVILEGED = object()
+
+# macOS 26 (Darwin 25) moved `sfltool dumpbtm` behind system.privilege.admin:
+# the unprivileged harvest this sensor was built on ("Ventura+, unprivileged")
+# no longer exists there. The failure is identified by its authorization
+# signature, never inferred from a bare non-zero exit.
+_BTM_PRIVILEGED_MARKERS = ("system.privilege.admin", "authorization failed",
+                           "errauthorization")
+
 
 def _parse_btm(text):
     """{identifier: {name, team, type, url}} from `sfltool dumpbtm`. A top-level
@@ -6271,9 +6434,17 @@ def snapshot_btm():
     auto-updaters …), so a false-empty adopted into the baseline would storm
     ~90 bogus 'new background item' findings the instant sfltool later succeeds.
     We therefore signal the non-answer as None (skipped by _scan_surfaces) so
-    sensor health remains DEGRADED instead of silently baselining false-empty."""
-    out, _, rc = run(BTM_DUMP_CMD, timeout=30)
+    sensor health remains DEGRADED instead of silently baselining false-empty.
+
+    A third outcome exists since macOS 26: dumpbtm refuses without interactive
+    admin authorization. That is not a flake — it will fail identically on
+    every scan this OS ever runs — so it returns SURFACE_PRIVILEGED and is
+    recorded as a permanent, named coverage gap rather than a degraded sensor."""
+    out, err, rc = run(BTM_DUMP_CMD, timeout=30)
     if rc != 0 or not out:
+        blob = ((err or "") + "\n" + (out or "")).lower()
+        if any(marker in blob for marker in _BTM_PRIVILEGED_MARKERS):
+            return SURFACE_PRIVILEGED
         return None  # timeout/failure — a non-answer, NOT "zero items"
     return _parse_btm(out)
 
@@ -9816,8 +9987,19 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
         started = time.monotonic()
         try:
             cur = snap_fn()
-            status = "DEGRADED" if cur is None else "OK"
-            detail = "sensor returned no reliable snapshot" if cur is None else ""
+            if cur is SURFACE_PRIVILEGED:
+                # OS-imposed privilege wall: a named permanent coverage gap,
+                # not a broken sensor. Never diffed, never adopted, never
+                # escalated to a coverage-degraded incident.
+                cur, status = None, "PRIVILEGED"
+                detail = ("this OS requires interactive admin authorization "
+                          "for the backing command; surface is observable "
+                          "only from a privileged context")
+            elif cur is None:
+                status = "DEGRADED"
+                detail = "sensor returned no reliable snapshot"
+            else:
+                status, detail = "OK", ""
         except Exception as e:
             cur = None
             status, detail = "FAILED", str(e)
@@ -10463,18 +10645,48 @@ def cmd_report():
 
 def cmd_incidents(show_all=False):
     incidents = list_incidents(active_only=not show_all)
+    tolerated = _recent_tolerated_count()
     if not incidents:
         print("No %sincidents." % ("recorded " if show_all else "active "))
+        if tolerated and not show_all:
+            print(_tolerated_footer(tolerated))
         return 0
     print("# Aegis incidents (%d)\n" % len(incidents))
     for item in incidents:
+        status = item["status"]
+        if item.get("resolution") == "auto-tolerated":
+            status = "TOLERATED"
         print("  #%s  %-12s %-8s %s\n      %s · %s evidence event%s" % (
-            item["id"], item["status"], item["severity"], item["title"],
+            item["id"], status, item["severity"], item["title"],
             item["correlation_key"], item["evidence_count"],
             "" if item["evidence_count"] == 1 else "s"))
+    if tolerated and not show_all:
+        print("\n" + _tolerated_footer(tolerated))
     print("\nDetails/actions: aegis.py incident <id> [ack|investigate|contain|"
           "recover|monitor|resolve|false-positive|benign-positive|reopen]")
     return 0
+
+
+def _recent_tolerated_count(window=30 * 86400):
+    """How many signals acquired tolerance auto-closed in the window. Suppression
+    that cannot be seen is indistinguishable from a detection gap, so the count
+    is surfaced wherever active incidents are listed."""
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        return db.execute(
+            "SELECT COUNT(*) FROM incidents WHERE resolution='auto-tolerated' "
+            "AND updated_at>=?", (_epoch() - window,)).fetchone()[0]
+    finally:
+        db.close()
+
+
+def _tolerated_footer(count):
+    return ("%d recurring signal(s) auto-tolerated in the last 30d — each "
+            "matched >=%d of your own benign-positive verdicts on the same "
+            "identity. Review: aegis.py incidents all; dispute: reopen <id>."
+            % (count, _TOLERANCE_MIN_VERDICTS))
 
 
 _INCIDENT_ACTIONS = {
@@ -10684,9 +10896,13 @@ def cmd_incident(incident_id, action=None, reason=None):
     if not item:
         print("no such incident: %s" % incident_id)
         return 1
+    status = item["status"]
+    resolution = item.get("resolution")
+    if resolution and resolution != status.lower().replace("_", "-"):
+        status = "%s (%s)" % (status, resolution)
     print("# Incident #%s — %s\n\n  severity: %s\n  status:   %s\n  chain:    %s"
           "\n  opened:   %s\n  updated:  %s\n\nEvidence:" % (
-              item["id"], item["title"], item["severity"], item["status"],
+              item["id"], item["title"], item["severity"], status,
               item["correlation_key"],
               datetime.fromtimestamp(item["created_at"]).isoformat(),
               datetime.fromtimestamp(item["updated_at"]).isoformat()))
@@ -10884,11 +11100,14 @@ def cmd_doctor():
         print("  ? sensors                     no completed scan recorded")
         problems.append("no sensor health")
     for item in health:
-        mark = "✓" if item["status"] == "OK" else "?"
+        # PRIVILEGED = a named, OS-imposed permanent coverage gap ("i", like
+        # rootwatch-absent below): shown so it is never mistaken for coverage,
+        # but not a problem — nothing here is fixable or unexpectedly broken.
+        mark = {"OK": "✓", "PRIVILEGED": "i"}.get(item["status"], "?")
         print("  %s %-27s %-10s failures=%d %s" % (
             mark, item["sensor_id"], item["status"],
             item["consecutive_failures"], item["detail"] or ""))
-        if item["status"] != "OK":
+        if item["status"] not in ("OK", "PRIVILEGED"):
             problems.append(item["sensor_id"])
     # INFO, never a problem: rootwatch is opt-in, but its absence is worth one
     # honest line — without it a same-uid attacker can kill Aegis and the
@@ -10990,7 +11209,7 @@ def cmd_status():
     if health:
         print("\n# Sensor coverage")
         for item in health:
-            mark = "✓" if item["status"] == "OK" else "?"
+            mark = {"OK": "✓", "PRIVILEGED": "i"}.get(item["status"], "?")
             print("  %s %-32s %s%s" % (
                 mark, item["sensor_id"], item["status"],
                 (" — " + item["detail"]) if item["detail"] else ""))
@@ -17082,7 +17301,12 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    ...the two dismissals are recorded separately and feed
                    different tuning queues: false-positive = the DETECTION was
                    wrong (tune the rule), benign-positive = the event was real
-                   but authorized (suppress this instance, rule is fine)
+                   but authorized (suppress this instance, rule is fine).
+                   Acquired tolerance: an identity you have dismissed
+                   benign-positive on 3+ distinct incidents re-opens PRE-CLOSED
+                   (TOLERATED, evidence kept, no alert) when only its content
+                   hash changed — never on higher severity, a new endpoint, or
+                   attack-defined evidence. `reopen` disputes + revokes it
   replay [days]    backtest the CURRENT correlation logic against recorded
                    history (default 30d). Read-only: opens no incident, sends
                    no notification — run it after changing detection logic
