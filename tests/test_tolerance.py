@@ -102,6 +102,35 @@ class TestToleranceIdentity(unittest.TestCase):
                    "short:ab"):
             self.assertIsNone(aegis._tolerance_identity(fp), fp)
 
+    def test_version_segments_in_paths_generalize(self):
+        # A vendor's versioned install dir renames every release; the same
+        # reviewed binary must map to ONE identity across versions...
+        v226 = aegis._tolerance_identity(
+            "beacon:/x/extensions/vendor.tool-2.1.226-darwin-arm64/bin/tool"
+            ":160.79.104.10:443")
+        v228 = aegis._tolerance_identity(
+            "beacon:/x/extensions/vendor.tool-2.1.228-darwin-arm64/bin/tool"
+            ":160.79.104.10:443")
+        self.assertIsNotNone(v226)
+        self.assertEqual(v226, v228)
+        # ...while the ENDPOINT is its own ':'-field with no '/': it is never
+        # normalized, so a new ip:port is a new identity and always alerts.
+        self.assertIn("160.79.104.10:443", v226)
+        other_ip = aegis._tolerance_identity(
+            "beacon:/x/extensions/vendor.tool-2.1.228-darwin-arm64/bin/tool"
+            ":35.190.46.17:443")
+        self.assertNotEqual(v228, other_ip)
+
+    def test_version_and_hash_compose_for_process_fingerprints(self):
+        a = aegis._tolerance_identity(
+            "process:/u/actions-runners/os/bin.2.336.0/Runner.Worker:adhoc:"
+            + "a" * 64)
+        b = aegis._tolerance_identity(
+            "process:/u/actions-runners/os/bin.2.340.1/Runner.Worker:adhoc:"
+            + "b" * 64)
+        self.assertIsNotNone(a)
+        self.assertEqual(a, b)
+
     def test_attack_defined_prefixes_never_tolerize(self):
         for fp in ("decoy:read:/home/x/.aws/credentials:" + "b" * 16,
                    "latch:cleared:/Library/LaunchAgents:" + "c" * 16,
@@ -210,6 +239,31 @@ class TestAcquiredTolerance(_Sandbox):
         fp = "persistence:changed:%s:%016x" % (PLIST, 99)
         self._ingest(_finding(fp), NOW)
         self.assertEqual(self._incident_for(fp)["status"], "OPEN")
+
+    def test_beacon_version_churn_earns_tolerance_end_to_end(self):
+        base = ("beacon:/u/ext/vendor.tool-2.1.%d-darwin-arm64/bin/tool"
+                ":160.79.104.10:443")
+        for i in range(3):
+            fp = base % (226 + i)
+            self._ingest(_finding(fp, category="net-beacon",
+                                  title="Persistent outbound connection"),
+                         NOW + i * 60)
+            aegis.transition_incident(
+                self._incident_for(fp)["id"], "FALSE_POSITIVE",
+                now=NOW + i * 60 + 30, reason_code="benign-positive")
+        fp = base % 240
+        self._ingest(_finding(fp, category="net-beacon",
+                              title="Persistent outbound connection"),
+                     NOW + 3600)
+        self.assertEqual(self._incident_for(fp)["resolution"],
+                         "auto-tolerated")
+        # Same binary, NEW endpoint: a new fact — must open and alert.
+        fp_new_ip = ("beacon:/u/ext/vendor.tool-2.1.240-darwin-arm64/bin/tool"
+                     ":203.0.113.9:443")
+        self._ingest(_finding(fp_new_ip, category="net-beacon",
+                              title="Persistent outbound connection"),
+                     NOW + 3700)
+        self.assertEqual(self._incident_for(fp_new_ip)["status"], "OPEN")
 
     def test_tolerated_incident_is_visible_and_counted(self):
         self._teach(3)

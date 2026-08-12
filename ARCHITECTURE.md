@@ -183,8 +183,10 @@ guards because they answer the same adversarial pressures:
   rules instead, and machine verdicts write no dismissal record, so tolerance
   can never feed on itself or pollute `backtest` precision.
 - **Antigen-specific**: the identity is the fingerprint minus its trailing
-  content hash, and only categories whose benign churn is hash-shaped are
-  eligible (an allowlist). A beacon's endpoint, a path, a marker set are facts —
+  content hash, with dotted version segments normalized inside path-like
+  fields only (a vendor's versioned install dir renames every release), and
+  only categories whose benign churn is hash- or version-shaped are eligible
+  (an allowlist). A beacon's endpoint, a base path, a marker set are facts —
   a new one is a new incident, always.
 - **Repeated exposure required**: three distinct dismissed incidents on the
   identity inside 180 days, so one hasty dismissal teaches nothing.
