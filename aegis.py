@@ -197,6 +197,7 @@ LATEST_JSON = os.path.join(STATE_DIR, "latest.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
 SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
 INTENT_FILE = os.path.join(STATE_DIR, "intent.jsonl")
+FLEET_SIGNERS = os.path.join(STATE_DIR, "allowed_signers")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
@@ -8793,6 +8794,29 @@ def _git_created_here(git, cwd, sha, author_email):
     return False
 
 
+def _git_fleet_signed(git, cwd, sha):
+    """True iff `sha` carries a cryptographic signature that verifies against
+    the PINNED device roster (~/.aegis/allowed_signers, written only by the
+    explicit `signers pin` command).
+
+    This is the cross-device rung: a commit made on ANOTHER of the operator's
+    machines arrives here by fetch — no local reflog, no local authorship —
+    but it carries the originating device's SSH signature, and signatures are
+    the one custody evidence that survives transport. Verification runs
+    against Aegis's own pinned copy, never against a roster file synced
+    through the repo itself: a poisoned remote that adds an attacker's key to
+    the tracked roster changes nothing here until the operator explicitly
+    re-pins. Only an exact 'G' (good, signer in the roster) vouches; every
+    other verdict — unsigned, bad, unknown key, expired, error — is a
+    non-match, and asymmetric keys mean this machine holds nothing that can
+    MAKE a signature, only what checks one."""
+    if not os.path.isfile(FLEET_SIGNERS):
+        return False
+    out, _e, rc = run([git, "-c", "gpg.ssh.allowedSignersFile=%s" % FLEET_SIGNERS,
+                       "-C", cwd, "log", "-1", "--format=%G?", sha], timeout=15)
+    return rc == 0 and (out or "").strip() == "G"
+
+
 def _git_provenance(path):
     """How the current content of `path` arrived.
 
@@ -8801,6 +8825,9 @@ def _git_provenance(path):
       'self-committed' — the commit that last touched it was CREATED on this
                          machine by the repo's own configured identity (HEAD
                          reflog records it as a `commit`), pushed or not
+      'fleet-signed'   — the commit arrived from elsewhere but carries a
+                         signature verifying against the PINNED device
+                         roster: made on one of the operator's own machines
       'remote-foreign' — committed AND reachable from a remote-tracking
                          branch, with no local record of authorship: it
                          arrived in (or belongs to) someone else's history
@@ -8833,6 +8860,8 @@ def _git_provenance(path):
     sha, author = out.split("|", 1)
     if _git_created_here(git, d, sha, author):
         return "self-committed"
+    if _git_fleet_signed(git, d, sha):
+        return "fleet-signed"
     br, _e, rc = run([git, "-C", d, "branch", "-r", "--contains", sha], timeout=15)
     return "remote-foreign" if (rc == 0 and (br or "").strip()) else "local-commit"
 
@@ -8847,6 +8876,13 @@ _PROVENANCE_NOTE = {
     "self-committed": ("The commit that last touched this file was created on "
                        "this machine by its own configured git identity — "
                        "self-authored churn, not an arrival."),
+    "fleet-signed": ("The commit that last touched this file arrived from "
+                     "elsewhere but carries an SSH signature verifying "
+                     "against your PINNED device roster "
+                     "(~/.aegis/allowed_signers) — made on one of your own "
+                     "machines. (The signature proves WHICH device, not that "
+                     "the device was healthy; the roster changes only by an "
+                     "explicit `signers pin`.)"),
     "remote-foreign": ("This arrived in your history from a REMOTE — it is a "
                        "third-party-authored instruction you may never have "
                        "read. This is the poisoned-repo case."),
@@ -8863,7 +8899,52 @@ _PROVENANCE_NOTE = {
 # finding to a recorded-but-quiet severity. Deliberately NOT consulted for
 # attack-defined content — a conceal imperative stays HIGH no matter who
 # appears to have written it, the same guard acquired tolerance applies.
-_SELF_CUSTODY = ("self-attested", "self-committed")
+_SELF_CUSTODY = ("self-attested", "self-committed", "fleet-signed")
+
+
+def cmd_signers(argv):
+    """CLI: `signers pin <file>` | `signers status`. Pinning copies a roster
+    of `principal ssh-key` lines into ~/.aegis/allowed_signers — the ONLY way
+    that file changes. Verification always reads the pinned copy, so a synced
+    or repo-tracked roster an attacker can edit never grants itself trust."""
+    sub = argv[2] if len(argv) > 2 else "status"
+    if sub == "pin" and len(argv) > 3:
+        src = os.path.realpath(os.path.expanduser(argv[3]))
+        try:
+            with open(src, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            print("cannot read %s: %s" % (src, e))
+            return 1
+        keys = [ln for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+        if not keys:
+            print("%s contains no signer lines; nothing pinned" % src)
+            return 1
+        fd = os.open(FLEET_SIGNERS + ".tmp",
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(FLEET_SIGNERS + ".tmp", FLEET_SIGNERS)
+        print("pinned %d signer(s) from %s -> %s" % (len(keys), src,
+                                                     FLEET_SIGNERS))
+        for ln in keys:
+            print("  " + " ".join(ln.split()[:2]) + " ...")
+        return 0
+    if sub == "status":
+        if not os.path.isfile(FLEET_SIGNERS):
+            print("no device roster pinned (fleet-signed grading inactive).\n"
+                  "Pin one: aegis.py signers pin <allowed_signers file>")
+            return 0
+        with open(FLEET_SIGNERS, encoding="utf-8", errors="replace") as f:
+            keys = [ln for ln in f.read().splitlines()
+                    if ln.strip() and not ln.lstrip().startswith("#")]
+        print("pinned roster: %s (%d signer(s))" % (FLEET_SIGNERS, len(keys)))
+        for ln in keys:
+            print("  " + " ".join(ln.split()[:2]) + " ...")
+        return 0
+    print("usage: signers pin <allowed_signers file> | signers status")
+    return 2
 
 
 def _custody(path, content_sha):
@@ -17679,6 +17760,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    Code/Codex): reads the tool-call JSON on stdin, attests the
                    written file. Prints nothing, always exits 0
   intent list [n]  show recent attestations and whether their MACs verify
+  signers pin <file>
+                   pin a device roster (`principal ssh-key` lines) into
+                   ~/.aegis/allowed_signers — the only way it changes. A
+                   commit arriving from another machine whose SSH signature
+                   verifies against the PINNED roster grades LOW
+                   (fleet-signed) instead of the poisoned-repo HIGH
+  signers status   show the pinned roster
   attck [days]     ATT&CK technique coverage: what's wired, what's actually
                    fired on this machine (default 180d). Read-only.
   baseline         reset the known-good persistence baseline to current state
@@ -17855,6 +17943,8 @@ def main(argv):
                             argv[4] if len(argv) > 4 else None)
     if cmd == "intent":
         return cmd_intent(argv)
+    if cmd == "signers":
+        return cmd_signers(argv)
     if cmd == "replay":
         try:
             days = int(argv[2]) if len(argv) > 2 else 30

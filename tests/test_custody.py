@@ -42,6 +42,7 @@ class CustodySandbox(unittest.TestCase):
             "INTENT_FILE": os.path.join(self.state, "intent.jsonl"),
             "HMAC_KEY_FILE": os.path.join(self.state, "hmac.key"),
             "SIGCACHE": os.path.join(self.state, "sigcache.json"),
+            "FLEET_SIGNERS": os.path.join(self.state, "allowed_signers"),
             "AGENT_CONFIG_ROOTS": [os.path.join(self.tmp, "agentroot")],
         }
         for k, v in overrides.items():
@@ -133,6 +134,82 @@ class GitProvenanceDiscriminator(CustodySandbox):
         self._git(victim, "config", "user.name", "Custody Test")
         self.assertEqual(
             aegis._git_provenance(os.path.join(victim, cfg_name)),
+            "remote-foreign")
+
+    def _signing_repo(self, name, keyname, email="me@local.test"):
+        """A repo configured to SSH-sign every commit with a fresh key.
+        Returns (repo_dir, pubkey_line)."""
+        repo = self._repo(name, email=email)
+        key = os.path.join(self.tmp, keyname)
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                        "-C", keyname, "-f", key], capture_output=True)
+        self._git(repo, "config", "gpg.format", "ssh")
+        self._git(repo, "config", "user.signingkey", key + ".pub")
+        self._git(repo, "config", "commit.gpgsign", "true")
+        with open(key + ".pub") as f:
+            pub = f.read().split()
+        return repo, "%s %s %s" % (email, pub[0], pub[1])
+
+    def test_pulled_but_fleet_signed_grades_as_own_device(self):
+        """The multi-device case: a commit made and SIGNED on device B
+        arrives on device A by clone/pull. A's reflog cannot vouch, but the
+        signature verifies against A's PINNED roster -> 'fleet-signed'.
+        Remove the pin and the same commit is 'remote-foreign' again — the
+        roster, not the repo, is what grants trust."""
+        origin = os.path.join(self.tmp, "origin.git")
+        subprocess.run([GIT, "init", "-q", "--bare", origin],
+                       capture_output=True)
+        author, roster_line = self._signing_repo("deviceB", "deviceB_key")
+        self._git(author, "remote", "add", "origin", origin)
+        cfg_name = "settings.json"
+        with open(os.path.join(author, cfg_name), "w") as f:
+            f.write(self._mcp_config("./hook.sh"))
+        self._git(author, "add", "-A")
+        r = self._git(author, "commit", "-q", "-m", "register hook")
+        if r.returncode != 0:
+            self.skipTest("git cannot SSH-sign here: %s" % r.stderr.strip())
+        self._git(author, "push", "-q", "origin", "main")
+        victim = os.path.join(self.tmp, "victim")
+        subprocess.run([GIT, "clone", "-q", origin, victim],
+                       capture_output=True,
+                       env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+                                GIT_CONFIG_SYSTEM=os.devnull))
+        self._git(victim, "config", "user.email", "me@local.test")
+        p = os.path.join(victim, cfg_name)
+        # No roster pinned: exactly the old poisoned-repo verdict.
+        self.assertEqual(aegis._git_provenance(p), "remote-foreign")
+        with open(aegis.FLEET_SIGNERS, "w") as f:
+            f.write(roster_line + "\n")
+        self.assertEqual(aegis._git_provenance(p), "fleet-signed")
+
+    def test_wrong_key_or_unsigned_arrival_stays_foreign(self):
+        """A pinned roster must vouch ONLY for its own keys: an arrival
+        signed by some other key — or not signed at all — keeps the
+        poisoned-repo HIGH path."""
+        origin = os.path.join(self.tmp, "origin.git")
+        subprocess.run([GIT, "init", "-q", "--bare", origin],
+                       capture_output=True)
+        author, _line = self._signing_repo("attacker", "attacker_key")
+        self._git(author, "remote", "add", "origin", origin)
+        with open(os.path.join(author, "settings.json"), "w") as f:
+            f.write(self._mcp_config("./hook.sh"))
+        self._git(author, "add", "-A")
+        r = self._git(author, "commit", "-q", "-m", "register hook")
+        if r.returncode != 0:
+            self.skipTest("git cannot SSH-sign here: %s" % r.stderr.strip())
+        self._git(author, "push", "-q", "origin", "main")
+        victim = os.path.join(self.tmp, "victim")
+        subprocess.run([GIT, "clone", "-q", origin, victim],
+                       capture_output=True,
+                       env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+                                GIT_CONFIG_SYSTEM=os.devnull))
+        self._git(victim, "config", "user.email", "me@local.test")
+        # Roster holds a DIFFERENT trusted device's key.
+        _repo2, trusted_line = self._signing_repo("deviceC", "deviceC_key")
+        with open(aegis.FLEET_SIGNERS, "w") as f:
+            f.write(trusted_line + "\n")
+        self.assertEqual(
+            aegis._git_provenance(os.path.join(victim, "settings.json")),
             "remote-foreign")
 
     def test_identity_mismatch_never_vouches(self):

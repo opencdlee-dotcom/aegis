@@ -220,6 +220,12 @@ python3 aegis.py intent hook TOOL   # harness post-write hook mode: reads the
                                #   tool-call JSON on stdin, attests the written
                                #   file; prints nothing, always exits 0
 python3 aegis.py intent list   # recent attestations + MAC validity
+python3 aegis.py signers pin FILE   # pin a device roster (principal ssh-key
+                               #   lines) — a commit arriving from another of
+                               #   YOUR machines whose SSH signature verifies
+                               #   against the PINNED roster grades LOW
+                               #   (fleet-signed) instead of poisoned-repo HIGH
+python3 aegis.py signers status # show the pinned roster
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)

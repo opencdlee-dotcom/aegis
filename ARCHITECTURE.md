@@ -208,7 +208,7 @@ self-inflicted HIGHs in one day is how the one foreign HIGH eventually gets
 dismissed unread. Custody grading answers the question that actually
 discriminates: **can this machine claim authorship of this change?**
 
-Three rungs, consulted in order; the first that vouches sets the grade:
+Four rungs, consulted in order; the first that vouches sets the grade:
 
 1. **Signed intent ledger** (`~/.aegis/intent.jsonl`). The agent harness calls
    `aegis.py intent hook <tool>` after each file-writing tool call; Aegis
@@ -223,7 +223,18 @@ Three rungs, consulted in order; the first that vouches sets the grade:
    local authorship record is `remote-foreign` → **HIGH** with the
    poisoned-repo warning — pushing your own commit does not make it foreign,
    and pulling someone else's never becomes yours.
-3. **Signer stability** (changed-target findings only). A resolved target
+3. **Fleet signature** (the multi-device rung). A commit that arrived from
+   elsewhere but carries an SSH signature verifying against the **pinned**
+   device roster (`~/.aegis/allowed_signers`) is `fleet-signed` → **LOW**: it
+   was made on one of the operator's own machines, and a signature is the one
+   custody evidence that survives transport. The roster is written only by the
+   explicit `signers pin` command — a roster synced or tracked through the repo
+   itself is merely the *source* the operator pins from, so a poisoned remote
+   that adds an attacker key to the tracked copy changes nothing until a human
+   re-pins. Verification is asymmetric: this machine holds nothing that can
+   *make* a trusted signature, only what checks one. Only an exact `G` verdict
+   vouches; unsigned, bad, unknown-key, expired, and error are all non-matches.
+4. **Signer stability** (changed-target findings only). A resolved target
    re-signed by the **same team** that signed its baselined content is the
    exact shape of a vendor updating its own binary → **MEDIUM** (recorded, can
    corroborate, opens no incident alone). The team is captured at snapshot
