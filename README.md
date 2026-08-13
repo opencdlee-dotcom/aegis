@@ -211,6 +211,15 @@ python3 aegis.py replay [days] # backtest the CURRENT correlation logic against
                                #   recorded history (default 30d). READ-ONLY:
                                #   opens no incident, sends no notification —
                                #   run it after changing detection logic
+python3 aegis.py intent record PATH [tool]   # attest an agent config/script you
+                               #   just authored: MAC'd {ts,path,sha256,tool}
+                               #   line in ~/.aegis/intent.jsonl. A delegate-
+                               #   surface change matching a valid record
+                               #   grades LOW (self-attested) instead of HIGH
+python3 aegis.py intent hook TOOL   # harness post-write hook mode: reads the
+                               #   tool-call JSON on stdin, attests the written
+                               #   file; prints nothing, always exits 0
+python3 aegis.py intent list   # recent attestations + MAC validity
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)
@@ -395,7 +404,7 @@ scheduled task is future work, and the gap is stated rather than implied.
 
 | Command / sensor | What it does | Notes |
 |---|---|---|
-| **agent-surface** *(sensor)* | Baselines and diffs the AI-agent trust surface: MCP server registrations, tool-hook configs, and instruction files. Alerts on a **new exec entry**, a **changed resolved target**, or a **new semantic imperative**. | Coverage here was previously **zero** (no matches for `mcp`, `claude_desktop`, `.envrc`, `tasks.json`, `git/hooks` anywhere in the file) while this channel appears in a documented majority of 2026 agent-delivered campaigns. |
+| **agent-surface** *(sensor)* | Baselines and diffs the AI-agent trust surface: MCP server registrations, tool-hook configs, and instruction files. Alerts on a **new exec entry**, a **changed resolved target**, or a **new semantic imperative** — each structural change graded by **chain of custody** (a signed intent-ledger record or a commit *created on this machine* by the repo's own identity grades LOW; a same-team re-signed target grades MEDIUM; anything the machine cannot claim stays HIGH, and attack-defined content never downgrades). | Coverage here was previously **zero** (no matches for `mcp`, `claude_desktop`, `.envrc`, `tasks.json`, `git/hooks` anywhere in the file) while this channel appears in a documented majority of 2026 agent-delivered campaigns. |
 | **session-theft** *(sensor)* | Flags a browser driven against **its own live profile** — `--remote-debugging-port`, `--load-extension`, `--user-data-dir` aimed at the real profile. | Cookie-store coverage was also **zero**: the only three `cookie` matches in 11,805 lines were redaction regexes. |
 | **session-binding** *(sensor)* | Reports App-Bound Encryption / DBSC posture once at baseline, then only on change. A binding **removal** is HIGH. | Designed to convert into a bound-session counter when macOS DBSC ships, rather than be deleted. |
 | `cauterize [incident] [done N]` | The dependency-ordered revocation plan derived from this disk. | Reads **no secret bytes** — presence and `stat()` only. |
