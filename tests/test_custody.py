@@ -71,6 +71,31 @@ class CustodySandbox(unittest.TestCase):
         return subprocess.run([GIT, "-C", cwd] + list(args),
                               capture_output=True, text=True, env=env)
 
+    def _git_env(self):
+        """Cleaned env for DIRECT subprocess git calls (init/clone), so the
+        developer's global config can't make a test pass locally and fail on
+        a runner — which happened: a bare origin inited without `-b main`
+        inherited init.defaultBranch=main from the author's global config,
+        while CI's default HEAD pointed at a nonexistent master and every
+        clone came out empty (provenance None, three jobs red)."""
+        env = dict(os.environ)
+        env.update({"GIT_TERMINAL_PROMPT": "0",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_SYSTEM": os.devnull})
+        return env
+
+    def _bare(self, name):
+        d = os.path.join(self.tmp, name)
+        subprocess.run([GIT, "init", "-q", "--bare", "-b", "main", d],
+                       capture_output=True, env=self._git_env())
+        return d
+
+    def _clone(self, origin, name):
+        d = os.path.join(self.tmp, name)
+        subprocess.run([GIT, "clone", "-q", origin, d],
+                       capture_output=True, env=self._git_env())
+        return d
+
     def _repo(self, name, email="me@local.test"):
         d = os.path.join(self.tmp, name)
         os.makedirs(d)
@@ -94,9 +119,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         """A commit made in this working copy by its configured identity is
         'self-committed' — even after it is pushed to a remote. This is the
         exact case that opened seven false HIGHs on the author's machine."""
-        origin = os.path.join(self.tmp, "origin.git")
-        subprocess.run([GIT, "init", "-q", "--bare", origin],
-                       capture_output=True)
+        origin = self._bare("origin.git")
         repo = self._repo("mine")
         cfg = os.path.join(repo, "settings.json")
         with open(cfg, "w") as f:
@@ -113,9 +136,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         """The same content pulled INTO a clone is 'remote-foreign': the
         victim's reflog records a fetch/merge, never a `commit` — the
         poisoned-repo arrival the sensor exists for."""
-        origin = os.path.join(self.tmp, "origin.git")
-        subprocess.run([GIT, "init", "-q", "--bare", origin],
-                       capture_output=True)
+        origin = self._bare("origin.git")
         author = self._repo("author")
         self._git(author, "remote", "add", "origin", origin)
         cfg_name = "settings.json"
@@ -124,11 +145,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         self._git(author, "add", "-A")
         self._git(author, "commit", "-q", "-m", "register hook")
         self._git(author, "push", "-q", "origin", "main")
-        victim = os.path.join(self.tmp, "victim")
-        subprocess.run([GIT, "clone", "-q", origin, victim],
-                       capture_output=True,
-                       env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
-                                GIT_CONFIG_SYSTEM=os.devnull))
+        victim = self._clone(origin, "victim")
         # Same human identity on both clones — identity alone must not vouch.
         self._git(victim, "config", "user.email", "me@local.test")
         self._git(victim, "config", "user.name", "Custody Test")
@@ -156,9 +173,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         signature verifies against A's PINNED roster -> 'fleet-signed'.
         Remove the pin and the same commit is 'remote-foreign' again — the
         roster, not the repo, is what grants trust."""
-        origin = os.path.join(self.tmp, "origin.git")
-        subprocess.run([GIT, "init", "-q", "--bare", origin],
-                       capture_output=True)
+        origin = self._bare("origin.git")
         author, roster_line = self._signing_repo("deviceB", "deviceB_key")
         self._git(author, "remote", "add", "origin", origin)
         cfg_name = "settings.json"
@@ -169,11 +184,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         if r.returncode != 0:
             self.skipTest("git cannot SSH-sign here: %s" % r.stderr.strip())
         self._git(author, "push", "-q", "origin", "main")
-        victim = os.path.join(self.tmp, "victim")
-        subprocess.run([GIT, "clone", "-q", origin, victim],
-                       capture_output=True,
-                       env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
-                                GIT_CONFIG_SYSTEM=os.devnull))
+        victim = self._clone(origin, "victim")
         self._git(victim, "config", "user.email", "me@local.test")
         p = os.path.join(victim, cfg_name)
         # No roster pinned: exactly the old poisoned-repo verdict.
@@ -186,9 +197,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         """A pinned roster must vouch ONLY for its own keys: an arrival
         signed by some other key — or not signed at all — keeps the
         poisoned-repo HIGH path."""
-        origin = os.path.join(self.tmp, "origin.git")
-        subprocess.run([GIT, "init", "-q", "--bare", origin],
-                       capture_output=True)
+        origin = self._bare("origin.git")
         author, _line = self._signing_repo("attacker", "attacker_key")
         self._git(author, "remote", "add", "origin", origin)
         with open(os.path.join(author, "settings.json"), "w") as f:
@@ -198,11 +207,7 @@ class GitProvenanceDiscriminator(CustodySandbox):
         if r.returncode != 0:
             self.skipTest("git cannot SSH-sign here: %s" % r.stderr.strip())
         self._git(author, "push", "-q", "origin", "main")
-        victim = os.path.join(self.tmp, "victim")
-        subprocess.run([GIT, "clone", "-q", origin, victim],
-                       capture_output=True,
-                       env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
-                                GIT_CONFIG_SYSTEM=os.devnull))
+        victim = self._clone(origin, "victim")
         self._git(victim, "config", "user.email", "me@local.test")
         # Roster holds a DIFFERENT trusted device's key.
         _repo2, trusted_line = self._signing_repo("deviceC", "deviceC_key")
