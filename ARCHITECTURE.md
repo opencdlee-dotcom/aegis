@@ -59,7 +59,7 @@ Three rules keep this honest rather than merely portable:
 | Pre-commit | Latched persistence surfaces (`chflags uchg` / deny-write ACE) and FIFO credential decoys, both placed **before** any attack | Makes the attacker's write fail rather than reporting it afterwards; a cleared latch or a read decoy is attack-defined evidence |
 | Contain | Manual process action, **reversible freeze**, and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
 | Prove detection | Positive-control assay per detector, with an efficacy half-life; every lane asserts **both** poles, and the delegate/session tier is covered too | Distinguishes "nothing found" from "no longer able to find"; unproven coverage is reported as unproven. A hostile-pole-only lane passes against a detector hardwired to say yes, and a benign-pole-only lane passes against a dead one — so a lane that checks one pole proves nothing |
-| Delegate-surface | Agent config discovered by **shape** (a `command`+`args` pair under an agent directory), hashed by **resolved target** rather than by config line, plus a semantic imperative detector for instruction files and git-derived provenance for each added line | An AI agent runs with the operator's full authority and takes instruction from files; an MCP registration is exec-on-start, a hook body is exec-per-tool-call, and a natural-language imperative is an execution primitive with no shell syntax for any grammar to match |
+| Delegate-surface | Agent config discovered by **shape** (a `command`+`args` pair under an agent directory), hashed by **resolved target** rather than by config line, plus a semantic imperative detector for instruction files and a **chain-of-custody grade** for each structural change (signed intent ledger, then git provenance, then signer stability) | An AI agent runs with the operator's full authority and takes instruction from files; an MCP registration is exec-on-start, a hook body is exec-per-tool-call, and a natural-language imperative is an execution primitive with no shell syntax for any grammar to match |
 | Session | Browser automation aimed at the **live** profile (debug port, sideloaded extension, real `--user-data-dir`), plus session-binding posture | Post-App-Bound-Encryption, cookie theft is the browser being driven against itself rather than a jar being copied; live cookies defeat MFA and their revocation belongs to the counterparty |
 | Recover-plan | Dependency-ordered revocation derived from the credential artifacts actually present on disk | The question after a theft is not "what happened" but "which accounts are theirs, in what order do I take them back" — and rotating in the wrong order hands over the reset link |
 | Witness | Hash-chained state anchored into the OS's root-owned log store | An attacker who tampers, or who stops the monitor, cannot do so silently |
@@ -197,6 +197,58 @@ guards because they answer the same adversarial pressures:
   evidence, closed as `auto-tolerated` citing the precedent count, counted in a
   footer on the active listing, and one `reopen` both re-alerts and revokes the
   tolerance (reopening deletes the dismissal rows the count was built on).
+
+### Chain of custody (delegate surface)
+
+The dominant benign churn on the delegate surface is not vendor updates — it is
+the operator's *own* agent tooling registering hooks, MCP servers, and skills,
+often through the operator's own git remote. Provenance that only asks "is this
+commit on a remote?" labels all of it with the poisoned-repo warning, and nine
+self-inflicted HIGHs in one day is how the one foreign HIGH eventually gets
+dismissed unread. Custody grading answers the question that actually
+discriminates: **can this machine claim authorship of this change?**
+
+Three rungs, consulted in order; the first that vouches sets the grade:
+
+1. **Signed intent ledger** (`~/.aegis/intent.jsonl`). The agent harness calls
+   `aegis.py intent hook <tool>` after each file-writing tool call; Aegis
+   appends one HMAC'd `{ts, path, sha256, tool}` record. A change whose content
+   hash matches a valid record is `self-attested` → **LOW**. This covers what
+   git cannot: untracked files and binaries outside any repo.
+2. **Git self-vs-foreign**. A commit is `self-committed` → **LOW** only when two
+   independent records agree: its author email equals the repo's configured
+   `user.email`, *and* the HEAD reflog remembers it being **created** here (a
+   local commit enters the reflog as `commit:`; a pulled one as
+   `pull:`/`merge:`/`clone:`, never `commit:`). Reachable from a remote with no
+   local authorship record is `remote-foreign` → **HIGH** with the
+   poisoned-repo warning — pushing your own commit does not make it foreign,
+   and pulling someone else's never becomes yours.
+3. **Signer stability** (changed-target findings only). A resolved target
+   re-signed by the **same team** that signed its baselined content is the
+   exact shape of a vendor updating its own binary → **MEDIUM** (recorded, can
+   corroborate, opens no incident alone). The team is captured at snapshot
+   time, so an old baseline without one fails toward HIGH, never toward quiet.
+
+Guards, because grading is where an attacker would want to stand:
+
+- **Grades, never mutes.** A downgraded finding is still created, still in the
+  report, still accumulates risk and joins correlation chains. Custody writes
+  no dismissal and cannot feed acquired tolerance.
+- **Attack-defined content never downgrades.** A conceal imperative stays HIGH
+  even when self-attested — an agent prompt-injected into persisting a hostile
+  instruction attests its own write. Custody grades *churn-shaped structure*,
+  not content; the imperative detector keeps its own judgement.
+- **Fail toward suspicion.** Bad MAC, stale record, expired reflog, identity
+  mismatch, git error, absent signer — each is a non-match, and a non-match
+  keeps HIGH. The failure mode of every rung is the pre-custody behavior.
+- **Forgeability is stated, not hidden.** The MAC key and the reflog are
+  same-uid-writable, so an attacker *already executing as you* can forge both.
+  That is the wrong threat for this surface, which exists to catch hostile
+  instructions at **arrival** — the poisoned repo, the trojaned config, the
+  malicious skill — i.e. before the attacker has local execution, which is the
+  only moment forging is impossible. Post-compromise silencing is the witness
+  layer's problem, and it is exactly as detectable as it was before custody
+  grading existed.
 
 `aegis.py replay [days]` re-runs the current correlation logic over recorded
 history in a throwaway in-memory database. It is strictly read-only — no

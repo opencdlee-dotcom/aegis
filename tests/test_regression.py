@@ -102,6 +102,7 @@ class Sandbox(unittest.TestCase):
             "LATEST_JSON": os.path.join(self.state, "latest.json"),
             "SEEN": os.path.join(self.state, "seen.json"),
             "SIGCACHE": os.path.join(self.state, "sigcache.json"),
+            "INTENT_FILE": os.path.join(self.state, "intent.jsonl"),
             "ALLOWLIST": os.path.join(self.state, "allowlist.json"),
             "RUN_LOG": os.path.join(self.state, "run.log"),
             "EVENT_DB": os.path.join(self.state, "aegis.db"),

@@ -196,6 +196,7 @@ LATEST_MD = os.path.join(STATE_DIR, "latest.md")
 LATEST_JSON = os.path.join(STATE_DIR, "latest.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
 SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
+INTENT_FILE = os.path.join(STATE_DIR, "intent.jsonl")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
@@ -8765,15 +8766,47 @@ def _git_bin():
         return None
 
 
+def _git_created_here(git, cwd, sha, author_email):
+    """True iff `sha` was CREATED in this working copy by its own configured
+    identity. Two independent records must agree: the commit's author email
+    equals the repo's `user.email`, and the HEAD reflog remembers the commit
+    being MADE here — a locally created commit enters the reflog as a
+    `commit`/`commit (amend)` entry, while a commit that arrived from
+    elsewhere enters as `pull:`/`merge:`/`fetch:`/`clone:` and never as
+    `commit`. Both records are same-uid-writable, so this is attribution
+    evidence for GRADING a finding, never proof of authorship — and both
+    checks fail toward suspicion (expired reflog, identity mismatch, any git
+    error all return False)."""
+    me, _e, rc = run([git, "-C", cwd, "config", "user.email"], timeout=10)
+    if rc != 0 or not (me or "").strip():
+        return False
+    if (author_email or "").strip() != me.strip():
+        return False
+    rl, _e, rc = run([git, "-C", cwd, "log", "-g", "--format=%H %gs",
+                      "-n", "400"], timeout=15)
+    if rc != 0:
+        return False
+    for line in (rl or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] == sha and parts[1].startswith("commit"):
+            return True
+    return False
+
+
 def _git_provenance(path):
     """How the current content of `path` arrived.
 
-      'untracked'    — exists only in the working tree, never committed
-      'worktree'     — tracked, with uncommitted local modifications
-      'remote'       — committed AND reachable from a remote-tracking branch:
-                       it came from (or is published to) someone else's history
-      'local-commit' — committed locally, not on any remote
-      None           — not in a repo, or git unavailable (reported, not guessed)
+      'untracked'      — exists only in the working tree, never committed
+      'worktree'       — tracked, with uncommitted local modifications
+      'self-committed' — the commit that last touched it was CREATED on this
+                         machine by the repo's own configured identity (HEAD
+                         reflog records it as a `commit`), pushed or not
+      'remote-foreign' — committed AND reachable from a remote-tracking
+                         branch, with no local record of authorship: it
+                         arrived in (or belongs to) someone else's history
+      'local-commit'   — committed, not on any remote, authorship
+                         unconfirmed (expired reflog or identity mismatch)
+      None             — not in a repo, or git unavailable (reported, not guessed)
     """
     git = _git_bin()
     if not git:
@@ -8792,26 +8825,228 @@ def _git_provenance(path):
         return "untracked"
     if st:
         return "worktree"
-    sha, _e, rc = run([git, "-C", d, "log", "-1", "--format=%H", "--", path],
+    out, _e, rc = run([git, "-C", d, "log", "-1", "--format=%H|%ae", "--", path],
                       timeout=10)
-    sha = (sha or "").strip()
-    if rc != 0 or not sha:
+    out = (out or "").strip()
+    if rc != 0 or "|" not in out:
         return None
+    sha, author = out.split("|", 1)
+    if _git_created_here(git, d, sha, author):
+        return "self-committed"
     br, _e, rc = run([git, "-C", d, "branch", "-r", "--contains", sha], timeout=15)
-    return "remote" if (rc == 0 and (br or "").strip()) else "local-commit"
+    return "remote-foreign" if (rc == 0 and (br or "").strip()) else "local-commit"
 
 
 _PROVENANCE_NOTE = {
-    "remote": ("This arrived in your history from a REMOTE — it is a "
-               "third-party-authored instruction you may never have read. "
-               "This is the poisoned-repo case."),
-    "untracked": ("This file is not tracked by git, so nothing recorded who "
-                  "wrote it. An agent process writes exactly like this."),
+    "self-attested": ("A supervised agent session recorded a signed intent "
+                      "entry for exactly this content at write time — this "
+                      "machine claims authorship. (Attribution, not proof: "
+                      "code already running as you could forge the record — "
+                      "but code already running as you no longer needs a "
+                      "config entry to gain execution.)"),
+    "self-committed": ("The commit that last touched this file was created on "
+                       "this machine by its own configured git identity — "
+                       "self-authored churn, not an arrival."),
+    "remote-foreign": ("This arrived in your history from a REMOTE — it is a "
+                       "third-party-authored instruction you may never have "
+                       "read. This is the poisoned-repo case."),
+    "untracked": ("This file is not tracked by git and no supervised agent "
+                  "session attested it, so nothing on this machine claims "
+                  "authorship of this change."),
     "worktree": ("Uncommitted local edit — routine if you made it."),
     "local-commit": ("Committed locally and not pushed — routine if you made it."),
-    None: ("Not in a git repository, so no provenance is available — treat "
-           "authorship as unknown rather than as yours."),
+    None: ("Not in a git repository and no supervised agent session attested "
+           "it — treat authorship as unknown rather than as yours."),
 }
+
+# Custody grades that downgrade a structural (churn-shaped) delegate-surface
+# finding to a recorded-but-quiet severity. Deliberately NOT consulted for
+# attack-defined content — a conceal imperative stays HIGH no matter who
+# appears to have written it, the same guard acquired tolerance applies.
+_SELF_CUSTODY = ("self-attested", "self-committed")
+
+
+def _custody(path, content_sha):
+    """(provenance, note) for a changed delegate-surface object.
+
+    The intent ledger is consulted first because it covers what git cannot
+    (untracked files, binaries outside any repo) and is bound to the exact
+    content hash; git provenance is the fallback for everything committed."""
+    if content_sha and _intent_attested(path, content_sha):
+        return "self-attested", _PROVENANCE_NOTE["self-attested"]
+    prov = _git_provenance(path)
+    return prov, _PROVENANCE_NOTE.get(prov, "")
+
+
+# --- the intent ledger: supervised writes attest themselves -------------------
+#
+# Git answers "how did this arrive" only for tracked files. The intent ledger
+# answers it for everything else the delegate surface watches: the agent
+# harness calls `aegis.py intent hook <tool>` after each file-writing tool
+# call, and Aegis appends one MAC'd {ts, path, sha256, tool} line. At diff
+# time a change whose content hash matches a valid record grades as
+# 'self-attested'.
+#
+# Threat honesty (the same split the witness layer states): the MAC key is
+# same-uid-readable, so an attacker ALREADY EXECUTING as you can forge
+# records. That does not defeat the surface's purpose, because it exists to
+# catch hostile instructions at ARRIVAL — a poisoned repo, a trojaned config,
+# a malicious skill — i.e. before the attacker has local execution, which is
+# the only moment forging is impossible. Post-compromise silence is the
+# witness layer's problem. And attestation only GRADES a finding (HIGH -> LOW,
+# still recorded in the report); it never suppresses one, never auto-closes an
+# incident, and never writes a dismissal, so it cannot feed tolerance.
+
+_INTENT_MAX_AGE_DAYS = 90
+_INTENT_MAX_BYTES = 2 * 1024 * 1024     # rewrite-prune past this
+
+
+def _intent_mac(ts, path, sha, tool):
+    msg = "intent:v1|%s|%s|%s|%s" % (ts, path, sha, tool)
+    return hmac.new(_hmac_key(), msg.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _intent_prune(lines):
+    """Keep only records younger than the retention window; validity is
+    checked at LOOKUP, not here, so a tampered line ages out instead of being
+    silently deleted the moment it would become evidence."""
+    cutoff = _epoch() - _INTENT_MAX_AGE_DAYS * 86400
+    kept = []
+    for ln in lines:
+        try:
+            if _epoch(json.loads(ln).get("ts")) >= cutoff:
+                kept.append(ln)
+        except Exception:
+            continue
+    return kept
+
+
+def intent_record(path, tool="manual"):
+    """Append one signed intent record for `path`'s CURRENT content.
+
+    Never raises and never prints: the caller is a harness hook whose failure
+    must not break or slow a tool call."""
+    try:
+        path = os.path.realpath(os.path.expanduser(path))
+        sha = sha256(path)
+        if not sha:
+            return False
+        tool = str(tool)[:64]
+        ts = now_iso()
+        rec = {"ts": ts, "path": path, "sha256": sha, "tool": tool,
+               "mac": _intent_mac(ts, path, sha, tool)}
+        line = json.dumps(rec, separators=(",", ":"))
+        try:
+            oversized = os.path.getsize(INTENT_FILE) > _INTENT_MAX_BYTES
+        except OSError:
+            oversized = False
+        if oversized:
+            with open(INTENT_FILE, encoding="utf-8", errors="replace") as f:
+                kept = _intent_prune(f.read().splitlines())
+            tmp = INTENT_FILE + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(kept) + ("\n" if kept else ""))
+            os.replace(tmp, INTENT_FILE)
+        fd = os.open(INTENT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _intent_attested(path, sha):
+    """True iff a valid signed intent record binds `path` to content `sha`
+    inside the retention window. Newest records win; a bad MAC or stale
+    timestamp is simply a non-match (fail toward suspicion)."""
+    if not sha:
+        return False
+    try:
+        real = os.path.realpath(os.path.expanduser(path))
+        with open(INTENT_FILE, "rb") as f:
+            blob = f.read(_INTENT_MAX_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return False
+    cutoff = _epoch() - _INTENT_MAX_AGE_DAYS * 86400
+    for ln in reversed(blob.splitlines()):
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if rec.get("sha256") != sha or rec.get("path") not in (path, real):
+            continue
+        if _epoch(rec.get("ts")) < cutoff:
+            continue
+        expect = _intent_mac(rec.get("ts"), rec.get("path"),
+                             rec.get("sha256"), rec.get("tool"))
+        if hmac.compare_digest(expect, str(rec.get("mac") or "")):
+            return True
+    return False
+
+
+def _intent_worthy(path):
+    """Is `path` something the delegate surface could ever grade? Cheap
+    prefilter for hook mode so the ledger holds agent-surface writes, not a
+    transcript of every file the operator's tools touch."""
+    base = os.path.basename(path)
+    if base in AGENT_INSTRUCTION_NAMES or base in AGENT_REPO_CONFIG_NAMES:
+        return True
+    if base.endswith((".json", ".toml", ".md", ".sh", ".py", ".js", ".ps1")):
+        return True
+    real = os.path.realpath(os.path.expanduser(path))
+    return any(real.startswith(os.path.realpath(r) + os.sep)
+               for r in AGENT_CONFIG_ROOTS if os.path.isdir(r))
+
+
+def cmd_intent(argv):
+    """CLI: `intent record <path> [tool]` | `intent hook <tool>` |
+    `intent list [n]`. Hook mode reads the harness's tool-call JSON on stdin,
+    extracts the written file's path, and attests it — always exits 0, prints
+    nothing, so a broken ledger can never break the operator's editor."""
+    sub = argv[2] if len(argv) > 2 else "list"
+    if sub == "record" and len(argv) > 3:
+        ok = intent_record(argv[3], argv[4] if len(argv) > 4 else "manual")
+        print("recorded" if ok else "not recorded (unreadable path?)")
+        return 0 if ok else 1
+    if sub == "hook":
+        tool = argv[3] if len(argv) > 3 else "agent"
+        try:
+            payload = json.loads(sys.stdin.read(1 << 20) or "{}")
+            ti = payload.get("tool_input") or {}
+            p = ti.get("file_path") or ti.get("path") or ""
+            if p and _intent_worthy(p):
+                intent_record(p, tool)
+        except Exception:
+            pass
+        return 0
+    if sub == "list":
+        try:
+            n = int(argv[3]) if len(argv) > 3 else 20
+        except ValueError:
+            n = 20
+        try:
+            with open(INTENT_FILE, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        for ln in lines[-n:]:
+            try:
+                rec = json.loads(ln)
+                expect = _intent_mac(rec.get("ts"), rec.get("path"),
+                                     rec.get("sha256"), rec.get("tool"))
+                ok = hmac.compare_digest(expect, str(rec.get("mac") or ""))
+                print("%s  %s  %s  [%s]" % (rec.get("ts"), "valid " if ok
+                      else "BADMAC", rec.get("path"), rec.get("tool")))
+            except Exception:
+                print("(unparseable line)")
+        if not lines:
+            print("no intent records")
+        return 0
+    print("usage: intent record <path> [tool] | intent hook <tool> | "
+          "intent list [n]")
+    return 2
 
 
 # --- discovery + snapshot ----------------------------------------------------
@@ -9021,8 +9256,20 @@ def snapshot_agent_surface():
             execs = {}
             for label, cmd, args in entries[:32]:
                 tgt, h = _resolve_exec_target(cmd, args)
-                execs["%s|%s" % (label, cmd)] = {
-                    "cmd": cmd, "args": args, "target": tgt, "target_sha": h}
+                ent = {"cmd": cmd, "args": args, "target": tgt, "target_sha": h}
+                if tgt and h:
+                    # Record who VOUCHES for the target alongside what it
+                    # hashes to, so a later rewrite can be graded "same
+                    # publisher updated its own binary" vs "something else
+                    # now answers to this config line". Stat-cached, so a
+                    # stable target costs the probe once, not once per scan;
+                    # recorded only when a signer exists, so Linux (no
+                    # ambient signing) adds nothing rather than noise.
+                    sig = classify_signature(tgt)
+                    if sig.get("team"):
+                        ent["target_team"] = sig["team"]
+                        ent["target_trust"] = sig["trust"]
+                execs["%s|%s" % (label, cmd)] = ent
             rec["execs"] = execs
         if os.path.basename(p) in AGENT_INSTRUCTION_NAMES or p.endswith(".md"):
             marks = _imperative_signals(text)
@@ -9037,11 +9284,21 @@ def diff_agent_surface(prior, cur):
     """Alert only on what an attacker must change to gain execution.
 
     Three classes, deliberately unequal:
-      * a NEW exec-capable entry, or a changed RESOLVED TARGET   -> HIGH
+      * a NEW exec-capable entry, or a changed RESOLVED TARGET   -> HIGH,
+        graded down by chain of custody (see below)
       * a new semantic imperative in an instruction file          -> by marker
       * a plain content edit with no exec and no marker           -> silent
     The third case is the overwhelming majority of real churn, and keeping it
-    silent is what makes the other two readable."""
+    silent is what makes the other two readable.
+
+    Custody grading: a structural change whose authorship this machine can
+    claim — a signed intent record from a supervised agent session, or a
+    commit created here by the repo's own identity — is recorded at LOW
+    instead of HIGH (visible in the report, no incident, no alert), and a
+    changed target re-signed by the SAME publisher as its baseline is
+    MEDIUM. Everything the machine cannot claim stays HIGH, now against a
+    quiet background. Attack-defined content (a conceal imperative) is never
+    downgraded, whoever wrote it — grading churn is not licensing content."""
     findings = []
     prior = prior or {}
     for path, rec in cur.items():
@@ -9052,34 +9309,55 @@ def diff_agent_surface(prior, cur):
             for key, e in execs.items():
                 oe = old_execs.get(key)
                 if old is not None and oe is None:
-                    prov = _git_provenance(path)
+                    prov, note = _custody(path, rec.get("sha256"))
+                    self_made = prov in _SELF_CUSTODY
                     findings.append(finding(
-                        "HIGH", "agent-surface",
+                        "LOW" if self_made else "HIGH", "agent-surface",
                         "New agent exec entry registered",
                         "%s registered a new executable entry: %s %s\nResolved "
                         "target: %s\n%s\nAn MCP server or tool hook runs with "
                         "your full authority every time the agent starts."
                         % (path, e.get("cmd"),
                            (" ".join(e.get("args") or []))[:400],
-                           e.get("target") or "(unresolved)",
-                           _PROVENANCE_NOTE.get(prov, "")),
+                           e.get("target") or "(unresolved)", note),
                         "agent-surface:newexec:%s:%s" % (path, key),
                         path=path, program=e.get("target") or e.get("cmd"),
-                        provenance=prov, markers=["agent-surface", "exec"]))
+                        provenance=prov,
+                        markers=["agent-surface", "exec"] +
+                                (["self-custody"] if self_made else [])))
                 elif oe is not None and oe.get("target_sha") and \
                         e.get("target_sha") and \
                         oe["target_sha"] != e["target_sha"]:
+                    prov, note = _custody(e.get("target"), e.get("target_sha"))
+                    same_signer = bool(oe.get("target_team")) and \
+                        oe.get("target_team") == e.get("target_team")
+                    if prov in _SELF_CUSTODY:
+                        sev, grade = "LOW", note
+                    elif same_signer:
+                        # The rewrite carries a valid signature from the same
+                        # team that signed the baselined content — vendor
+                        # updater churn's exact shape. MEDIUM: recorded and
+                        # able to corroborate, no incident by itself.
+                        sev = "MEDIUM"
+                        grade = ("Both the old and new content are validly "
+                                 "signed by the same publisher (team %s) — "
+                                 "the shape of a vendor updating its own "
+                                 "binary." % e.get("target_team"))
+                    else:
+                        sev, grade = "HIGH", note
                     findings.append(finding(
-                        "HIGH", "agent-surface",
+                        sev, "agent-surface",
                         "Agent exec target changed underneath a static config",
                         "%s: the config line for %s is unchanged, but the file "
                         "it resolves to (%s) has different contents. This is "
                         "the supply-chain shape a config-only hash cannot see."
-                        % (path, e.get("cmd"), e.get("target")),
+                        "\n%s" % (path, e.get("cmd"), e.get("target"), grade),
                         "agent-surface:target:%s:%s:%s"
                         % (path, key, (e.get("target_sha") or "")[:12]),
-                        path=path, program=e.get("target"),
-                        markers=["agent-surface", "exec", "supply-chain"]))
+                        path=path, program=e.get("target"), provenance=prov,
+                        markers=["agent-surface", "exec", "supply-chain"] +
+                                (["self-custody"] if prov in _SELF_CUSTODY
+                                 else [])))
                 elif oe is not None and not oe.get("target_sha") and \
                         e.get("target_sha") and oe.get("target"):
                     # The target MATERIALIZED: baselined as an absolute path
@@ -9093,26 +9371,35 @@ def diff_agent_surface(prior, cur):
                     # dormant config entry acquiring an executable payload,
                     # which is the cheapest way to arm an agent config without
                     # ever editing a watched file.
+                    prov, note = _custody(e.get("target"), e.get("target_sha"))
+                    self_made = prov in _SELF_CUSTODY
                     findings.append(finding(
-                        "HIGH", "agent-surface",
+                        "LOW" if self_made else "HIGH", "agent-surface",
                         "Agent exec target appeared under a static config",
                         "%s: the config line for %s never changed, but its "
                         "target (%s) did not exist when this surface was "
                         "baselined and now does. A config entry that pointed "
-                        "at nothing is now executable at agent start."
-                        % (path, e.get("cmd"), e.get("target")),
+                        "at nothing is now executable at agent start.\n%s"
+                        % (path, e.get("cmd"), e.get("target"), note),
                         "agent-surface:materialized:%s:%s:%s"
                         % (path, key, (e.get("target_sha") or "")[:12]),
-                        path=path, program=e.get("target"),
-                        markers=["agent-surface", "exec", "supply-chain"]))
+                        path=path, program=e.get("target"), provenance=prov,
+                        markers=["agent-surface", "exec", "supply-chain"] +
+                                (["self-custody"] if self_made else [])))
             new_marks = set(rec.get("imperatives") or [])
             old_marks = set((old or {}).get("imperatives") or [])
             gained = sorted(new_marks - old_marks)
             if gained and old is not None:
                 sev = _imperative_severity(gained)
                 if sev:
+                    # Deliberately _git_provenance, not _custody: custody
+                    # grades structure and this branch judges CONTENT. A
+                    # hostile directive an agent was prompt-injected into
+                    # writing is self-attested and still hostile, so
+                    # attestation must not soften it; provenance here only
+                    # ever escalates.
                     prov = _git_provenance(path)
-                    if prov == "remote" and sev == "MEDIUM":
+                    if prov == "remote-foreign" and sev == "MEDIUM":
                         sev = "HIGH"
                     findings.append(finding(
                         sev, "agent-surface",
@@ -17381,6 +17668,17 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   replay [days]    backtest the CURRENT correlation logic against recorded
                    history (default 30d). Read-only: opens no incident, sends
                    no notification — run it after changing detection logic
+  intent record <path> [tool]
+                   attest the current content of an agent config/script you
+                   just authored: appends a MAC'd {ts,path,sha256,tool} line
+                   to ~/.aegis/intent.jsonl. A delegate-surface change whose
+                   hash matches a valid record grades LOW (self-attested,
+                   still in the report) instead of opening a HIGH incident
+  intent hook <tool>
+                   harness hook mode (wire as a post-write hook in Claude
+                   Code/Codex): reads the tool-call JSON on stdin, attests the
+                   written file. Prints nothing, always exits 0
+  intent list [n]  show recent attestations and whether their MACs verify
   attck [days]     ATT&CK technique coverage: what's wired, what's actually
                    fired on this machine (default 180d). Read-only.
   baseline         reset the known-good persistence baseline to current state
@@ -17555,6 +17853,8 @@ def main(argv):
     if cmd == "incident" and len(argv) > 2:
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
+    if cmd == "intent":
+        return cmd_intent(argv)
     if cmd == "replay":
         try:
             days = int(argv[2]) if len(argv) > 2 else 30
