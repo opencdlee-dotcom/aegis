@@ -165,6 +165,27 @@ lookup rather than an investigation. And corroboration is scored, not just
 counted: two *different* sensors implicating one entity outranks the same number
 of hits from one sensor.
 
+**And the output is kept readable, because attention is the real budget.** A
+detector that files more alerts than you can read has not made you safer — it
+has taught you to ignore it, and that lesson applies to every future alert too.
+So: a new install spends its first two weeks **learning** (`aegis.py learn` —
+everything recorded and correlated, but non-CRITICAL signals open pre-closed
+instead of interrupting, because every ordinary thing a detector has not yet
+seen is new by construction); an exec entry is identified by **the command it
+runs**, never its position in a config file, so inserting one hook cannot
+re-alert the twenty below it; an incident that stops producing evidence **ages
+out as ambient** after a week and reopens the moment it recurs; Aegis's own
+upgrade is **attested by `install`** and graded down the ordinary custody
+ladder, rather than the tool's loudest recurring alert being itself. `report`
+leads with one verdict line and what changed since the last scan; `report
+--full` still has everything.
+
+That report is a summariser, so it **checks its own headline against the
+findings it summarizes on every run and publishes the result** — a
+contradiction is printed at the top, above the evidence. It has already earned
+that: on its first run against live data it caught a green "nothing new"
+printed over two open CRITICAL chains.
+
 ---
 
 ## Install / use
