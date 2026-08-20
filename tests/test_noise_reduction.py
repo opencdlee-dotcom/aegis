@@ -73,32 +73,6 @@ class ExecIdentityIsWhatRuns(unittest.TestCase):
                             aegis._exec_identity("node", ["b"]))
 
 
-class RotatingEndpointsNeedEvidence(unittest.TestCase):
-    """Fix 2b — a load-balanced service generalizes only once rotation is
-    demonstrated across distinct addresses."""
-
-    def test_class_factors_out_address_and_version(self):
-        k = aegis._beacon_endpoint_class("beacon:/app-1.2.3/bin/x:1.2.3.4:443")
-        self.assertIsNotNone(k)
-        self.assertNotIn("1.2.3.4", k[0])
-        self.assertIn("#", k[0])
-        self.assertEqual(k[1], "1.2.3.4")
-
-    def test_a_hostname_is_a_fact_and_never_generalizes(self):
-        self.assertIsNone(
-            aegis._beacon_endpoint_class("beacon:/bin/x:evil.example.com:443"))
-
-    def test_attack_defined_prefixes_never_generalize(self):
-        for p in ("decoy:", "latch:", "canary:"):
-            self.assertIsNone(
-                aegis._beacon_endpoint_class(p + "beacon:/bin/x:1.2.3.4:443"))
-
-    def test_port_is_part_of_the_class(self):
-        a = aegis._beacon_endpoint_class("beacon:/bin/x:1.2.3.4:443")[0]
-        b = aegis._beacon_endpoint_class("beacon:/bin/x:1.2.3.4:4444")[0]
-        self.assertNotEqual(a, b)
-
-
 class _DBCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="aegis_noise_")
@@ -197,6 +171,81 @@ class LegacyExecIncidentsRetire(_DBCase):
         i = self._inc("p", key="signal:persistence:changed:/a.plist:deadbeef00")
         aegis._retire_legacy_exec_incidents(self.db, self.now)
         self.assertEqual(self._status(i), "OPEN")
+
+
+class RotatingEndpointsNeedEvidence(_DBCase):
+    """Fix 2b — a rotating service generalizes only once rotation is
+    demonstrated, and the shape of the evidence decides how far it generalizes."""
+
+    def test_ipv6_is_parsed_from_the_right(self):
+        """The defect real data exposed. A beacon fingerprint is
+        `beacon:<path>:<ip>:<port>` and an IPv6 address contains colons, so
+        splitting on ':' and taking [-2] silently folded 'fd7a:115c:a1e0::'
+        into the PATH and read the empty tail as the address — no IPv6 beacon
+        could ever generalize, and the class was polluted with the address."""
+        self.assertEqual(
+            aegis._beacon_parts("beacon:/opt/homebrew/opt/syncthing/bin/"
+                                "syncthing:fd7a:115c:a1e0:::22000"),
+            ("/opt/homebrew/opt/syncthing/bin/syncthing", "fd7a:115c:a1e0::",
+             "22000"))
+
+    def test_ipv4_and_version_churn(self):
+        self.assertEqual(
+            aegis._beacon_parts("beacon:/app-1.2.3/bin/x:1.2.3.4:443"),
+            ("/app-#/bin/x", "1.2.3.4", "443"))
+
+    def test_a_hostname_is_a_fact_and_never_generalizes(self):
+        fp = "beacon:/bin/x:evil.example.com:443"
+        self.assertIsNone(aegis._beacon_parts(fp))
+        self.assertEqual(aegis._beacon_endpoint_classes(fp), [])
+
+    def test_attack_defined_prefixes_never_generalize(self):
+        for pre in ("decoy:", "latch:", "canary:"):
+            self.assertIsNone(
+                aegis._beacon_parts(pre + "beacon:/bin/x:1.2.3.4:443"))
+
+    def test_the_narrow_class_keeps_the_port(self):
+        a = aegis._beacon_endpoint_classes("beacon:/bin/x:1.2.3.4:443")[0][0]
+        b = aegis._beacon_endpoint_classes("beacon:/bin/x:1.2.3.4:4444")[0][0]
+        self.assertNotEqual(a, b)
+
+    def _dismiss(self, endpoints, sev="HIGH"):
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS dismissals(id INTEGER PRIMARY KEY,"
+            "incident_id INT, correlation_key TEXT, reason_code TEXT,"
+            "category TEXT, dismissed_at INT)")
+        for n, (ip, port) in enumerate(endpoints):
+            key = "signal:beacon:/bin/app:%s:%s" % (ip, port)
+            i = self._inc("b%d" % n, sev=sev, key=key)
+            self.db.execute(
+                "INSERT INTO dismissals(incident_id,correlation_key,reason_code,"
+                "category,dismissed_at) VALUES(?,?,?,?,?)",
+                (i, key, "benign-positive", "net-beacon", self.now))
+        return aegis._rotating_endpoint_memory(self.db, self.now)
+
+    def test_fixed_port_rotation_earns_only_the_narrow_class(self):
+        mem = self._dismiss([("1.1.1.1", "443"), ("2.2.2.2", "443"),
+                             ("3.3.3.3", "443")])
+        self.assertIn("beacon:/bin/app:#ip:443", mem)
+        self.assertNotIn("beacon:/bin/app:#ip:#port", mem,
+                         "one port is not evidence of peer-to-peer")
+
+    def test_peer_to_peer_breadth_earns_the_port_agnostic_class(self):
+        """Syncthing's real shape: address AND port both vary, so the
+        fixed-port class can never reach its threshold and the operator's
+        verdicts would otherwise teach nothing."""
+        mem = self._dismiss([("1.1.1.1", "22000"), ("2.2.2.2", "59217"),
+                             ("3.3.3.3", "62124")])
+        self.assertIn("beacon:/bin/app:#ip:#port", mem)
+
+    def test_two_endpoints_earn_nothing(self):
+        self.assertEqual(
+            self._dismiss([("1.1.1.1", "443"), ("2.2.2.2", "443")]), {})
+
+    def test_one_address_repeated_earns_nothing(self):
+        """Repetition is not rotation — the exact-key reattach covers that."""
+        self.assertEqual(
+            self._dismiss([("1.1.1.1", "443")] * 3), {})
 
 
 class ReportLeadsWithAVerdict(unittest.TestCase):

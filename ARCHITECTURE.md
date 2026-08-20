@@ -354,12 +354,24 @@ cascade. Both sides of the diff are normalized (`_migrate_exec_keys`), so an
 upgrade from a legacy baseline is silent rather than presenting every baselined
 entry as new. A genuinely new command still fires at `HIGH`.
 
-**Rotating endpoints generalize only on evidence.** A beacon's address is a
-fact and a new endpoint alerts — but a load-balanced service answers from a new
-address every few days, re-opening forever. `_beacon_endpoint_class` factors the
-address out of the binary+port, and `_rotating_endpoint_memory` will only use
-that class once the operator has dismissed `_ROTATING_MIN_ENDPOINTS` *distinct*
-addresses on it. Hostnames never generalize; attack-defined prefixes never do.
+**Rotating endpoints generalize only on evidence, at two widths.** A beacon's
+address is a fact and a new endpoint alerts — but a rotating service re-opens
+forever. `_beacon_endpoint_classes` offers two classes, narrowest first, and
+`_rotating_endpoint_memory` grants one only on the matching evidence:
+`<path>:#ip:<port>` (a service on a fixed port answering from rotating
+addresses — a CDN, an update channel) needs `_ROTATING_MIN_ENDPOINTS` distinct
+addresses; `<path>:#ip:#port` (a peer-to-peer client, which varies address and
+port together by design) needs that many distinct address:port pairs spanning
+`_ROTATING_MIN_PORTS` distinct ports, so it is strictly harder to earn.
+
+The second width exists because the first was not enough for real software:
+Syncthing's dismissed endpoints on the reference machine spanned five ports and
+five addresses, so no fixed-port class could reach its threshold and six human
+verdicts taught nothing. Note also that a beacon fingerprint is
+`beacon:<path>:<ip>:<port>` and an IPv6 address contains colons — the address
+is parsed from the right (`_BEACON_FP_RE`), never by splitting on ':', which
+silently folded the address into the path and made every IPv6 beacon
+un-generalizable. Hostnames never generalize; attack-defined prefixes never do.
 
 **Aegis's own upgrade is attested, not exempted.** `_install_runtime_copy`
 writes one ordinary intent record for the runtime copy it installs, so the same

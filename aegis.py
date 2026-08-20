@@ -2692,45 +2692,73 @@ def _set_learning_period(days):
 
 
 _ROTATING_MIN_ENDPOINTS = 3
-# An IPv4 literal, or an IPv6 one (which survives ':'-splitting as a bare hex
-# run). Only a literal address may be generalized away — a hostname is a fact.
-_ROTATING_IP_RE = re.compile(r"^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{0,4})$", re.I)
+_ROTATING_MIN_PORTS = 2
+# beacon fingerprints are built as "beacon:<path>:<ip>:<port>", and an IPv6
+# address contains colons — so the address CANNOT be recovered by splitting on
+# ':' and taking the second-to-last field. That is what the first version did,
+# and on real data it silently folded "fd7a:115c:a1e0::" into the path and
+# treated the empty tail as the address, so no IPv6 beacon could ever
+# generalize. Parse from the right instead: a numeric port, preceded by either
+# a dotted quad or a run of hextets.
+_BEACON_FP_RE = re.compile(
+    r"^beacon:(?P<path>.+?):"
+    r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*):"
+    r"(?P<port>\d+)$")
 
 
-def _beacon_endpoint_class(fingerprint):
-    """(endpoint_class, ip) for a beacon fingerprint, else None.
-
-    A beacon fingerprint is `beacon:<path>:<ip>:<port>`, and the ip is
-    deliberately part of its identity — a new endpoint is a new fact. But a
-    load-balanced service (a CDN, an update channel) answers on a different
-    address every few days, so the SAME reviewed binary talking to the SAME
-    port re-opens forever, one incident per rotation. The endpoint CLASS is
-    the binary and port with the address factored out; the address is returned
-    alongside so the caller can require breadth before generalizing over it."""
+def _beacon_parts(fingerprint):
+    """(path, ip, port) for a beacon fingerprint, else None. Version churn in
+    the path is normalized; a hostname is a fact and refuses to parse."""
     fp = str(fingerprint or "")
-    if not fp.startswith("beacon:"):
+    if fp.startswith(_NEVER_TOLERATE_PREFIXES):
         return None
-    parts = fp.split(":")
-    if len(parts) < 4:
+    m = _BEACON_FP_RE.match(fp)
+    if not m:
         return None
-    port, ip = parts[-1], parts[-2]
-    if not port.isdigit() or not _ROTATING_IP_RE.match(ip):
-        return None
-    path = _TOLERANCE_VERSION_RE.sub("#", ":".join(parts[1:-2]))
+    path = _TOLERANCE_VERSION_RE.sub("#", m.group("path"))
     if not path:
         return None
-    return ("beacon:%s:#ip:%s" % (path, port), ip)
+    return path, m.group("ip"), m.group("port")
+
+
+def _beacon_endpoint_classes(fingerprint):
+    """The endpoint classes a beacon fingerprint could be tolerated under,
+    narrowest first, each paired with the observation that would evidence it.
+
+    Two levels, because one shape was not enough for real software:
+
+      * `<path>:#ip:<port>` — a service on a FIXED port answering from rotating
+        addresses. A CDN, an update channel. Evidenced by distinct addresses.
+      * `<path>:#ip:#port`  — a peer-to-peer client, which varies address AND
+        port together by design (Syncthing's dismissed endpoints on this
+        machine spanned five ports and five addresses, so the fixed-port class
+        could never reach its threshold and the operator's verdicts taught
+        nothing). Evidenced by distinct address:port PAIRS across several
+        distinct ports — i.e. the operator has demonstrated this program talks
+        to many peers, not that it moved once.
+
+    The broader level is strictly harder to earn (it needs breadth in two
+    dimensions), and neither level tolerates anything the guards in
+    _apply_correlations already refuse: never CRITICAL, never above the
+    reviewed severity, never a disputed identity, never attack-defined.
+    """
+    parts = _beacon_parts(fingerprint)
+    if not parts:
+        return []
+    path, ip, port = parts
+    return [("beacon:%s:#ip:%s" % (path, port), ip),
+            ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
 
 
 def _rotating_endpoint_memory(db, now):
     """{endpoint_class: (verdicts, max_reviewed_sev)} for classes the operator
-    has dismissed across >= _ROTATING_MIN_ENDPOINTS DISTINCT addresses.
+    has dismissed across enough DISTINCT endpoints to establish rotation.
 
-    Breadth across addresses is the evidence, and it is what keeps this narrow:
-    dismissing one binary:ip three times teaches nothing here (the exact-key
-    reattach already covers that) — it takes three DIFFERENT addresses on one
-    binary and port before rotation is an established fact about that service.
-    Until then every new address still alerts."""
+    Breadth is the evidence, and it is what keeps this narrow: dismissing one
+    binary:ip three times teaches nothing here (the exact-key reattach already
+    covers that). It takes three genuinely different endpoints — and, for the
+    port-agnostic level, several different ports — before rotation is an
+    established fact about that program rather than a single move."""
     memory = {}
     try:
         rows = db.execute(
@@ -2743,17 +2771,22 @@ def _rotating_endpoint_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        klass = _beacon_endpoint_class(row["correlation_key"][len("signal:"):])
-        if not klass:
-            continue
-        bucket = seen.setdefault(klass[0], {"ips": set(), "inc": set(),
-                                            "sev": -1})
-        bucket["ips"].add(klass[1])
-        bucket["inc"].add(row["incident_id"])
-        bucket["sev"] = max(bucket["sev"], SEV_ORDER.get(row["severity"], -1))
+        for klass, observed in _beacon_endpoint_classes(
+                row["correlation_key"][len("signal:"):]):
+            bucket = seen.setdefault(klass, {"obs": set(), "ports": set(),
+                                             "inc": set(), "sev": -1})
+            bucket["obs"].add(observed)
+            bucket["ports"].add(observed.rsplit(":", 1)[-1])
+            bucket["inc"].add(row["incident_id"])
+            bucket["sev"] = max(bucket["sev"],
+                                SEV_ORDER.get(row["severity"], -1))
     for klass, bucket in seen.items():
-        if len(bucket["ips"]) >= _ROTATING_MIN_ENDPOINTS:
-            memory[klass] = (len(bucket["inc"]), bucket["sev"])
+        if len(bucket["obs"]) < _ROTATING_MIN_ENDPOINTS:
+            continue
+        # the port-agnostic level additionally demands breadth ACROSS ports
+        if klass.endswith(":#port") and len(bucket["ports"]) < _ROTATING_MIN_PORTS:
+            continue
+        memory[klass] = (len(bucket["inc"]), bucket["sev"])
     return memory
 
 
@@ -2800,9 +2833,8 @@ def _disputed_identities(db):
         ident = _tolerance_identity(fp)
         if ident:
             idents.add(ident)
-        klass = _beacon_endpoint_class(fp)
-        if klass:
-            idents.add(klass[0])
+        for klass, _observed in _beacon_endpoint_classes(fp):
+            idents.add(klass)
     return idents
 
 
@@ -3120,10 +3152,9 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
             ident = _tolerance_identity(fp)
             if ident:
                 candidates.append((ident, tolerance))
-            if rotating and not fp.startswith(_NEVER_TOLERATE_PREFIXES):
-                klass = _beacon_endpoint_class(fp)
-                if klass:
-                    candidates.append((klass[0], rotating))
+            if rotating:
+                for klass, _observed in _beacon_endpoint_classes(fp):
+                    candidates.append((klass, rotating))
             for ident, memory in candidates:
                 if ident in disputed:
                     continue
