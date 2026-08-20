@@ -198,7 +198,7 @@ guards because they answer the same adversarial pressures:
   footer on the active listing, and one `reopen` both re-alerts and revokes the
   tolerance (reopening deletes the dismissal rows the count was built on).
 
-### Chain of custody (delegate surface)
+### Chain of custody (all sensors)
 
 The dominant benign churn on the delegate surface is not vendor updates — it is
 the operator's *own* agent tooling registering hooks, MCP servers, and skills,
@@ -208,7 +208,11 @@ self-inflicted HIGHs in one day is how the one foreign HIGH eventually gets
 dismissed unread. Custody grading answers the question that actually
 discriminates: **can this machine claim authorship of this change?**
 
-Four rungs, consulted in order; the first that vouches sets the grade:
+Custody began on the delegate surface and now grades every sensor. Two
+families of rung, in order; the first that vouches sets the grade. The
+**authorship** rungs (1-4) answer *did this machine make this change?*; the
+**origin** rungs (5-7) answer the weaker but far more common question *did
+this arrive through something the operator set up?*
 
 1. **Signed intent ledger** (`~/.aegis/intent.jsonl`). The agent harness calls
    `aegis.py intent hook <tool>` after each file-writing tool call; Aegis
@@ -240,6 +244,52 @@ Four rungs, consulted in order; the first that vouches sets the grade:
    corroborate, opens no incident alone). The team is captured at snapshot
    time, so an old baseline without one fails toward HIGH, never toward quiet.
 
+The origin rungs exist because the delegate surface was never where the volume
+was. `persistence.diff`, `process`, `net-listener`, `net-outbound` and
+`net-beacon` scored on code signature plus path writability alone — two axes on
+which a Homebrew daemon, a VSCode extension helper and a dropped payload are
+indistinguishable, because ad-hoc signing in a user-writable path describes all
+three. A single directory migration could therefore produce sixty HIGHs beside
+a genuine intrusion. These rungs demote **one step only** (never to LOW, with
+the one exception noted): origin is not authorship, and a package can be
+malicious, a publisher can ship a bad build, a stolen certificate signs cleanly.
+
+5. **Relocated** (changed persistence item) → **LOW**, the one origin rung that
+   goes that far, because it is a proof about *content* rather than about
+   provenance: the program bytes and the payload script's own hash are both
+   byte-identical to the baseline and only the directory changed. Nothing new
+   executes, so there is nothing to grade. It requires proof on **both** halves
+   of what a job runs — requiring only the program hash would be worthless for
+   the dominant `<interpreter> <script>` shape, where the program is `/bin/bash`
+   and identical by definition while the script is the half that could have been
+   swapped. This is why persistence snapshots hash `script_target` at all (see
+   below); when a baseline predates that hashing the rung is refused outright,
+   since an unproven half is not a passing half.
+6. **Publisher stability** (changed persistence item) → **MEDIUM**. The binary
+   changed in place but carries the **same signing authority** as its baseline,
+   and that authority is Apple/App-Store/Developer-ID. This is the literal shape
+   of a vendor auto-update — the Microsoft, OneDrive and Zoom updaters rotate
+   their own bytes on a schedule. A different signer, or an unsigned rebuild, is
+   never this rung.
+7. **Package receipt** (binary-keyed findings) → **MEDIUM**. The binary is owned
+   by a package-manager transaction on this machine, proven by reading that
+   manager's **receipt** — Homebrew's `INSTALL_RECEIPT.json` beside the
+   versioned Cellar root, the editor's own `extensions.json` index, pipx's
+   `pipx_metadata.json` at the venv root. It is deliberately *never* a path
+   prefix: treating `/opt/homebrew/…` as a trust rule would vouch for anything
+   an attacker drops into a directory the user can write to, which is precisely
+   the file being graded. Both the link and its target are probed, because the
+   managers point in opposite directions — Homebrew's `bin/` entries are
+   symlinks *into* the Cellar, while a venv's `bin/python` is a symlink *out* to
+   the system interpreter. A hand-installed binary (an unpacked CI runner, a
+   curled release tarball) has no receipt and correctly keeps its severity.
+
+Two weak git rungs that the ladder previously named and then ignored:
+`worktree` and `local-commit` printed "routine if you made it" while the finding
+stayed HIGH. They now demote **one step**, not to LOW — an uncommitted local
+edit is also exactly what a local attacker's change looks like, so it earns
+quiet rather than silence.
+
 Guards, because grading is where an attacker would want to stand:
 
 - **Grades, never mutes.** A downgraded finding is still created, still in the
@@ -260,6 +310,24 @@ Guards, because grading is where an attacker would want to stand:
   only moment forging is impossible. Post-compromise silencing is the witness
   layer's problem, and it is exactly as detectable as it was before custody
   grading existed.
+
+#### Hashing the payload, not the interpreter
+
+Custody's relocation rung forced a gap in the persistence sensor into the open.
+A launchd job or systemd unit is overwhelmingly `<interpreter> <script>`, and
+the snapshot recorded only `program` — so it hashed `/bin/bash` and said nothing
+about the file that actually carries the behaviour. Rewriting that script left
+program, args and env all identical, and `check_persistence` emitted **no
+finding at all**: a payload swap under a stable config was invisible to the one
+sensor whose whole job is watching what runs at boot.
+
+Snapshots now carry `script_target` and its `target_sha` on every platform (the
+shared record helper, so launchd plists, systemd units and Run keys all inherit
+it), a change in that hash is a reported change rated with a swapped binary, and
+the same evidence is what lets a genuine relocation be told apart from a
+substitution. The hash is required on **both** sides before either conclusion is
+drawn — a field merely appearing as an old baseline rolls forward is not a swap,
+and must not alert on every job at once.
 
 `aegis.py replay [days]` re-runs the current correlation logic over recorded
 history in a throwaway in-memory database. It is strictly read-only — no

@@ -3333,7 +3333,8 @@ def _persist_record(label=None):
     the item is a launchd plist, a systemd unit, or a registry Run key."""
     return {"label": label, "program": None, "args": None, "args_sha256": None,
             "sha256": None, "trust": "unknown", "run_at_load": False,
-            "authority": None, "env": None}
+            "authority": None, "env": None,
+            "script_target": None, "target_sha": None}
 
 
 def _finish_persist_record(rec, prog, args):
@@ -3350,6 +3351,21 @@ def _finish_persist_record(rec, prog, args):
         rec["authority"] = sig["authority"]
     elif prog:
         rec["trust"] = "missing"
+    # Hash the PAYLOAD, not just the interpreter. The dominant persistence
+    # shape is `/bin/bash <script>` — recording only `program` hashes bash and
+    # says nothing about what actually runs, so rewriting the script under an
+    # otherwise-unchanged plist/unit was invisible to check_persistence
+    # (same program, same args, same env -> no finding). Carrying the target's
+    # own hash closes that blind spot, and is also the evidence that lets a
+    # pure path RELOCATION be distinguished from a payload swap (_custody_of).
+    tgt = _script_target(rec.get("args"), prog)
+    if tgt:
+        rec["script_target"] = tgt
+        try:
+            if os.path.isfile(tgt):
+                rec["target_sha"] = sha256(tgt)
+        except Exception:
+            pass
     return rec
 
 
@@ -3734,10 +3750,7 @@ def _snapshot_persistence_mac():
             if not name.endswith(".plist"):
                 continue
             path = os.path.join(d, name)
-            rec = {"label": name[:-6], "program": None, "args": None,
-                   "args_sha256": None,
-                   "sha256": None, "trust": "unknown", "run_at_load": False,
-                   "authority": None, "env": None}
+            rec = _persist_record(label=name[:-6])
             try:
                 with open(path, "rb") as f:
                     pl = plistlib.load(f)
@@ -3745,25 +3758,13 @@ def _snapshot_persistence_mac():
                 pl = {}
             prog, args = _plist_program(pl if isinstance(pl, dict) else {})
             rec["label"] = (pl.get("Label") if isinstance(pl, dict) else None) or rec["label"]
-            rec["program"] = prog
-            if args is not None:
-                raw_args = json.dumps(args, sort_keys=True, default=str)
-                rec["args_sha256"] = hashlib.sha256(raw_args.encode()).hexdigest()
-                rec["args"] = _redact_value(args)
             rec["run_at_load"] = bool(pl.get("RunAtLoad")) if isinstance(pl, dict) else False
             ev = pl.get("EnvironmentVariables") if isinstance(pl, dict) else None
             if isinstance(ev, dict):
                 # keep only injection-relevant keys — the rest is noise/PII
                 inj = {k: str(v) for k, v in ev.items() if k in _DYLD_INJECT_KEYS}
                 rec["env"] = inj or None
-            if prog and os.path.exists(prog):
-                rec["sha256"] = sha256(prog)
-                sig = classify_signature(prog)
-                rec["trust"] = sig["trust"]
-                rec["authority"] = sig["authority"]
-            elif prog:
-                rec["trust"] = "missing"
-            snap[path] = rec
+            snap[path] = _finish_persist_record(rec, prog, args)
     return snap
 
 
@@ -4014,7 +4015,8 @@ def _persistence_severity(rec):
 
 
 def _persistence_change_detail(label, old, rec,
-                               prog_changed, env_changed, args_changed):
+                               prog_changed, env_changed, args_changed,
+                               target_changed=False):
     """Human-readable before->after for the fields that actually mutated. The
     old message always printed the PROGRAM path on both sides, so an args- or
     env-only change rendered as the nonsensical 'args changed (X -> X)' with an
@@ -4044,6 +4046,11 @@ def _persistence_change_detail(label, old, rec,
                 (old.get("sha256") or "?")[:12], (rec.get("sha256") or "?")[:12]))
     if args_changed:
         parts.append("args [%s] -> [%s]" % (_args_str(old), _args_str(rec)))
+    if target_changed:
+        parts.append("payload %s bytes %s -> %s" % (
+            rec.get("script_target") or old.get("script_target") or "?",
+            (old.get("target_sha") or "?")[:12],
+            (rec.get("target_sha") or "?")[:12]))
     if env_changed:
         parts.append("env %s -> %s" % (_env_str(old), _env_str(rec)))
     return "%s: %s" % (label, "; ".join(parts))
@@ -4077,13 +4084,24 @@ def check_persistence(baseline_snap, current_snap):
             env_changed = (old.get("env") or None) != (rec.get("env") or None)
             args_changed = ((old.get("args_sha256") or old.get("args") or None) !=
                             (rec.get("args_sha256") or rec.get("args") or None))
-            if prog_changed or env_changed or args_changed:
+            # The payload the interpreter is told to run. Without this the
+            # dominant `/bin/bash <script>` job could have its SCRIPT rewritten
+            # with no finding at all — program, args and env are all unchanged
+            # by a content swap, so a program/args/env-only diff is blind to
+            # the one file that actually carries the behaviour. Requires the
+            # hash on BOTH sides: a baseline taken before payload hashing has
+            # no old value, and a field simply appearing is not a swap.
+            target_changed = bool(old.get("target_sha")) and \
+                bool(rec.get("target_sha")) and \
+                old.get("target_sha") != rec.get("target_sha")
+            if prog_changed or env_changed or args_changed or target_changed:
                 # Fold the current sha256/env/args into the fingerprint (sha256
                 # alone is unchanged on an env-only mutation) so a real change
                 # re-alerts but a steady mutated state does not storm.
                 fp = hashlib.sha256(repr(
                     (rec.get("sha256"), rec.get("env"),
-                     rec.get("args_sha256") or rec.get("args"))
+                     rec.get("args_sha256") or rec.get("args"),
+                     rec.get("target_sha"))
                 ).encode()).hexdigest()[:16]
                 # The mutated record's own risk drives severity (env-injection /
                 # adhoc-in-tmp escalate to CRITICAL), but a swapped program binary
@@ -4091,16 +4109,36 @@ def check_persistence(baseline_snap, current_snap):
                 # (supply-chain / stolen-cert swap), so a program/hash change never
                 # scores below HIGH — the change itself is the signal.
                 sev = _persistence_severity(rec)
-                if prog_changed and SEV_ORDER[sev] < SEV_ORDER["HIGH"]:
+                # A rewritten payload under an unchanged config is the same
+                # supply-chain shape as a swapped binary, and is rated with it.
+                if (prog_changed or target_changed) and \
+                        SEV_ORDER[sev] < SEV_ORDER["HIGH"]:
                     sev = "HIGH"
+                # Chain of custody, same ladder the delegate surface uses.
+                # Attack-defined mutations (dylib-injection env, hostile argv)
+                # are excluded at BOTH ends — _custody_persistence refuses to
+                # return a rung for them, and _demote is told explicitly — so a
+                # payload can never be quieted by proving who moved it.
+                attack_defined = bool(rec.get("env")) or _hostile_args(
+                    rec.get("args"), rec.get("program"))
+                prov = (None if attack_defined
+                        else _custody_persistence(old, rec)
+                        or (_custody(path, rec.get("sha256"))[0]
+                            if _intent_worthy(path) else None))
+                graded = _demote(sev, prov, attack_defined=attack_defined)
+                detail = _persistence_change_detail(
+                    rec["label"], old, rec,
+                    prog_changed, env_changed, args_changed, target_changed)
+                note = _PROVENANCE_NOTE.get(prov) if prov else None
+                if note:
+                    detail = "%s\n%s" % (detail, note)
                 findings.append(finding(
-                    sev, "persistence",
+                    graded, "persistence",
                     "Persistence item CHANGED",
-                    _persistence_change_detail(
-                        rec["label"], old, rec,
-                        prog_changed, env_changed, args_changed),
+                    detail,
                     "persistence:changed:%s:%s" % (path, fp),
                     path=path, program=rec.get("program"), trust=rec.get("trust"),
+                    custody=prov,
                     script_target=_script_target(rec.get("args"),
                                                  rec.get("program"))))
     for path, old in base.items():
@@ -4548,11 +4586,13 @@ def check_processes():
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
+            graded, rung, note = _grade_binary(sev, comm)
             findings.append(finding(
-                sev, "process", "Suspicious running process",
-                "%s (%s) %s" % (comm, sig["trust"], reason),
+                graded, "process", "Suspicious running process",
+                "%s (%s) %s%s" % (comm, sig["trust"], reason,
+                                  ("\n" + note) if note else ""),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
-                path=comm, trust=sig["trust"], sha256=sha))
+                path=comm, trust=sig["trust"], sha256=sha, custody=rung))
     return findings
 
 
@@ -6818,15 +6858,19 @@ def diff_listeners(prior, cur):
                ("an unattributable process (uid %s — attributing it to a pid "
                 "needs root)" % uid if uid is not None
                 else "an unattributable process"))
+        graded, rung, note = _grade_binary(
+            "HIGH" if hostile else "MEDIUM", path if resolvable else None)
         return finding(
-            "HIGH" if hostile else "MEDIUM",
+            graded,
             "net-listener", "New network listener",
-            "%s is accepting connections on TCP port %s [%s]%s"
+            "%s is accepting connections on TCP port %s [%s]%s%s"
             % (who, port, trust,
                " — an untrusted binary in a user-writable path listening "
                "on the network is a bind-shell / rogue-server shape" if hostile
-               else " — reachable from the network; verify you started this"),
-            "listener:%s" % key, path=path, port=port, trust=trust, uid=uid)
+               else " — reachable from the network; verify you started this",
+               ("\n" + note) if note else ""),
+            "listener:%s" % key, path=path, port=port, trust=trust, uid=uid,
+            custody=rung)
     return _diff_map(prior, cur, new_fn)
 
 
@@ -6883,15 +6927,17 @@ def _outbound_finding(path, rip, rport):
             return None
     elif not (suspicious_sig(trust) and is_risky_location(path)):
         return None
+    graded, rung, note = _grade_binary("MEDIUM", path)
     return finding(
-        "MEDIUM", "net-outbound", "Untrusted binary connected outbound",
+        graded, "net-outbound", "Untrusted binary connected outbound",
         "%s [%s] in a user-writable path is connected to %s:%s — an "
         "unvouched-for binary holding an outbound socket is a payload-"
         "phoning-home / exfil shape. Recorded for correlation."
-        % (path, trust, rip, rport),
+        % (path, trust, rip, rport)
+        + (("\n" + note) if note else ""),
         "outbound:%s:%s:%s" % (path, rip, rport), path=path, program=path,
         remote=rip, port=rport, trust=trust, confidence="medium",
-        markers=["outbound-exfil"])
+        custody=rung, markers=["outbound-exfil"])
 
 
 def _parse_proc_net_tcp_established(text):
@@ -7090,17 +7136,20 @@ def _beacon_recurrence(history, current_rows):
             continue
         if not (suspicious_sig(trust) or is_risky_location(path)):
             continue
+        graded, rung, note = _grade_binary("HIGH", path)
         findings.append(finding(
-            "HIGH", "net-beacon",
+            graded, "net-beacon",
             "Persistent outbound connection (beacon shape)",
             "%s [%s] has held a connection to %s:%s in %d scans spanning "
             "%.1f hours. Ephemeral outbound churn does not survive between "
             "scans; the same non-browser binary re-observed at the same "
             "remote endpoint is the residue an interval C2 beacon leaves."
-            % (path, trust, rip, rport, len(stamps), span / 3600.0),
+            % (path, trust, rip, rport, len(stamps), span / 3600.0)
+            + (("\n" + note) if note else ""),
             "beacon:%s:%s:%s" % (path, rip, rport), path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
-            span_secs=span, markers=["outbound-exfil", "beacon"]))
+            span_secs=span, custody=rung,
+            markers=["outbound-exfil", "beacon"]))
     return findings
 
 
@@ -8889,6 +8938,21 @@ _PROVENANCE_NOTE = {
     "untracked": ("This file is not tracked by git and no supervised agent "
                   "session attested it, so nothing on this machine claims "
                   "authorship of this change."),
+    "relocated": ("The program bytes AND the payload script are byte-identical "
+                  "to the baseline — only the directory changed. Nothing new "
+                  "executes here; this is a move, not a substitution."),
+    "publisher-stable": ("The binary changed in place but is re-signed by the "
+                         "SAME authority as its baseline — the shape of a "
+                         "vendor auto-update. (Origin, not authorship: a "
+                         "publisher can ship a bad build, and a stolen cert "
+                         "signs too, so this quiets it rather than clearing "
+                         "it.)"),
+    "package-managed": ("This binary is owned by a package-manager transaction "
+                        "on this machine, proven by its receipt on disk — it "
+                        "arrived through an install you ran, not a drop. "
+                        "(Ad-hoc signing is normal for Homebrew/extension "
+                        "binaries and is why signature scoring alone cannot "
+                        "tell them from a payload.)"),
     "worktree": ("Uncommitted local edit — routine if you made it."),
     "local-commit": ("Committed locally and not pushed — routine if you made it."),
     None: ("Not in a git repository and no supervised agent session attested "
@@ -8900,6 +8964,267 @@ _PROVENANCE_NOTE = {
 # attack-defined content — a conceal imperative stays HIGH no matter who
 # appears to have written it, the same guard acquired tolerance applies.
 _SELF_CUSTODY = ("self-attested", "self-committed", "fleet-signed")
+
+# --- vouching rungs: identity evidence the NON-agent sensors already hold ----
+#
+# Chain-of-custody was built for the delegate surface and, until now, only
+# diff_agent_surface() ever asked "did this machine make this change?". The
+# sensors that generate the bulk of the volume — persistence.diff, process,
+# outbound — never asked at all: they scored on code signature plus path
+# writability alone. That is why a directory migration, a vendor auto-update,
+# and a Homebrew daemon all arrive as HIGH next to a genuine intrusion.
+#
+# These three rungs answer the same question from evidence those sensors
+# ALREADY carry, with no new collection and no network:
+#
+#   relocated        the program bytes AND the payload hash are identical and
+#                    only the directory changed  -> nothing new executes
+#   publisher-stable the binary changed in place but is re-signed by the SAME
+#                    authority as its baseline   -> a vendor update
+#   package-managed  the binary is owned by a package-manager transaction on
+#                    this machine, proven by its RECEIPT on disk
+#
+# They are deliberately weaker than _SELF_CUSTODY: those three are claims of
+# AUTHORSHIP, these are claims of ORIGIN. So they demote one step (HIGH ->
+# MEDIUM), never straight to LOW, except `relocated`, which is a proof that
+# the executed content is byte-identical and therefore carries no new code.
+_VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
+
+# Recognised-but-weak: git knows the edit is local and unpushed. The note has
+# always read "routine if you made it" while the finding stayed HIGH anyway —
+# the ladder named the rung and then ignored it. One step down, not to LOW: an
+# uncommitted worktree edit is exactly what a local attacker's change also
+# looks like, so it earns quiet, not silence.
+_WEAK_CUSTODY = ("worktree", "local-commit")
+
+_CUSTODY_FLOOR = {"relocated": "LOW"}
+
+
+def _demote(severity, provenance, attack_defined=False):
+    """Lower `severity` by what custody can prove about `provenance`.
+
+    The three invariants this function exists to hold, all inherited from the
+    delegate-surface grader that came before it:
+
+      * grading DEMOTES, it never suppresses — every finding stays in the
+        report at its new level, no finding is dropped, no incident is
+        auto-closed, and nothing here ever writes a dismissal, so a demotion
+        can never feed acquired tolerance;
+      * attack-DEFINED evidence is never demoted, whoever authored it. A
+        hostile argv, an IOC hit, a dylib-injection env, a conceal imperative
+        keeps its severity even under perfect custody: knowing who wrote a
+        payload is not a reason to stop calling it a payload;
+      * a rung may only move severity DOWN. If a caller passes something the
+        ladder does not recognise, severity is returned untouched.
+    """
+    if attack_defined or not provenance:
+        return severity
+    if provenance in _SELF_CUSTODY:
+        target = "LOW"
+    elif provenance in _VOUCHED_CUSTODY:
+        target = _CUSTODY_FLOOR.get(provenance) or _step_down(severity)
+    elif provenance in _WEAK_CUSTODY:
+        target = _step_down(severity)
+    else:
+        return severity
+    return target if SEV_ORDER[target] < SEV_ORDER[severity] else severity
+
+
+_SEV_LADDER = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
+
+
+def _step_down(severity):
+    try:
+        i = _SEV_LADDER.index(severity)
+    except ValueError:
+        return severity
+    return _SEV_LADDER[max(0, i - 1)]
+
+
+# --- package-manager receipts -------------------------------------------------
+#
+# Nearly every "untrusted binary in a user-writable path" on a developer's
+# machine is a package manager's output. Homebrew ships Go/Rust binaries that
+# are ad-hoc (linker) signed by construction; VSCode extensions ship vendored
+# helpers; pipx builds venvs under Application Support. Signature-and-location
+# scoring cannot tell those from a dropped payload, because on those two axes
+# they are identical.
+#
+# The discriminator is the RECEIPT: a package manager records the transaction
+# that put the file there. This is checked by reading that receipt, never by
+# matching a path prefix — "/opt/homebrew/..." as a trust rule would vouch for
+# anything an attacker drops into a directory the user can write to, which is
+# precisely the file we are trying to grade. A receipt means the file arrived
+# through an install the operator initiated.
+#
+# Honest limits, because this rung is the most attackable one here: an attacker
+# who can overwrite a Cellar file (same access as any other user-writable path)
+# inherits its receipt, and a malicious package installed on purpose has a
+# perfectly good receipt too. That is why it demotes one step to MEDIUM and
+# never to LOW, and why it is refused entirely for behaviour-defined findings.
+
+
+def _homebrew_receipt(real):
+    """`<prefix>/Cellar/<formula>/<version>/...` with an install receipt."""
+    parts = real.split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("Cellar")
+    except ValueError:
+        return None
+    if i + 2 >= len(parts):
+        return None
+    formula, version = parts[i + 1], parts[i + 2]
+    root = os.sep.join(parts[:i + 3])
+    if os.path.isfile(os.path.join(root, "INSTALL_RECEIPT.json")):
+        return "homebrew:%s@%s" % (formula, version)
+    return None
+
+
+def _vscode_receipt(real):
+    """A file inside an extension directory the editor's own index lists."""
+    marker = os.sep + ".vscode"
+    idx = real.find(marker)
+    if idx < 0:
+        return None
+    parts = real[idx:].split(os.sep)
+    # ['', '.vscode(-insiders)', 'extensions', '<publisher.name-version>', ...]
+    if len(parts) < 4 or parts[2] != "extensions":
+        return None
+    ext_id = parts[3]
+    root = real[:idx] + os.sep.join(parts[:3])
+    for name in ("extensions.json", ".obsolete"):
+        if ext_id in (_read_text(os.path.join(root, name)) or ""):
+            return "vscode:%s" % ext_id
+    return None
+
+
+def _pipx_receipt(real):
+    """A pipx venv carries pipx_metadata.json at its root."""
+    parts = real.split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("venvs")
+    except ValueError:
+        return None
+    if i + 1 >= len(parts):
+        return None
+    root = os.sep.join(parts[:i + 2])
+    if os.path.isfile(os.path.join(root, "pipx_metadata.json")):
+        return "pipx:%s" % parts[i + 1]
+    return None
+
+
+_PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt)
+
+
+def _package_receipt(path):
+    """The package-manager transaction that owns `path`, or None.
+
+    Symlinks are resolved first: Homebrew's `bin/` and `opt/` entries are
+    links into the versioned Cellar, and the receipt lives beside the target.
+    """
+    if not path:
+        return None
+    # Both the link and its target are probed, because the two managers point
+    # in OPPOSITE directions: Homebrew's bin/ entries are symlinks INTO the
+    # versioned Cellar (the receipt is at the target), while a pipx/venv
+    # `bin/python` is a symlink OUT to the system interpreter (the receipt is
+    # at the link). Resolving only one of them silently loses the other.
+    cands = []
+    for c in (path, os.path.realpath(path) if path else None):
+        try:
+            if c and c not in cands and os.path.exists(c):
+                cands.append(c)
+        except Exception:
+            continue
+    for cand in cands:
+        for probe in _PACKAGE_RECEIPTS:
+            try:
+                hit = probe(cand)
+            except Exception:
+                hit = None
+            if hit:
+                return hit
+    return None
+
+
+def _grade_binary(severity, path, attack_defined=False):
+    """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
+
+    process / net-listener / net-outbound / net-beacon all raise on the same
+    two axes — the code signature is not trustworthy and the file sits in a
+    user-writable path. On a developer's machine that describes essentially
+    every package-manager artifact, which is why those sensors produce the
+    volume they do. A receipt is the evidence that separates "arrived through
+    an install you ran" from "was dropped here".
+
+    One step only, never to LOW: origin is not innocence. A package-managed
+    binary can still be the thing beaconing — the update itself can be the
+    compromise — so this quiets the identity half of the alarm and leaves the
+    behaviour half at a level that still reaches the report.
+    """
+    if attack_defined:
+        return severity, None, None
+    rung = "package-managed" if _package_receipt(path) else None
+    if not rung:
+        return severity, None, None
+    return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
+
+
+def _custody_persistence(old, rec):
+    """Custody rung for a CHANGED persistence item, or None.
+
+    Answers one question: does the diff between `old` and `rec` describe the
+    same software in a new place / a newer build, or something else running?
+
+    `relocated` requires proof on BOTH halves of what a job executes — the
+    program bytes and the payload script's own hash. Requiring only the
+    program hash would be worthless for the dominant `/bin/bash <script>`
+    shape, where the program is bash and identical by definition while the
+    script is the part that could have been swapped. When the baseline
+    predates payload hashing (`target_sha` absent) no relocation claim is
+    made at all: an unproven half is not a passing half.
+    """
+    if not isinstance(old, dict) or not isinstance(rec, dict):
+        return None
+    # Environment injection and hostile argv are attack-DEFINED. They are
+    # refused here as well as at the demotion gate, so no future caller can
+    # reach a vouching rung by a path that skips the gate.
+    if rec.get("env") or _hostile_args(rec.get("args"), rec.get("program")):
+        return None
+
+    op, np_ = old.get("program"), rec.get("program")
+    osha, nsha = old.get("sha256"), rec.get("sha256")
+    otgt, ntgt = old.get("script_target"), rec.get("script_target")
+    otsha, ntsha = old.get("target_sha"), rec.get("target_sha")
+
+    # --- relocated: identical content, different directory --------------------
+    same_program = bool(osha) and osha == nsha
+    moved = bool(op and np_ and op != np_
+                 and os.path.basename(op) == os.path.basename(np_))
+    if same_program and (moved or op == np_):
+        if ntgt or otgt:
+            # a payload exists: it must be present on both sides, byte-equal,
+            # and keep its own basename
+            proven = bool(otsha) and otsha == ntsha
+            same_name = bool(otgt and ntgt) and \
+                os.path.basename(otgt) == os.path.basename(ntgt)
+            if proven and same_name and otgt != ntgt:
+                return "relocated"
+            if proven and same_name and otgt == ntgt and moved:
+                return "relocated"
+        elif moved:
+            # no payload script at all — the program IS the whole job
+            return "relocated"
+
+    # --- publisher-stable: same place, same signer, newer build ---------------
+    auth_o, auth_n = old.get("authority"), rec.get("authority")
+    if (op == np_ and osha and nsha and osha != nsha
+            and auth_o and auth_n and auth_o == auth_n
+            and rec.get("trust") in ("apple", "app-store", "developer-id")):
+        return "publisher-stable"
+    return None
+
+
 
 
 def cmd_signers(argv):
@@ -9391,9 +9716,8 @@ def diff_agent_surface(prior, cur):
                 oe = old_execs.get(key)
                 if old is not None and oe is None:
                     prov, note = _custody(path, rec.get("sha256"))
-                    self_made = prov in _SELF_CUSTODY
                     findings.append(finding(
-                        "LOW" if self_made else "HIGH", "agent-surface",
+                        _demote("HIGH", prov), "agent-surface",
                         "New agent exec entry registered",
                         "%s registered a new executable entry: %s %s\nResolved "
                         "target: %s\n%s\nAn MCP server or tool hook runs with "
@@ -9405,15 +9729,15 @@ def diff_agent_surface(prior, cur):
                         path=path, program=e.get("target") or e.get("cmd"),
                         provenance=prov,
                         markers=["agent-surface", "exec"] +
-                                (["self-custody"] if self_made else [])))
+                                (["self-custody"] if prov in _SELF_CUSTODY else [])))
                 elif oe is not None and oe.get("target_sha") and \
                         e.get("target_sha") and \
                         oe["target_sha"] != e["target_sha"]:
                     prov, note = _custody(e.get("target"), e.get("target_sha"))
                     same_signer = bool(oe.get("target_team")) and \
                         oe.get("target_team") == e.get("target_team")
-                    if prov in _SELF_CUSTODY:
-                        sev, grade = "LOW", note
+                    if _demote("HIGH", prov) != "HIGH":
+                        sev, grade = _demote("HIGH", prov), note
                     elif same_signer:
                         # The rewrite carries a valid signature from the same
                         # team that signed the baselined content — vendor
@@ -9453,9 +9777,8 @@ def diff_agent_surface(prior, cur):
                     # which is the cheapest way to arm an agent config without
                     # ever editing a watched file.
                     prov, note = _custody(e.get("target"), e.get("target_sha"))
-                    self_made = prov in _SELF_CUSTODY
                     findings.append(finding(
-                        "LOW" if self_made else "HIGH", "agent-surface",
+                        _demote("HIGH", prov), "agent-surface",
                         "Agent exec target appeared under a static config",
                         "%s: the config line for %s never changed, but its "
                         "target (%s) did not exist when this surface was "
@@ -9466,7 +9789,7 @@ def diff_agent_surface(prior, cur):
                         % (path, key, (e.get("target_sha") or "")[:12]),
                         path=path, program=e.get("target"), provenance=prov,
                         markers=["agent-surface", "exec", "supply-chain"] +
-                                (["self-custody"] if self_made else [])))
+                                (["self-custody"] if prov in _SELF_CUSTODY else [])))
             new_marks = set(rec.get("imperatives") or [])
             old_marks = set((old or {}).get("imperatives") or [])
             gained = sorted(new_marks - old_marks)
