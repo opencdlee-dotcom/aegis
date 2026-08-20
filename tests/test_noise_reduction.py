@@ -285,6 +285,33 @@ class LearningPeriod(unittest.TestCase):
         self.assertFalse(aegis._in_learning_period(1000, b))
         self.assertFalse(aegis._in_learning_period(500, {}))
 
+    def test_setting_the_window_rewatermarks_the_baseline(self):
+        """`learn` writes a watched trust store out-of-band. Without a
+        re-watermark the next scan reports Aegis's own documented command as
+        'baseline modified out-of-band' — which it did, once, on the live
+        machine."""
+        tmp = tempfile.mkdtemp(prefix="aegis_learn_")
+        saved = (aegis.STATE_DIR, aegis.BASELINE, aegis.SELFSTATE,
+                 aegis.HMAC_KEY_FILE)
+        aegis.STATE_DIR = tmp
+        aegis.BASELINE = os.path.join(tmp, "baseline.json")
+        aegis.SELFSTATE = os.path.join(tmp, "selfstate.json")
+        aegis.HMAC_KEY_FILE = os.path.join(tmp, "hmac.key")
+        try:
+            aegis.save_json(aegis.BASELINE, {"persistence": {}})
+            aegis.record_selfstate()
+            before = aegis.load_json(aegis.SELFSTATE, {}).get("baseline_mac")
+            aegis._set_learning_period(7)
+            after = aegis.load_json(aegis.SELFSTATE, {}).get("baseline_mac")
+            self.assertIsNotNone(after)
+            self.assertNotEqual(before, after, "watermark must follow the write")
+            self.assertEqual(after, aegis._hmac_file(aegis.BASELINE))
+        finally:
+            (aegis.STATE_DIR, aegis.BASELINE, aegis.SELFSTATE,
+             aegis.HMAC_KEY_FILE) = saved
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_report_says_it_is_learning(self):
         md = aegis._brief_report([], [], [], [], False, 5, 0)
         self.assertIn("Learning this machine", md)

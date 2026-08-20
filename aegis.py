@@ -2685,6 +2685,9 @@ def _set_learning_period(days):
     until = int(_epoch()) + int(days) * 86400 if days else 0
     baseline["learning_until"] = until
     save_json(BASELINE, baseline)
+    # This is an out-of-band write to a watched trust store; re-watermark it or
+    # the next scan correctly reports OUR OWN documented command as tampering.
+    _record_baseline_watermark()
     return until
 
 
@@ -11090,6 +11093,19 @@ def record_selfstate():
         present = os.path.exists(path)
         st["%s_sha" % name] = sha256(path) if present else None
         st["%s_mac" % name] = _hmac_file(path) if present else None
+    save_json(SELFSTATE, st)
+
+
+def _record_baseline_watermark():
+    """Re-watermark the baseline right after WE rewrite it out-of-band, so a
+    deliberate `aegis.py learn` is not read as tampering on the next scan.
+    Only the baseline keys are touched — refreshing the whole selfstate here
+    would also silently re-bless a tampered allowlist or canary record. Same
+    discipline (and same reason) as _record_canary_watermark."""
+    st = load_json(SELFSTATE, {})
+    present = os.path.exists(BASELINE)
+    st["baseline_sha"] = sha256(BASELINE) if present else None
+    st["baseline_mac"] = _hmac_file(BASELINE) if present else None
     save_json(SELFSTATE, st)
 
 
