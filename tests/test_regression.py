@@ -105,6 +105,7 @@ class Sandbox(unittest.TestCase):
             "INTENT_FILE": os.path.join(self.state, "intent.jsonl"),
             "FLEET_SIGNERS": os.path.join(self.state, "allowed_signers"),
             "ALLOWLIST": os.path.join(self.state, "allowlist.json"),
+            "SURFACE_WALLS": os.path.join(self.state, "surface_walls.json"),
             "RUN_LOG": os.path.join(self.state, "run.log"),
             "EVENT_DB": os.path.join(self.state, "aegis.db"),
             "SELFSTATE": os.path.join(self.state, "selfstate.json"),

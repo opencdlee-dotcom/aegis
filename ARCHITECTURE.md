@@ -275,7 +275,8 @@ malicious, a publisher can ship a bad build, a stolen certificate signs cleanly.
    by a package-manager transaction on this machine, proven by reading that
    manager's **receipt** — Homebrew's `INSTALL_RECEIPT.json` beside the
    versioned Cellar root, the editor's own `extensions.json` index, pipx's
-   `pipx_metadata.json` at the venv root. It is deliberately *never* a path
+   `pipx_metadata.json` at the venv root, and the `BUILD` stamp uv writes into
+   each interpreter it manages under `uv/python/<dist>/`. It is deliberately *never* a path
    prefix: treating `/opt/homebrew/…` as a trust rule would vouch for anything
    an attacker drops into a directory the user can write to, which is precisely
    the file being graded. Both the link and its target are probed, because the

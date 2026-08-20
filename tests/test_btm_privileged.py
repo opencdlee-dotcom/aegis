@@ -47,9 +47,28 @@ _DUMP_OK = """#1:
 class TestSnapshotBtmOutcomes(unittest.TestCase):
     def setUp(self):
         self._run = aegis.run
+        # Isolate the proven-wall memory. These cases describe a machine that
+        # has NEVER proven a wall — which is the only state in which a generic
+        # failure still means "a sensor that should be answering isn't".
+        # Without redirecting it the class reads the real ~/.aegis file, so the
+        # verdict would depend on whether the developer's own Mac happens to be
+        # walled: a test that passes or fails by accident of the host.
+        self._walls = aegis.SURFACE_WALLS
+        self._tmp = tempfile.mkdtemp(prefix="aegis_btm_walls_")
+        aegis.SURFACE_WALLS = os.path.join(self._tmp, "surface_walls.json")
 
     def tearDown(self):
         aegis.run = self._run
+        aegis.SURFACE_WALLS = self._walls
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_a_proven_wall_reclassifies_a_later_silent_failure(self):
+        """The auth prompt blocking to the timeout yields EMPTY stderr, so the
+        marker never appears — but it is the same permanent refusal."""
+        aegis.run = lambda cmd, timeout=15, extra_env=None: ("", _AUTH_STDERR, 1)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        aegis.run = lambda cmd, timeout=15, extra_env=None: ("", "", 1)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
 
     def test_authorization_refusal_is_privileged(self):
         aegis.run = lambda cmd, timeout=15, extra_env=None: ("", _AUTH_STDERR, 1)

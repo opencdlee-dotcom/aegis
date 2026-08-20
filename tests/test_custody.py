@@ -645,6 +645,30 @@ class PackageReceiptsVouchByEvidenceNotByPath(unittest.TestCase):
             os.path.join(self.tmp, "Cellar", "x", "1", "bin", "gone")))
         self.assertIsNone(aegis._package_receipt(None))
 
+    def test_a_uv_managed_python_with_its_build_receipt_vouches(self):
+        """uv is the fourth package manager on a Python developer's machine and
+        ships its own interpreters under ~/.local/share/uv/python/<dist>/, each
+        stamped with a BUILD receipt. Without this probe every script run by a
+        uv-managed interpreter reads as an unvouched binary in a user-writable
+        path — which on this machine is most of them."""
+        root = os.path.join(self.tmp, "uv", "python", "cpython-3.13-macos")
+        binp = os.path.join(root, "bin", "python3.13")
+        os.makedirs(os.path.dirname(binp))
+        with open(binp, "w") as f:
+            f.write("x")
+        with open(os.path.join(root, "BUILD"), "w") as f:
+            f.write("20260408")
+        self.assertEqual(aegis._package_receipt(binp),
+                         "uv-python:cpython-3.13-macos")
+
+    def test_a_uv_shaped_path_without_the_build_receipt_does_not_vouch(self):
+        root = os.path.join(self.tmp, "uv", "python", "cpython-evil")
+        binp = os.path.join(root, "bin", "python3")
+        os.makedirs(os.path.dirname(binp))
+        with open(binp, "w") as f:
+            f.write("x")
+        self.assertIsNone(aegis._package_receipt(binp))
+
     def test_grade_binary_leaves_an_unvouched_binary_alone(self):
         sev, rung, note = aegis._grade_binary("HIGH", os.path.join(self.tmp, "x"))
         self.assertEqual((sev, rung, note), ("HIGH", None, None))
@@ -699,3 +723,78 @@ class BaselineSurvivesAPrivilegedSurface(unittest.TestCase):
         self.assertNotIn("walled", written, "privileged surface must be omitted")
         self.assertNotIn("absent", written, "a non-answer must be omitted")
         self.assertEqual(written["fine"], {"a": 1})
+
+
+class PrivilegeWallIsRemembered(unittest.TestCase):
+    """A privilege wall must not masquerade as a degraded sensor.
+
+    Regression (2026-08-20, this machine): `sfltool dumpbtm` needs interactive
+    admin authorization on macOS 26. It raises an auth prompt, and the SAME
+    OS condition produces two different verdicts depending on timing:
+
+      * prompt auto-cancelled fast -> stderr carries "authorization failed" ->
+        the marker matches -> SURFACE_PRIVILEGED -> a named permanent gap,
+        correctly no incident;
+      * prompt left sitting -> the command blocks to the 30s timeout -> stderr
+        is EMPTY -> no marker -> None -> DEGRADED -> after three consecutive
+        misses, a HIGH "Security coverage degraded" incident.
+
+    So a machine whose surface is permanently walled off intermittently opened
+    HIGH incidents about it. The sensor's own docstring already states the
+    governing fact — the refusal "will fail identically on every scan this OS
+    ever runs" — which is exactly what makes one observation sufficient to
+    classify later non-answers from the same command.
+
+    Fail-toward-suspicion is preserved at both ends: a machine that has NEVER
+    proven a wall still degrades on a non-answer, and a single success clears
+    the memory, so a failure after the wall comes down is treated as new.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_wall_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._saved = {"SURFACE_WALLS": getattr(aegis, "SURFACE_WALLS", None),
+                       "run": aegis.run}
+        self.addCleanup(self._restore)
+        aegis.SURFACE_WALLS = os.path.join(self.tmp, "surface_walls.json")
+
+    def _restore(self):
+        for k, v in self._saved.items():
+            if v is not None:
+                setattr(aegis, k, v)
+
+    def _run_returns(self, out, err, rc):
+        aegis.run = lambda *a, **k: (out, err, rc)
+
+    # the timeout shape: no stdout, no stderr, non-zero rc
+    TIMEOUT = ("", "", 1)
+    WALLED = ("", "sfltool: authorization failed", 1)
+
+    def test_a_timeout_with_no_history_still_degrades(self):
+        """Never seen a wall here -> a non-answer stays a non-answer."""
+        self._run_returns(*self.TIMEOUT)
+        self.assertIsNone(aegis.snapshot_btm())
+
+    def test_the_marker_is_recognised_as_a_wall(self):
+        self._run_returns(*self.WALLED)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+
+    def test_a_timeout_after_a_proven_wall_is_that_wall(self):
+        """The regression: same condition, different timing, same verdict."""
+        self._run_returns(*self.WALLED)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        self._run_returns(*self.TIMEOUT)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED,
+                      "a timeout after a proven wall must not read as DEGRADED")
+
+    def test_a_success_clears_the_memory_so_later_failures_are_new(self):
+        """If the wall comes down, a later failure is genuinely unexplained."""
+        self._run_returns(*self.WALLED)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        self._run_returns("", "", 0)          # rc 0 but empty -> still a non-answer
+        aegis.snapshot_btm()
+        self._run_returns("btm dump\n", "", 0)  # a real success clears it
+        aegis.snapshot_btm()
+        self._run_returns(*self.TIMEOUT)
+        self.assertIsNone(aegis.snapshot_btm(),
+                          "memory must be cleared by a success")

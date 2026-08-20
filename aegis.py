@@ -6478,6 +6478,55 @@ BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
 # stops masquerading as a broken sensor.
 SURFACE_PRIVILEGED = object()
 
+# Remembering a proven wall.
+#
+# The refusal above is an OS POLICY, not a flake — the sensor's own contract is
+# that it "will fail identically on every scan this OS ever runs". But the
+# command raises an interactive authorization prompt, and the same condition
+# reaches us two different ways depending on whether that prompt was dismissed:
+# cancelled fast, stderr carries the marker and we classify correctly; left
+# sitting, the command blocks to the timeout and stderr is EMPTY, so the marker
+# never appears and a permanent wall reads as a DEGRADED sensor — which after
+# three consecutive misses opens a HIGH "coverage degraded" incident about a
+# gap that is already named, already reported, and cannot be fixed locally.
+#
+# One observation is therefore enough to classify later non-answers from the
+# same command. Fail-toward-suspicion is preserved at both ends: a machine that
+# has never proven a wall still degrades on a non-answer, and any SUCCESS
+# clears the memory, so a failure after the wall comes down is treated as new
+# rather than silently absorbed. The memory only ever downgrades a sensor-health
+# verdict — it can never suppress a finding, because a walled surface is not
+# diffed at all.
+SURFACE_WALLS = os.path.join(STATE_DIR, "surface_walls.json")
+
+
+def _wall_seen(name):
+    """Has this surface ever proven an OS privilege wall on this machine?"""
+    try:
+        return bool((load_json(SURFACE_WALLS, {}) or {}).get(name))
+    except Exception:
+        return False
+
+
+def _wall_record(name):
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        if name not in walls:
+            walls[name] = now_iso()
+            save_json(SURFACE_WALLS, walls)
+    except Exception:
+        pass
+
+
+def _wall_clear(name):
+    """The surface answered — the wall is down, so forget it."""
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        if walls.pop(name, None) is not None:
+            save_json(SURFACE_WALLS, walls)
+    except Exception:
+        pass
+
 # macOS 26 (Darwin 25) moved `sfltool dumpbtm` behind system.privilege.admin:
 # the unprivileged harvest this sensor was built on ("Ventura+, unprivileged")
 # no longer exists there. The failure is identified by its authorization
@@ -6556,8 +6605,17 @@ def snapshot_btm():
     if rc != 0 or not out:
         blob = ((err or "") + "\n" + (out or "")).lower()
         if any(marker in blob for marker in _BTM_PRIVILEGED_MARKERS):
+            _wall_record("btm")
+            return SURFACE_PRIVILEGED
+        if _wall_seen("btm"):
+            # This machine has already PROVEN the wall. The authorization
+            # prompt blocking to the timeout produces an empty stderr and so
+            # carries no marker, but it is the same permanent refusal — not a
+            # newly broken sensor. Classifying it as DEGRADED opened HIGH
+            # incidents about an already-named gap.
             return SURFACE_PRIVILEGED
         return None  # timeout/failure — a non-answer, NOT "zero items"
+    _wall_clear("btm")   # it answered: any later failure is genuinely new
     return _parse_btm(out)
 
 
@@ -9113,7 +9171,28 @@ def _pipx_receipt(real):
     return None
 
 
-_PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt)
+def _uv_python_receipt(real):
+    """uv ships its own interpreters under <data>/uv/python/<dist>/, each
+    stamped with a BUILD receipt (the python-build-standalone build date) that
+    uv writes on install. On a Python developer's machine these are the busiest
+    unvouched binaries there are — every script a uv-managed interpreter runs
+    scores as ad-hoc-in-a-user-writable-path without this."""
+    parts = real.split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("python")
+    except ValueError:
+        return None
+    # require the uv/python/<dist> shape, then prove it with the receipt
+    if i == 0 or parts[i - 1] != "uv" or i + 1 >= len(parts):
+        return None
+    root = os.sep.join(parts[:i + 2])
+    if os.path.isfile(os.path.join(root, "BUILD")):
+        return "uv-python:%s" % parts[i + 1]
+    return None
+
+
+_PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
+                     _uv_python_receipt)
 
 
 def _package_receipt(path):
