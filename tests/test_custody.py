@@ -648,3 +648,54 @@ class PackageReceiptsVouchByEvidenceNotByPath(unittest.TestCase):
     def test_grade_binary_leaves_an_unvouched_binary_alone(self):
         sev, rung, note = aegis._grade_binary("HIGH", os.path.join(self.tmp, "x"))
         self.assertEqual((sev, rung, note), ("HIGH", None, None))
+
+
+class BaselineSurvivesAPrivilegedSurface(unittest.TestCase):
+    """`aegis.py baseline` must not die when a surface is behind an admin wall.
+
+    Regression (2026-08-20, this machine): macOS 26 moved `sfltool dumpbtm`
+    behind system.privilege.admin, so snapshot_btm returns SURFACE_PRIVILEGED —
+    a bare object() sentinel meaning "permanent, OS-imposed coverage gap". The
+    scan path already treated it as a non-answer, but cmd_baseline only skipped
+    None. Being truthy and `is not None`, the sentinel went into the baseline
+    dict and json.dump raised TypeError, taking the ENTIRE command out: the
+    persistence baseline could not be reset at all on an affected machine.
+
+    The sentinel is deliberately not None precisely so the two can be told
+    apart, which is exactly why every consumer has to test for it by identity.
+    """
+
+    def test_the_sentinel_is_distinguishable_and_unserializable(self):
+        self.assertIsNotNone(aegis.SURFACE_PRIVILEGED)
+        self.assertTrue(aegis.SURFACE_PRIVILEGED)   # truthy: `if snap:` is a trap
+        with self.assertRaises(TypeError):
+            json.dumps(aegis.SURFACE_PRIVILEGED)
+
+    def test_baseline_omits_a_privileged_surface_and_still_writes(self):
+        tmp = tempfile.mkdtemp(prefix="aegis_baseline_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        baseline_path = os.path.join(tmp, "baseline.json")
+
+        saved = {k: getattr(aegis, k) for k in
+                 ("BASELINE", "SURFACES", "snapshot_persistence",
+                  "flush_sigcache", "record_selfstate", "ensure_state")}
+        self.addCleanup(lambda: [setattr(aegis, k, v) for k, v in saved.items()])
+
+        aegis.BASELINE = baseline_path
+        aegis.ensure_state = lambda: None
+        aegis.flush_sigcache = lambda: None
+        aegis.record_selfstate = lambda: None
+        aegis.snapshot_persistence = lambda: {}
+        aegis.SURFACES = [
+            ("walled", lambda: aegis.SURFACE_PRIVILEGED, None),
+            ("fine", lambda: {"a": 1}, None),
+            ("absent", lambda: None, None),
+        ]
+
+        rc = aegis._cmd_baseline_locked()
+        self.assertEqual(rc, 0)
+        with open(baseline_path, encoding="utf-8") as f:
+            written = json.load(f)
+        self.assertNotIn("walled", written, "privileged surface must be omitted")
+        self.assertNotIn("absent", written, "a non-answer must be omitted")
+        self.assertEqual(written["fine"], {"a": 1})

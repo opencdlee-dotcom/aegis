@@ -11280,10 +11280,19 @@ def _cmd_baseline_locked(trust="verified"):
             snap = snap_fn()
         except Exception:
             snap = None
-        # A None snapshot means the backing command couldn't be read now; omit
-        # the surface so the next scan adopts it once it can, rather than
-        # baselining a false-empty (see snapshot_btm).
-        if snap is not None:
+        # A None snapshot means the backing command couldn't be read now, and
+        # SURFACE_PRIVILEGED means this OS puts the surface behind an
+        # interactive admin wall. Both are non-answers and both are omitted, so
+        # the next scan adopts the surface once it can rather than baselining a
+        # false-empty (see snapshot_btm).
+        #
+        # The sentinel must be tested for explicitly: it is a bare object(), so
+        # it is truthy and `is not None`, and letting it through put a
+        # non-serializable value into the baseline dict — `baseline` then died
+        # in json.dump on any machine where the wall is up (macOS 26 moved
+        # `sfltool dumpbtm` behind system.privilege.admin), taking the whole
+        # command out. The scan path already treats the two identically.
+        if snap is not None and snap is not SURFACE_PRIVILEGED:
             b[key] = snap
     save_json(BASELINE, b)
     flush_sigcache()
