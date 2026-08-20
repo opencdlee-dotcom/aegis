@@ -197,7 +197,9 @@ python3 aegis.py update-check            # is ~/.aegis/aegis.py stale behind thi
 python3 aegis.py scan          # run once, print report, establish baseline
 python3 aegis.py status        # fast hardening posture + XProtect definition age
 python3 aegis.py doctor        # coverage/permission/sensor-health diagnostics
-python3 aegis.py report        # reprint the latest report
+python3 aegis.py report        # reprint the brief report (verdict + what's new)
+python3 aegis.py report --full # every finding, grouped by category
+python3 aegis.py learn         # learning-period status (start|extend|done)
 python3 aegis.py baseline      # accept current state as known-good (resets diff)
 python3 aegis.py incidents     # active incidents, evidence count, and state
 python3 aegis.py incident ID   # evidence, KNOWN BENIGN CAUSES for the sensors

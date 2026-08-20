@@ -1558,9 +1558,16 @@ class TextEncodingIsPinned(unittest.TestCase):
             md = aegis.write_report([f], first_run=False)
             with open(aegis.LATEST_MD, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), md)
-            # The icon is the byte sequence cp1252 cannot represent; assert it
-            # actually reached the file rather than being dropped.
-            self.assertIn(aegis.SEV_ICON["MEDIUM"], md)
+            # The brief report leads with a verdict rather than enumerating
+            # every finding, so the per-severity icon now lives in the full
+            # render. Both layers are asserted: each carries a byte sequence
+            # cp1252 cannot represent, and each must reach its file intact.
+            self.assertTrue(any(ord(c) > 0x7F for c in md),
+                            "brief report lost all non-ASCII")
+            full = aegis._full_report(aegis.load_json(aegis.LATEST_JSON, {}))
+            self.assertIn(aegis.SEV_ICON["MEDIUM"], full)
+            # the operator's own non-ASCII text must survive the round trip too
+            self.assertIn("caf\u00e9.exe", full)
         finally:
             (aegis.STATE_DIR, aegis.LATEST_MD, aegis.LATEST_JSON) = saved
             import shutil

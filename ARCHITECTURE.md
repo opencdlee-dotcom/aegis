@@ -335,6 +335,68 @@ history in a throwaway in-memory database. It is strictly read-only — no
 incident, no notification, no durable write — so a detection change can be
 backtested before it ships.
 
+## Signal-to-noise tier
+
+A detector is only as good as the attention it still commands. Measured on the
+reference machine 2026-08-20, before this tier existed: 281 incidents lifetime,
+131 adjudicated `FALSE_POSITIVE`, 129 still `OPEN`, and no true positive that a
+test fixture had not planted. The sensors were not blind — the output was
+unreadable, which is the worse failure, because it silences every future alert
+too. Five mechanisms address it, and each one that suppresses something must
+prove what it still says.
+
+**Exec identity is what runs, not where it sits.** An exec-capable config entry
+is keyed on its command and arguments (`_exec_identity`), never on its position
+in the file. The positional key it replaced (`hooks.SessionStart[4].hooks[0]`)
+renumbered every later sibling whenever one was inserted, so a single added hook
+re-alerted the whole list: 55 of 67 un-generalizable open incidents were that
+cascade. Both sides of the diff are normalized (`_migrate_exec_keys`), so an
+upgrade from a legacy baseline is silent rather than presenting every baselined
+entry as new. A genuinely new command still fires at `HIGH`.
+
+**Rotating endpoints generalize only on evidence.** A beacon's address is a
+fact and a new endpoint alerts — but a load-balanced service answers from a new
+address every few days, re-opening forever. `_beacon_endpoint_class` factors the
+address out of the binary+port, and `_rotating_endpoint_memory` will only use
+that class once the operator has dismissed `_ROTATING_MIN_ENDPOINTS` *distinct*
+addresses on it. Hostnames never generalize; attack-defined prefixes never do.
+
+**Aegis's own upgrade is attested, not exempted.** `_install_runtime_copy`
+writes one ordinary intent record for the runtime copy it installs, so the same
+custody ladder every other surface uses grades the change (`HIGH` -> `LOW`,
+still reported). A payload swapped by anything that did not come through
+`install` records nothing and stays `HIGH`. Persistence changes now also grade
+the *payload* against the ledger, not only the config file naming it — the
+dominant `<interpreter> <script>` job mutates by having its script rewritten.
+
+**Incidents age out.** An `OPEN` signal or risk incident with no new evidence in
+`_AGE_OUT_DAYS` closes as ambient, retained and reopened by recurrence. Never
+CRITICAL, never a correlation chain, never attack-defined evidence — a quiet
+week is not an acquittal for a tripped decoy. Machine verdicts write no
+`dismissals` row, so they cannot feed tolerance or backtest precision.
+
+**The learning period.** A fresh install starts a `_LEARNING_DEFAULT_DAYS`
+window (`aegis.py learn`) in which everything is recorded and correlated but a
+non-CRITICAL signal opens pre-closed as `learning` instead of alerting. A
+detector's first weeks on a real machine are its worst: every ordinary thing it
+has not yet seen is new by construction. CRITICAL chains and tripped
+decoys/latches always alert.
+
+**The report leads with a verdict.** `latest.md` is the brief report — one
+verdict line, what is new since the last scan, open CRITICALs, degraded
+coverage; `aegis.py report --full` renders everything from `latest.json`. The
+report it replaced opened with ninety red bullets over 208 lines.
+
+Because the report is a summariser, it asserts its own headline against the
+findings and incidents it summarizes on every run (`_report_self_check`) and
+**publishes the result**: a clean run prints what was verified, and a
+contradiction is printed at the TOP, above the evidence, since a reader who
+trusts the first paragraph must not have to reach the last line to learn it was
+wrong. This is not decorative — it caught a real defect in the verdict logic on
+its first run against live data, a green "Nothing new" printed over two open
+CRITICAL chains. An open CRITICAL now outranks a quiet scan and the learning
+period both.
+
 ## Transactional quarantine
 
 Each quarantine item owns an authoritative `txn.json`. The manifest is rebuilt

@@ -337,6 +337,7 @@ AGENT_SKILL_ROOTS = [os.path.join(HOME, d) for d in (
 _SELF_PATH = os.path.abspath(__file__)
 
 SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+SEV_NAMES = {v: k for k, v in SEV_ORDER.items()}
 SEV_ICON = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦", "INFO": "⬜"}
 NOTIFY_MIN_SEV = "HIGH"  # only >= this AND new gets a desktop notification
 
@@ -2643,6 +2644,116 @@ def _tolerance_identity(fingerprint):
     return ":".join(normalized)
 
 
+_LEARNING_DEFAULT_DAYS = 14
+
+
+def _learning_until(baseline=None):
+    """Epoch at which the learning period ends, or 0 when none is active."""
+    if baseline is None:
+        baseline, _corrupt = load_baseline()
+    try:
+        return int((baseline or {}).get("learning_until") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _in_learning_period(now, baseline=None):
+    """Is this machine still building its picture of 'normal'?
+
+    A detector's first weeks on a real machine are its worst: every ordinary
+    thing it has never seen is, by construction, new — and on a development
+    box that is hundreds of things (interpreters under user-writable paths,
+    update channels beaconing, editor extensions rewriting themselves). Alerting
+    on all of it teaches the operator, correctly, that the tool does not know
+    what it is looking at, and that lesson survives every later improvement.
+
+    During the window everything is still RECORDED and correlated — this is not
+    a blind period, and nothing stops being watched. What changes is that a
+    non-CRITICAL signal opens pre-closed as 'learning' instead of alerting, so
+    the envelope of normal gets built from evidence rather than from the
+    operator's patience. Attack-defined evidence and CRITICAL chains are
+    excluded: a tripped decoy on day one is not ordinary, and never was.
+    """
+    return now < _learning_until(baseline)
+
+
+def _set_learning_period(days):
+    """Start/extend/end the learning period; returns the new end epoch."""
+    baseline, corrupt = load_baseline()
+    if corrupt or baseline is None:
+        baseline = baseline or {}
+    until = int(_epoch()) + int(days) * 86400 if days else 0
+    baseline["learning_until"] = until
+    save_json(BASELINE, baseline)
+    return until
+
+
+_ROTATING_MIN_ENDPOINTS = 3
+# An IPv4 literal, or an IPv6 one (which survives ':'-splitting as a bare hex
+# run). Only a literal address may be generalized away — a hostname is a fact.
+_ROTATING_IP_RE = re.compile(r"^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{0,4})$", re.I)
+
+
+def _beacon_endpoint_class(fingerprint):
+    """(endpoint_class, ip) for a beacon fingerprint, else None.
+
+    A beacon fingerprint is `beacon:<path>:<ip>:<port>`, and the ip is
+    deliberately part of its identity — a new endpoint is a new fact. But a
+    load-balanced service (a CDN, an update channel) answers on a different
+    address every few days, so the SAME reviewed binary talking to the SAME
+    port re-opens forever, one incident per rotation. The endpoint CLASS is
+    the binary and port with the address factored out; the address is returned
+    alongside so the caller can require breadth before generalizing over it."""
+    fp = str(fingerprint or "")
+    if not fp.startswith("beacon:"):
+        return None
+    parts = fp.split(":")
+    if len(parts) < 4:
+        return None
+    port, ip = parts[-1], parts[-2]
+    if not port.isdigit() or not _ROTATING_IP_RE.match(ip):
+        return None
+    path = _TOLERANCE_VERSION_RE.sub("#", ":".join(parts[1:-2]))
+    if not path:
+        return None
+    return ("beacon:%s:#ip:%s" % (path, port), ip)
+
+
+def _rotating_endpoint_memory(db, now):
+    """{endpoint_class: (verdicts, max_reviewed_sev)} for classes the operator
+    has dismissed across >= _ROTATING_MIN_ENDPOINTS DISTINCT addresses.
+
+    Breadth across addresses is the evidence, and it is what keeps this narrow:
+    dismissing one binary:ip three times teaches nothing here (the exact-key
+    reattach already covers that) — it takes three DIFFERENT addresses on one
+    binary and port before rotation is an established fact about that service.
+    Until then every new address still alerts."""
+    memory = {}
+    try:
+        rows = db.execute(
+            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+            "AND d.correlation_key LIKE 'signal:beacon:%'",
+            (now - _TOLERANCE_WINDOW,)).fetchall()
+    except Exception:
+        return memory
+    seen = {}
+    for row in rows:
+        klass = _beacon_endpoint_class(row["correlation_key"][len("signal:"):])
+        if not klass:
+            continue
+        bucket = seen.setdefault(klass[0], {"ips": set(), "inc": set(),
+                                            "sev": -1})
+        bucket["ips"].add(klass[1])
+        bucket["inc"].add(row["incident_id"])
+        bucket["sev"] = max(bucket["sev"], SEV_ORDER.get(row["severity"], -1))
+    for klass, bucket in seen.items():
+        if len(bucket["ips"]) >= _ROTATING_MIN_ENDPOINTS:
+            memory[klass] = (len(bucket["inc"]), bucket["sev"])
+    return memory
+
+
 def _tolerance_memory(db, now):
     """{identity: (distinct_verdicts, max_reviewed_sev_order)} from the
     operator's own benign-positive dismissals of signal incidents inside the
@@ -2682,30 +2793,38 @@ def _disputed_identities(db):
             "SELECT correlation_key FROM incidents WHERE status IN (%s) "
             "AND correlation_key LIKE 'signal:%%'" % marks,
             _ACTIVE_INCIDENT_STATES):
-        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        fp = row["correlation_key"][len("signal:"):]
+        ident = _tolerance_identity(fp)
         if ident:
             idents.add(ident)
+        klass = _beacon_endpoint_class(fp)
+        if klass:
+            idents.add(klass[0])
     return idents
 
 
-def _auto_tolerate(db, incident_id, verdicts, now):
+def _auto_tolerate(db, incident_id, verdicts, now, reason="auto-tolerated"):
     """Close a just-created incident under acquired tolerance. The guard is in
     the WHERE: only an OPEN incident created THIS pass may be auto-closed, so a
     reattach to something the operator already saw is never swept from under
     them. Deliberately writes NO dismissals row — machine verdicts must never
-    feed backtest precision, category down-weighting, or future tolerance."""
+    feed backtest precision, category down-weighting, or future tolerance.
+
+    `reason` names WHICH machine verdict closed it (acquired tolerance, or the
+    learning period), so `incidents all` can tell them apart — they mean very
+    different things and an operator auditing later needs the distinction."""
     cur = db.execute(
         "UPDATE incidents SET status='FALSE_POSITIVE',"
-        "resolution='auto-tolerated',updated_at=?,next_reminder_at=NULL "
+        "resolution=?,updated_at=?,next_reminder_at=NULL "
         "WHERE id=? AND status='OPEN' AND created_at=?",
-        (now, incident_id, now))
+        (reason, now, incident_id, now))
     if cur.rowcount:
         db.execute(
             "INSERT INTO events(occurred_at,observed_at,source,event_type,"
             "incident_id,data_json) VALUES(?,?,?,?,?,?)",
             (now, now, "incident", "incident.lifecycle", incident_id,
              json.dumps({"from": "OPEN", "to": "FALSE_POSITIVE",
-                         "reason_code": "auto-tolerated",
+                         "reason_code": reason,
                          "prior_verdicts": verdicts})))
 
 
@@ -2978,27 +3097,55 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # but an identity the operator has repeatedly reviewed as benign-positive
     # opens pre-closed under acquired tolerance instead of re-alerting.
     tolerance = _tolerance_memory(db, now)
-    disputed = _disputed_identities(db) if tolerance else frozenset()
+    rotating = _rotating_endpoint_memory(db, now)
+    disputed = _disputed_identities(db) if (tolerance or rotating) \
+        else frozenset()
+    learning = _in_learning_period(now)
     for event_id, f in new_events:
         if f.get("category") in suppressed_categories or event_id in attached \
                 or SEV_ORDER.get(f.get("severity"), -1) \
                 < SEV_ORDER["HIGH"]:
             continue
         verdicts = 0
-        if tolerance and f.get("category") in _TOLERANCE_CATEGORIES \
+        if f.get("category") in _TOLERANCE_CATEGORIES \
                 and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]:
-            ident = _tolerance_identity(f.get("fingerprint"))
-            if ident and ident not in disputed:
-                count, reviewed_sev = tolerance.get(ident, (0, -1))
+            fp = f.get("fingerprint")
+            # Two generalizations, same guards: the exact identity (hash and
+            # version churn), then — only for beacons, and only once rotation
+            # is evidenced across distinct addresses — the endpoint class.
+            candidates = []
+            ident = _tolerance_identity(fp)
+            if ident:
+                candidates.append((ident, tolerance))
+            if rotating and not fp.startswith(_NEVER_TOLERATE_PREFIXES):
+                klass = _beacon_endpoint_class(fp)
+                if klass:
+                    candidates.append((klass[0], rotating))
+            for ident, memory in candidates:
+                if ident in disputed:
+                    continue
+                count, reviewed_sev = memory.get(ident, (0, -1))
                 if count and SEV_ORDER.get(f.get("severity"), -1) \
                         <= reviewed_sev:
                     verdicts = count
+                    break
+        # The learning period closes what tolerance has no verdict for yet.
+        # Same exclusions as every other machine verdict: never CRITICAL, never
+        # attack-defined. Checked AFTER tolerance so an identity the operator
+        # actually reviewed is still credited to tolerance in the audit trail.
+        in_learning = bool(
+            learning and not verdicts
+            and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]
+            and not str(f.get("fingerprint") or "").startswith(
+                _NEVER_TOLERATE_PREFIXES))
         incident_id = _upsert_incident(
             db, "signal:" + f["fingerprint"], f["title"],
             f["severity"], "signal", now, [event_id],
-            initially_notified or bool(verdicts))
+            initially_notified or bool(verdicts) or in_learning)
         if verdicts:
             _auto_tolerate(db, incident_id, verdicts, now)
+        elif in_learning:
+            _auto_tolerate(db, incident_id, 0, now, reason="learning-period")
 
 
 def _record_health(db, health, now):
@@ -3054,6 +3201,115 @@ def _record_health(db, health, now):
                        _ACTIVE_INCIDENT_STATES)
 
 
+_LAST_AGED_OUT = 0
+_AGE_OUT_DAYS = 7
+# Never aged out, whatever their age: the chain incidents that ARE the product
+# (a correlated kill chain is not ambient just because it is old), anything
+# CRITICAL, and attack-defined evidence — a tripped decoy or latch is a fact
+# about an attacker, and a quiet week is not an acquittal.
+_AGE_OUT_KINDS = ("signal", "risk")
+
+
+def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
+    """Close OPEN incidents that stopped producing evidence, and say so.
+
+    An incident queue that only ever grows stops being a queue. On this machine
+    it reached 129 open — one of them carrying 87 evidence events over weeks —
+    at which point the list communicates nothing: the operator cannot tell the
+    two items that arrived today from the hundred that have been sitting there,
+    so the whole surface gets ignored. That is a worse failure than a missed
+    alert, because it is silent and it applies to every future alert too.
+
+    An incident whose evidence stopped is a description of the past. It is
+    closed as ambient — retained in full under `incidents all`, reopenable, and
+    counted in the report's ambient line so the closure is visible rather than a
+    disappearance. Evidence RESUMING re-opens it through the ordinary reattach
+    path, which is what makes this safe: age-out forgets a quiet thing, and the
+    thing stops being quiet the moment it acts again.
+
+    Writes NO dismissals row. A machine verdict must never feed backtest
+    precision or acquired tolerance — the same discipline _auto_tolerate holds.
+    """
+    cutoff = now - days * 86400
+    marks = ",".join("?" for _ in _AGE_OUT_KINDS)
+    rows = db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status='OPEN' "
+        "AND kind IN (%s) AND severity<>'CRITICAL' AND updated_at<?" % marks,
+        _AGE_OUT_KINDS + (cutoff,)).fetchall()
+    aged = []
+    for row in rows:
+        key = row["correlation_key"] or ""
+        fp = key[len("signal:"):] if key.startswith("signal:") else key
+        if fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        aged.append(row["id"])
+    if not aged:
+        return 0
+    marks2 = ",".join("?" for _ in aged)
+    db.execute(
+        "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+        "updated_at=?,next_reminder_at=NULL WHERE id IN (%s) AND status='OPEN'"
+        % marks2,
+        ("aged out: no new evidence in %dd (ambient; reopens if it recurs)"
+         % days, now) + tuple(aged))
+    return len(aged)
+
+
+# The exec identity produced by _exec_identity always ends in "|<12 hex>".
+_NEW_EXEC_ID_RE = re.compile(r"\|[0-9a-f]{12}$")
+
+
+def _is_legacy_exec_fingerprint(fp):
+    """True for an agent-surface fingerprint minted under the RETIRED positional
+    exec identity ("<json-pointer>|<cmd>"), which no live scan can ever produce
+    again."""
+    for prefix, trailing_sha in (("agent-surface:newexec:", False),
+                                 ("agent-surface:target:", True),
+                                 ("agent-surface:materialized:", True)):
+        if not fp.startswith(prefix):
+            continue
+        body = fp[len(prefix):]
+        if trailing_sha:
+            body = body.rsplit(":", 1)[0]    # drop the trailing target sha12
+        return "|" in body and not _NEW_EXEC_ID_RE.search(body)
+    return False
+
+
+def _retire_legacy_exec_incidents(db, now):
+    """One-time: close incidents keyed on the retired positional exec identity.
+
+    Changing what identifies an exec entry orphans every incident minted under
+    the old scheme — the sensor can no longer emit those fingerprints, so no
+    future evidence can ever reattach to them and no operator verdict on them
+    can ever be reused. Left alone they would sit OPEN forever (age-out would
+    take them eventually, but as 'ambient', which misdescribes why they closed).
+
+    They are closed as SUPERSEDED, with their evidence intact: whatever they
+    described, if it is still true, re-alerts under the new identity on the very
+    next scan. Guarded by a meta key so it runs once per upgrade, not per scan.
+    """
+    if db.execute("SELECT value FROM meta WHERE key='exec_identity_migrated'"
+                  ).fetchone():
+        return 0
+    aged = [row["id"] for row in db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status IN "
+        "('OPEN','ACK') AND correlation_key LIKE 'signal:agent-surface:%'")
+        if _is_legacy_exec_fingerprint(
+            (row["correlation_key"] or "")[len("signal:"):])]
+    if aged:
+        marks = ",".join("?" for _ in aged)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: exec entries are now identified by the command they "
+             "run, not their position in the config — re-alerts under the new "
+             "identity if still present", now) + tuple(aged))
+    db.execute("INSERT INTO meta(key,value) VALUES('exec_identity_migrated',?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+               (str(now),))
+    return len(aged)
+
+
 def record_security_state(findings, sensor_health=(), now=None,
                           initially_notified=False,
                           suppressed_categories=frozenset()):
@@ -3090,6 +3346,25 @@ def record_security_state(findings, sensor_health=(), now=None,
             _record_health(db, sensor_health, now)
             _apply_correlations(db, new_events, now, initially_notified,
                                 frozenset(suppressed_categories))
+            # AFTER correlation: anything that produced evidence this scan has
+            # just had updated_at refreshed, so only genuinely quiet incidents
+            # are candidates. Ordering matters — the reverse would age out an
+            # incident in the same breath as its new evidence.
+            try:
+                retired = _retire_legacy_exec_incidents(db, now)
+                if retired:
+                    log_run("retired %d incident(s) keyed on the old positional "
+                            "exec identity" % retired)
+            except Exception as e:
+                log_run("exec-identity migration skipped: %s" % e)
+            try:
+                global _LAST_AGED_OUT
+                aged = _age_out_incidents(db, now)
+                _LAST_AGED_OUT = aged
+                if aged:
+                    log_run("aged out %d ambient incident(s)" % aged)
+            except Exception as e:
+                log_run("age-out skipped: %s" % e)
             db.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON "
                        "CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
         # Bound raw observations while retaining materialized signals/incidents.
@@ -4125,6 +4400,17 @@ def check_persistence(baseline_snap, current_snap):
                         else _custody_persistence(old, rec)
                         or (_custody(path, rec.get("sha256"))[0]
                             if _intent_worthy(path) else None))
+                # A job of the dominant `<interpreter> <script>` shape mutates
+                # by having its SCRIPT rewritten — the config file is untouched,
+                # so grading only `path` can never see who did it and every
+                # payload update reads as a swap. Ask the ledger about the
+                # payload that actually changed. Same rung, same demote-only
+                # ladder, same attack-defined refusal above.
+                if prov is None and target_changed:
+                    tgt = rec.get("script_target") or _script_target(
+                        rec.get("args"), rec.get("program"))
+                    if tgt and rec.get("target_sha") and _intent_worthy(tgt):
+                        prov = _custody(tgt, rec.get("target_sha"))[0]
                 graded = _demote(sev, prov, attack_defined=attack_defined)
                 detail = _persistence_change_detail(
                     rec["label"], old, rec,
@@ -9485,6 +9771,54 @@ def _intent_worthy(path):
                for r in AGENT_CONFIG_ROOTS if os.path.isdir(r))
 
 
+def cmd_learn(argv):
+    """CLI: `learn [status|start [days]|extend <days>|done]`.
+
+    Exists because the learning period is only automatic for a FRESH install,
+    and the machine that most needs one is usually an existing install whose
+    operator has stopped reading the report. `learn start` gives them a way to
+    draw a line and rebuild the envelope from evidence."""
+    sub = argv[2] if len(argv) > 2 else "status"
+    now = int(_epoch())
+    if sub == "status":
+        until = _learning_until()
+        if not until:
+            print("learning period: not active")
+            print("  start one with: %s learn start [days]  (default %d)"
+                  % (_SELF_PATH, _LEARNING_DEFAULT_DAYS))
+            return 0
+        if now >= until:
+            print("learning period: ENDED %s"
+                  % time.strftime("%Y-%m-%d", time.localtime(until)))
+            return 0
+        print("learning period: ACTIVE — %d day(s) remaining (ends %s)"
+              % (max(0, (until - now + 86399) // 86400),
+                 time.strftime("%Y-%m-%d", time.localtime(until))))
+        print("  Non-CRITICAL findings are recorded and correlated but open "
+              "pre-closed as 'learning'\n  instead of alerting. CRITICAL chains "
+              "and tripped decoys/latches still alert.")
+        return 0
+    if sub in ("start", "extend"):
+        try:
+            days = int(argv[3]) if len(argv) > 3 else _LEARNING_DEFAULT_DAYS
+        except ValueError:
+            print("usage: aegis.py learn %s [days]" % sub)
+            return 1
+        if days <= 0:
+            print("usage: aegis.py learn %s [days]  (days must be > 0)" % sub)
+            return 1
+        until = _set_learning_period(days)
+        print("learning period active for %d day(s) — ends %s"
+              % (days, time.strftime("%Y-%m-%d", time.localtime(until))))
+        return 0
+    if sub == "done":
+        _set_learning_period(0)
+        print("learning period ended — full alerting restored")
+        return 0
+    print("usage: aegis.py learn [status|start [days]|extend <days>|done]")
+    return 1
+
+
 def cmd_intent(argv):
     """CLI: `intent record <path> [tool]` | `intent hook <tool>` |
     `intent list [n]`. Hook mode reads the harness's tool-call JSON on stdin,
@@ -9754,7 +10088,11 @@ def snapshot_agent_surface():
                     if sig.get("team"):
                         ent["target_team"] = sig["team"]
                         ent["target_trust"] = sig["trust"]
-                execs["%s|%s" % (label, cmd)] = ent
+                # `label` is the positional JSON pointer. It stays in the
+                # record for the report ("where is this hook?") but must not
+                # be part of the identity — see _exec_identity.
+                ent["label"] = label
+                execs[_exec_identity(cmd, args)] = ent
             rec["execs"] = execs
         if os.path.basename(p) in AGENT_INSTRUCTION_NAMES or p.endswith(".md"):
             marks = _imperative_signals(text)
@@ -9763,6 +10101,49 @@ def snapshot_agent_surface():
             rec["lines"] = len(text.splitlines())
         snap[p] = rec
     return snap
+
+
+def _exec_identity(cmd, args):
+    """The stable identity of an exec-capable config entry: WHAT RUNS, never
+    WHERE IT SITS.
+
+    The identity used to be "<json-pointer>|<cmd>" — and the pointer is
+    positional (`hooks.SessionStart[4].hooks[0]`). Inserting one hook renumbers
+    every later sibling, so each one presented as a *deleted* old entry plus a
+    *brand-new* exec registration and re-opened a fresh HIGH incident. One hook
+    added at the top of a list could re-alert the whole list; 55 of the 67
+    un-generalizable open incidents on this machine were that cascade, all of
+    them the same handful of unchanged commands.
+
+    Position is not a security fact — the command and its arguments are what
+    execute with the operator's authority. Keying identity on those makes a
+    renumbering silent and a genuinely new command loud, which is the
+    distinction the sensor exists to draw. Two entries in one file that run the
+    identical command collapse to one identity deliberately: that is one
+    execution capability, and it should alert once."""
+    blob = "\x00".join([str(cmd or "")] + [str(a) for a in (args or [])])
+    return "%s|%s" % (
+        str(cmd or "")[:120],
+        hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:12])
+
+
+def _migrate_exec_keys(execs):
+    """Re-key a possibly-legacy exec snapshot onto _exec_identity.
+
+    Baselines written before the identity fix carry positional keys. Re-keying
+    the PRIOR side at diff time makes the upgrade silent (the entries match and
+    nothing alerts) instead of presenting every baselined entry as new — the
+    exact storm this fix exists to end. Lossless: the ent already carries the
+    cmd/args the identity is derived from."""
+    if not execs:
+        return {}
+    out = {}
+    for key, ent in execs.items():
+        if not isinstance(ent, dict) or not ent.get("cmd"):
+            out[key] = ent          # unparseable: keep as-is, never drop
+            continue
+        out[_exec_identity(ent.get("cmd"), ent.get("args"))] = ent
+    return out
 
 
 def diff_agent_surface(prior, cur):
@@ -9789,8 +10170,13 @@ def diff_agent_surface(prior, cur):
     for path, rec in cur.items():
         old = prior.get(path)
         try:
-            execs = rec.get("execs") or {}
-            old_execs = (old or {}).get("execs") or {}
+            # BOTH sides are normalized onto _exec_identity. The current side
+            # is already in that form when it comes from snapshot_agent_surface,
+            # so this is a no-op there — but it makes the diff independent of
+            # the caller's key vintage rather than silently mis-diffing a
+            # legacy-shaped snapshot as "everything is new".
+            execs = _migrate_exec_keys(rec.get("execs") or {})
+            old_execs = _migrate_exec_keys((old or {}).get("execs") or {})
             for key, e in execs.items():
                 oe = old_execs.get(key)
                 if old is not None and oe is None:
@@ -9798,11 +10184,13 @@ def diff_agent_surface(prior, cur):
                     findings.append(finding(
                         _demote("HIGH", prov), "agent-surface",
                         "New agent exec entry registered",
-                        "%s registered a new executable entry: %s %s\nResolved "
-                        "target: %s\n%s\nAn MCP server or tool hook runs with "
-                        "your full authority every time the agent starts."
+                        "%s registered a new executable entry: %s %s\nAt: %s"
+                        "\nResolved target: %s\n%s\nAn MCP server or tool hook "
+                        "runs with your full authority every time the agent "
+                        "starts."
                         % (path, e.get("cmd"),
                            (" ".join(e.get("args") or []))[:400],
+                           e.get("label") or "(position unrecorded)",
                            e.get("target") or "(unresolved)", note),
                         "agent-surface:newexec:%s:%s" % (path, key),
                         path=path, program=e.get("target") or e.get("cmd"),
@@ -10995,39 +11383,181 @@ def gather_all(baseline_snap, current_snap, health=None):
     return findings
 
 
-def write_report(findings, first_run, incidents=None, sensor_health=None):
+VERDICT_ICON = {"alert": "🔴", "minor": "🟡", "clear": "🟢", "learning": "🔵"}
+
+
+def _report_self_check(verdict, new_findings, findings, incidents):
+    """Assert the headline against the findings it claims to summarize.
+
+    A report is a summariser: it reduces N findings and M incidents to one line
+    that most readers will never read past. That makes exactly one failure mode
+    catastrophic and invisible — a headline that contradicts its own input. Tests
+    cover the cases we thought of; this covers the case the machine is actually
+    in, on real data, every run.
+
+    Returns a list of contradictions (empty = consistent). The caller PUBLISHES
+    the result: a silent check reassures the author, a printed one tells the
+    reader how much was verified.
+    """
+    problems = []
+    worst_new = max([SEV_ORDER.get(f.get("severity"), -1) for f in new_findings]
+                    or [-1])
+    if verdict == "clear" and new_findings:
+        problems.append("headline says nothing new, but %d finding(s) are new"
+                        % len(new_findings))
+    if verdict in ("clear", "minor") and worst_new >= SEV_ORDER["HIGH"]:
+        problems.append("headline is not an alert, but a new finding is %s"
+                        % SEV_NAMES[worst_new])
+    if verdict == "alert" and worst_new < SEV_ORDER["HIGH"]:
+        problems.append("headline claims an alert with no new HIGH+ finding")
+    open_crit = [i for i in (incidents or [])
+                 if i.get("severity") == "CRITICAL"]
+    if open_crit and verdict in ("clear", "minor", "learning"):
+        problems.append("headline says %s with %d open CRITICAL incident(s)"
+                        % (verdict, len(open_crit)))
+    if verdict == "standing" and not open_crit:
+        problems.append("headline claims a standing CRITICAL with none open")
+    return problems
+
+
+def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
+                  learning_days, aged):
+    """The one-line-verdict report. Detail lives behind `report --full`."""
     counts = {}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
-    lines = []
-    lines.append("# Aegis report - %s" % now_iso())
-    lines.append("")
-    if first_run:
-        lines.append("> First run: baseline established. Persistence items above "
-                     "are recorded as known-good; you will only be alerted about "
-                     "NEW/changed persistence from now on.")
-        lines.append("")
-    summary = "  ".join("%s %s %d" % (SEV_ICON[s], s, counts[s])
-                        for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
-                        if counts.get(s))
-    lines.append("**Summary:** %s" % (summary or "no findings"))
-    lines.append("")
+    worst_new = max([SEV_ORDER.get(f.get("severity"), -1) for f in new_findings]
+                    or [-1])
+    incidents = incidents or []
+    crit = [i for i in incidents if i.get("severity") == "CRITICAL"]
+    # Order matters, and an open CRITICAL outranks everything below it. A
+    # standing unresolved kill chain is not a quiet machine, and it is not
+    # something a learning period gets to sit on either — the first draft of
+    # this function printed "Nothing new" over two open CRITICAL chains, and
+    # the self-check below is what caught it on real data.
+    n_new_high = len([f for f in new_findings
+                      if SEV_ORDER.get(f["severity"], -1) >= SEV_ORDER["HIGH"]])
+    if worst_new >= SEV_ORDER["HIGH"]:
+        verdict = "alert"
+    elif crit:
+        verdict = "standing"
+    elif learning_days:
+        verdict = "learning"
+    elif new_findings:
+        verdict = "minor"
+    else:
+        verdict = "clear"
     degraded = [h for h in (sensor_health or []) if h.get("status") != "OK"]
+    total_sensors = len(sensor_health or [])
+
+    lines = ["# Aegis — %s" % now_iso(), ""]
+    if verdict == "alert":
+        head = "%s **%d NEW alert%s need you.**" % (
+            VERDICT_ICON["alert"], n_new_high, "" if n_new_high == 1 else "s")
+    elif verdict == "standing":
+        head = ("%s **%d CRITICAL incident%s still open** — nothing new this "
+                "scan." % (VERDICT_ICON["alert"], len(crit),
+                           "" if len(crit) == 1 else "s"))
+    elif verdict == "minor":
+        head = "%s **%d new finding%s, none above MEDIUM.**" % (
+            VERDICT_ICON["minor"], len(new_findings),
+            "" if len(new_findings) == 1 else "s")
+    elif verdict == "learning":
+        head = ("%s **Learning this machine — %d day%s left.** Recording "
+                "everything; alerting only on CRITICAL chains and tripped "
+                "decoys." % (VERDICT_ICON["learning"], learning_days,
+                             "" if learning_days == 1 else "s"))
+    else:
+        head = "%s **Nothing new.**" % VERDICT_ICON["clear"]
+    lines += [head, ""]
+
+    ctx = ["%d finding%s this scan" % (len(findings),
+                                       "" if len(findings) == 1 else "s")]
+    ctx.append("%d incident%s open" % (len(incidents),
+                                       "" if len(incidents) == 1 else "s"))
+    if crit:
+        ctx.append("**%d CRITICAL**" % len(crit))
+    if total_sensors:
+        ctx.append("%d/%d sensors OK" % (total_sensors - len(degraded),
+                                         total_sensors))
+    if aged:
+        ctx.append("%d aged out as ambient" % aged)
+    lines += ["- " + " · ".join(ctx), ""]
+
+    if first_run:
+        lines += ["> First run: baseline established. Persistence items are "
+                  "recorded as known-good; only NEW/changed persistence alerts "
+                  "from here.", ""]
+
+    top = [f for f in new_findings
+           if SEV_ORDER.get(f["severity"], -1) >= SEV_ORDER["HIGH"]][:5]
+    if top:
+        lines.append("## New since last scan")
+        for f in top:
+            lines.append("- %s **%s** — %s" % (
+                SEV_ICON[f["severity"]], f["title"],
+                (f["detail"] or "").splitlines()[0][:160]))
+        lines.append("")
+    if crit:
+        lines.append("## Open CRITICAL incidents")
+        for i in crit[:5]:
+            lines.append("- %s **#%s %s** — %s (%s evidence event%s)" % (
+                SEV_ICON.get(i.get("severity"), "?"), i.get("id"),
+                i.get("title"), i.get("status"), i.get("evidence_count", 0),
+                "" if i.get("evidence_count") == 1 else "s"))
+        lines.append("")
     if degraded:
         lines.append("## Coverage health")
         for h in degraded:
-            lines.append("- ? **%s: %s** — %s" %
-                         (h.get("sensor_id"), h.get("status"),
-                          h.get("detail") or "coverage unavailable"))
+            lines.append("- **%s: %s** — %s" % (
+                h.get("sensor_id"), h.get("status"),
+                h.get("detail") or "coverage unavailable"))
+        lines.append("")
+
+    problems = _report_self_check(verdict, new_findings, findings, incidents)
+    if problems:
+        # At the TOP of what the reader sees next, not the bottom: someone who
+        # trusts the first paragraph must not have to reach the last line to
+        # learn it was wrong.
+        lines.insert(2, "> ⚠️ **REPORT SELF-CHECK FAILED — do not trust the "
+                        "headline above.** " + "; ".join(problems))
+        lines.insert(3, "")
+    else:
+        lines.append("_Self-check: headline verified against %d finding(s) and "
+                     "%d incident(s)._" % (len(findings), len(incidents)))
+    lines.append("_Full detail: `aegis.py report --full` · incidents: "
+                 "`aegis.py incidents`_")
+    return "\n".join(lines) + "\n"
+
+
+def _full_report(payload):
+    """The complete, grouped report, rendered from the durable latest.json."""
+    findings = payload.get("findings") or []
+    incidents = payload.get("incidents") or []
+    health = payload.get("sensor_health") or []
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    lines = ["# Aegis report (full) - %s" % payload.get("ts", ""), ""]
+    summary = "  ".join("%s %s %d" % (SEV_ICON[s], s, counts[s])
+                        for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+                        if counts.get(s))
+    lines += ["**Summary:** %s" % (summary or "no findings"), ""]
+    degraded = [h for h in health if h.get("status") != "OK"]
+    if degraded:
+        lines.append("## Coverage health")
+        for h in degraded:
+            lines.append("- **%s: %s** — %s" % (
+                h.get("sensor_id"), h.get("status"),
+                h.get("detail") or "coverage unavailable"))
         lines.append("")
     if incidents:
         lines.append("## Active incidents")
-        for incident in incidents:
+        for i in incidents:
             lines.append("- %s **#%s %s** — %s (%s evidence event%s)" % (
-                SEV_ICON.get(incident.get("severity"), "?"), incident.get("id"),
-                incident.get("title"), incident.get("status"),
-                incident.get("evidence_count", 0),
-                "" if incident.get("evidence_count") == 1 else "s"))
+                SEV_ICON.get(i.get("severity"), "?"), i.get("id"),
+                i.get("title"), i.get("status"), i.get("evidence_count", 0),
+                "" if i.get("evidence_count") == 1 else "s"))
         lines.append("")
     if not findings:
         lines.append("_No findings._")
@@ -11039,12 +11569,38 @@ def write_report(findings, first_run, incidents=None, sensor_health=None):
                 lines.append("## %s" % cur)
             lines.append("- %s **%s** — %s" % (
                 SEV_ICON[f["severity"]], f["title"], f["detail"]))
-    md = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def write_report(findings, first_run, incidents=None, sensor_health=None,
+                 prior_seen=None, aged=0):
+    """Write the brief report to latest.md and the full payload to latest.json.
+
+    The report this replaced opened with ninety red bullets and ran 208 lines,
+    which is a way of saying nothing at all: an operator cannot find the two
+    things that arrived today in a wall of things that have been there for
+    weeks, so they stop opening it. What a monitor owes its reader first is a
+    verdict — and then, only if the verdict is interesting, the evidence.
+    """
+    incidents = incidents or []
+    if prior_seen is None:
+        new_findings = list(findings)   # unknown history: treat all as new,
+    else:                               # which can only over-report, never under
+        new_findings = [f for f in findings
+                        if f.get("fingerprint") not in prior_seen]
+    now = int(_epoch())
+    until = _learning_until()
+    learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
+    md = _brief_report(findings, new_findings, incidents, sensor_health,
+                       first_run, learning_days, aged)
     with open(LATEST_MD, "w", encoding="utf-8") as f:
         f.write(md)
-    save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings})
+    save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings,
+                            "incidents": incidents,
+                            "sensor_health": list(sensor_health or []),
+                            "new_fingerprints": [f.get("fingerprint")
+                                                 for f in new_findings]})
     return md
-
 
 SEEN_MAX = 10000  # bound the dedup ledger; findings.jsonl is the durable record
 
@@ -11250,6 +11806,10 @@ def _cmd_scan_locked(quiet=False):
         baseline["trust"] = "unverified"
         baseline["persistence"] = current
         baseline["shell_history_adopted"] = True
+        # A fresh install knows nothing about this machine yet; give it a window
+        # to learn before it starts interrupting. See _in_learning_period.
+        baseline["learning_until"] = int(_epoch()) + \
+            _LEARNING_DEFAULT_DAYS * 86400
         save_json(BASELINE, baseline)
     elif baseline is not None and not baseline.get("shell_history_adopted"):
         adopt.add("shell-history")
@@ -11276,6 +11836,10 @@ def _cmd_scan_locked(quiet=False):
                       "binaries were NOT vouched for" % _SIG_PROBE_FAILURES,
             "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
 
+    # Captured BEFORE emit, which is what updates the ledger: this is the set
+    # the previous scan had already reported, and the difference against it is
+    # the report's "new since last scan".
+    prior_seen = set(load_json(SEEN, {}))
     new_high = emit(findings, first_run, adopt=adopt)
     # Pre-authorized reversible response, if the operator armed any. Runs
     # AFTER emit so the report is written before anything acts on it, and is
@@ -11309,7 +11873,8 @@ def _cmd_scan_locked(quiet=False):
         log_run("event-store failure: %s" % e)
         incidents, persisted_health = [], health
     md = write_report(findings, first_run, incidents=incidents,
-                      sensor_health=persisted_health)
+                      sensor_health=persisted_health, prior_seen=prior_seen,
+                      aged=_LAST_AGED_OUT)
     flush_sigcache()
     record_selfstate()
     # Extend the tamper-evidence chain AFTER state is settled, so the link
@@ -11483,7 +12048,14 @@ def cmd_canary(action="plant"):
     return 0
 
 
-def cmd_report():
+def cmd_report(full=False):
+    if full:
+        payload = load_json(LATEST_JSON, None)
+        if not payload:
+            print("No report yet. Run: aegis.py scan")
+            return 0
+        sys.stdout.write(_full_report(payload))
+        return 0
     if os.path.exists(LATEST_MD):
         with open(LATEST_MD, encoding="utf-8") as f:
             sys.stdout.write(f.read())
@@ -16270,6 +16842,21 @@ def _install_runtime_copy():
     shutil.copyfile(src, tmp)
     os.chmod(tmp, 0o700)
     os.replace(tmp, dst)
+    # Attest the copy we just made. Aegis's own upgrade rewrites the payload
+    # its launchd job runs, which is — structurally — indistinguishable from
+    # an attacker swapping that payload, and so alerted HIGH every time the
+    # operator updated Aegis. The tool's loudest recurring alert being its own
+    # install is how a monitor teaches its operator to ignore it.
+    #
+    # This does NOT self-exempt: it writes one ordinary intent record, so the
+    # SAME custody ladder every other surface uses grades the change, and the
+    # finding is still reported (LOW) rather than suppressed. A payload swapped
+    # by anything that did not come through `install` records nothing and stays
+    # HIGH, which is the case that actually matters.
+    try:
+        intent_record(dst, "aegis-install")
+    except Exception:
+        pass    # an unattested install is noisier, never broken
     return dst
 
 
@@ -18141,7 +18728,19 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
 
  DETECT (default; runs on the scheduled interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
-  report           print the latest report
+  report [--full]  print the latest report. The default is the BRIEF report:
+                   one verdict line, what is new since the last scan, open
+                   CRITICALs, and degraded coverage. `--full` renders every
+                   finding grouped by category, from the same latest.json
+  learn [status|start [days]|extend <days>|done]
+                   the learning period. A fresh install starts one
+                   automatically (14d): everything is still recorded and
+                   correlated, but a non-CRITICAL signal opens PRE-CLOSED as
+                   'learning' instead of alerting, so the picture of normal is
+                   built from evidence rather than from your patience.
+                   CRITICAL chains and tripped decoys/latches always alert.
+                   `learn start` begins one on an EXISTING install — the case
+                   that usually needs it most
   status           print hardening, XProtect, sensor coverage, and incidents
   doctor           verify actual coverage/liveness (unknown is never green)
   incidents [all]  list active incidents (or complete history)
@@ -18338,7 +18937,7 @@ def main(argv):
     if cmd == "scan":
         return cmd_scan()
     if cmd == "report":
-        return cmd_report()
+        return cmd_report(full=(len(argv) > 2 and argv[2] in ("--full", "full")))
     if cmd == "status":
         return cmd_status()
     if cmd == "doctor":
@@ -18352,6 +18951,8 @@ def main(argv):
     if cmd == "incident" and len(argv) > 2:
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
+    if cmd == "learn":
+        return cmd_learn(argv)
     if cmd == "intent":
         return cmd_intent(argv)
     if cmd == "signers":
