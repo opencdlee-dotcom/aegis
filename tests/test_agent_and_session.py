@@ -783,6 +783,25 @@ class TestWritEnforcementIsActuallyWired(AgentSandbox):
                          aegis._SURFACE_WRIT_SCOPE.get("brand_new_surface",
                                                        "persistence"))
 
+    def test_apply_writ_reads_state_once_for_the_whole_batch(self):
+        aegis.save_json(aegis.WRIT_FILE, {"enforcing": True, "writs": []})
+        findings = [self._finding() for _ in range(100)]
+        real_load = aegis.load_json
+        reads = []
+
+        def counting_load(path, default):
+            if path == aegis.WRIT_FILE:
+                reads.append(path)
+            return real_load(path, default)
+
+        aegis.load_json = counting_load
+        try:
+            out = aegis._apply_writ(findings, "shellrc")
+        finally:
+            aegis.load_json = real_load
+        self.assertEqual(100, len(out))
+        self.assertEqual(1, len(reads), "writ state was re-read per finding")
+
 
 # --------------------------------------------------------------------------- #
 # Extension capability grading

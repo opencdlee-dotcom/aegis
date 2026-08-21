@@ -165,6 +165,27 @@ lookup rather than an investigation. And corroboration is scored, not just
 counted: two *different* sensors implicating one entity outranks the same number
 of hits from one sensor.
 
+**And the output is kept readable, because attention is the real budget.** A
+detector that files more alerts than you can read has not made you safer — it
+has taught you to ignore it, and that lesson applies to every future alert too.
+So: a new install spends its first two weeks **learning** (`aegis.py learn` —
+everything recorded and correlated, but non-CRITICAL signals open pre-closed
+instead of interrupting, because every ordinary thing a detector has not yet
+seen is new by construction); an exec entry is identified by **the command it
+runs**, never its position in a config file, so inserting one hook cannot
+re-alert the twenty below it; an incident that stops producing evidence **ages
+out as ambient** after a week and reopens the moment it recurs; Aegis's own
+upgrade is **attested by `install`** and graded down the ordinary custody
+ladder, rather than the tool's loudest recurring alert being itself. `report`
+leads with one verdict line and what changed since the last scan; `report
+--full` still has everything.
+
+That report is a summariser, so it **checks its own headline against the
+findings it summarizes on every run and publishes the result** — a
+contradiction is printed at the top, above the evidence. It has already earned
+that: on its first run against live data it caught a green "nothing new"
+printed over two open CRITICAL chains.
+
 ---
 
 ## Install / use
@@ -197,7 +218,9 @@ python3 aegis.py update-check            # is ~/.aegis/aegis.py stale behind thi
 python3 aegis.py scan          # run once, print report, establish baseline
 python3 aegis.py status        # fast hardening posture + XProtect definition age
 python3 aegis.py doctor        # coverage/permission/sensor-health diagnostics
-python3 aegis.py report        # reprint the latest report
+python3 aegis.py report        # reprint the brief report (verdict + what's new)
+python3 aegis.py report --full # every finding, grouped by category
+python3 aegis.py learn         # learning-period status (start|extend|done)
 python3 aegis.py baseline      # accept current state as known-good (resets diff)
 python3 aegis.py incidents     # active incidents, evidence count, and state
 python3 aegis.py incident ID   # evidence, KNOWN BENIGN CAUSES for the sensors
@@ -211,6 +234,21 @@ python3 aegis.py replay [days] # backtest the CURRENT correlation logic against
                                #   recorded history (default 30d). READ-ONLY:
                                #   opens no incident, sends no notification —
                                #   run it after changing detection logic
+python3 aegis.py intent record PATH [tool]   # attest an agent config/script you
+                               #   just authored: MAC'd {ts,path,sha256,tool}
+                               #   line in ~/.aegis/intent.jsonl. A delegate-
+                               #   surface change matching a valid record
+                               #   grades LOW (self-attested) instead of HIGH
+python3 aegis.py intent hook TOOL   # harness post-write hook mode: reads the
+                               #   tool-call JSON on stdin, attests the written
+                               #   file; prints nothing, always exits 0
+python3 aegis.py intent list   # recent attestations + MAC validity
+python3 aegis.py signers pin FILE   # pin a device roster (principal ssh-key
+                               #   lines) — a commit arriving from another of
+                               #   YOUR machines whose SSH signature verifies
+                               #   against the PINNED roster grades LOW
+                               #   (fleet-signed) instead of poisoned-repo HIGH
+python3 aegis.py signers status # show the pinned roster
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)
@@ -395,7 +433,7 @@ scheduled task is future work, and the gap is stated rather than implied.
 
 | Command / sensor | What it does | Notes |
 |---|---|---|
-| **agent-surface** *(sensor)* | Baselines and diffs the AI-agent trust surface: MCP server registrations, tool-hook configs, and instruction files. Alerts on a **new exec entry**, a **changed resolved target**, or a **new semantic imperative**. | Coverage here was previously **zero** (no matches for `mcp`, `claude_desktop`, `.envrc`, `tasks.json`, `git/hooks` anywhere in the file) while this channel appears in a documented majority of 2026 agent-delivered campaigns. |
+| **agent-surface** *(sensor)* | Baselines and diffs the AI-agent trust surface: MCP server registrations, tool-hook configs, and instruction files. Alerts on a **new exec entry**, a **changed resolved target**, or a **new semantic imperative** — each structural change graded by **chain of custody** (a signed intent-ledger record or a commit *created on this machine* by the repo's own identity grades LOW; a same-team re-signed target grades MEDIUM; anything the machine cannot claim stays HIGH, and attack-defined content never downgrades). | Coverage here was previously **zero** (no matches for `mcp`, `claude_desktop`, `.envrc`, `tasks.json`, `git/hooks` anywhere in the file) while this channel appears in a documented majority of 2026 agent-delivered campaigns. |
 | **session-theft** *(sensor)* | Flags a browser driven against **its own live profile** — `--remote-debugging-port`, `--load-extension`, `--user-data-dir` aimed at the real profile. | Cookie-store coverage was also **zero**: the only three `cookie` matches in 11,805 lines were redaction regexes. |
 | **session-binding** *(sensor)* | Reports App-Bound Encryption / DBSC posture once at baseline, then only on change. A binding **removal** is HIGH. | Designed to convert into a bound-session counter when macOS DBSC ships, rather than be deleted. |
 | `cauterize [incident] [done N]` | The dependency-ordered revocation plan derived from this disk. | Reads **no secret bytes** — presence and `stat()` only. |

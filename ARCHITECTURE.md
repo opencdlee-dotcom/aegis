@@ -59,7 +59,7 @@ Three rules keep this honest rather than merely portable:
 | Pre-commit | Latched persistence surfaces (`chflags uchg` / deny-write ACE) and FIFO credential decoys, both placed **before** any attack | Makes the attacker's write fail rather than reporting it afterwards; a cleared latch or a read decoy is attack-defined evidence |
 | Contain | Manual process action, **reversible freeze**, and transactional file/app quarantine | Stops a reviewed threat while retaining reversible evidence |
 | Prove detection | Positive-control assay per detector, with an efficacy half-life; every lane asserts **both** poles, and the delegate/session tier is covered too | Distinguishes "nothing found" from "no longer able to find"; unproven coverage is reported as unproven. A hostile-pole-only lane passes against a detector hardwired to say yes, and a benign-pole-only lane passes against a dead one — so a lane that checks one pole proves nothing |
-| Delegate-surface | Agent config discovered by **shape** (a `command`+`args` pair under an agent directory), hashed by **resolved target** rather than by config line, plus a semantic imperative detector for instruction files and git-derived provenance for each added line | An AI agent runs with the operator's full authority and takes instruction from files; an MCP registration is exec-on-start, a hook body is exec-per-tool-call, and a natural-language imperative is an execution primitive with no shell syntax for any grammar to match |
+| Delegate-surface | Agent config discovered by **shape** (a `command`+`args` pair under an agent directory), hashed by **resolved target** rather than by config line, plus a semantic imperative detector for instruction files and a **chain-of-custody grade** for each structural change (signed intent ledger, then git provenance, then signer stability) | An AI agent runs with the operator's full authority and takes instruction from files; an MCP registration is exec-on-start, a hook body is exec-per-tool-call, and a natural-language imperative is an execution primitive with no shell syntax for any grammar to match |
 | Session | Browser automation aimed at the **live** profile (debug port, sideloaded extension, real `--user-data-dir`), plus session-binding posture | Post-App-Bound-Encryption, cookie theft is the browser being driven against itself rather than a jar being copied; live cookies defeat MFA and their revocation belongs to the counterparty |
 | Recover-plan | Dependency-ordered revocation derived from the credential artifacts actually present on disk | The question after a theft is not "what happened" but "which accounts are theirs, in what order do I take them back" — and rotating in the wrong order hands over the reset link |
 | Witness | Hash-chained state anchored into the OS's root-owned log store | An attacker who tampers, or who stops the monitor, cannot do so silently |
@@ -198,10 +198,216 @@ guards because they answer the same adversarial pressures:
   footer on the active listing, and one `reopen` both re-alerts and revokes the
   tolerance (reopening deletes the dismissal rows the count was built on).
 
+### Chain of custody (all sensors)
+
+The dominant benign churn on the delegate surface is not vendor updates — it is
+the operator's *own* agent tooling registering hooks, MCP servers, and skills,
+often through the operator's own git remote. Provenance that only asks "is this
+commit on a remote?" labels all of it with the poisoned-repo warning, and nine
+self-inflicted HIGHs in one day is how the one foreign HIGH eventually gets
+dismissed unread. Custody grading answers the question that actually
+discriminates: **can this machine claim authorship of this change?**
+
+Custody began on the delegate surface and now grades every sensor. Two
+families of rung, in order; the first that vouches sets the grade. The
+**authorship** rungs (1-4) answer *did this machine make this change?*; the
+**origin** rungs (5-7) answer the weaker but far more common question *did
+this arrive through something the operator set up?*
+
+1. **Signed intent ledger** (`~/.aegis/intent.jsonl`). The agent harness calls
+   `aegis.py intent hook <tool>` after each file-writing tool call; Aegis
+   appends one HMAC'd `{ts, path, sha256, tool}` record. A change whose content
+   hash matches a valid record is `self-attested` → **LOW**. This covers what
+   git cannot: untracked files and binaries outside any repo.
+2. **Git self-vs-foreign**. A commit is `self-committed` → **LOW** only when two
+   independent records agree: its author email equals the repo's configured
+   `user.email`, *and* the HEAD reflog remembers it being **created** here (a
+   local commit enters the reflog as `commit:`; a pulled one as
+   `pull:`/`merge:`/`clone:`, never `commit:`). Reachable from a remote with no
+   local authorship record is `remote-foreign` → **HIGH** with the
+   poisoned-repo warning — pushing your own commit does not make it foreign,
+   and pulling someone else's never becomes yours.
+3. **Fleet signature** (the multi-device rung). A commit that arrived from
+   elsewhere but carries an SSH signature verifying against the **pinned**
+   device roster (`~/.aegis/allowed_signers`) is `fleet-signed` → **LOW**: it
+   was made on one of the operator's own machines, and a signature is the one
+   custody evidence that survives transport. The roster is written only by the
+   explicit `signers pin` command — a roster synced or tracked through the repo
+   itself is merely the *source* the operator pins from, so a poisoned remote
+   that adds an attacker key to the tracked copy changes nothing until a human
+   re-pins. Verification is asymmetric: this machine holds nothing that can
+   *make* a trusted signature, only what checks one. Only an exact `G` verdict
+   vouches; unsigned, bad, unknown-key, expired, and error are all non-matches.
+4. **Signer stability** (changed-target findings only). A resolved target
+   re-signed by the **same team** that signed its baselined content is the
+   exact shape of a vendor updating its own binary → **MEDIUM** (recorded, can
+   corroborate, opens no incident alone). The team is captured at snapshot
+   time, so an old baseline without one fails toward HIGH, never toward quiet.
+
+The origin rungs exist because the delegate surface was never where the volume
+was. `persistence.diff`, `process`, `net-listener`, `net-outbound` and
+`net-beacon` scored on code signature plus path writability alone — two axes on
+which a Homebrew daemon, a VSCode extension helper and a dropped payload are
+indistinguishable, because ad-hoc signing in a user-writable path describes all
+three. A single directory migration could therefore produce sixty HIGHs beside
+a genuine intrusion. These rungs demote **one step only** (never to LOW, with
+the one exception noted): origin is not authorship, and a package can be
+malicious, a publisher can ship a bad build, a stolen certificate signs cleanly.
+
+5. **Relocated** (changed persistence item) → **LOW**, the one origin rung that
+   goes that far, because it is a proof about *content* rather than about
+   provenance: the program bytes and the payload script's own hash are both
+   byte-identical to the baseline and only the directory changed. Nothing new
+   executes, so there is nothing to grade. It requires proof on **both** halves
+   of what a job runs — requiring only the program hash would be worthless for
+   the dominant `<interpreter> <script>` shape, where the program is `/bin/bash`
+   and identical by definition while the script is the half that could have been
+   swapped. This is why persistence snapshots hash `script_target` at all (see
+   below); when a baseline predates that hashing the rung is refused outright,
+   since an unproven half is not a passing half.
+6. **Publisher stability** (changed persistence item) → **MEDIUM**. The binary
+   changed in place but carries the **same signing authority** as its baseline,
+   and that authority is Apple/App-Store/Developer-ID. This is the literal shape
+   of a vendor auto-update — the Microsoft, OneDrive and Zoom updaters rotate
+   their own bytes on a schedule. A different signer, or an unsigned rebuild, is
+   never this rung.
+7. **Package receipt** (binary-keyed findings) → **MEDIUM**. The binary is owned
+   by a package-manager transaction on this machine, proven by reading that
+   manager's **receipt** — Homebrew's `INSTALL_RECEIPT.json` beside the
+   versioned Cellar root, the editor's own `extensions.json` index, pipx's
+   `pipx_metadata.json` at the venv root, and the `BUILD` stamp uv writes into
+   each interpreter it manages under `uv/python/<dist>/`. It is deliberately *never* a path
+   prefix: treating `/opt/homebrew/…` as a trust rule would vouch for anything
+   an attacker drops into a directory the user can write to, which is precisely
+   the file being graded. Both the link and its target are probed, because the
+   managers point in opposite directions — Homebrew's `bin/` entries are
+   symlinks *into* the Cellar, while a venv's `bin/python` is a symlink *out* to
+   the system interpreter. A hand-installed binary (an unpacked CI runner, a
+   curled release tarball) has no receipt and correctly keeps its severity.
+
+Two weak git rungs that the ladder previously named and then ignored:
+`worktree` and `local-commit` printed "routine if you made it" while the finding
+stayed HIGH. They now demote **one step**, not to LOW — an uncommitted local
+edit is also exactly what a local attacker's change looks like, so it earns
+quiet rather than silence.
+
+Guards, because grading is where an attacker would want to stand:
+
+- **Grades, never mutes.** A downgraded finding is still created, still in the
+  report, still accumulates risk and joins correlation chains. Custody writes
+  no dismissal and cannot feed acquired tolerance.
+- **Attack-defined content never downgrades.** A conceal imperative stays HIGH
+  even when self-attested — an agent prompt-injected into persisting a hostile
+  instruction attests its own write. Custody grades *churn-shaped structure*,
+  not content; the imperative detector keeps its own judgement.
+- **Fail toward suspicion.** Bad MAC, stale record, expired reflog, identity
+  mismatch, git error, absent signer — each is a non-match, and a non-match
+  keeps HIGH. The failure mode of every rung is the pre-custody behavior.
+- **Forgeability is stated, not hidden.** The MAC key and the reflog are
+  same-uid-writable, so an attacker *already executing as you* can forge both.
+  That is the wrong threat for this surface, which exists to catch hostile
+  instructions at **arrival** — the poisoned repo, the trojaned config, the
+  malicious skill — i.e. before the attacker has local execution, which is the
+  only moment forging is impossible. Post-compromise silencing is the witness
+  layer's problem, and it is exactly as detectable as it was before custody
+  grading existed.
+
+#### Hashing the payload, not the interpreter
+
+Custody's relocation rung forced a gap in the persistence sensor into the open.
+A launchd job or systemd unit is overwhelmingly `<interpreter> <script>`, and
+the snapshot recorded only `program` — so it hashed `/bin/bash` and said nothing
+about the file that actually carries the behaviour. Rewriting that script left
+program, args and env all identical, and `check_persistence` emitted **no
+finding at all**: a payload swap under a stable config was invisible to the one
+sensor whose whole job is watching what runs at boot.
+
+Snapshots now carry `script_target` and its `target_sha` on every platform (the
+shared record helper, so launchd plists, systemd units and Run keys all inherit
+it), a change in that hash is a reported change rated with a swapped binary, and
+the same evidence is what lets a genuine relocation be told apart from a
+substitution. The hash is required on **both** sides before either conclusion is
+drawn — a field merely appearing as an old baseline rolls forward is not a swap,
+and must not alert on every job at once.
+
 `aegis.py replay [days]` re-runs the current correlation logic over recorded
 history in a throwaway in-memory database. It is strictly read-only — no
 incident, no notification, no durable write — so a detection change can be
 backtested before it ships.
+
+## Signal-to-noise tier
+
+A detector is only as good as the attention it still commands. Measured on the
+reference machine 2026-08-20, before this tier existed: 281 incidents lifetime,
+131 adjudicated `FALSE_POSITIVE`, 129 still `OPEN`, and no true positive that a
+test fixture had not planted. The sensors were not blind — the output was
+unreadable, which is the worse failure, because it silences every future alert
+too. Five mechanisms address it, and each one that suppresses something must
+prove what it still says.
+
+**Exec identity is what runs, not where it sits.** An exec-capable config entry
+is keyed on its command and arguments (`_exec_identity`), never on its position
+in the file. The positional key it replaced (`hooks.SessionStart[4].hooks[0]`)
+renumbered every later sibling whenever one was inserted, so a single added hook
+re-alerted the whole list: 55 of 67 un-generalizable open incidents were that
+cascade. Both sides of the diff are normalized (`_migrate_exec_keys`), so an
+upgrade from a legacy baseline is silent rather than presenting every baselined
+entry as new. A genuinely new command still fires at `HIGH`.
+
+**Rotating endpoints generalize only on evidence, at two widths.** A beacon's
+address is a fact and a new endpoint alerts — but a rotating service re-opens
+forever. `_beacon_endpoint_classes` offers two classes, narrowest first, and
+`_rotating_endpoint_memory` grants one only on the matching evidence:
+`<path>:#ip:<port>` (a service on a fixed port answering from rotating
+addresses — a CDN, an update channel) needs `_ROTATING_MIN_ENDPOINTS` distinct
+addresses; `<path>:#ip:#port` (a peer-to-peer client, which varies address and
+port together by design) needs that many distinct address:port pairs spanning
+`_ROTATING_MIN_PORTS` distinct ports, so it is strictly harder to earn.
+
+The second width exists because the first was not enough for real software:
+Syncthing's dismissed endpoints on the reference machine spanned five ports and
+five addresses, so no fixed-port class could reach its threshold and six human
+verdicts taught nothing. Note also that a beacon fingerprint is
+`beacon:<path>:<ip>:<port>` and an IPv6 address contains colons — the address
+is parsed from the right (`_BEACON_FP_RE`), never by splitting on ':', which
+silently folded the address into the path and made every IPv6 beacon
+un-generalizable. Hostnames never generalize; attack-defined prefixes never do.
+
+**Aegis's own upgrade is attested, not exempted.** `_install_runtime_copy`
+writes one ordinary intent record for the runtime copy it installs, so the same
+custody ladder every other surface uses grades the change (`HIGH` -> `LOW`,
+still reported). A payload swapped by anything that did not come through
+`install` records nothing and stays `HIGH`. Persistence changes now also grade
+the *payload* against the ledger, not only the config file naming it — the
+dominant `<interpreter> <script>` job mutates by having its script rewritten.
+
+**Incidents age out.** An `OPEN` signal or risk incident with no new evidence in
+`_AGE_OUT_DAYS` closes as ambient, retained and reopened by recurrence. Never
+CRITICAL, never a correlation chain, never attack-defined evidence — a quiet
+week is not an acquittal for a tripped decoy. Machine verdicts write no
+`dismissals` row, so they cannot feed tolerance or backtest precision.
+
+**The learning period.** A fresh install starts a `_LEARNING_DEFAULT_DAYS`
+window (`aegis.py learn`) in which everything is recorded and correlated but a
+non-CRITICAL signal opens pre-closed as `learning` instead of alerting. A
+detector's first weeks on a real machine are its worst: every ordinary thing it
+has not yet seen is new by construction. CRITICAL chains and tripped
+decoys/latches always alert.
+
+**The report leads with a verdict.** `latest.md` is the brief report — one
+verdict line, what is new since the last scan, open CRITICALs, degraded
+coverage; `aegis.py report --full` renders everything from `latest.json`. The
+report it replaced opened with ninety red bullets over 208 lines.
+
+Because the report is a summariser, it asserts its own headline against the
+findings and incidents it summarizes on every run (`_report_self_check`) and
+**publishes the result**: a clean run prints what was verified, and a
+contradiction is printed at the TOP, above the evidence, since a reader who
+trusts the first paragraph must not have to reach the last line to learn it was
+wrong. This is not decorative — it caught a real defect in the verdict logic on
+its first run against live data, a green "Nothing new" printed over two open
+CRITICAL chains. An open CRITICAL now outranks a quiet scan and the learning
+period both.
 
 ## Transactional quarantine
 

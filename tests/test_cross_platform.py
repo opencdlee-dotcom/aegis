@@ -1187,12 +1187,14 @@ class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
 
     def setUp(self):
         self._saved = (aegis.run, aegis._PROC_ENUM_FAILED, aegis.IS_WIN,
-                       aegis.IS_MAC, aegis.IS_LINUX)
+                       aegis.IS_MAC, aegis.IS_LINUX,
+                       aegis._PROC_ARGV_PARTIAL)
         aegis._PROC_ENUM_FAILED = False
+        aegis._PROC_ARGV_PARTIAL = False
 
     def tearDown(self):
         (aegis.run, aegis._PROC_ENUM_FAILED, aegis.IS_WIN, aegis.IS_MAC,
-         aegis.IS_LINUX) = self._saved
+         aegis.IS_LINUX, aegis._PROC_ARGV_PARTIAL) = self._saved
 
     def test_a_timed_out_windows_query_is_recorded_not_swallowed(self):
         aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
@@ -1215,6 +1217,19 @@ class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
         aegis.run = lambda *a, **k: ("1\tme\tC:\\W\\x.exe\tx.exe\n", "", 0)
         self.assertEqual(1, len(list(aegis._iter_processes())))
         self.assertFalse(aegis._PROC_ENUM_FAILED)
+
+    def test_mac_argv_partial_answer_is_marked_degraded(self):
+        """A successful executable table plus failed argv table is useful but
+        incomplete: behavioral argv coverage must not be reported healthy."""
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = False, True, False
+        replies = iter([
+            ("42  501  /bin/zsh\n", "", 0),
+            ("", "permission denied", 1),
+        ])
+        aegis.run = lambda *a, **k: next(replies)
+        rows = list(aegis._iter_processes())
+        self.assertEqual([("42", "501", "/bin/zsh", "/bin/zsh")], rows)
+        self.assertTrue(aegis._PROC_ARGV_PARTIAL)
 
 
 class OutboundRowsBatchesPsByPid(unittest.TestCase):
@@ -1558,9 +1573,16 @@ class TextEncodingIsPinned(unittest.TestCase):
             md = aegis.write_report([f], first_run=False)
             with open(aegis.LATEST_MD, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), md)
-            # The icon is the byte sequence cp1252 cannot represent; assert it
-            # actually reached the file rather than being dropped.
-            self.assertIn(aegis.SEV_ICON["MEDIUM"], md)
+            # The brief report leads with a verdict rather than enumerating
+            # every finding, so the per-severity icon now lives in the full
+            # render. Both layers are asserted: each carries a byte sequence
+            # cp1252 cannot represent, and each must reach its file intact.
+            self.assertTrue(any(ord(c) > 0x7F for c in md),
+                            "brief report lost all non-ASCII")
+            full = aegis._full_report(aegis.load_json(aegis.LATEST_JSON, {}))
+            self.assertIn(aegis.SEV_ICON["MEDIUM"], full)
+            # the operator's own non-ASCII text must survive the round trip too
+            self.assertIn("caf\u00e9.exe", full)
         finally:
             (aegis.STATE_DIR, aegis.LATEST_MD, aegis.LATEST_JSON) = saved
             import shutil
