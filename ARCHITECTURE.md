@@ -409,6 +409,90 @@ its first run against live data, a green "Nothing new" printed over two open
 CRITICAL chains. An open CRITICAL now outranks a quiet scan and the learning
 period both.
 
+## Precision tier
+
+Measured cause, 2026-08-21: 283 incidents lifetime — 215 FALSE_POSITIVE, 46
+OPEN, 22 RESOLVED, **zero true positives**. A live scan produced 52 findings of
+which exactly **two** were new fingerprints; the other 50 were standing
+observations re-rendered as though fresh. 118 of 120 dismissals were
+`benign-positive` — the rule fired correctly on a shape that is benign *here*.
+
+The menu-bar plugin counts OPEN INCIDENTS, so that — not findings-per-scan —
+is the number the operator actually reads, and it is what this tier targets.
+
+### Identity fixes (what a finding is *about*)
+
+| Sensor | Was identified by | Now identified by | Measured |
+|---|---|---|---|
+| `amfid` | sha256 of the whole log **message** | the rejected **file**, grouped by package receipt | 26 → 8 findings |
+| `ide-ext` | the extension **directory** (carries the version) | `publisher.name`, version as an attribute | 3 → 0 findings |
+| `persistence.diff` | `<path>:<content-hash>` (the *incident* key) | `<path>` — the file is the case | 46 → 37 open incidents |
+
+The amfid sensor never set `path`, so nothing reached the custody ladder even
+though 18 of its 19 files sat under a Homebrew receipt the grader already
+understood. The extension sensor made every upgrade a new extension: four
+`claude-code` directories and five `chatgpt` directories on the reference
+machine, nine entries for two extensions.
+
+The persistence fix is the one that moves the menu bar. `case_fingerprint` is a
+new optional field: the **fingerprint** identifies THIS observation (content-
+addressed, so a genuinely new change is still a new signal and still notifies
+once), while the **case** identifies the thing the operator must decide about.
+Folding the content hash into the case key meant one plist edited three times
+became three open HIGH incidents. This is safe against "now dismissing the case
+mutes the file forever" because `_upsert_incident` already refuses to reattach a
+fingerprint a dismissed incident has never seen — subject keying is precisely
+the shape that guard was written for. `_merge_legacy_persistence_cases`
+migrates existing incidents once, folding duplicates into the survivor with
+their evidence intact (verified on a copy of the live store: 46 → 37, 9 folded,
+17,908 evidence rows preserved, idempotent).
+
+### The vouch tier (what the operator can say that nothing else can)
+
+Every custody rung before this one answers *"did this machine make this
+change?"* from evidence the machine already holds — git reflog, package
+receipt, agent-session attestation, fleet SSH signature. None can vouch for a
+workload that arrived **by hand**.
+
+That gap had a name: two self-hosted GitHub Actions runners under
+`~/actions-runners`, ad-hoc signed, in a user-writable path, holding a permanent
+TLS connection to Microsoft. They produced 11 of one scan's 52 findings and 24
+of its 46 open incidents. Every attribute the process, net-outbound and
+net-beacon rules key on is *definitional* for a CI runner, so no tuning of those
+rules could ever separate them from a real implant.
+
+`aegis.py vouch add <path> <key> [endpoint ...]` records a signed contract.
+Three properties make it a control rather than an allowlist:
+
+1. **A passphrase is required.** Signed with a key held outside `~/.aegis`,
+   verified against a roster pinned by a separate explicit command. This is
+   deliberately **not** the fleet roster: the fleet signing key is passphrase-
+   less by design (it signs commits unattended), so code running as the operator
+   could mint fleet signatures silently. A vouch must cost a human keystroke, or
+   it vouches for whatever compromised the machine.
+2. **It binds to exact bytes.** Path, sha256, uid, and — for network scope —
+   the precise endpoint set. Change any of them and the vouch stops applying.
+   An identity-only vouch (no endpoints) covers identity and deliberately says
+   *nothing* about where a binary may connect, so it can never wildcard an exfil
+   destination. "The operator installed it" is a fact about one moment, not a
+   permanent character reference.
+3. **It fails closed.** A malformed line, a broken chain link, a rollback, an
+   unverifiable signature or an unpinned roster discards the **entire** vouch
+   set and raises a CRITICAL `vouch-store` finding. Partial trust in a store
+   somebody edited is worse than none: it lets an attacker delete the one record
+   that would have made their change loud.
+
+Dismissals never create a vouch, and `_demote` still refuses every attack-defined
+finding — a hostile argv, an IOC hit, a conceal imperative keeps its severity
+under a perfect vouch, because knowing who installed a payload is not a reason
+to stop calling it a payload.
+
+**Honest limit, stated because the design depends on the operator knowing it:**
+an attacker who can rewrite `aegis.py`, its verifier and the pinned roster under
+the same uid defeats any local scheme. This buys tamper **evidence**, not
+tamper-proofing. Resistance beyond that needs a hardware-backed key or a
+root-owned anchor — a deliberate future rung, not this one.
+
 ## Transactional quarantine
 
 Each quarantine item owns an authoritative `txn.json`. The manifest is rebuilt

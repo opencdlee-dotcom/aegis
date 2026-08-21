@@ -56,6 +56,9 @@ class ProtectiveSandbox(unittest.TestCase):
             "QUARANTINE_DIR": os.path.join(self.state, "quarantine"),
             "QUARANTINE_MANIFEST": os.path.join(self.state, "quarantine",
                                                 "manifest.json"),
+            # Vouch tier: the signed workload log and its pinned signer roster.
+            "VOUCH_FILE": os.path.join(self.state, "vouches.jsonl"),
+            "VOUCH_SIGNERS": os.path.join(self.state, "vouch_signers"),
         }
         for k, v in overrides.items():
             self._saved[k] = getattr(aegis, k)

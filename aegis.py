@@ -147,6 +147,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import hashlib
 import hmac
@@ -1297,6 +1298,11 @@ if IS_MAC:
         # clipboard surface.
         "logger": "/usr/bin/logger", "pbpaste": "/usr/bin/pbpaste",
         "pbcopy": "/usr/bin/pbcopy",
+        # Vouch tier: ssh-keygen -Y is the signature verifier for the operator
+        # vouch log. Pinned to the system path like every other tool here, so a
+        # PATH-shadowing "ssh-keygen" cannot become the thing that decides
+        # whether a vouch is genuine.
+        "ssh-keygen": "/usr/bin/ssh-keygen",
     }
 elif IS_LINUX:
     # Distros disagree on /usr/bin vs /bin (usrmerge) and /usr/sbin vs /sbin;
@@ -1315,7 +1321,9 @@ elif IS_LINUX:
                                 "sestatus", "notify-send",
                                 # protective tier
                                 "logger", "journalctl", "xclip", "wl-paste",
-                                "wl-copy")}
+                                "wl-copy",
+                                # vouch tier: the signature verifier
+                                "ssh-keygen")}
 else:
     _SYS32 = os.path.join(WIN_SYSTEMROOT, "System32")
     _TRUSTED_TOOLS = {
@@ -1370,10 +1378,16 @@ def _service_control_guard(cmd):
                   "with no AEGIS_TEST_LAUNCHCTL stub" % (cmd[0],), 2)
 
 
-def run(cmd, timeout=15, extra_env=None):
+def run(cmd, timeout=15, extra_env=None, stdin_data=None):
     """Run a command, return (stdout, stderr, rc). Never raises. extra_env
     entries are added to the restricted environment — the injection-safe way to
-    hand attacker-influenced strings (paths, titles) to PowerShell."""
+    hand attacker-influenced strings (paths, titles) to PowerShell.
+
+    stdin_data feeds text on standard input for the one tool that requires it
+    (`ssh-keygen -Y verify` reads the signed payload from stdin). It stays in
+    this helper rather than a bare subprocess call so signature verification
+    inherits the same restricted environment and command allowlist as every
+    other command Aegis runs."""
     cmd, refusal = _service_control_guard(cmd)
     if refusal is not None:
         return refusal
@@ -1417,7 +1431,7 @@ def run(cmd, timeout=15, extra_env=None):
             # ANSI/OEM output rather than fix anything.
             _trusted_command(cmd), capture_output=True, text=True,
             errors="replace", timeout=timeout,
-            check=False, env=safe_env
+            check=False, env=safe_env, input=stdin_data
         )
         return p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired:
@@ -2137,6 +2151,17 @@ def _redact_value(value):
 CONFIDENCE_ORDER = {"high": 2, "medium": 1, "low": 0}
 
 
+def _sha_key(text):
+    """Short stable digest of `text`, for use inside a fingerprint.
+
+    One spelling of the truncated-sha256 idiom that fingerprints already use
+    everywhere, so an identity key can never drift from the length or encoding
+    another call site picked.
+    """
+    return hashlib.sha256(
+        (text or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def finding(severity, category, title, detail, fingerprint, **extra):
     rule_id = extra.pop("rule_id", None)
     # Confidence is a SEPARATE axis from severity (Secureworks/Vectra/Sigma
@@ -2614,6 +2639,24 @@ _TOLERANCE_CATEGORIES = frozenset((
 # Attack-defined evidence (deadfall's own trigger prefixes plus honeytokens):
 # no verdict history may ever tolerize these.
 _NEVER_TOLERATE_PREFIXES = ("decoy:", "latch:", "canary:")
+
+
+def _program_subject(path):
+    """The version-normalized identity of a program on disk.
+
+    `~/.vscode/extensions/openai.chatgpt-26.818.31338-darwin-arm64/bin/codex`
+    and its predecessor at 26.814.41407 are the SAME program to an operator and
+    two unrelated entities to a path-keyed store. Every editor-extension update
+    therefore minted fresh process and beacon incidents forever — on the
+    reference machine `codex` sat open at three versions and `claude` at two,
+    which was most of what remained after the persistence fix.
+
+    Reuses the tolerance layer's version regex so there is exactly ONE spelling
+    of "these two paths are the same software at different versions" in the
+    file. Nothing else is generalized: the digest still identifies the bytes,
+    and this only ever names the CASE those bytes belong to.
+    """
+    return _TOLERANCE_VERSION_RE.sub("#", path or "")
 
 
 def _tolerance_identity(fingerprint):
@@ -3180,9 +3223,25 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
             and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]
             and not str(f.get("fingerprint") or "").startswith(
                 _NEVER_TOLERATE_PREFIXES))
+        # The incident is keyed on the SUBJECT where a sensor names one, and
+        # on the raw fingerprint everywhere else. The two are different
+        # questions: the fingerprint identifies THIS observation (content-
+        # addressed, so a genuinely new change is still a new signal and still
+        # notifies once), while the case identifies the THING the operator has
+        # to make a decision about. Folding the content hash into the case key
+        # meant one launchd plist edited three times became three open HIGH
+        # incidents -- 17 open incidents over ~7 files on the reference machine,
+        # and the menu bar counts incidents, so that WAS the number being read.
+        #
+        # This is safe against the obvious objection -- "now dismissing the case
+        # mutes the file forever" -- because _upsert_incident already refuses to
+        # reattach a fingerprint a dismissed incident has never seen; an entity-
+        # keyed case that meets new evidence opens a fresh incident instead of
+        # swallowing it. Subject keying is precisely the shape that guard was
+        # written for.
         incident_id = _upsert_incident(
-            db, "signal:" + f["fingerprint"], f["title"],
-            f["severity"], "signal", now, [event_id],
+            db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
+            f["title"], f["severity"], "signal", now, [event_id],
             initially_notified or bool(verdicts) or in_learning)
         if verdicts:
             _auto_tolerate(db, incident_id, verdicts, now)
@@ -3352,6 +3411,73 @@ def _retire_legacy_exec_incidents(db, now):
     return len(aged)
 
 
+_LEGACY_PERSIST_CASE_RE = re.compile(
+    r"^(signal:persistence:changed:.*):[0-9a-f]{8,64}$")
+
+
+def _merge_legacy_persistence_cases(db, now):
+    """One-time: collapse per-content-hash persistence incidents onto the file.
+
+    The retired key was `signal:persistence:changed:<path>:<content-hash>`, so
+    one launchd plist edited three times sat as three separate OPEN HIGH
+    incidents. On the reference machine that was 17 open incidents over about 7
+    files, and the menu-bar plugin counts OPEN INCIDENTS — so those duplicates
+    were most of the number the operator actually read.
+
+    Unlike the exec-identity migration this does NOT close anything, because
+    nothing here is orphaned: the newest incident per file is RE-KEYED to the
+    subject and keeps its evidence, and its now-duplicate siblings are folded
+    into it (their events reattached, then marked superseded). The subject case
+    therefore inherits a real history instead of starting empty, and any file
+    that is still changing keeps alerting under the same case.
+
+    Guarded by a meta key so it runs once per upgrade, not per scan.
+    """
+    if db.execute("SELECT value FROM meta WHERE key='persistence_case_merged'"
+                  ).fetchone():
+        return 0
+    groups = {}
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE "
+            "'signal:persistence:changed:%' ORDER BY id"):
+        m = _LEGACY_PERSIST_CASE_RE.match(row["correlation_key"] or "")
+        if m:
+            groups.setdefault(m.group(1), []).append(row["id"])
+    merged = 0
+    for key, ids in groups.items():
+        keep, dupes = ids[-1], ids[:-1]
+        # Re-key the survivor to the subject. If some other incident already
+        # holds that exact key, keep THAT one and fold the survivor in too, so
+        # the migration can never violate the correlation_key uniqueness the
+        # rest of the store assumes.
+        existing = db.execute(
+            "SELECT id FROM incidents WHERE correlation_key=? AND id!=? "
+            "ORDER BY id LIMIT 1", (key, keep)).fetchone()
+        if existing:
+            dupes = dupes + [keep]
+            keep = existing["id"]
+        else:
+            db.execute("UPDATE incidents SET correlation_key=?,updated_at=? "
+                       "WHERE id=?", (key, now, keep))
+        for dupe in dupes:
+            db.execute("UPDATE incident_events SET incident_id=? WHERE "
+                       "incident_id=?", (keep, dupe))
+            db.execute("UPDATE events SET incident_id=? WHERE incident_id=?",
+                       (keep, dupe))
+            db.execute(
+                "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+                "updated_at=?,next_reminder_at=NULL WHERE id=?",
+                ("superseded: folded into the one case for this file — a "
+                 "persistence item is now one case per FILE, not one per "
+                 "content hash", now, dupe))
+            merged += 1
+    db.execute("INSERT INTO meta(key,value) VALUES('persistence_case_merged',?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+               (str(now),))
+    return merged
+
+
 def record_security_state(findings, sensor_health=(), now=None,
                           initially_notified=False,
                           suppressed_categories=frozenset()):
@@ -3399,6 +3525,13 @@ def record_security_state(findings, sensor_health=(), now=None,
                             "exec identity" % retired)
             except Exception as e:
                 log_run("exec-identity migration skipped: %s" % e)
+            try:
+                folded = _merge_legacy_persistence_cases(db, now)
+                if folded:
+                    log_run("folded %d duplicate persistence incident(s) into "
+                            "one case per file" % folded)
+            except Exception as e:
+                log_run("persistence-case migration skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
@@ -4465,6 +4598,7 @@ def check_persistence(baseline_snap, current_snap):
                     "Persistence item CHANGED",
                     detail,
                     "persistence:changed:%s:%s" % (path, fp),
+                    case_fingerprint="persistence:changed:%s" % path,
                     path=path, program=rec.get("program"), trust=rec.get("trust"),
                     custody=prov,
                     script_target=_script_target(rec.get("args"),
@@ -4925,6 +5059,7 @@ def check_processes():
                 "%s (%s) %s%s" % (comm, sig["trust"], reason,
                                   ("\n" + note) if note else ""),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
+                case_fingerprint="process:%s" % _program_subject(comm),
                 path=comm, trust=sig["trust"], sha256=sha, custody=rung))
     return findings
 
@@ -6727,6 +6862,55 @@ def diff_browserext(prior, cur):
 
 
 # --- IDE / editor extensions --------------------------------------------------
+# An extension's identity is `publisher.name`. The DIRECTORY carries the version
+# (`anthropic.claude-code-2.1.238-darwin-arm64`), and VSCode leaves the old
+# directory behind on upgrade — so keying on the directory made every update a
+# brand-new extension. On the reference machine that meant four `claude-code`
+# directories and five `chatgpt` directories: nine entries, two extensions, and
+# a fresh MEDIUM "New editor extension" on each bump.
+#
+# The version is deliberately NOT part of the identity and deliberately NOT
+# diffed here. What this sensor answers is "did an extension I never installed
+# appear?", and a version bump is not that. The bytes an upgrade brings are
+# graded by the custody/receipt ladder that already covers extension payloads;
+# duplicating it as an inventory alert only buys noise.
+_EXT_VERSION_RE = re.compile(r"^(?P<id>.+?)-(?P<ver>\d+(?:\.\d+)+)(?:-.*)?$")
+
+
+def _ext_identity(name):
+    """('publisher.name', 'version') for an extension directory name.
+
+    A name with no parseable version keeps its WHOLE self as the identity —
+    never truncate something we could not parse, because a half-parsed identity
+    would silently merge two different extensions.
+    """
+    m = _EXT_VERSION_RE.match(name or "")
+    if not m:
+        return (name, None)
+    return (m.group("id"), m.group("ver"))
+
+
+def _ext_key(key):
+    """Normalize an '<editor>:<dir-name>' snapshot key to '<editor>:<identity>'.
+
+    Applied to BOTH sides of the diff so an existing baseline written under the
+    old version-bearing keys upgrades silently instead of re-alerting the whole
+    inventory once.
+    """
+    editor, _, name = (key or "").partition(":")
+    if not _:
+        return key
+    return "%s:%s" % (editor, _ext_identity(name)[0])
+
+
+def _ext_normalize(snap):
+    """{normalized key: display name}, newest directory per identity winning."""
+    out = {}
+    for k in sorted(snap or {}):
+        out[_ext_key(k)] = snap[k]
+    return out
+
+
 def snapshot_ide_ext():
     snap = {}
     for root in IDE_EXT_ROOTS:
@@ -6742,7 +6926,7 @@ def snapshot_ide_ext():
             if not os.path.isdir(p):
                 continue
             disp = _manifest_name(os.path.join(p, "package.json")) or name
-            snap["%s:%s" % (editor, name)] = disp
+            snap["%s:%s" % (editor, _ext_identity(name)[0])] = disp
     return snap
 
 
@@ -6752,7 +6936,7 @@ def diff_ide_ext(prior, cur):
                        "%s (%s) — a backdoored VSCode/Cursor extension is a live "
                        "supply-chain vector; confirm you installed it"
                        % (k, name), "ideext:%s" % k, ext=k, name=name)
-    return _diff_map(prior, cur, new_fn)
+    return _diff_map(_ext_normalize(prior), _ext_normalize(cur), new_fn)
 
 
 # --- crypto-wallet integrity --------------------------------------------------
@@ -7318,7 +7502,8 @@ def _outbound_finding(path, rip, rport):
             return None
     elif not (suspicious_sig(trust) and is_risky_location(path)):
         return None
-    graded, rung, note = _grade_binary("MEDIUM", path)
+    graded, rung, note = _grade_binary("MEDIUM", path,
+                                      endpoint="%s:%s" % (rip, rport))
     return finding(
         graded, "net-outbound", "Untrusted binary connected outbound",
         "%s [%s] in a user-writable path is connected to %s:%s — an "
@@ -7527,7 +7712,8 @@ def _beacon_recurrence(history, current_rows):
             continue
         if not (suspicious_sig(trust) or is_risky_location(path)):
             continue
-        graded, rung, note = _grade_binary("HIGH", path)
+        graded, rung, note = _grade_binary(
+            "HIGH", path, endpoint="%s:%s" % (rip, rport))
         findings.append(finding(
             graded, "net-beacon",
             "Persistent outbound connection (beacon shape)",
@@ -7537,7 +7723,10 @@ def _beacon_recurrence(history, current_rows):
             "remote endpoint is the residue an interval C2 beacon leaves."
             % (path, trust, rip, rport, len(stamps), span / 3600.0)
             + (("\n" + note) if note else ""),
-            "beacon:%s:%s:%s" % (path, rip, rport), path=path, program=path,
+            "beacon:%s:%s:%s" % (path, rip, rport),
+            case_fingerprint="beacon:%s:%s:%s" % (
+                _program_subject(path), rip, rport),
+            path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
             markers=["outbound-exfil", "beacon"]))
@@ -8077,25 +8266,104 @@ def _parse_amfid_denials(ndjson_text):
     return hits
 
 
+# amfid names the rejected FILE in its message; the file is the identity.
+# Hashing the raw MESSAGE instead minted a fresh fingerprint every time the
+# same file was re-checked (26 findings for 19 distinct files on the reference
+# machine, seven of them counted twice), and left `path` unset — so nothing
+# reached the custody ladder, though 18 of those 19 sat under a Homebrew
+# receipt `_package_receipt` already understands.
+# The leading form is authoritative because it survives paths containing
+# spaces ("Chrome Apps.localized/Google Drive.app/..."); the NSURL tail is the
+# fallback for builds that word the prefix differently.
+_AMFID_PATH_RE = re.compile(r"^(/.+?)\s+(?:is\s+)?not valid\b")
+_AMFID_NSURL_RE = re.compile(r"NSURL=file://(/[^\s},]+)")
+
+
+def _amfid_path(msg):
+    """The rejected file's path from an amfid denial message, or None.
+
+    Never raises and never guesses: an unparsable message returns None and the
+    caller keeps reporting it under the old message-keyed identity. The live
+    message format varies by OS build, so a parser miss must degrade to the
+    noisier behaviour, never to silence.
+    """
+    if not msg or not isinstance(msg, str):
+        return None
+    m = _AMFID_PATH_RE.search(msg.strip())
+    if m:
+        return m.group(1)
+    m = _AMFID_NSURL_RE.search(msg)
+    return m.group(1) if m else None
+
+
 def check_amfid_log(window_hours=None):
     """Harvest amfid code-signature-validation FAILURE events from the
     unified log. Kept at MEDIUM/low-confidence (log+correlation tier, below
     the notify floor) for the same reason as the syspolicy harvest: the live
     message format varies by OS build and can't be verified against a real
     denial in the field here, so it enriches without risking a noisy page.
-    On any log-read failure it degrades to empty (never a storm)."""
+    On any log-read failure it degrades to empty (never a storm).
+
+    One finding per rejected FILE, and one finding per package RECEIPT where a
+    receipt covers several files: a Homebrew formula whose twelve bundled
+    `.so`s are all ad-hoc signed is one fact about that formula, not twelve
+    findings. Files with no receipt stay one-per-file at full visibility —
+    grouping is a rendering decision about things custody can already vouch
+    for, never a reason to stop reporting an unvouched-for rejection.
+    """
     out, rc = _log_show(_PRED_AMFID, window_hours)
     if rc != 0 or not out:
         return []
-    findings = []
+    by_path, unparsed = {}, []
     for msg, ts in _parse_amfid_denials(out):
-        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]
+        path = _amfid_path(msg)
+        if not path:
+            unparsed.append((msg, ts))
+        elif path not in by_path:
+            by_path[path] = (msg, ts)
+
+    grouped, solo = {}, []
+    for path in by_path:
+        receipt = _package_receipt(path)
+        if receipt:
+            grouped.setdefault(receipt, []).append(path)
+        else:
+            solo.append(path)
+
+    findings = []
+    for receipt in sorted(grouped):
+        paths = sorted(grouped[receipt])
+        sev, rung, note = _grade_binary("MEDIUM", paths[0])
+        detail = ("amfid rejected %d file(s) belonging to %s (e.g. %s) — every "
+                  "one carries that package's install receipt, so this is the "
+                  "package's own ad-hoc signing, not a swap. Verify only if you "
+                  "did not install it." % (len(paths), receipt, paths[0]))
+        findings.append(finding(
+            sev, "amfid", "Code-signature validation failed (amfid)",
+            detail + (" [%s]" % note if note else ""),
+            "amfid:deny:receipt:%s" % _sha_key(receipt), confidence="low",
+            markers=["amfid-deny"], path=paths[0], receipt=receipt,
+            member_count=len(paths), members=paths[:20]))
+
+    for path in sorted(solo):
+        msg, ts = by_path[path]
+        sev, rung, note = _grade_binary("MEDIUM", path)
+        findings.append(finding(
+            sev, "amfid", "Code-signature validation failed (amfid)",
+            "amfid rejected %s at %s — the OS refused to trust its code "
+            "signature; verify it was expected (a broken build, or a real "
+            "tamper attempt)." % (path, ts) + (" [%s]" % note if note else ""),
+            "amfid:deny:path:%s" % _sha_key(path), confidence="low",
+            markers=["amfid-deny"], path=path))
+
+    for msg, ts in unparsed:
         findings.append(finding(
             "MEDIUM", "amfid", "Code-signature validation failed (amfid)",
             "amfid rejected a binary/library's signature at %s: %s — the OS "
             "refused to trust something's code signature; verify it was "
             "expected (a broken build, or a real tamper attempt)."
-            % (ts, msg[:240]), "amfid:deny:%s" % digest, confidence="low",
+            % (ts, msg[:240]),
+            "amfid:deny:%s" % _sha_key(msg), confidence="low",
             markers=["amfid-deny"]))
     return findings
 
@@ -9307,6 +9575,14 @@ def _git_provenance(path):
 
 
 _PROVENANCE_NOTE = {
+    "operator-vouched": ("The operator signed a vouch for exactly these bytes "
+                         "at exactly this path, with a passphrase-protected "
+                         "key verified against the pinned vouch roster. This "
+                         "is the strongest rung here because it is the only "
+                         "one code running as the operator cannot mint "
+                         "silently. It binds to the CONTENT: change the bytes, "
+                         "the uid, or (for network scope) the endpoint, and "
+                         "the vouch stops applying and this re-alerts."),
     "self-attested": ("A supervised agent session recorded a signed intent "
                       "entry for exactly this content at write time — this "
                       "machine claims authorship. (Attribution, not proof: "
@@ -9354,7 +9630,8 @@ _PROVENANCE_NOTE = {
 # finding to a recorded-but-quiet severity. Deliberately NOT consulted for
 # attack-defined content — a conceal imperative stays HIGH no matter who
 # appears to have written it, the same guard acquired tolerance applies.
-_SELF_CUSTODY = ("self-attested", "self-committed", "fleet-signed")
+_SELF_CUSTODY = ("operator-vouched", "self-attested", "self-committed",
+                 "fleet-signed")
 
 # --- vouching rungs: identity evidence the NON-agent sensors already hold ----
 #
@@ -9559,7 +9836,7 @@ def _package_receipt(path):
     return None
 
 
-def _grade_binary(severity, path, attack_defined=False):
+def _grade_binary(severity, path, attack_defined=False, endpoint=None):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
 
     process / net-listener / net-outbound / net-beacon all raise on the same
@@ -9576,10 +9853,311 @@ def _grade_binary(severity, path, attack_defined=False):
     """
     if attack_defined:
         return severity, None, None
-    rung = "package-managed" if _package_receipt(path) else None
-    if not rung:
+    # The vouch tier is consulted FIRST because it is the only rung backed by
+    # something an attacker cannot produce with the operator's own uid. Where
+    # the caller names an endpoint, the vouch must cover that exact endpoint —
+    # an identity vouch never widens into "may talk to anywhere".
+    if _vouch_covers(path, endpoint):
+        rung = "operator-vouched"
+    elif _package_receipt(path):
+        rung = "package-managed"
+    else:
         return severity, None, None
     return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
+
+
+# --- the vouch tier: a workload the operator signed for, by hand -------------
+#
+# Every rung above answers "did this machine make this change?" from evidence
+# the machine already holds. None of them can vouch for a workload that arrived
+# by hand: no git history, no package receipt, no agent session. On the
+# reference machine that gap had a name — two self-hosted GitHub Actions
+# runners under ~/actions-runners, ad-hoc signed, in a user-writable path,
+# holding a permanent TLS connection to Microsoft. Every attribute the process,
+# net-outbound and net-beacon rules key on is DEFINITIONAL for a CI runner, so
+# they produced 11 of one scan's 52 findings and 24 of its 46 open incidents,
+# and no amount of tuning those rules could separate them from a real implant.
+#
+# The missing evidence is not technical, it is human: the operator knows. This
+# tier is the narrow, revocable, cryptographically-bound way to say so.
+#
+# Three properties make it a security control rather than an allowlist:
+#
+#   1. It is signed by a key with a PASSPHRASE, held outside ~/.aegis, and
+#      verified against a roster pinned by a separate explicit command. This is
+#      deliberately NOT the fleet roster: the fleet signing key is passphrase-
+#      less by design (it signs commits unattended), so code running as the
+#      operator could mint fleet signatures silently. A vouch must cost a human
+#      keystroke, or it vouches for whatever compromised the machine.
+#   2. It binds to EXACT BYTES plus the execution binding — path, sha256, uid,
+#      and, for network scope, the precise endpoint set. Every future change
+#      escapes the vouch and re-alerts at full severity. "The operator installed
+#      it" is a fact about one moment, not a permanent character reference.
+#   3. It FAILS CLOSED. A malformed line, a broken chain link, a rollback, an
+#      unverifiable signature or an unpinned roster does not degrade to "no
+#      vouches" — it discards the entire vouch set AND raises a CRITICAL
+#      tamper finding, because a trust store that has been edited is itself the
+#      most interesting event on the machine.
+#
+# The honest limit, stated because the design depends on the operator knowing
+# it: an attacker who can rewrite aegis.py, its verifier and the pinned roster
+# under the same uid defeats any local scheme. What this buys is tamper
+# EVIDENCE, not tamper-proofing. Resistance beyond that needs a hardware-backed
+# key or a root-owned anchor, which is a deliberate future rung, not this one.
+VOUCH_FILE = os.path.join(STATE_DIR, "vouches.jsonl")
+VOUCH_SIGNERS = os.path.join(STATE_DIR, "vouch_signers")
+_VOUCH_NAMESPACE = "aegis-vouch"
+_VOUCH_GENESIS = "0" * 64
+_VOUCH_DEFAULT_TTL = 180 * 86400
+_VOUCH_NET_SCOPE = ("net-outbound", "net-beacon", "net-listener")
+
+
+def _vouch_canonical(rec):
+    """The exact bytes a vouch record is signed over and chained by.
+
+    Canonical JSON — sorted keys, no insignificant whitespace — computed over
+    every field EXCEPT the signature, so the signature can be added to the same
+    object without changing what it commits to.
+    """
+    body = {k: v for k, v in (rec or {}).items() if k != "sig"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def _vouch_link(rec):
+    return hashlib.sha256(
+        _vouch_canonical(rec).encode("utf-8", "replace")).hexdigest()
+
+
+def _vouch_verify_sig(payload, sig, principal):
+    """True iff `sig` is a good ssh signature over `payload` by a principal in
+    the PINNED vouch roster. Any failure — missing roster, missing ssh-keygen,
+    bad signature, unknown signer, timeout — is False, never an exception."""
+    if not sig or not os.path.isfile(VOUCH_SIGNERS):
+        return False
+    sig_path = None
+    try:
+        fd, sig_path = tempfile.mkstemp(prefix="aegis_vsig_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(sig if sig.endswith("\n") else sig + "\n")
+        _out, _err, rc = run(
+            ["ssh-keygen", "-Y", "verify", "-f", VOUCH_SIGNERS,
+             "-I", principal, "-n", _VOUCH_NAMESPACE, "-s", sig_path],
+            timeout=15, stdin_data=payload)
+        return rc == 0
+    except Exception:
+        return False
+    finally:
+        if sig_path:
+            try:
+                os.unlink(sig_path)
+            except OSError:
+                pass
+
+
+def load_vouches(now=None):
+    """({subject: record}, tamper_reason_or_None) from the signed vouch log.
+
+    Returns ({}, None) when no vouch file exists — an operator who has never
+    vouched for anything is the normal case, not a tamper event.
+
+    On ANY integrity failure returns ({}, reason): the whole set is discarded,
+    never the offending line alone. Partial trust in a store somebody edited is
+    worse than none, because it lets an attacker delete the one record that
+    would have made their change loud.
+    """
+    now = _epoch(now)
+    if not os.path.isfile(VOUCH_FILE):
+        return {}, None
+    if not os.path.isfile(VOUCH_SIGNERS):
+        return {}, ("a vouch log exists but no signer roster is pinned — "
+                    "nothing can verify it (pin one: aegis.py vouch pin ...)")
+    try:
+        with open(VOUCH_FILE, "r", encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    except Exception as e:
+        return {}, "vouch log unreadable: %s" % e
+
+    active, prev, seq = {}, _VOUCH_GENESIS, 0
+    for n, line in enumerate(lines, 1):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            return {}, "vouch log line %d is not valid JSON" % n
+        if not isinstance(rec, dict):
+            return {}, "vouch log line %d is not an object" % n
+        if rec.get("prev") != prev:
+            return {}, ("vouch log line %d breaks the hash chain (rollback or "
+                        "removed record)" % n)
+        if not isinstance(rec.get("seq"), int) or rec["seq"] != seq + 1:
+            return {}, "vouch log line %d has a non-sequential seq" % n
+        principal = str(rec.get("principal") or "")
+        if not principal or not _vouch_verify_sig(
+                _vouch_canonical(rec), rec.get("sig"), principal):
+            return {}, ("vouch log line %d is not signed by a pinned signer"
+                        % n)
+        subject = str(rec.get("subject") or "")
+        if not subject:
+            return {}, "vouch log line %d names no subject" % n
+        if rec.get("action") == "revoke":
+            active.pop(subject, None)
+        elif rec.get("action") == "vouch":
+            active[subject] = rec
+        else:
+            return {}, "vouch log line %d has an unknown action" % n
+        prev, seq = _vouch_link(rec), rec["seq"]
+
+    live = {s: r for s, r in active.items()
+            if not r.get("expires_at") or int(r["expires_at"]) > now}
+    return live, None
+
+
+def _vouch_subject(path):
+    return "workload:%s" % _sha_key(os.path.realpath(path or ""))
+
+
+def _vouch_covers(path, endpoint=None, now=None):
+    """True iff a verified, unexpired vouch covers exactly these bytes at this
+    path, for this endpoint.
+
+    Every clause is an AND, and every mismatch is a silent False that leaves
+    the finding at full severity — a deviated contract must never read as a
+    weaker vouch. Where the caller names an endpoint (the network sensors), the
+    vouch must list that exact endpoint: a vouch with no endpoint set vouches
+    for the IDENTITY of a binary and deliberately says nothing about where it
+    may connect, so it can never wildcard an exfil destination.
+    """
+    if not path:
+        return False
+    try:
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            return False
+        st = os.stat(real)
+    except OSError:
+        return False
+    vouches, tamper = load_vouches(now)
+    if tamper:
+        return False
+    rec = vouches.get(_vouch_subject(real))
+    if not rec:
+        return False
+    if str(rec.get("path") or "") != real:
+        return False
+    if rec.get("uid") is not None and int(rec["uid"]) != st.st_uid:
+        return False
+    if sha256(real) != str(rec.get("sha256") or ""):
+        return False
+    if endpoint is not None:
+        return endpoint in (rec.get("endpoints") or [])
+    return True
+
+
+def _vouch_chain_head():
+    """(prev_link, last_seq) for appending. Refuses to extend a log that does
+    not currently verify — appending to a broken chain would launder it."""
+    if not os.path.isfile(VOUCH_FILE):
+        return _VOUCH_GENESIS, 0
+    _v, tamper = load_vouches()
+    if tamper:
+        raise ValueError(tamper)
+    with open(VOUCH_FILE, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    if not lines:
+        return _VOUCH_GENESIS, 0
+    last = json.loads(lines[-1])
+    return _vouch_link(last), int(last["seq"])
+
+
+def _vouch_sign(payload, key_path):
+    """Armored ssh signature over `payload`, or None.
+
+    ssh-keygen prompts for the key's passphrase on the terminal; that prompt is
+    the entire human gate this tier is built around, so it is never suppressed
+    and never cached by Aegis.
+    """
+    data_path = None
+    try:
+        fd, data_path = tempfile.mkstemp(prefix="aegis_vsign_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        # Not run() — this one must inherit the real tty to prompt for the
+        # passphrase, which capture_output would swallow.
+        rc = subprocess.call(
+            ["/usr/bin/ssh-keygen", "-Y", "sign", "-f", key_path,
+             "-n", _VOUCH_NAMESPACE, "-q", data_path])
+        if rc != 0:
+            return None
+        with open(data_path + ".sig", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        for p in (data_path, (data_path + ".sig") if data_path else None):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _vouch_record(action, path, principal, endpoints=(), ttl=None, now=None):
+    """The unsigned record for `path`, bound to its bytes and execution uid."""
+    now = _epoch(now)
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    return {
+        "action": action,
+        "subject": _vouch_subject(real),
+        "path": real,
+        "sha256": sha256(real),
+        "uid": st.st_uid,
+        "endpoints": sorted(endpoints or []),
+        "principal": principal,
+        "created_at": now,
+        "expires_at": now + int(ttl or _VOUCH_DEFAULT_TTL),
+    }
+
+
+def _vouch_append(rec, key_path):
+    """Chain, sign and append one record. Returns the signed record."""
+    prev, seq = _vouch_chain_head()
+    rec = dict(rec)
+    rec["prev"], rec["seq"] = prev, seq + 1
+    sig = _vouch_sign(_vouch_canonical(rec), key_path)
+    if not sig:
+        raise ValueError("signing failed (wrong passphrase, or no such key)")
+    rec["sig"] = sig
+    line = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    fd = os.open(VOUCH_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return rec
+
+
+def check_vouch_store():
+    """CRITICAL when the vouch log exists but does not verify.
+
+    This is the fail-closed half of the tier and the reason it can be a
+    security control at all. It is deliberately CRITICAL and deliberately
+    attack-defined — a store whose chain broke or whose signature stopped
+    verifying is either corruption or somebody editing what the monitor
+    trusts, and neither is something to grade down.
+    """
+    if not os.path.isfile(VOUCH_FILE):
+        return []
+    _v, tamper = load_vouches()
+    if not tamper:
+        return []
+    return [finding(
+        "CRITICAL", "vouch-store", "Vouch store failed verification",
+        "%s did not verify: %s. Every vouch has been DISCARDED for this scan "
+        "and all vouched workloads are being graded as if unvouched. Either "
+        "the log was corrupted or something edited what Aegis trusts."
+        % (VOUCH_FILE, tamper),
+        "vouch:tamper:%s" % _sha_key(tamper), confidence="high",
+        markers=["trust-store-tamper"], attack_defined=True,
+        path=VOUCH_FILE)]
 
 
 def _custody_persistence(old, rec):
@@ -9637,6 +10215,104 @@ def _custody_persistence(old, rec):
     return None
 
 
+
+
+def cmd_vouch(argv):
+    """`vouch` — the operator's own signature on a workload.
+
+    Deliberately manual in every respect: the operator names the path, the
+    endpoints, and types a passphrase. Nothing here can be driven by a
+    dismissal, a heuristic, or a prior verdict — an automatic path into this
+    store would hand an attacker the one rung the rest of the ladder cannot
+    forge.
+    """
+    sub = argv[2] if len(argv) > 2 else ""
+
+    if sub == "pin":
+        if len(argv) < 4:
+            print("usage: aegis.py vouch pin <allowed_signers file>")
+            return 2
+        src = argv[3]
+        try:
+            with open(src, encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            print("cannot read %s: %s" % (src, e))
+            return 1
+        keys = [ln for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+        if not keys:
+            print("%s contains no signer lines; nothing pinned" % src)
+            return 1
+        fd = os.open(VOUCH_SIGNERS + ".tmp",
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(VOUCH_SIGNERS + ".tmp", VOUCH_SIGNERS)
+        print("pinned %d vouch signer(s) -> %s" % (len(keys), VOUCH_SIGNERS))
+        return 0
+
+    if sub in ("list", "status", ""):
+        vouches, tamper = load_vouches()
+        if tamper:
+            print("VOUCH STORE FAILED VERIFICATION: %s" % tamper)
+            print("every vouch is being ignored; workloads grade as unvouched.")
+            return 1
+        if not os.path.isfile(VOUCH_SIGNERS):
+            print("no vouch roster pinned (vouching inactive).")
+            print("  aegis.py vouch pin <allowed_signers file>")
+        if not vouches:
+            print("no active vouches.")
+            return 0
+        print("%d active vouch(es):" % len(vouches))
+        for subj in sorted(vouches, key=lambda k: vouches[k]["path"]):
+            r = vouches[subj]
+            print("  %s" % r["path"])
+            print("    sha256=%s uid=%s expires=%s"
+                  % (r["sha256"][:16], r.get("uid"),
+                     datetime.fromtimestamp(int(r["expires_at"])).isoformat()))
+            if r.get("endpoints"):
+                print("    endpoints: %s" % ", ".join(r["endpoints"]))
+        return 0
+
+    if sub in ("add", "revoke"):
+        if len(argv) < 5:
+            print("usage: aegis.py vouch %s <path> <signing-key> "
+                  "[endpoint ...]" % sub)
+            print("  the signing key must be passphrase-protected and live "
+                  "OUTSIDE ~/.aegis")
+            return 2
+        path, key = argv[3], argv[4]
+        endpoints = list(argv[5:])
+        if not os.path.isfile(path):
+            print("no such file: %s" % path)
+            return 1
+        if not os.path.isfile(VOUCH_SIGNERS):
+            print("no vouch roster pinned — pin one first:")
+            print("  aegis.py vouch pin <allowed_signers file>")
+            return 1
+        principal = os.environ.get("AEGIS_VOUCH_PRINCIPAL") or ""
+        if not principal:
+            print("set AEGIS_VOUCH_PRINCIPAL to the principal named in %s"
+                  % VOUCH_SIGNERS)
+            return 2
+        try:
+            rec = _vouch_record(
+                "vouch" if sub == "add" else "revoke", path, principal,
+                endpoints=endpoints)
+            _vouch_append(rec, key)
+        except Exception as e:
+            print("%s failed: %s" % (sub, e))
+            return 1
+        print("%s recorded for %s" % (sub, os.path.realpath(path)))
+        if sub == "add" and not endpoints:
+            print("  NOTE: identity-only vouch — this does NOT quiet network "
+                  "findings.\n  Re-run with the exact endpoints to cover those.")
+        return 0
+
+    print("usage: aegis.py vouch [list | pin <file> | add <path> <key> "
+          "[endpoint ...] | revoke <path> <key>]")
+    return 2
 
 
 def cmd_signers(argv):
@@ -11365,6 +12041,10 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
         ("self-protection", check_self_protection, ()),
+        # Fail-closed half of the vouch tier: a trust store that stopped
+        # verifying is the most interesting event on the machine, so it is a
+        # first-class sensor rather than a check buried in the grader.
+        ("vouch-store", check_vouch_store, ()),
     ]
     if IS_MAC:
         sensors += [
@@ -19051,6 +19731,8 @@ def main(argv):
         return cmd_intent(argv)
     if cmd == "signers":
         return cmd_signers(argv)
+    if cmd == "vouch":
+        return cmd_vouch(argv)
     if cmd == "replay":
         try:
             days = int(argv[2]) if len(argv) > 2 else 30

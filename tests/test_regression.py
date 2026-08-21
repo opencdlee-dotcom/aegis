@@ -137,6 +137,12 @@ class Sandbox(unittest.TestCase):
             # the first time something new writes.
             "NOTARY_FILE": os.path.join(self.state, "notary.jsonl"),
             "OBSERVATIONS_DIR": os.path.join(self.state, "observations"),
+            # Vouch tier. check_vouch_store() runs inside every scan, so these
+            # are in the same "written by cmd_scan itself" class as NOTARY_FILE
+            # above: leaving them out would point the verifier at the
+            # developer's real vouch log during any scan-invoking test.
+            "VOUCH_FILE": os.path.join(self.state, "vouches.jsonl"),
+            "VOUCH_SIGNERS": os.path.join(self.state, "vouch_signers"),
             # Response-tier state. These were previously sandboxed only inside
             # TestResponseTier, so any OTHER test that reached log_action() —
             # and the protective tier's commands all do — appended to the real
