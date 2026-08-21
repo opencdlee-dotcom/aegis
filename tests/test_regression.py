@@ -1621,6 +1621,126 @@ class TestTrustStoreTamper(Sandbox):
         self.assertFalse(any("tampered" in f["fingerprint"] for f in fs), fs)
 
 
+class TestResponseCliRequiresHumanAuthorization(unittest.TestCase):
+    """Mutating response commands must prove a human at the dispatcher.
+
+    The internal cmd_* functions stay composable/testable; only direct CLI
+    entry is gated, before any response implementation can mutate state.
+    """
+
+    COMMANDS = (
+        ("quarantine", "/tmp/payload", "cmd_quarantine"),
+        ("restore", "qid-1", "cmd_restore"),
+        ("destroy", "qid-1", "cmd_destroy"),
+        ("kill", "4242", "cmd_kill"),
+        ("freeze", "4242", "cmd_freeze"),
+        ("thaw", "freeze-1", "cmd_thaw"),
+        ("neutralize", "/tmp/payload", "cmd_neutralize"),
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_response_auth_")
+        self._paths = (aegis.STATE_DIR, aegis.ACTION_LOG, aegis.RUN_LOG)
+        aegis.STATE_DIR = self.tmp
+        aegis.ACTION_LOG = os.path.join(self.tmp, "actions.jsonl")
+        aegis.RUN_LOG = os.path.join(self.tmp, "run.log")
+
+    def tearDown(self):
+        aegis.STATE_DIR, aegis.ACTION_LOG, aegis.RUN_LOG = self._paths
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _audit(self):
+        with open(aegis.ACTION_LOG, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_refusal_happens_before_any_mutating_command_runs(self):
+        saved_auth = aegis.authorize_interactive
+        saved_cmds = {name: getattr(aegis, name) for _, _, name in self.COMMANDS}
+        authorizations, mutations = [], []
+
+        def refuse(purpose, target):
+            authorizations.append((purpose, target))
+            return False, "refused-not-interactive"
+
+        aegis.authorize_interactive = refuse
+        for _verb, _arg, name in self.COMMANDS:
+            setattr(aegis, name,
+                    lambda *a, _name=name, **k: mutations.append(_name) or 0)
+        try:
+            for verb, arg, _name in self.COMMANDS:
+                extra = ["--yes"] if verb == "destroy" else []
+                self.assertNotEqual(0, aegis.main(["aegis.py", verb, arg] + extra))
+        finally:
+            aegis.authorize_interactive = saved_auth
+            for name, fn in saved_cmds.items():
+                setattr(aegis, name, fn)
+        self.assertEqual([], mutations)
+        self.assertEqual(
+            ["%s %s" % (verb, arg) for verb, arg, _ in self.COMMANDS],
+            [target for _purpose, target in authorizations])
+
+    def test_authorized_destroy_still_requires_and_preserves_yes(self):
+        saved_auth, saved_destroy = (aegis.authorize_interactive,
+                                     aegis.cmd_destroy)
+        seen = []
+        aegis.authorize_interactive = lambda purpose, target: (True, "tty-only")
+        aegis.cmd_destroy = lambda qid, confirmed=False: seen.append(
+            (qid, confirmed)) or 0
+        try:
+            self.assertEqual(0, aegis.main(
+                ["aegis.py", "destroy", "qid-1", "--yes"]))
+        finally:
+            aegis.authorize_interactive, aegis.cmd_destroy = (saved_auth,
+                                                               saved_destroy)
+        self.assertEqual([("qid-1", True)], seen)
+
+    def test_every_authorization_decision_is_durably_bound_to_command(self):
+        saved_auth = aegis.authorize_interactive
+        saved_cmds = {name: getattr(aegis, name) for _, _, name in self.COMMANDS}
+        channels = iter(["gui-dialog", "notification", "tty-only",
+                         "gui-dialog", "notification", "tty-only",
+                         "gui-dialog"])
+        aegis.authorize_interactive = lambda purpose, target: (True,
+                                                                next(channels))
+        for _verb, _arg, name in self.COMMANDS:
+            setattr(aegis, name, lambda *a, **k: 0)
+        try:
+            for verb, arg, _name in self.COMMANDS:
+                extra = ["--yes"] if verb == "destroy" else []
+                self.assertEqual(0, aegis.main(["aegis.py", verb, arg] + extra))
+        finally:
+            aegis.authorize_interactive = saved_auth
+            for name, fn in saved_cmds.items():
+                setattr(aegis, name, fn)
+        records = self._audit()
+        self.assertEqual(7, len(records))
+        self.assertEqual(["response-auth"] * 7,
+                         [r["action"] for r in records])
+        self.assertEqual(
+            ["%s %s" % (verb, arg) for verb, arg, _ in self.COMMANDS],
+            [r["target"] for r in records])
+        self.assertEqual(
+            ["gui-dialog", "notification", "tty-only", "gui-dialog",
+             "notification", "tty-only", "gui-dialog"],
+            [r["channel"] for r in records])
+
+        # A refusal is equally important evidence and must land before return.
+        aegis.authorize_interactive = lambda purpose, target: (
+            False, "refused-not-interactive")
+        saved_kill = aegis.cmd_kill
+        aegis.cmd_kill = lambda *a, **k: self.fail("refusal reached mutation")
+        try:
+            self.assertEqual(1, aegis.main(["aegis.py", "kill", "99"]))
+        finally:
+            aegis.authorize_interactive, aegis.cmd_kill = (saved_auth,
+                                                            saved_kill)
+        refused = self._audit()[-1]
+        self.assertEqual("response-auth", refused["action"])
+        self.assertEqual("kill 99", refused["target"])
+        self.assertEqual("refused", refused["result"])
+        self.assertEqual("refused-not-interactive", refused["channel"])
+
+
 class TestResponseTier(Sandbox):
     """The opt-in quarantine/restore/destroy/kill/sandbox/neutralize response
     tier. Every path is redirected into the per-test tmp store; no real ~/.aegis
@@ -2721,6 +2841,28 @@ class TestIntelFeeds(Sandbox):
         self.assertEqual(
             aegis.check_intel({"k": "notadict", "j": {"sha256": None}},
                               [{}, "x"]), [])
+
+    def test_check_intel_loads_sets_once_for_the_whole_pass(self):
+        sha = "55" * 32
+        self._write_intel(tf_hashes={sha: {"family": "AMOS",
+                                           "first_seen": None}})
+        real_sets = aegis._intel_sets
+        calls = []
+
+        def counting_sets():
+            calls.append(1)
+            return real_sets()
+
+        aegis._intel_sets = counting_sets
+        try:
+            fs = aegis.check_intel({
+                "a": {"sha256": sha, "program": "/a"},
+                "b": {"sha256": sha, "program": "/b"},
+            })
+        finally:
+            aegis._intel_sets = real_sets
+        self.assertEqual(2, len(fs))
+        self.assertEqual(1, len(calls), "intel sets were loaded per hash")
 
     def test_outbound_connection_to_known_c2_is_critical(self):
         self._write_intel(tf_net={self.C2: {"family": "Cobalt Strike",

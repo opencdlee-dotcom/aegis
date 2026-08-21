@@ -150,6 +150,7 @@ import sys
 import time
 import hashlib
 import hmac
+import ipaddress
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -2715,10 +2716,17 @@ def _beacon_parts(fingerprint):
     m = _BEACON_FP_RE.match(fp)
     if not m:
         return None
+    ip, port = m.group("ip"), m.group("port")
+    try:
+        ipaddress.ip_address(ip)
+        if not 1 <= int(port) <= 65535:
+            return None
+    except ValueError:
+        return None
     path = _TOLERANCE_VERSION_RE.sub("#", m.group("path"))
     if not path:
         return None
-    return path, m.group("ip"), m.group("port")
+    return path, ip, port
 
 
 def _beacon_endpoint_classes(fingerprint):
@@ -4653,6 +4661,9 @@ def _typosquats_apple_daemon(name):
 # which turns it into a DEGRADED sensor entry -- an unanswered process table must
 # never be reported as an empty one.
 _PROC_ENUM_FAILED = False
+# The executable table can succeed while macOS's separate full-argv query
+# fails. Keep the useful rows, but publish that behavioral coverage is partial.
+_PROC_ARGV_PARTIAL = False
 
 # Scan-scoped process-table cache. None => walk live (the default, and every
 # by-hand command). gather_all arms it with ONE walk before the sensor loop and
@@ -4705,7 +4716,7 @@ def _iter_processes_live():
       windows: one CIM query
     `owner` is the uid string (posix) or DOMAIN\\user (Windows); callers compare
     it against _own_owner() to enforce the same-user boundary."""
-    global _PROC_ENUM_FAILED
+    global _PROC_ENUM_FAILED, _PROC_ARGV_PARTIAL
     if IS_LINUX:
         try:
             pids = [d for d in os.listdir("/proc") if d.isdigit()]
@@ -4795,6 +4806,8 @@ def _iter_processes_live():
             parts = line.split(None, 1)
             if len(parts) == 2:
                 argvs[parts[0]] = parts[1].strip()
+    else:
+        _PROC_ARGV_PARTIAL = True
     # A failed argv call is NOT a reason to drop the process table: exec path,
     # owner and the same-user boundary all still hold without argv. The argv
     # sensors simply see nothing rather than seeing something wrong.
@@ -11216,10 +11229,11 @@ def _apply_writ(findings, surface_key):
     if not isinstance(data, dict) or not data.get("enforcing"):
         return findings
     scope = _SURFACE_WRIT_SCOPE.get(surface_key, "persistence")
+    covered = _writ_data_covers(data, scope)
     out = []
     for f in findings:
         try:
-            if writ_covers(scope):
+            if covered:
                 # Authorized: keep the record, drop it below the notify floor.
                 f["severity"] = "INFO"
                 f["writ"] = "covered"
@@ -11792,11 +11806,12 @@ def cmd_scan(quiet=False):
 
 
 def _cmd_scan_locked(quiet=False):
-    global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED
+    global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED, _PROC_ARGV_PARTIAL
     ensure_state()
     # per-scan; a stale count or flag would mislead every later run
     _SIG_PROBE_FAILURES = 0
     _PROC_ENUM_FAILED = False
+    _PROC_ARGV_PARTIAL = False
     health = []
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
@@ -11872,6 +11887,12 @@ def _cmd_scan_locked(quiet=False):
             "sensor_id": "process.enumerate", "status": "DEGRADED",
             "detail": "the process table could not be read this scan; no "
                       "process or behavioural finding below is complete",
+            "duration_ms": 0, "item_count": 0})
+    elif _PROC_ARGV_PARTIAL:
+        health.append({
+            "sensor_id": "process.argv", "status": "DEGRADED",
+            "detail": "the executable table was read, but macOS full argv "
+                      "enumeration failed; behavioral findings are incomplete",
             "duration_ms": 0, "item_count": 0})
 
     if _SIG_PROBE_FAILURES:
@@ -12935,10 +12956,12 @@ def _intel_sets():
     return hashes, net
 
 
-def _intel_hash_finding(sha, path, where):
+def _intel_hash_finding(sha, path, where, hashes=None):
     if not sha:
         return None
-    meta = _intel_sets()[0].get(str(sha).lower())
+    if hashes is None:
+        hashes = _intel_sets()[0]
+    meta = hashes.get(str(sha).lower())
     if meta is None:
         return None
     return finding(
@@ -12984,9 +13007,10 @@ def check_intel(current_snap, prior_findings=None):
     the scan already did, scheduled by gather_all only when local intel
     exists."""
     findings, seen = [], set()
+    hashes, _net = _intel_sets()
 
     def grade(sha, path, where):
-        f = _intel_hash_finding(sha, path, where)
+        f = _intel_hash_finding(sha, path, where, hashes=hashes)
         if f and f["fingerprint"] not in seen:
             seen.add(f["fingerprint"])
             findings.append(f)
@@ -18490,10 +18514,8 @@ def _writs_open(now=None):
             if isinstance(w, dict) and w.get("expires", 0) > now]
 
 
-def writ_covers(scope, when=None):
-    """Was `scope` under an open writ at `when`? False when enforcement is off,
-    so every existing call site keeps its current behaviour byte-for-byte."""
-    data = load_json(WRIT_FILE, {})
+def _writ_data_covers(data, scope, when=None):
+    """Pure coverage check over one already-loaded writ snapshot."""
     if not isinstance(data, dict) or not data.get("enforcing"):
         return False
     when = _epoch(when)
@@ -18505,6 +18527,12 @@ def writ_covers(scope, when=None):
             if scope in scopes or "all" in scopes:
                 return True
     return False
+
+
+def writ_covers(scope, when=None):
+    """Was `scope` under an open writ at `when`? False when enforcement is off,
+    so every existing call site keeps its current behaviour byte-for-byte."""
+    return _writ_data_covers(load_json(WRIT_FILE, {}), scope, when)
 
 
 def cmd_writ(action="list", reason=None, minutes=20, scopes=None):
@@ -18979,6 +19007,25 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
 """
 
 
+def _authorize_response_cli(verb, argument=None):
+    """Human gate for direct CLI entry to mutating response commands.
+
+    Internal cmd_* calls remain composable (notably neutralize's ordered
+    quarantine steps); the dispatcher is the trust boundary where an external
+    script would otherwise gain response authority.
+    """
+    target = "%s %s" % (verb, argument if argument is not None else "all")
+    ok, channel = authorize_interactive("Authorize response command", target)
+    # Audit-before-mutation: both approval and refusal are durable, including
+    # which authorization channel made the decision. If the append fails, an
+    # approval cannot safely proceed because it would become unauditable.
+    recorded = log_action(
+        "response-auth", target, "authorized" if ok else "refused",
+        channel=channel, verb=verb,
+        argument=argument if argument is not None else "all")
+    return bool(ok and recorded)
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "scan"
     if cmd == "scan":
@@ -19057,23 +19104,37 @@ def main(argv):
         return cmd_rootwatch(argv[2] if len(argv) > 2 else "status")
     # --- response tier (opt-in) ---
     if cmd == "quarantine" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_quarantine(argv[2])
     if cmd in ("quarantine-list", "ql"):
         return cmd_quarantine_list()
     if cmd == "restore" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_restore(argv[2])
     if cmd == "destroy" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_destroy(argv[2], confirmed=("--yes" in argv[3:]))
     if cmd == "kill" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_kill(argv[2])
     if cmd == "sandbox" and len(argv) > 2:
         return cmd_sandbox(argv[2], argv[3:])
     if cmd == "neutralize" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_neutralize(argv[2])
     # --- protective tier (opt-in, by-hand) ---
     if cmd == "freeze" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_freeze(argv[2])
     if cmd == "thaw":
+        if not _authorize_response_cli(cmd, argv[2] if len(argv) > 2 else None):
+            return 1
         return cmd_thaw(argv[2] if len(argv) > 2 else None)
     if cmd == "frozen":
         return cmd_frozen()

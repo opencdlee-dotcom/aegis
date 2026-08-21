@@ -199,6 +199,19 @@ class RotatingEndpointsNeedEvidence(_DBCase):
         self.assertIsNone(aegis._beacon_parts(fp))
         self.assertEqual(aegis._beacon_endpoint_classes(fp), [])
 
+    def test_only_semantically_valid_ip_and_port_literals_generalize(self):
+        """Shape-compatible garbage is not endpoint evidence. A tolerance
+        class must be learned only from real IP literals on valid TCP ports."""
+        invalid = (
+            "beacon:/bin/x:999.999.999.999:443",
+            "beacon:/bin/x:12345::1:443",
+            "beacon:/bin/x:::443",
+            "beacon:/bin/x:1.2.3.4:0",
+            "beacon:/bin/x:1.2.3.4:65536",
+        )
+        for fp in invalid:
+            self.assertIsNone(aegis._beacon_parts(fp), fp)
+
     def test_attack_defined_prefixes_never_generalize(self):
         for pre in ("decoy:", "latch:", "canary:"):
             self.assertIsNone(
