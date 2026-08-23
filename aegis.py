@@ -8376,6 +8376,14 @@ def _amfid_path(msg):
     return m.group(1) if m else None
 
 
+# Both separators, deliberately: this splits paths that arrive as TEXT from a
+# log message, not from the local filesystem, so os.sep is the wrong authority
+# — a posix-style path is perfectly normal on Windows (and CI proved it: the
+# os.sep version returned None for every forward-slash path there). Greedy so a
+# nested venv resolves to its innermost site-packages.
+_SITEPACKAGES_RE = re.compile(r"^(.*[\\/]site-packages)(?:[\\/]|$)")
+
+
 def _sitepackages_root(path):
     """The `.../site-packages` directory owning `path`, or None.
 
@@ -8386,12 +8394,8 @@ def _sitepackages_root(path):
     `.so` files in one venv are one fact about that venv, and saying it once is
     a legibility win that claims nothing about where the venv came from.
     """
-    parts = (path or "").split(os.sep)
-    try:
-        i = len(parts) - 1 - parts[::-1].index("site-packages")
-    except ValueError:
-        return None
-    return os.sep.join(parts[:i + 1])
+    m = _SITEPACKAGES_RE.match(path or "")
+    return m.group(1) if m else None
 
 
 def check_amfid_log(window_hours=None):

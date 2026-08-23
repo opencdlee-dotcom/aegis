@@ -266,6 +266,20 @@ class VenvOutputIsGroupedButNeverGraded(unittest.TestCase):
                 "/p/.venv/lib/python3.12/site-packages/foo/_c.so"),
             "/p/.venv/lib/python3.12/site-packages")
 
+    def test_windows_separators_resolve_too(self):
+        """CI caught this on both Windows runners: the first implementation
+        split on os.sep, so every forward-slash path returned None off posix.
+        These paths arrive as TEXT out of a log message, not from the local
+        filesystem, so os.sep was never the right authority."""
+        self.assertEqual(
+            aegis._sitepackages_root(
+                r"C:\proj\.venv\Lib\site-packages\foo\_c.pyd"),
+            r"C:\proj\.venv\Lib\site-packages")
+        self.assertEqual(
+            aegis._sitepackages_root(
+                r"C:\proj\.venv\Lib\site-packages"),
+            r"C:\proj\.venv\Lib\site-packages")
+
     def test_a_path_outside_a_venv_has_no_root(self):
         self.assertIsNone(aegis._sitepackages_root("/opt/homebrew/bin/rg"))
         self.assertIsNone(aegis._sitepackages_root(""))
