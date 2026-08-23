@@ -20,6 +20,7 @@ Each class pins the fix AND the safety property that keeps the fix from
 becoming a blind spot -- the safety half is the point, because both fixes
 suppress something.
 """
+import inspect
 import os
 import shutil
 import sys
@@ -247,3 +248,47 @@ class ProgramIdentitySurvivesAnUpgrade(unittest.TestCase):
             case_fingerprint="beacon:%s:9.9.9.9:443"
                              % aegis._program_subject("/p/claude-1.0.0/claude"))
         self.assertNotEqual(f1["case_fingerprint"], f2["case_fingerprint"])
+
+
+class VenvOutputIsGroupedButNeverGraded(unittest.TestCase):
+    """Fix 5 -- a project virtualenv is grouped, but claims no provenance.
+
+    Measured 2026-08-23: a `.venv` appeared under ~/Ai/001/ARC/Vaultkeeper and
+    its 22 ad-hoc signed wheels each became their own amfid finding, taking the
+    sensor from 8 back to 27. Same class as the Homebrew case, but pip and uv
+    write wheels straight into site-packages with no receipt beside the file --
+    so `_package_receipt` cannot see it and MUST NOT pretend to.
+    """
+
+    def test_the_owning_site_packages_dir_is_found(self):
+        self.assertEqual(
+            aegis._sitepackages_root(
+                "/p/.venv/lib/python3.12/site-packages/foo/_c.so"),
+            "/p/.venv/lib/python3.12/site-packages")
+
+    def test_a_path_outside_a_venv_has_no_root(self):
+        self.assertIsNone(aegis._sitepackages_root("/opt/homebrew/bin/rg"))
+        self.assertIsNone(aegis._sitepackages_root(""))
+
+    def test_grouping_is_not_grading(self):
+        """The safety property that separates this from the receipt tier: a
+        venv group is reported at MEDIUM, never demoted. Nothing vouches for a
+        directory just because a package manager wrote it."""
+        src = inspect.getsource(aegis.check_amfid_log)
+        venv_block = src.split("venvs, ungrouped")[1].split("for path in sorted(ungrouped)")[0]
+        self.assertIn('"MEDIUM"', venv_block)
+        self.assertNotIn("_grade_binary", venv_block)
+
+    def test_a_new_file_in_a_reported_venv_still_alerts(self):
+        """The blind spot a plain directory-keyed group would have opened: a
+        malicious .so dropped into an already-reported venv must not inherit
+        that group's identity and vanish. The member digest is in the
+        fingerprint precisely so it does not."""
+        a = "amfid:deny:venv:%s:%s" % (
+            aegis._sha_key("/p/site-packages"),
+            aegis._sha_key("\n".join(["/p/site-packages/a.so"])))
+        b = "amfid:deny:venv:%s:%s" % (
+            aegis._sha_key("/p/site-packages"),
+            aegis._sha_key("\n".join(["/p/site-packages/a.so",
+                                      "/p/site-packages/evil.so"])))
+        self.assertNotEqual(a, b)

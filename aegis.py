@@ -8376,6 +8376,24 @@ def _amfid_path(msg):
     return m.group(1) if m else None
 
 
+def _sitepackages_root(path):
+    """The `.../site-packages` directory owning `path`, or None.
+
+    A project venv is a package manager's output just as much as a Cellar tree
+    is, but it carries no receipt `_package_receipt` can read — pip and uv write
+    wheels straight into site-packages with no install record beside the file.
+    So this is used ONLY to group, never to grade: twenty-two ad-hoc signed
+    `.so` files in one venv are one fact about that venv, and saying it once is
+    a legibility win that claims nothing about where the venv came from.
+    """
+    parts = (path or "").split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("site-packages")
+    except ValueError:
+        return None
+    return os.sep.join(parts[:i + 1])
+
+
 def check_amfid_log(window_hours=None):
     """Harvest amfid code-signature-validation FAILURE events from the
     unified log. Kept at MEDIUM/low-confidence (log+correlation tier, below
@@ -8425,7 +8443,36 @@ def check_amfid_log(window_hours=None):
             markers=["amfid-deny"], path=paths[0], receipt=receipt,
             member_count=len(paths), members=paths[:20]))
 
-    for path in sorted(solo):
+    # Second grouping pass, for package output that has no receipt to read: a
+    # project venv. Grouped but NEVER graded — the fingerprint carries a digest
+    # of the member set, so a NEW file appearing in an already-reported venv
+    # mints a new identity and alerts once, which is exactly the case a plain
+    # directory-keyed group would have swallowed.
+    venvs, ungrouped = {}, []
+    for path in solo:
+        root = _sitepackages_root(path)
+        if root:
+            venvs.setdefault(root, []).append(path)
+        else:
+            ungrouped.append(path)
+    for root in sorted(venvs):
+        paths = sorted(venvs[root])
+        if len(paths) < 2:
+            ungrouped.extend(paths)
+            continue
+        findings.append(finding(
+            "MEDIUM", "amfid", "Code-signature validation failed (amfid)",
+            "amfid rejected %d file(s) under %s — a project virtualenv's "
+            "wheels are ad-hoc signed by construction. No install receipt "
+            "vouches for this directory, so this is NOT graded down; it is "
+            "reported once instead of %d times. e.g. %s"
+            % (len(paths), root, len(paths), paths[0]),
+            "amfid:deny:venv:%s:%s" % (_sha_key(root),
+                                       _sha_key("\n".join(paths))),
+            confidence="low", markers=["amfid-deny"], path=paths[0],
+            venv=root, member_count=len(paths), members=paths[:20]))
+
+    for path in sorted(ungrouped):
         msg, ts = by_path[path]
         sev, rung, note = _grade_binary("MEDIUM", path)
         findings.append(finding(
