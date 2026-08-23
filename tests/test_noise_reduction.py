@@ -173,6 +173,32 @@ class LegacyExecIncidentsRetire(_DBCase):
         self.assertEqual(self._status(i), "OPEN")
 
 
+class LegacyProgramIncidentsRetire(_DBCase):
+    """Only unreachable version-keyed cases are superseded on upgrade."""
+
+    def test_versioned_program_cases_retire_once(self):
+        process = self._inc(
+            "p", key="signal:process:/tmp/tool:unsigned:" + "a" * 64)
+        beacon = self._inc(
+            "b", key="signal:beacon:/opt/tool-2.1.0/bin/tool:1.2.3.4:443")
+        self.assertEqual(
+            aegis._retire_orphaned_program_incidents(self.db, self.now), 2)
+        self.assertEqual(self._status(process), "FALSE_POSITIVE")
+        self.assertEqual(self._status(beacon), "FALSE_POSITIVE")
+        self.assertEqual(
+            aegis._retire_orphaned_program_incidents(self.db, self.now), 0)
+
+    def test_endpoint_version_does_not_retire_stable_program(self):
+        stable = self._inc(
+            "b", key="signal:beacon:/opt/tool/bin/tool:1.2.3.4:443")
+        outbound = self._inc(
+            "o", key="signal:outbound:/opt/tool/bin/tool:8.9.10.11:443")
+        self.assertEqual(
+            aegis._retire_orphaned_program_incidents(self.db, self.now), 0)
+        self.assertEqual(self._status(stable), "OPEN")
+        self.assertEqual(self._status(outbound), "OPEN")
+
+
 class RotatingEndpointsNeedEvidence(_DBCase):
     """Fix 2b — a rotating service generalizes only once rotation is
     demonstrated, and the shape of the evidence decides how far it generalizes."""

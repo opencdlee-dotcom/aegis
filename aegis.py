@@ -3415,6 +3415,70 @@ _LEGACY_PERSIST_CASE_RE = re.compile(
     r"^(signal:persistence:changed:.*):[0-9a-f]{8,64}$")
 
 
+_LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:.*:[0-9a-f]{64}$")
+
+
+def _is_orphaned_program_key(key):
+    """True for a signal key the program-subject sensors can no longer emit.
+
+    Two shapes were retired when process/outbound/beacon moved to a case keyed
+    on the PROGRAM rather than the versioned path it happens to live at:
+
+      * process keys carried a trailing `:<trust>:<sha256>`, so a rebuild of
+        the same program was a different entity;
+      * outbound/beacon keys embedded the version-bearing path, so every
+        editor-extension update minted a fresh incident forever.
+
+    A path with no version segment normalizes to itself, so those keys are NOT
+    orphaned and are deliberately left alone — this closes only what has
+    actually become unreachable.
+    """
+    key = key or ""
+    if _LEGACY_PROCESS_KEY_RE.match(key):
+        return True
+    if key.startswith(("signal:beacon:", "signal:outbound:")):
+        fp = key[len("signal:"):]
+        if fp.startswith("outbound:"):
+            fp = "beacon:" + fp[len("outbound:"):]
+        match = _BEACON_FP_RE.match(fp)
+        return bool(match and _TOLERANCE_VERSION_RE.search(match.group("path")))
+    return False
+
+
+def _retire_orphaned_program_incidents(db, now):
+    """One-time: close incidents whose correlation key the sensors retired.
+
+    Same reasoning as _retire_legacy_exec_incidents, and deliberately the same
+    remedy rather than a key rewrite: an outbound/beacon key ends in an
+    endpoint, and an IPv6 endpoint is itself full of colons, so any attempt to
+    parse the old key back into (path, address, port) would be guesswork on the
+    one table that must not be guessed at.
+
+    Closed as SUPERSEDED with evidence intact. Nothing is being judged benign:
+    whatever these described, if it is still true, re-alerts on the very next
+    scan under the new identity — collapsed by program instead of multiplied by
+    version. Guarded by a meta key so it runs once per upgrade, not per scan.
+    """
+    if db.execute("SELECT value FROM meta WHERE key='program_case_migrated'"
+                  ).fetchone():
+        return 0
+    aged = [row["id"] for row in db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status IN "
+        "('OPEN','ACK')") if _is_orphaned_program_key(row["correlation_key"])]
+    if aged:
+        marks = ",".join("?" for _ in aged)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: process/outbound/beacon cases are now keyed on the "
+             "PROGRAM, not the versioned path it lives at — re-alerts under "
+             "the new identity if still present", now) + tuple(aged))
+    db.execute("INSERT INTO meta(key,value) VALUES('program_case_migrated',?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+               (str(now),))
+    return len(aged)
+
+
 def _merge_legacy_persistence_cases(db, now):
     """One-time: collapse per-content-hash persistence incidents onto the file.
 
@@ -3532,6 +3596,13 @@ def record_security_state(findings, sensor_health=(), now=None,
                             "one case per file" % folded)
             except Exception as e:
                 log_run("persistence-case migration skipped: %s" % e)
+            try:
+                orphaned = _retire_orphaned_program_incidents(db, now)
+                if orphaned:
+                    log_run("retired %d incident(s) keyed on the old versioned-"
+                            "path program identity" % orphaned)
+            except Exception as e:
+                log_run("program-case migration skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
@@ -7502,8 +7573,11 @@ def _outbound_finding(path, rip, rport):
             return None
     elif not (suspicious_sig(trust) and is_risky_location(path)):
         return None
-    graded, rung, note = _grade_binary("MEDIUM", path,
-                                      endpoint="%s:%s" % (rip, rport))
+    endpoint = "%s:%s" % (rip, rport)
+    graded, rung, note = _grade_binary("MEDIUM", path, endpoint=endpoint)
+    dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
+    if dev_note:
+        note = (note + "\n" + dev_note) if note else dev_note
     return finding(
         graded, "net-outbound", "Untrusted binary connected outbound",
         "%s [%s] in a user-writable path is connected to %s:%s — an "
@@ -7511,7 +7585,10 @@ def _outbound_finding(path, rip, rport):
         "phoning-home / exfil shape. Recorded for correlation."
         % (path, trust, rip, rport)
         + (("\n" + note) if note else ""),
-        "outbound:%s:%s:%s" % (path, rip, rport), path=path, program=path,
+        "outbound:%s:%s:%s" % (path, rip, rport),
+        case_fingerprint=dev_case or ("outbound:%s:%s:%s" % (
+            _program_subject(path), rip, rport)),
+        path=path, program=path,
         remote=rip, port=rport, trust=trust, confidence="medium",
         custody=rung, markers=["outbound-exfil"])
 
@@ -7712,8 +7789,11 @@ def _beacon_recurrence(history, current_rows):
             continue
         if not (suspicious_sig(trust) or is_risky_location(path)):
             continue
-        graded, rung, note = _grade_binary(
-            "HIGH", path, endpoint="%s:%s" % (rip, rport))
+        endpoint = "%s:%s" % (rip, rport)
+        graded, rung, note = _grade_binary("HIGH", path, endpoint=endpoint)
+        dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
+        if dev_note:
+            note = (note + "\n" + dev_note) if note else dev_note
         findings.append(finding(
             graded, "net-beacon",
             "Persistent outbound connection (beacon shape)",
@@ -7724,8 +7804,8 @@ def _beacon_recurrence(history, current_rows):
             % (path, trust, rip, rport, len(stamps), span / 3600.0)
             + (("\n" + note) if note else ""),
             "beacon:%s:%s:%s" % (path, rip, rport),
-            case_fingerprint="beacon:%s:%s:%s" % (
-                _program_subject(path), rip, rport),
+            case_fingerprint=dev_case or ("beacon:%s:%s:%s" % (
+                _program_subject(path), rip, rport)),
             path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
@@ -10133,6 +10213,45 @@ def _vouch_append(rec, key_path):
     with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(line + "\n")
     return rec
+
+
+_VOUCH_DEVIATION_NOTE = (
+    "These bytes ARE vouched — the digest still matches the contract you "
+    "signed — but this endpoint is not in that contract's reviewed set. That "
+    "is either an endpoint rotation (GitHub, a CDN, a relay pool) or vouched "
+    "software reaching somewhere new, and the two are indistinguishable from "
+    "here. Severity is NOT reduced. Confirm and re-vouch with the new "
+    "endpoint, or revoke: `aegis.py vouch list`.")
+
+
+def _vouch_endpoint_deviation(path, endpoint):
+    """(case_key, note) when `path` is a vouched workload reaching an endpoint
+    its vouch does not cover; (None, None) otherwise.
+
+    This exists because the alternative is worse in both directions. Binding a
+    vouch to an exact endpoint set is right — an identity vouch that widened
+    into "may contact anything on 443" would hide the one connection worth
+    seeing. But a workload whose provider rotates addresses then re-alerts as a
+    COLD, brand-new HIGH beacon every rotation, which is the same alert-fatigue
+    the whole precision tier exists to end, and it trains the operator to
+    silence beacons by hand-editing a trust store.
+
+    So the rotation batches into the workload's own case: one case per vouched
+    workload, each unreviewed endpoint attached to it as its own evidence
+    fingerprint. Severity is deliberately UNCHANGED — this never demotes.
+    Nothing here decides the endpoint is benign; it decides only which case the
+    operator reads it in.
+    """
+    if not path or endpoint is None:
+        return None, None
+    # Fully covered, or not a vouched workload at all: not a deviation.
+    if _vouch_covers(path, endpoint) or not _vouch_covers(path):
+        return None, None
+    try:
+        subject = _vouch_subject(os.path.realpath(path))
+    except OSError:
+        return None, None
+    return "vouched-endpoint:%s" % subject, _VOUCH_DEVIATION_NOTE
 
 
 def check_vouch_store():
@@ -15121,6 +15240,45 @@ def _process_identity(pid):
     return None, None
 
 
+def _process_start_token(pid):
+    """Stable creation token for a live process, or None when unavailable.
+
+    A numeric PID is a reusable slot.  Response actions bind to this token so
+    an exited target cannot be replaced by an unrelated process between the
+    ownership check and a signal.
+    """
+    pid = int(pid)
+    if IS_LINUX:
+        try:
+            with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
+                stat = fh.read().strip()
+            # comm (field 2) is parenthesized and may itself contain spaces or
+            # ')'; fields after its final ')' begin with state (field 3).
+            tail = stat[stat.rfind(")") + 1:].split()
+            return tail[19] if len(tail) > 19 else None  # field 22: starttime
+        except (OSError, ValueError, IndexError):
+            return None
+    if IS_WIN:
+        script = ("$p=Get-CimInstance Win32_Process -Filter 'ProcessId = %d' "
+                  "-ErrorAction SilentlyContinue;if($p){$p.CreationDate}" % pid)
+        out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", script], timeout=15)
+    else:
+        out, _, rc = run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
+    token = (out or "").strip()
+    return token if rc == 0 and token else None
+
+
+def _process_matches(pid, expected_owner, expected_comm, expected_start):
+    """True for the authorized process, False for PID reuse, None if gone."""
+    owner, comm = _process_identity(pid)
+    if owner is None:
+        return None
+    current_start = _process_start_token(pid)
+    return (owner == expected_owner and comm == expected_comm and
+            current_start is not None and current_start == expected_start)
+
+
 def _process_alive(pid):
     if IS_WIN:
         out, _, rc = run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
@@ -15163,10 +15321,25 @@ def cmd_kill(pid):
         print("refuse: pid %d is a session-critical process (%s)" % (pid, comm))
         log_action("kill", str(pid), "refused-protected-comm", comm=comm)
         return 1
+    start_token = _process_start_token(pid)
+    if start_token is None:
+        print("refuse: could not bind pid %d to a stable process identity" % pid)
+        log_action("kill", str(pid), "refused-no-start-token", comm=comm)
+        return 1
+
+    def revalidate():
+        same = _process_matches(pid, owner, comm, start_token)
+        if same is False:
+            print("refuse: pid %d was reused after authorization" % pid)
+            log_action("kill", str(pid), "refused-pid-reused", comm=comm)
+        return same
 
     if IS_WIN:
         # No POSIX signals: taskkill without /F requests a clean WM_CLOSE, then
         # /F is the SIGKILL equivalent — the same graceful-then-forced ladder.
+        same = revalidate()
+        if same is not True:
+            return 0 if same is None else 1
         run(["taskkill", "/PID", str(pid)], timeout=20)
         for _ in range(10):
             time.sleep(0.1)
@@ -15174,6 +15347,9 @@ def cmd_kill(pid):
                 log_action("kill", str(pid), "ok-graceful", comm=comm)
                 print("Killed pid %d (%s) gracefully." % (pid, comm))
                 return 0
+        same = revalidate()
+        if same is not True:
+            return 0 if same is None else 1
         run(["taskkill", "/PID", str(pid), "/F"], timeout=20)
         gone = not _process_alive(pid)
         log_action("kill", str(pid), "ok-forced" if gone else "failed", comm=comm)
@@ -15183,6 +15359,9 @@ def cmd_kill(pid):
         return 0 if gone else 1
 
     import signal as _signal
+    same = revalidate()
+    if same is not True:
+        return 0 if same is None else 1
     try:
         os.kill(pid, _signal.SIGTERM)
     except ProcessLookupError:
@@ -15197,6 +15376,9 @@ def cmd_kill(pid):
             log_action("kill", str(pid), "ok-sigterm", comm=comm)
             print("Killed pid %d (%s) with SIGTERM." % (pid, comm))
             return 0
+    same = revalidate()
+    if same is not True:
+        return 0 if same is None else 1
     try:
         os.kill(pid, _signal.SIGKILL)
     except Exception:

@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
@@ -2059,6 +2060,31 @@ class TestResponseTier(Sandbox):
         self.assertNotEqual(aegis.cmd_kill(target), 0)
         self.assertEqual(subprocess.run(["ps", "-p", str(target)]).returncode, 0,
                          "guard should not have killed the other-user process")
+
+    def test_kill_refuses_pid_reused_after_authorization(self):
+        """A PID is only a slot: if its process start token changes between
+        authorization and signalling, Aegis must fail closed without sending
+        any signal to the replacement process."""
+        tokens = iter(("start-A", "start-B"))
+        sent = []
+        with mock.patch.object(aegis, "_process_identity",
+                               return_value=(str(os.getuid()), "harmless")), \
+             mock.patch.object(aegis, "_process_start_token", create=True,
+                               side_effect=lambda _pid: next(tokens)), \
+             mock.patch.object(aegis.os, "kill",
+                               side_effect=lambda pid, sig: sent.append((pid, sig))):
+            self.assertNotEqual(aegis.cmd_kill(424242), 0)
+        self.assertEqual(sent, [], "replacement process received a signal")
+
+    def test_ci_actions_use_supported_node_runtime(self):
+        workflow = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                ".github", "workflows", "ci.yml")
+        with open(workflow, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn("actions/checkout@v4", text)
+        self.assertNotIn("actions/setup-python@v5", text)
+        self.assertIn("actions/checkout@v5", text)
+        self.assertIn("actions/setup-python@v6", text)
 
     # neutralize (ordered launchd kill-chain) -----------------------------
     def test_neutralize_quarantines_plist(self):

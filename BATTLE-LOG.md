@@ -1,3 +1,30 @@
+# Aegis — `/doit` closure (2026-08-23)
+
+The residual PID-reuse race and the concurrent alert-identity follow-up are now
+closed and shipped through the same evidence gates. A kill authorization binds
+to owner, executable identity, and the OS process-creation token, then
+revalidates immediately before both graceful and forced termination. A
+replacement PID is refused without receiving a signal. CI actions moved from
+the deprecated Node 20 releases to `checkout@v5` and `setup-python@v6`.
+
+Review of the concurrent incident migration found and fixed one additional
+safety defect before shipment: its version detector searched the whole network
+key, so an endpoint such as `1.2.3.4` could look like a version and auto-close a
+stable-path incident. It now parses the endpoint key and searches only the
+program path. Versioned legacy cases retire once; stable program paths remain
+open. Vouched workloads with unreviewed rotating endpoints batch into one
+workload case without reducing severity, while changed or unvouched binaries
+receive no batching privilege.
+
+Captured final gates: focused fail-before proofs were 2 failures (PID reuse and
+old CI action releases), then 31 focused checks passed; the authoritative suite
+passed **1,014 tests, 4 skipped, 11 subtests**; `selftest.py` passed **7/7**; and
+`git diff --check` passed. The PID check materially narrows but cannot make the
+final user-space check-to-signal instruction atomic on every supported OS; that
+last kernel-scheduling interval remains an honest platform limit.
+
+---
+
 # Aegis — Battle-Test Log (2026-08-21, `/battle-test` siege — 6 fixes, delegated 4-lens hunt)
 
 Full repository siege under the fable-mode gates. Aegis has manually invoked
