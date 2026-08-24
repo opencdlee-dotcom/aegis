@@ -427,6 +427,8 @@ is the number the operator actually reads, and it is what this tier targets.
 | `amfid` | sha256 of the whole log **message** | the rejected **file**, grouped by package receipt | 26 → 8 findings |
 | `ide-ext` | the extension **directory** (carries the version) | `publisher.name`, version as an attribute | 3 → 0 findings |
 | `persistence.diff` | `<path>:<content-hash>` (the *incident* key) | `<path>` — the file is the case | 46 → 37 open incidents |
+| `net-outbound` | `<versioned path>:<ip>:<port>` | `<program>` — endpoints are evidence | 8 → 4 report lines; 64 → 7 stored identities |
+| `net-beacon` | `<versioned path>:<ip>:<port>` (*signal* key) | `<program>:<ip>:<port>` | 47 → 31 stored identities |
 
 The amfid sensor never set `path`, so nothing reached the custody ladder even
 though 18 of its 19 files sat under a Homebrew receipt the grader already
@@ -446,6 +448,49 @@ the shape that guard was written for. `_merge_legacy_persistence_cases`
 migrates existing incidents once, folding duplicates into the survivor with
 their evidence intact (verified on a copy of the live store: 46 → 37, 9 folded,
 17,908 evidence rows preserved, idempotent).
+
+#### The outbound sensor: the endpoint is evidence, not identity
+
+`net-outbound` became the largest sensor in the report, and every one of its
+lines was the same handful of facts wearing different sockets: one `claude`
+binary at three Google frontends was three findings, Syncthing's relay pool had
+left 30+ stored fingerprints, and six extension updates of one program were six
+more identities for it.
+
+The damage was not only readability. `_accumulate_risk` sums one weight per
+DISTINCT fingerprint on an entity, so endpoint rotation **manufactured risk
+score out of a single fact**. Measured on the live store: the `claude` binary's
+"Accumulated risk … 4 signals, score 5.2" was three-quarters one fact, and
+scores 3.1 under subject identity — below the 4.0 threshold, so it stops
+opening a HIGH incident at all. Syncthing's fell 7.4 → 5.2.
+
+So the subject of "an untrusted binary is talking out" is the **program**. Its
+endpoints are carried on the finding (`endpoints`, `endpoint_count`, all
+rendered with the count always stated so a capped list cannot read as a
+complete one) and it **grades on the worst of them**: custody is endpoint-scoped
+for network vouches, so one uncovered endpoint still un-demotes the whole
+subject and still carries its deviation case. Nothing is hidden and nothing is
+laundered.
+
+Three things deliberately keep endpoint identity, because for them the endpoint
+*is* the fact:
+
+- **`net-beacon`** — its detection is persistence at one FIXED endpoint. Only
+  the version churn came out of its signal key.
+- **`intel`** — a catalogued C2 address is what the intel identifies; that
+  finding stays CRITICAL and per-endpoint.
+- **the tolerance layer** — "a new endpoint is a new fact" is unchanged there.
+
+This costs no page: `net-outbound` is below the notify floor by design and
+exists to be read and correlated.
+
+**No migration ships with it, and that is a finding rather than an omission.**
+Being below the notify floor, this sensor has never opened an incident of its
+own: on the live store `signal:outbound:%` matched 0 incidents of any status
+against 64 stored signals, while the HIGH beacon sensor beside it had 36. A
+fold like `_merge_legacy_persistence_cases` would have been guarding an empty
+set. If an outbound case ever does open under the old shape, the 7-day age-out
+tier already closes a stale signal case — no new mechanism is required.
 
 ### The vouch tier (what the operator can say that nothing else can)
 

@@ -208,12 +208,13 @@ class TestOutbound(Sandbox):
         risky = os.path.join(self.tmp, "payload")  # tmp is a risky prefix
         aegis.RISKY_PREFIXES = tuple(set(aegis.RISKY_PREFIXES) | {self.tmp})
         self.adhoc_binary(risky)
-        f = aegis._outbound_finding(risky, "45.94.47.145", "8080")
-        self.assertIsNotNone(f)
-        self.assertEqual(f["severity"], "MEDIUM")
-        self.assertIn("outbound-exfil", f["markers"])
+        fs = aegis._outbound_findings([(risky, "45.94.47.145", "8080")])
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["severity"], "MEDIUM")
+        self.assertIn("outbound-exfil", fs[0]["markers"])
         # A system-signed binary talking out is normal → no finding.
-        self.assertIsNone(aegis._outbound_finding("/bin/ls", "45.94.47.145", "80"))
+        self.assertEqual(
+            aegis._outbound_findings([("/bin/ls", "45.94.47.145", "80")]), [])
 
 
 # --------------------------------------------------------------------------- #

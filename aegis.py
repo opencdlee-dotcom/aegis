@@ -7555,12 +7555,35 @@ def _parse_netstat_established(text):
     return rows
 
 
-def _outbound_finding(path, rip, rport):
-    """Score one outbound connection. A finding only for an unsigned/ad-hoc/broken
-    binary in a user-writable path (the rogue-payload-phoning-home shape); None
-    for a signed or system-path process (a browser/updater talking out is normal).
-    MEDIUM/medium-confidence: logged + fed to correlation, below the notify floor
-    (ad-hoc dev binaries talk to the network routinely — must not page alone)."""
+# The IDENTITY of "an untrusted binary is talking out" is the PROGRAM, not the
+# socket. The retired key was `outbound:<versioned path>:<ip>:<port>`, which
+# made every anycast frontend, every relay in a peer pool, every ephemeral peer
+# port, and every vendor update its own signal about one adjudicable fact. On
+# the reference machine that was one `claude` binary reported three times (three
+# Google frontends) inside a single scan, and 64 stored fingerprints over ~7
+# programs across time.
+#
+# It was not merely unreadable, it was WRONG: _accumulate_risk sums one weight
+# per DISTINCT fingerprint on an entity, so endpoint rotation MANUFACTURED risk
+# score out of a single fact — a program with a rotating relay pool could reach
+# the accumulation threshold on its own churn.
+#
+# Endpoints are not discarded, they are demoted from identity to EVIDENCE: the
+# finding carries the whole live endpoint set and grades on the WORST of them,
+# so a vouched workload reaching an endpoint its vouch does not cover still
+# raises that subject's finding and still lands in the deviation case. The
+# "a new endpoint is a new fact" invariant stays where it belongs — on
+# net-beacon, whose detection IS persistence at one fixed endpoint and which
+# therefore keeps the endpoint in its key. This sensor sits below the notify
+# floor and exists to be read and correlated, so nothing here can lose a page.
+_OUTBOUND_DETAIL_ENDPOINTS = 8
+
+
+def _outbound_candidate_trust(path):
+    """The trust verdict for `path` when it qualifies for the outbound rule,
+    else None — the rogue-payload-phoning-home shape: an unsigned/ad-hoc/broken
+    binary in a user-writable path. A signed or system-path process (a browser
+    or updater talking out) is normal and never qualifies."""
     if not path:
         return None
     if not (path.startswith("/") or (IS_WIN and ":" in path[:3])):
@@ -7573,24 +7596,71 @@ def _outbound_finding(path, rip, rport):
             return None
     elif not (suspicious_sig(trust) and is_risky_location(path)):
         return None
-    endpoint = "%s:%s" % (rip, rport)
-    graded, rung, note = _grade_binary("MEDIUM", path, endpoint=endpoint)
-    dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
-    if dev_note:
-        note = (note + "\n" + dev_note) if note else dev_note
-    return finding(
-        graded, "net-outbound", "Untrusted binary connected outbound",
-        "%s [%s] in a user-writable path is connected to %s:%s — an "
-        "unvouched-for binary holding an outbound socket is a payload-"
-        "phoning-home / exfil shape. Recorded for correlation."
-        % (path, trust, rip, rport)
-        + (("\n" + note) if note else ""),
-        "outbound:%s:%s:%s" % (path, rip, rport),
-        case_fingerprint=dev_case or ("outbound:%s:%s:%s" % (
-            _program_subject(path), rip, rport)),
-        path=path, program=path,
-        remote=rip, port=rport, trust=trust, confidence="medium",
-        custody=rung, markers=["outbound-exfil"])
+    return trust
+
+
+def _outbound_findings(rows):
+    """One MEDIUM/medium-confidence finding per PROGRAM holding live outbound
+    sockets, over `rows` of (path, remote_ip, remote_port).
+
+    Below the notify floor on purpose (ad-hoc dev binaries talk to the network
+    routinely — must not page alone): logged, rendered, and fed to correlation.
+
+    The subject's severity and custody rung are the WORST across its endpoints,
+    because custody is endpoint-scoped for network vouches: one uncovered
+    endpoint is enough to un-demote the whole subject, and it carries its
+    deviation case with it. Endpoints render sorted and capped, with the count
+    always stated so a truncated list can never read as a complete one."""
+    by_subject = {}
+    for path, rip, rport in rows:
+        trust = _outbound_candidate_trust(path)
+        if trust is None:
+            continue
+        by_subject.setdefault(_program_subject(path), set()).add(
+            (str(path), str(rip), str(rport), str(trust)))
+    findings = []
+    for subject in sorted(by_subject):
+        worst = None
+        endpoints = []
+        for path, rip, rport, trust in sorted(by_subject[subject]):
+            endpoint = "%s:%s" % (rip, rport)
+            endpoints.append(endpoint)
+            graded, rung, note = _grade_binary("MEDIUM", path,
+                                               endpoint=endpoint)
+            dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
+            # Rank: severity first, then a vouch deviation (the fact the
+            # operator must actually adjudicate), then an ungraded rung — all
+            # three tie-break toward the endpoint that says the most.
+            rank = (SEV_ORDER.get(graded, -1), 1 if dev_case else 0,
+                    0 if rung else 1)
+            if worst is None or rank > worst[0]:
+                worst = (rank, path, rip, rport, trust, graded, rung, note,
+                         dev_case, dev_note)
+        _r, path, rip, rport, trust, graded, rung, note, dev_case, dev_note \
+            = worst
+        if dev_note:
+            note = (note + "\n" + dev_note) if note else dev_note
+        shown = endpoints[:_OUTBOUND_DETAIL_ENDPOINTS]
+        rendered = ", ".join(shown)
+        if len(endpoints) > len(shown):
+            rendered += " (+%d more)" % (len(endpoints) - len(shown))
+        findings.append(finding(
+            graded, "net-outbound", "Untrusted binary connected outbound",
+            "%s [%s] in a user-writable path is connected to %d live "
+            "endpoint(s): %s — an unvouched-for binary holding an outbound "
+            "socket is a payload-phoning-home / exfil shape. Recorded for "
+            "correlation." % (path, trust, len(endpoints), rendered)
+            + (("\n" + note) if note else ""),
+            "outbound:%s" % subject,
+            case_fingerprint=dev_case or ("outbound:%s" % subject),
+            path=path, program=path,
+            # remote/port stay scalar (the worst endpoint) so every existing
+            # consumer of those attributes keeps working; the full set is its
+            # own attribute rather than a replacement.
+            remote=rip, port=rport, endpoints=endpoints,
+            endpoint_count=len(endpoints), trust=trust, confidence="medium",
+            custody=rung, markers=["outbound-exfil"]))
+    return findings
 
 
 def _parse_proc_net_tcp_established(text):
@@ -7709,6 +7779,7 @@ def check_outbound():
     findings = []
     seen = set()
     snap_rows = []
+    generic_rows = []
     for path, rip, rport in _outbound_rows():
         key = "%s:%s:%s" % (path, rip, rport)
         if key in seen:
@@ -7720,12 +7791,16 @@ def check_outbound():
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
         snap_rows.append((path, rip, rport, trust))
         # Community intel first (local set lookup): a known-C2 endpoint match
-        # is CRITICAL regardless of the binary's signature; only the rest
-        # falls through to the signature-gated generic scorer.
-        f = _intel_net_finding(path, rip, rport) or \
-            _outbound_finding(path, rip, rport)
-        if f:
-            findings.append(f)
+        # is CRITICAL regardless of the binary's signature, and stays keyed on
+        # the ENDPOINT because that is what the intel identifies — a catalogued
+        # C2 address is the fact, not the program that reached it. Only the
+        # rest falls through to the subject-keyed generic scorer below.
+        intel = _intel_net_finding(path, rip, rport)
+        if intel:
+            findings.append(intel)
+        else:
+            generic_rows.append((path, rip, rport))
+    findings += _outbound_findings(generic_rows)
     if snap_rows:
         record_observation(BEACON_SENSOR_ID, sorted(snap_rows))
         findings += _beacon_recurrence(
@@ -7803,7 +7878,13 @@ def _beacon_recurrence(history, current_rows):
             "remote endpoint is the residue an interval C2 beacon leaves."
             % (path, trust, rip, rport, len(stamps), span / 3600.0)
             + (("\n" + note) if note else ""),
-            "beacon:%s:%s:%s" % (path, rip, rport),
+            # Version churn is not identity here either: the CASE already
+            # collapsed by program, but the signal key kept the versioned path,
+            # so one program beaconing to one endpoint across six extension
+            # updates was six stored signals — six weights on one entity in
+            # _accumulate_risk. The endpoint stays in the key: persistence at a
+            # FIXED endpoint is this sensor's whole detection.
+            "beacon:%s:%s:%s" % (_program_subject(path), rip, rport),
             case_fingerprint=dev_case or ("beacon:%s:%s:%s" % (
                 _program_subject(path), rip, rport)),
             path=path, program=path,
