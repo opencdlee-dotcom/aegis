@@ -96,6 +96,49 @@ def _forbid_real_state_writes():
 
 IS_MAC = sys.platform == "darwin"
 
+
+# --------------------------------------------------------------------------- #
+# The trust vocabulary is PER-PLATFORM, and a test that hard-codes one body's
+# word reads as platform-neutral while being anything but.
+#
+# Earned 2026-08-24: tests/test_outbound_subject.py stubbed
+# `classify_signature` to return `{"trust": "adhoc"}` and its own class
+# docstring promised the assertions held "on every OS". Ad-hoc signing is a
+# codesign concept with no Authenticode equivalent, so `suspicious_sig()`
+# rightly rejects "adhoc" on Windows -- every sensor gated on it minted ZERO
+# findings there and all 12 cases in the file failed. macOS and Linux were
+# green (Linux never consults the verdict: its branch keys on the structural
+# exec tell), so the only thing that could see it was a Windows runner, and it
+# took 24 minutes of CI to say so.
+#
+# So ask for the CONCEPT, never for one body's spelling. `suspicious_trust_for`
+# mirrors the split in `aegis.suspicious_sig`; a mirror can drift from what it
+# mirrors, which is why tests/test_cross_platform.py asserts it against the
+# real predicate on all three bodies rather than trusting this comment.
+# --------------------------------------------------------------------------- #
+def suspicious_trust_for(is_win, is_linux):
+    """A trust verdict that `aegis.suspicious_sig()` accepts on that body.
+
+    Linux keys on 'broken' alone ('unmanaged' is true of every locally built
+    binary); Windows on Authenticode's 'unsigned'/'broken'; macOS additionally
+    on codesign's 'adhoc'. Each body gets the verdict most representative of
+    the rogue-binary shape these sensors exist to catch.
+    """
+    if is_linux:
+        return "broken"
+    return "unsigned" if is_win else "adhoc"
+
+
+SUSPICIOUS_TRUST = suspicious_trust_for(aegis.IS_WIN, aegis.IS_LINUX)
+
+# Fail at COLLECTION, not 200 assertions later as an unexplained "0 != 1": if
+# the product's vocabulary moves, the suite says so in the words of the thing
+# that changed.
+assert aegis.suspicious_sig(SUSPICIOUS_TRUST), (
+    "conftest.SUSPICIOUS_TRUST is %r, which aegis.suspicious_sig() rejects on "
+    "this body -- the trust vocabulary moved and this mirror did not."
+    % (SUSPICIOUS_TRUST,))
+
 # Classes whose assertions are inherently macOS-specific.
 _MAC_ONLY_CLASSES = frozenset((
     # kqueue / live log-stream watch internals

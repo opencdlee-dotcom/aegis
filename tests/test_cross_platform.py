@@ -556,6 +556,74 @@ class TrustSemantics(unittest.TestCase):
             aegis.IS_LINUX, aegis.IS_WIN = saved
 
 
+class StubbedTrustQualifiesOnEveryBody(unittest.TestCase):
+    """The gate a stubbed trust verdict has to clear, simulated per body.
+
+    `TrustSemantics` above already pinned that the vocabulary differs by body.
+    What nothing checked was the consequence: a SENSOR whose test feeds it a
+    stubbed verdict inherits that split, and if the test hard-codes one body's
+    word the sensor mints zero findings on the others while every assertion
+    still reads as platform-neutral.
+
+    That is not hypothetical. On 2026-08-24 all 12 cases in
+    tests/test_outbound_subject.py failed on both Windows legs -- `{"trust":
+    "adhoc"}`, a codesign word with no Authenticode equivalent, so
+    `suspicious_sig` rejected it, `_outbound_candidate_trust` returned None for
+    every row, and each assertion failed as an unexplained `0 != 1`. macOS and
+    Linux were green, so only a Windows runner could see it, and it cost 24
+    minutes of CI to say so.
+
+    These two cases cost milliseconds and catch the same class on any body:
+    the first checks the conftest mirror against the real predicate, the second
+    drives the sensor end-to-end through each simulated gate.
+    """
+
+    _BODIES = (("mac", False, False), ("win", True, False),
+               ("linux", False, True))
+
+    def test_the_conftest_mirror_matches_the_real_predicate(self):
+        from conftest import suspicious_trust_for
+        saved = aegis.IS_WIN, aegis.IS_LINUX
+        try:
+            for name, is_win, is_linux in self._BODIES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                verdict = suspicious_trust_for(is_win, is_linux)
+                self.assertTrue(
+                    aegis.suspicious_sig(verdict),
+                    "%s: conftest offers %r, which suspicious_sig rejects "
+                    "there" % (name, verdict))
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved
+
+    def test_the_outbound_sensor_mints_a_finding_on_every_body(self):
+        from conftest import suspicious_trust_for
+        path = "/Users/x/.vscode/extensions/some.ext-1.0.0/native/claude"
+        saved_flags = aegis.IS_WIN, aegis.IS_LINUX
+        saved_fns = {n: getattr(aegis, n) for n in (
+            "classify_signature", "is_risky_location", "_grade_binary",
+            "_vouch_endpoint_deviation")}
+        aegis.is_risky_location = lambda p: True
+        aegis._grade_binary = lambda sev, p, **k: (sev, None, None)
+        aegis._vouch_endpoint_deviation = lambda p, ep: (None, None)
+        try:
+            for name, is_win, is_linux in self._BODIES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                verdict = suspicious_trust_for(is_win, is_linux)
+                aegis.classify_signature = lambda p, **k: {"trust": verdict}
+                fs = aegis._outbound_findings([(path, "1.2.3.4", "443"),
+                                               (path, "5.6.7.8", "443")])
+                self.assertEqual(
+                    len(fs), 1,
+                    "%s: the outbound sensor minted %d findings for a "
+                    "qualifying binary -- the gate rejected the verdict this "
+                    "body actually uses" % (name, len(fs)))
+                self.assertEqual(fs[0]["endpoint_count"], 2)
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved_flags
+            for n, fn in saved_fns.items():
+                setattr(aegis, n, fn)
+
+
 class ExecAlertSemantics(unittest.TestCase):
     def test_linux_volatile_exec_alerts_without_any_signature(self):
         saved = aegis.IS_LINUX, aegis.IS_MAC

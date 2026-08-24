@@ -26,6 +26,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from conftest import SUSPICIOUS_TRUST  # noqa: E402
 
 CLAUDE_241 = ("/Users/x/.vscode/extensions/anthropic.claude-code-2.1.241-"
               "darwin-arm64/resources/native-binary/claude")
@@ -34,13 +35,18 @@ CLAUDE_233 = CLAUDE_241.replace("2.1.241", "2.1.233")
 
 class _Stubbed(unittest.TestCase):
     """Pure over (path, ip, port): the platform probes and the custody ladder
-    are stubbed so these assert the GROUPING, on every OS."""
+    are stubbed so these assert the GROUPING, on every OS.
+
+    The stubbed verdict is `SUSPICIOUS_TRUST`, not the literal "adhoc": the
+    gate these rows must clear (`suspicious_sig`) speaks a different vocabulary
+    per body, and a mac word hard-coded here is what made this whole file fail
+    12/12 on Windows while reading as platform-neutral."""
 
     def setUp(self):
         self._saved = {n: getattr(aegis, n) for n in (
             "classify_signature", "is_risky_location", "_grade_binary",
             "_vouch_endpoint_deviation")}
-        aegis.classify_signature = lambda p, **k: {"trust": "adhoc"}
+        aegis.classify_signature = lambda p, **k: {"trust": SUSPICIOUS_TRUST}
         aegis.is_risky_location = lambda p: True
         aegis._grade_binary = lambda sev, path, **k: (sev, None, None)
         aegis._vouch_endpoint_deviation = lambda path, ep: (None, None)
@@ -158,7 +164,7 @@ class BeaconKeepsItsEndpoint(unittest.TestCase):
 
     def _rows(self, path, ip="1.2.3.4", port="443"):
         now = int(aegis.time.time())
-        row = [path, ip, port, "adhoc"]
+        row = [path, ip, port, SUSPICIOUS_TRUST]
         hist = [(now - 4000, [row]), (now - 2500, [row]), (now - 100, [row])]
         return hist, [row]
 
@@ -173,8 +179,8 @@ class BeaconKeepsItsEndpoint(unittest.TestCase):
 
     def test_two_endpoints_are_still_two_beacons(self):
         now = int(aegis.time.time())
-        rows = [[CLAUDE_241, "1.2.3.4", "443", "adhoc"],
-                [CLAUDE_241, "9.9.9.9", "443", "adhoc"]]
+        rows = [[CLAUDE_241, "1.2.3.4", "443", SUSPICIOUS_TRUST],
+                [CLAUDE_241, "9.9.9.9", "443", SUSPICIOUS_TRUST]]
         hist = [(now - 4000, rows), (now - 2500, rows), (now - 100, rows)]
         fs = aegis._beacon_recurrence(hist, rows)
         self.assertEqual(len({f["fingerprint"] for f in fs}), 2)
@@ -197,7 +203,7 @@ class NoMigrationIsNeeded(unittest.TestCase):
     def test_the_case_key_carries_no_endpoint(self):
         saved = (aegis.classify_signature, aegis.is_risky_location,
                  aegis._grade_binary, aegis._vouch_endpoint_deviation)
-        aegis.classify_signature = lambda p, **k: {"trust": "adhoc"}
+        aegis.classify_signature = lambda p, **k: {"trust": SUSPICIOUS_TRUST}
         aegis.is_risky_location = lambda p: True
         aegis._grade_binary = lambda sev, path, **k: (sev, None, None)
         aegis._vouch_endpoint_deviation = lambda path, ep: (None, None)
