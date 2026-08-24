@@ -1551,7 +1551,7 @@ class TestWalletIntegrity(Sandbox):
 class TestVendorImpersonation(Sandbox):
     def _sev(self, label, authority, prog="/Users/x/.hidden/GoogleUpdate"):
         rec = {"label": label, "program": prog, "args": [prog],
-               "trust": "developer-id", "sha256": "s", "run_at_load": True,
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True,
                "env": None, "authority": authority}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
@@ -2214,6 +2214,11 @@ class TestListenerSurface(Sandbox):
 # invisible to the file-oriented Mach-O check. Ad-hoc bundle ⇒ HIGH; signed-but-
 # unnotarized ⇒ MEDIUM with Gatekeeper's own verdict; notarized ⇒ silent.
 # --------------------------------------------------------------------------- #
+# Keeps the LITERAL "developer-id" on purpose: an unnotarized Developer-ID
+# .app is a macOS Gatekeeper concept with no analog on any other body, and
+# this class is macOS-gated in conftest for exactly that reason. Proven by
+# mutation 2026-08-24 — swapping it to PUBLISHER_TRUST was the only one of
+# four sites that broke a test.
 class TestHotDirAppBundle(Sandbox):
     def _mk_app(self, name="Evil.app"):
         app = os.path.join(self.hot, name)
@@ -3287,7 +3292,7 @@ class TestPersistenceEnvDiff(Sandbox):
         return {"label": "com.benign.updater",
                 "program": "/opt/homebrew/bin/updater",
                 "args": ["/opt/homebrew/bin/updater"], "sha256": "a" * 64,
-                "trust": "developer-id", "run_at_load": True,
+                "trust": PUBLISHER_TRUST, "run_at_load": True,
                 "authority": "Developer ID Application: Benign Corp (TEAM123456)",
                 "env": None}
 
