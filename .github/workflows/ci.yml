@@ -60,9 +60,17 @@ jobs:
   # 24:27) against that 35-minute step cap. Nothing announced the growth — the
   # comment asking the next person to "re-measure rather than nudge the
   # constant" is not a mechanism, and the only signal a cap is outgrown is a
-  # KeyboardInterrupt that reads exactly like a test failure. So the step now
-  # prints `--durations=25`: every run publishes its own slowest cases, and the
-  # next sizing decision is a measurement instead of another guess.
+  # KeyboardInterrupt that reads exactly like a test failure.
+  #
+  # `--durations=25` is NOT a fix for that. Be precise about what it buys,
+  # because crediting it with more is how the next person skips building the
+  # real signal: it publishes the slowest CASES, not the step's total against
+  # its cap, and it prints only when pytest finishes — so on the one run that
+  # actually hits the cap it prints nothing at all. What it does buy is a
+  # per-body cost profile that did not exist before. Its first run already paid
+  # for itself: the top two cases measured 189.41s and 188.25s here against
+  # 35.48s and 35.74s on macOS, a uniform ~5.2x that makes the (cheap, local)
+  # macOS profile a usable model for this (expensive, remote) one.
   windows:
     name: windows-latest / py${{ matrix.python }}
     runs-on: windows-latest
@@ -116,8 +124,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
+      # Measured in THIS position on the first run after the split (2026-08-24):
+      # 625s on py3.9 and 816s on py3.12. That 816s is outside the 681-767s
+      # range this step used to be sized against — those numbers were taken
+      # while it ran third, behind a 24-minute suite, on a warm runner. Sizing
+      # a cap from measurements taken in a different position is the exact
+      # mistake this file has already made twice, so the cap stays at 25 and
+      # the new numbers are recorded here instead of being trimmed toward.
       - name: Live Windows harness (real registry, schtasks, CIM, Authenticode)
-        timeout-minutes: 20
+        timeout-minutes: 25
         env:
           AEGIS_WIN_LIVE: "1"
         run: python tests/win_live_harness.py

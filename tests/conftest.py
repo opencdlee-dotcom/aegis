@@ -121,23 +121,58 @@ def suspicious_trust_for(is_win, is_linux):
 
     Linux keys on 'broken' alone ('unmanaged' is true of every locally built
     binary); Windows on Authenticode's 'unsigned'/'broken'; macOS additionally
-    on codesign's 'adhoc'. Each body gets the verdict most representative of
-    the rogue-binary shape these sensors exist to catch.
+    on codesign's 'adhoc'.
+
+    One honest caveat, because the obvious reading of this function is wrong:
+    on Linux `_classify_linux` emits ONLY 'os-managed' and 'unmanaged', so
+    'broken' is a verdict a real Linux host can never produce. The
+    suspicious_sig arm is dead by construction there and Linux takes its signal
+    from structure instead (see _exec_alert). 'broken' is returned so a STUBBED
+    gate opens on all three bodies with one helper; it is not a claim about
+    what Linux observes. A test that means to assert Linux behaviour must
+    exercise the structural arm, not this verdict.
     """
     if is_linux:
         return "broken"
     return "unsigned" if is_win else "adhoc"
 
 
+def publisher_trust_for(is_win, is_linux):
+    """A trust verdict `aegis.publisher_sig()` accepts on that body — the
+    positive twin of suspicious_trust_for, mirroring aegis.publisher_sig.
+
+    macOS returns "apple" rather than "developer-id" so the conversion of the
+    existing fixtures is a no-op there: those records already said "apple", and
+    a fixture rewrite that silently changes what a macOS assertion means would
+    be a worse bug than the one being fixed.
+    """
+    if is_linux:
+        return "os-managed"
+    return "os-signed" if is_win else "apple"
+
+
+PUBLISHER_TRUST = publisher_trust_for(aegis.IS_WIN, aegis.IS_LINUX)
+
 SUSPICIOUS_TRUST = suspicious_trust_for(aegis.IS_WIN, aegis.IS_LINUX)
 
 # Fail at COLLECTION, not 200 assertions later as an unexplained "0 != 1": if
 # the product's vocabulary moves, the suite says so in the words of the thing
 # that changed.
-assert aegis.suspicious_sig(SUSPICIOUS_TRUST), (
-    "conftest.SUSPICIOUS_TRUST is %r, which aegis.suspicious_sig() rejects on "
-    "this body -- the trust vocabulary moved and this mirror did not."
-    % (SUSPICIOUS_TRUST,))
+#
+# A bare `assert` would be the obvious spelling and the wrong one: `python -O`
+# strips assert statements outright, so the guard would vanish on exactly the
+# invocation nobody thinks to re-check, and the `0 != N` noise it exists to
+# prevent would come back silently. Raise explicitly.
+if not aegis.publisher_sig(PUBLISHER_TRUST):
+    raise RuntimeError(
+        "conftest.PUBLISHER_TRUST is %r, which aegis.publisher_sig() rejects "
+        "on this body -- the trust vocabulary moved and this mirror did not."
+        % (PUBLISHER_TRUST,))
+if not aegis.suspicious_sig(SUSPICIOUS_TRUST):
+    raise RuntimeError(
+        "conftest.SUSPICIOUS_TRUST is %r, which aegis.suspicious_sig() rejects "
+        "on this body -- the trust vocabulary moved and this mirror did not."
+        % (SUSPICIOUS_TRUST,))
 
 # Classes whose assertions are inherently macOS-specific.
 _MAC_ONLY_CLASSES = frozenset((
