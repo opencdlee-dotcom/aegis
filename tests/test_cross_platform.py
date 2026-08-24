@@ -626,7 +626,13 @@ class NoTestHardCodesOneBodysTrustVocabulary(unittest.TestCase):
 
     # A stubbed trust value looks like one of these, which is what makes a
     # scan viable at all rather than a grep for a bare word in prose.
-    _STUB_SHAPES = ('"trust": "%s"', "'trust': '%s'", '"trust", "%s"')
+    # Both spellings a fixture actually uses. The keyword-default form was
+    # missed on the first pass and cost a full CI cycle to find: tests/
+    # test_custody.py's `_prec(..., trust="developer-id")` fed a macOS word to
+    # every custody assertion in the file while its docstring called itself
+    # "the shape every platform snapshot produces".
+    _STUB_SHAPES = ('"trust": "%s"', "'trust': '%s'", '"trust", "%s"',
+                    'trust="%s"', "trust='%s'")
 
     # RATCHET, not an exemption list. Found by this guard on 2026-08-24, all
     # pre-existing. Each of these builds a persistence record with a macOS-only
@@ -644,6 +650,14 @@ class NoTestHardCodesOneBodysTrustVocabulary(unittest.TestCase):
     # The list may only SHRINK: an entry naming a class that no longer offends
     # fails this test, so a fixed case cannot quietly leave debt behind and a
     # renamed class cannot quietly keep an exemption.
+    # The one place a body-specific word is the POINT: this module's own
+    # PublisherStableIsReachableOnEveryBody names each body's vocabulary in a
+    # table and flips the flags to match, so it is asserting the split rather
+    # than accidentally depending on one side of it.
+    _BY_DESIGN = frozenset((
+        "test_cross_platform.py:PublisherStableIsReachableOnEveryBody",
+    ))
+
     _KNOWN_UNTRIAGED = frozenset((
         # The two remaining entries stub "developer-id" specifically, and
         # PUBLISHER_TRUST is "apple" on macOS: swapping them would silently
@@ -652,6 +666,11 @@ class NoTestHardCodesOneBodysTrustVocabulary(unittest.TestCase):
         # They need a per-case reading, not a mechanical rewrite.
         "test_regression.py:TestVendorImpersonation",
         "test_regression.py:TestPersistenceEnvDiff",
+        # Same reasoning: `_target_change` defaults both sides to
+        # "developer-id" to compare TEAM identity across a target swap, and
+        # PUBLISHER_TRUST is "apple" on macOS — a mechanical swap would change
+        # what the macOS assertion compares.
+        "test_custody.py:CustodyGrading",
     ))
 
     def test_no_ungated_test_stubs_a_macos_only_trust_verdict(self):
@@ -680,6 +699,8 @@ class NoTestHardCodesOneBodysTrustVocabulary(unittest.TestCase):
                     if cls in conftest._MAC_ONLY_CLASSES:
                         continue
                     key = "%s:%s" % (name, cls)
+                    if key in self._BY_DESIGN:
+                        continue
                     seen_baseline.add(key)
                     if key in self._KNOWN_UNTRIAGED:
                         continue

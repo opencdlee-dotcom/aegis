@@ -28,7 +28,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
-from conftest import PUBLISHER_TRUST  # noqa: E402
+from conftest import PUBLISHER_TRUST, SUSPICIOUS_TRUST  # noqa: E402
 
 
 # Cross-platform stand-ins for the POSIX one-liners this fixture used to shell
@@ -4173,7 +4173,7 @@ class TestPersistenceChangeDetail(Sandbox):
     def test_program_path_change_shows_old_and_new_path(self):
         detail = self._changed(
             self._base(),
-            self._base(program="/tmp/evil", sha256="dead", trust="adhoc"))
+            self._base(program="/tmp/evil", sha256="dead", trust=SUSPICIOUS_TRUST))
         self.assertIn("program /usr/bin/python3 -> /tmp/evil", detail)
 
     def test_program_bytes_change_shows_hash_delta_when_path_same(self):
