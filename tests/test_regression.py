@@ -28,6 +28,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from conftest import PUBLISHER_TRUST  # noqa: E402
 
 
 # Cross-platform stand-ins for the POSIX one-liners this fixture used to shell
@@ -431,7 +432,7 @@ class TestAgentSurfaceTruncationReportedOnOneShotScan(Sandbox):
 class TestHostileArgsSeverity(Sandbox):
     def _sev(self, args, program=None):
         rec = {"label": "x", "program": program or args[0], "args": args,
-               "trust": "apple", "sha256": "s", "run_at_load": True}
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True}
         fs = aegis.check_persistence({}, {"/fake/x.plist": rec})
         return fs[0]["severity"]
 
@@ -778,7 +779,7 @@ class TestShellRc(Sandbox):
 class TestDyldInjection(Sandbox):
     def test_dyld_insert_libraries_is_high(self):
         rec = {"label": "x", "program": "/usr/bin/python3", "args": None,
-               "trust": "apple", "sha256": "s", "run_at_load": True,
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True,
                "env": {"DYLD_INSERT_LIBRARIES": "/Users/me/.hidden/evil.dylib"}}
         fs = aegis.check_persistence({}, {"/fake/x.plist": rec})
         self.assertGreaterEqual(aegis.SEV_ORDER[fs[0]["severity"]],
@@ -802,7 +803,7 @@ class TestDyldInjection(Sandbox):
 # --------------------------------------------------------------------------- #
 class TestExpandedHostileArgs(Sandbox):
     def _sev(self, args):
-        rec = {"label": "x", "program": args[0], "args": args, "trust": "apple",
+        rec = {"label": "x", "program": args[0], "args": args, "trust": PUBLISHER_TRUST,
                "sha256": "s", "run_at_load": True, "env": None}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
@@ -1025,7 +1026,7 @@ class TestSurfaceAdoptionOnUpgrade(Sandbox):
 class TestHiddenHomeScriptPersistence(Sandbox):
     def _sev(self, args, program="/bin/bash"):
         rec = {"label": "com.finder.helper", "program": program, "args": args,
-               "trust": "apple", "sha256": "s", "run_at_load": True, "env": None}
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True, "env": None}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
     def test_bash_hidden_home_script_is_high(self):
@@ -1125,7 +1126,7 @@ class TestIdeExtensions(Sandbox):
 class TestInterpreterScriptTarget(Sandbox):
     def _sev(self, args):
         rec = {"label": "com.user.x", "program": args[0], "args": args,
-               "trust": "apple", "sha256": "s", "run_at_load": True, "env": None}
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True, "env": None}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
     def test_phexia_osascript_userlib_script_is_medium(self):
@@ -3441,7 +3442,7 @@ class TestProgramArgv0Decoy(Sandbox):
         self.write_plist("honest.plist",
                          ["/bin/bash", "-c", self.PAYLOAD], program="/bin/bash")
         saved_cls = aegis.classify_signature
-        aegis.classify_signature = lambda p: {"trust": "apple", "team": None,
+        aegis.classify_signature = lambda p: {"trust": PUBLISHER_TRUST, "team": None,
                                               "authority": "Software Signing"}
         try:
             snap = aegis.snapshot_persistence()
@@ -3473,7 +3474,7 @@ class TestProgramArgv0Decoy(Sandbox):
 class TestHiddenHomeNormpathDodge(Sandbox):
     def _rec(self, args):
         return {"label": "com.user.helper", "program": "/bin/bash",
-                "trust": "apple", "authority": "Software Signing", "args": args,
+                "trust": PUBLISHER_TRUST, "authority": "Software Signing", "args": args,
                 "env": None, "run_at_load": True, "sha256": "deadbeef"}
 
     def test_clean_hidden_home_script_is_high_control(self):
@@ -3569,7 +3570,7 @@ class TestBaselineSchemaMigration(Sandbox):
         return {"created": "legacy", "persistence": {"/tmp/agent.plist": {
             "label": "agent", "program": "/bin/sh",
             "args": ["/bin/sh", "-c", "token=%s" % secret],
-            "trust": "apple", "sha256": "abc", "run_at_load": True,
+            "trust": PUBLISHER_TRUST, "sha256": "abc", "run_at_load": True,
         }}}
 
     def test_owned_legacy_baseline_is_hashed_redacted_and_rewatermarked(self):
@@ -4153,7 +4154,7 @@ class TestPersistenceChangeDetail(Sandbox):
 
     def _base(self, **kw):
         rec = {"label": "com.charlie.aegis", "program": "/usr/bin/python3",
-               "sha256": "0f534e4b", "trust": "apple", "run_at_load": True,
+               "sha256": "0f534e4b", "trust": PUBLISHER_TRUST, "run_at_load": True,
                "args": ["/usr/bin/python3", "/x/aegis.py", "watch", "600"],
                "args_sha256": "AAA", "env": None}
         rec.update(kw)

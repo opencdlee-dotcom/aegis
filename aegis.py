@@ -2060,6 +2060,36 @@ def suspicious_sig(trust):
     return trust in ("adhoc", "unsigned", "broken")
 
 
+def publisher_sig(trust):
+    """Does this verdict mean "a trusted publisher vouches for these bytes"?
+
+    The positive twin of suspicious_sig(), per-body for the same reason and
+    kept beside it so there is exactly ONE spelling of each half of the trust
+    vocabulary in this file.
+
+    mac: apple / app-store / developer-id. `signed-other` is deliberately out —
+         a signature that chains to no trusted root vouches for nobody.
+    windows: os-signed / signed-valid — both are Authenticode status "Valid",
+         and `authority` carries the signer CN.
+    linux: os-managed — dpkg/rpm/pacman owns the file, so the distro pipeline
+         is the publisher and `authority` carries "dpkg:<pkg>" (or rpm/pacman).
+
+    Written 2026-08-24. Until then `_custody_persistence` inlined the macOS
+    triple, so the `publisher-stable` demotion was structurally UNREACHABLE on
+    Windows and Linux: `_authenticode_record` emits os-signed/signed-valid and
+    `_classify_linux` emits os-managed, none of which the inlined list
+    contained. Every off-mac host paid full severity for a vendor's ordinary
+    in-place update — the same defect class as the outbound-sensor gate, in the
+    opposite direction (a demotion that never fires rather than an alert that
+    never fires).
+    """
+    if IS_LINUX:
+        return trust == "os-managed"
+    if IS_WIN:
+        return trust in ("os-signed", "signed-valid")
+    return trust in ("apple", "app-store", "developer-id")
+
+
 # --------------------------------------------------------------------------- #
 # Finding model
 # --------------------------------------------------------------------------- #
@@ -10461,7 +10491,7 @@ def _custody_persistence(old, rec):
     auth_o, auth_n = old.get("authority"), rec.get("authority")
     if (op == np_ and osha and nsha and osha != nsha
             and auth_o and auth_n and auth_o == auth_n
-            and rec.get("trust") in ("apple", "app-store", "developer-id")):
+            and publisher_sig(rec.get("trust"))):
         return "publisher-stable"
     return None
 
