@@ -30,9 +30,15 @@ You are a background security monitor for macOS, Linux, and Windows. Your job is
 - Runs as launchd agent (macOS), systemd timer (Linux), or Task Scheduler (Windows)
 - Zero third-party dependencies, local-only (no telemetry, no cloud)
 - CI: Linux 3.9+3.12, macOS 3.12, Windows 3.9+3.12
-- Verification: `python3 -m pytest tests/ -q` (~8 min, 994 tests). There is NO
+- Verification: `python3 -m pytest tests/ -q` (~7 min, 1040 tests). There is NO
   `selftest` subcommand — `aegis.py` with an unknown arg, or no arg at all,
   runs a REAL `scan` against live `~/.aegis` state rather than printing help.
+- **Before pushing anything platform-shaped, diff a simulated body against your
+  merge base**: `PYTHONPATH=tests SIM_BODY=win python3 -m pytest tests/ -q -p simbody`.
+  See `tests/simbody.py` — a macOS run cannot fail on a fixture that hard-codes
+  macOS vocabulary, BY CONSTRUCTION, and that has now cost two CI cycles. Read
+  its docstring first: the absolute failure count is meaningless, only the diff
+  against your merge base is.
 
 ## Important Notes
 - You are NOT Norton — you are a detect-only monitor
