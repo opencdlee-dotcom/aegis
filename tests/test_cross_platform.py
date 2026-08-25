@@ -794,6 +794,53 @@ class StubbedTrustQualifiesOnEveryBody(unittest.TestCase):
                 setattr(aegis, n, fn)
 
 
+    def test_each_body_row_can_actually_fail(self):
+        """The negative half. Without it the Linux row above asserts nothing.
+
+        Linux's gate is `_exec_alert(path, trust) or is_risky_location(path)`,
+        and the positive test stubs is_risky_location True — so that row passed
+        for a reason unrelated to the verdict and could not fail on a wrong
+        one. A row that cannot fail is not coverage; it is the same shape as
+        the fixture that shipped 12 Windows failures while reading as
+        platform-neutral.
+
+        Each body is driven here to the state where it must mint NOTHING:
+        macOS and Windows on a verdict `suspicious_sig` rejects, and Linux on a
+        path that is neither risky nor a volatile exec — because on Linux the
+        verdict arm is dead by construction (`_classify_linux` emits only
+        os-managed and unmanaged) and structure is the whole signal.
+        """
+        saved_flags = aegis.IS_WIN, aegis.IS_LINUX
+        saved_fns = {n: getattr(aegis, n) for n in (
+            "classify_signature", "is_risky_location", "_grade_binary",
+            "_vouch_endpoint_deviation")}
+        aegis._grade_binary = lambda sev, p, **k: (sev, None, None)
+        aegis._vouch_endpoint_deviation = lambda p, ep: (None, None)
+        # A real, existing, non-volatile file: _exec_alert returns None for it,
+        # which is what makes the Linux row's structural arm testably shut.
+        self.assertTrue(os.path.exists(aegis._SELF_PATH))
+        cases = (
+            # body,   is_win, is_linux, path,              trust,        risky
+            ("mac",   False,  False,    "/Users/x/.vscode/e/claude", "apple",     True),
+            ("win",   True,   False,    "/Users/x/.vscode/e/claude", "os-signed", True),
+            ("linux", False,  True,     aegis._SELF_PATH,            "unmanaged", False),
+        )
+        try:
+            for name, is_win, is_linux, path, trust, risky in cases:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                aegis.classify_signature = lambda p, **k: {"trust": trust}
+                aegis.is_risky_location = lambda p: risky
+                self.assertEqual(
+                    aegis._outbound_findings([(path, "1.2.3.4", "443")]), [],
+                    "%s: a binary this body has no reason to alert on still "
+                    "minted a finding — the row above cannot be trusted to "
+                    "fail either" % name)
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved_flags
+            for n, fn in saved_fns.items():
+                setattr(aegis, n, fn)
+
+
 class NativePackageManagersEarnAReceipt(unittest.TestCase):
     """The second custody rung, on the bodies that are not macOS.
 
