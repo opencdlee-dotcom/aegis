@@ -249,7 +249,8 @@ python3 aegis.py signers pin FILE   # pin a device roster (principal ssh-key
                                #   against the PINNED roster grades LOW
                                #   (fleet-signed) instead of poisoned-repo HIGH
 python3 aegis.py signers status # show the pinned roster
-python3 aegis.py allow PATH    # stop alerting on findings matching PATH
+python3 aegis.py allow PATH    # stop alerting on findings matching PATH; their
+                               #   open incidents close as 'allowlisted' too
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
                                #   the hash, never the file; scan stays local-only)
 python3 aegis.py intel update  # OPT-IN community IOC feeds (abuse.ch; no key) —
