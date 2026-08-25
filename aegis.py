@@ -12356,7 +12356,14 @@ def gather_all(baseline_snap, current_snap, health=None):
     # sensors only it can answer. A sensor that cannot exist here is absent
     # rather than permanently DEGRADED.
     sensors = [
-        ("persistence.diff", check_persistence, (baseline_snap, current_snap)),
+        # Writ-wrapped like every registry surface: launchd/systemd/Run-key
+        # persistence is the flagship change-shaped sensor, yet only the
+        # _scan_surfaces registry flowed through _apply_writ — so
+        # `writ enforce on` governed shellrc and browser extensions while the
+        # primary persistence diff bypassed enforcement entirely.
+        ("persistence.diff",
+         lambda b, c: _apply_writ(check_persistence(b, c), "persistence"),
+         (baseline_snap, current_snap)),
         ("process", check_processes, ()),
         ("behavior", check_behavior, ()),
         ("shell-history", check_shell_history, ()),

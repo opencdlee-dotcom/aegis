@@ -783,6 +783,27 @@ class TestWritEnforcementIsActuallyWired(AgentSandbox):
                          aegis._SURFACE_WRIT_SCOPE.get("brand_new_surface",
                                                        "persistence"))
 
+    def test_the_primary_persistence_sensor_is_governed(self):
+        """check_persistence is the flagship change-shaped sensor, yet only
+        the _scan_surfaces registry flowed through _apply_writ — so
+        `writ enforce on` governed shellrc and browser extensions while
+        launchd persistence itself bypassed enforcement entirely."""
+        aegis.save_json(aegis.WRIT_FILE, {"enforcing": True, "writs": []})
+        fp = "persistence:changed:/tmp/writ-wire-probe"
+        canned = aegis.finding("MEDIUM", "persistence", "Persistence changed",
+                               "probe", fp)
+        saved = aegis.check_persistence
+        aegis.check_persistence = lambda b, c: [dict(canned)]
+        try:
+            out = aegis.gather_all(None, {}, health=[])
+        finally:
+            aegis.check_persistence = saved
+        mine = [f for f in out if f["fingerprint"] == fp]
+        self.assertEqual(1, len(mine))
+        self.assertEqual("unauthorized", mine[0].get("writ"),
+                         "check_persistence findings bypass writ enforcement")
+        self.assertEqual("HIGH", mine[0]["severity"])
+
     def test_apply_writ_reads_state_once_for_the_whole_batch(self):
         aegis.save_json(aegis.WRIT_FILE, {"enforcing": True, "writs": []})
         findings = [self._finding() for _ in range(100)]
