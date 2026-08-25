@@ -3597,6 +3597,33 @@ class TestBaselineSchemaMigration(Sandbox):
         self.assertFalse(any("tampered" in f["fingerprint"]
                              for f in aegis.check_self_protection()))
 
+    def test_v2_baseline_with_positional_exec_keys_is_rekeyed_once(self):
+        """The exec-identity fix normalized BOTH diff sides on every scan
+        because the persisted baseline was never rewritten. Schema v3 settles
+        the keys in the store once, watermark-guarded like v2."""
+        new_key = aegis._exec_identity("node", ["srv"])
+        ent = {"cmd": "node", "args": ["srv"], "target": "/usr/bin/node",
+               "target_sha": "a" * 64}
+        aegis.save_json(aegis.BASELINE, {
+            "created": "t", "schema_version": 2, "trust": "verified",
+            "persistence": {},
+            "agent_surface": {"/cfg.json": {
+                "sha256": "x" * 64,
+                "execs": {"hooks.SessionStart[0].hooks[0]|node srv": ent}}}})
+        aegis.save_json(aegis.SELFSTATE,
+                        {"baseline_sha": aegis.sha256(aegis.BASELINE)})
+        baseline, corrupt = aegis.load_baseline()
+        self.assertFalse(corrupt)
+        self.assertEqual(baseline["schema_version"],
+                         aegis.BASELINE_SCHEMA_VERSION)
+        self.assertEqual(baseline["trust"], "verified")
+        self.assertEqual(
+            list(baseline["agent_surface"]["/cfg.json"]["execs"]), [new_key])
+        with open(aegis.BASELINE, "r", encoding="utf-8") as stored:
+            self.assertIn(new_key, stored.read())   # settled ON DISK
+        state = aegis.load_json(aegis.SELFSTATE, {})
+        self.assertEqual(state["baseline_sha"], aegis.sha256(aegis.BASELINE))
+
     def test_watermark_mismatch_blocks_migration_and_remains_detectable(self):
         secret = "sk-live-DoNotLaunderTamper"
         aegis.save_json(aegis.BASELINE, self._legacy(secret))

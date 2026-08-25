@@ -53,6 +53,26 @@ class ExecIdentityIsWhatRuns(unittest.TestCase):
         self.assertEqual(len(fs), 1)
         self.assertEqual(fs[0]["severity"], "HIGH")
 
+    def test_a_settled_baseline_is_a_plain_compare(self):
+        """Exec keys are settled in the store (baseline v3), so the steady-
+        state diff must not re-hash every entry on both sides each scan — a
+        forever-tax paid for a baseline vintage most installs never had. A
+        legacy-shaped prior is still re-keyed in memory, because the
+        watermark-mismatch path leaves a tampered file untouched on disk."""
+        calls = []
+        real = aegis._migrate_exec_keys
+        aegis._migrate_exec_keys = lambda execs: (calls.append(1), real(execs))[1]
+        try:
+            aegis.diff_agent_surface(self._snap(["a"]), self._snap(["a", "b"]))
+            self.assertEqual(calls, [], "steady state must not re-key")
+            legacy = {"/cfg/settings.json": {"sha256": "x" * 64, "execs": {
+                "hooks.SessionStart[0].hooks[0]|a": {"cmd": "a", "args": []}}}}
+            fs = self._new_execs(legacy, self._snap(["a"]))
+            self.assertTrue(calls, "a legacy-shaped prior must be re-keyed")
+            self.assertEqual(fs, [], "re-keyed legacy prior must match")
+        finally:
+            aegis._migrate_exec_keys = real
+
     def test_reordering_alone_is_silent(self):
         before, after = ["a", "b", "c"], ["c", "a", "b"]
         self.assertEqual(self._new_execs(self._snap(before),

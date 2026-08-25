@@ -203,7 +203,7 @@ FLEET_SIGNERS = os.path.join(STATE_DIR, "allowed_signers")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
-BASELINE_SCHEMA_VERSION = 2
+BASELINE_SCHEMA_VERSION = 3
 HOSTS_FILE = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                            "System32", "drivers", "etc", "hosts")
               if IS_WIN else "/etc/hosts")
@@ -11255,13 +11255,21 @@ def diff_agent_surface(prior, cur):
     for path, rec in cur.items():
         old = prior.get(path)
         try:
-            # BOTH sides are normalized onto _exec_identity. The current side
-            # is already in that form when it comes from snapshot_agent_surface,
-            # so this is a no-op there — but it makes the diff independent of
-            # the caller's key vintage rather than silently mis-diffing a
-            # legacy-shaped snapshot as "everything is new".
-            execs = _migrate_exec_keys(rec.get("execs") or {})
-            old_execs = _migrate_exec_keys((old or {}).get("execs") or {})
+            # Exec keys are settled in the STORE (baseline schema v3 re-keys a
+            # legacy positional snapshot once, at load), so the steady state
+            # is a plain compare — no per-scan re-hashing of every entry on
+            # both sides. The in-memory fallback survives for the one path
+            # that deliberately skips the store rewrite: a watermark mismatch
+            # keeps a tampered baseline byte-identical for evidence, and a
+            # legacy-shaped prior reaching here must be re-keyed rather than
+            # mis-diffed as "everything is new". Both sides are re-keyed
+            # together so a hand-built legacy pair still compares equal.
+            execs = rec.get("execs") or {}
+            old_execs = (old or {}).get("execs") or {}
+            if any(not _NEW_EXEC_ID_RE.search(str(k)) for k in old_execs) \
+                    or any(not _NEW_EXEC_ID_RE.search(str(k)) for k in execs):
+                execs = _migrate_exec_keys(execs)
+                old_execs = _migrate_exec_keys(old_execs)
             for key, e in execs.items():
                 oe = old_execs.get(key)
                 if old is not None and oe is None:
@@ -12805,13 +12813,23 @@ def load_baseline():
 
 
 def _migrate_baseline(data):
-    """Upgrade legacy raw-argv baselines without laundering tamper evidence."""
+    """Upgrade a legacy baseline IN THE STORE, once, without laundering tamper
+    evidence. `schema_version` is the gate: a file already at the current
+    version is returned without a single record inspected.
+
+      v2  raw argv -> args_sha256, record redacted (a secret in
+          ProgramArguments must not persist in plaintext)
+      v3  agent_surface exec entries re-keyed from the retired positional
+          identity onto _exec_identity — settled in the store once, so
+          diff_agent_surface no longer re-hashes both sides on every scan
+    """
     if not isinstance(data, dict):
         return data
-    records = data.get("persistence")
-    if not isinstance(records, dict) or not any(
-            isinstance(rec, dict) and "args_sha256" not in rec
-            for rec in records.values()):
+    try:
+        version = int(data.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= BASELINE_SCHEMA_VERSION:
         return data
 
     # Rewrite only when the existing self-protection watermark agrees. If an
@@ -12823,24 +12841,30 @@ def _migrate_baseline(data):
     if recorded and recorded != current:
         return data
 
-    for key, rec in list(records.items()):
-        if not isinstance(rec, dict):
-            continue
-        raw_args = rec.get("args")
-        if "args_sha256" not in rec:
+    records = data.get("persistence")
+    if isinstance(records, dict):
+        for key, rec in list(records.items()):
+            if not isinstance(rec, dict) or "args_sha256" in rec:
+                continue
+            raw_args = rec.get("args")
             if raw_args is None:
                 rec["args_sha256"] = None
             else:
                 encoded = json.dumps(raw_args, sort_keys=True, default=str)
                 rec["args_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
-        records[key] = _redact_value(rec)
+            records[key] = _redact_value(rec)
+    surface = data.get("agent_surface")
+    if isinstance(surface, dict):
+        for rec in surface.values():
+            if isinstance(rec, dict) and isinstance(rec.get("execs"), dict):
+                rec["execs"] = _migrate_exec_keys(rec["execs"])
     data["schema_version"] = BASELINE_SCHEMA_VERSION
     data["trust"] = data.get("trust") or "unverified"
     save_json(BASELINE, data)
     state["baseline_sha"] = sha256(BASELINE)
     save_json(SELFSTATE, state)
-    log_run("migrated baseline schema to v%d (legacy argv redacted)" %
-            BASELINE_SCHEMA_VERSION)
+    log_run("migrated baseline schema v%d -> v%d"
+            % (version, BASELINE_SCHEMA_VERSION))
     return data
 
 
