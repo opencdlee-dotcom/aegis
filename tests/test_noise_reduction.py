@@ -104,7 +104,7 @@ class _DBCase(unittest.TestCase):
               title TEXT, severity TEXT, kind TEXT, status TEXT,
               resolution TEXT, created_at INT, updated_at INT,
               next_reminder_at INT, reminder_count INT DEFAULT 0,
-              last_notified_at INT);
+              last_notified_at INT, subject_json TEXT);
             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE events(id INTEGER PRIMARY KEY, occurred_at INT,
               observed_at INT, source TEXT, event_type TEXT, signal_id INT,
@@ -373,6 +373,177 @@ class RotatingEndpointsNeedEvidence(_DBCase):
         """Repetition is not rotation — the exact-key reattach covers that."""
         self.assertEqual(
             self._dismiss([("1.1.1.1", "443")] * 3), {})
+
+
+class SubjectIdentityIsStructured(_DBCase):
+    """Identity is declared as FIELDS by the three sensors whose identity
+    churned, rendered to the same strings the fingerprint parsers derive, and
+    stored on the incident — so the operator's verdicts attach to what a
+    finding is ABOUT rather than to how a sensor happened to spell it. The
+    fingerprint regexes remain only as the fallback for rows that predate
+    subjects."""
+
+    @staticmethod
+    def _beacon(path, ip, port):
+        return aegis.finding(
+            "HIGH", "net-beacon", "b", "d",
+            "beacon:%s:%s:%s" % (aegis._program_subject(path), ip, port),
+            subject=aegis._subject("beacon", path, ip=ip, port=port))
+
+    @staticmethod
+    def _process(comm, trust, sha):
+        return aegis.finding(
+            "HIGH", "process", "p", "d", "process:%s:%s:%s" % (comm, trust, sha),
+            subject=aegis._subject("process", comm, trust=trust, content=sha))
+
+    @staticmethod
+    def _persist(path, content):
+        return aegis.finding(
+            "HIGH", "persistence", "Persistence item CHANGED", "d",
+            "persistence:changed:%s:%s" % (path, content),
+            subject=aegis._subject("persistence", path, content=content))
+
+    def test_rendered_identity_agrees_with_the_string_derivation(self):
+        """ONE memory: a row that carries a subject and a row that predates
+        one must render the same identity for the same finding, or the
+        operator's older verdicts stop counting the day this ships."""
+        cases = [
+            self._beacon("/opt/homebrew/opt/syncthing/bin/syncthing",
+                         "fd7a:115c:a1e0::", "22000"),
+            self._beacon("/app-1.2.3/bin/x", "1.2.3.4", "443"),
+            self._process("/Users/me/.vscode/extensions/pub.tool-1.4.2/bin/tool",
+                          "adhoc", "a" * 64),
+            self._process("/tmp/plain", "unsigned", "b" * 64),
+            self._process("/tmp/nohash", "unsigned", None),
+            self._persist("/L/app-2.0/x.plist", "c" * 12),
+        ]
+        for f in cases:
+            fp = f["fingerprint"]
+            self.assertEqual(aegis._finding_identity(f),
+                             aegis._tolerance_identity(fp), fp)
+            self.assertEqual(aegis._finding_endpoint_classes(f),
+                             aegis._beacon_endpoint_classes(fp), fp)
+        # and the no-hash, no-version process really has nothing to generalize
+        self.assertIsNone(aegis._finding_identity(cases[4]))
+
+    def test_a_hostname_endpoint_never_generalizes_from_fields(self):
+        self.assertEqual(aegis._finding_endpoint_classes(
+            self._beacon("/bin/x", "evil.example.com", "443")), [])
+        self.assertEqual(aegis._subject_endpoint_classes(
+            aegis._subject("beacon", "/bin/x", ip="1.2.3.4", port="70000")), [])
+
+    def _stored(self, key, subject, sev="HIGH"):
+        i = self._inc("s", sev=sev, key=key)
+        self.db.execute("UPDATE incidents SET subject_json=? WHERE id=?",
+                        (aegis.json.dumps(subject), i))
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS dismissals(id INTEGER PRIMARY KEY,"
+            "incident_id INT, correlation_key TEXT, reason_code TEXT,"
+            "category TEXT, dismissed_at INT)")
+        self.db.execute(
+            "INSERT INTO dismissals(incident_id,correlation_key,reason_code,"
+            "category,dismissed_at) VALUES(?,?,?,?,?)",
+            (i, key, "benign-positive", "x", self.now))
+        return i
+
+    def test_memory_is_built_from_the_stored_subject_not_the_key(self):
+        """The string parsers are unreachable for a row that carries a
+        subject: beacons and processes stored under deliberately UNPARSEABLE
+        keys still generalize, and still count as disputed while open."""
+        for n, ip in enumerate(("fd7a::1", "fd7a::2", "fd7a::3")):
+            self._stored("signal:beacon:garbage-%d" % n,
+                         aegis._subject("beacon", "/bin/app", ip=ip, port="443"))
+        for n in range(3):
+            self._stored("signal:process:garbage-%d" % n,
+                         aegis._subject("process", "/bin/tool", trust="adhoc",
+                                        content="%064x" % n))
+        saved = (aegis._beacon_endpoint_classes, aegis._tolerance_identity)
+
+        def boom(_fp):
+            raise AssertionError("string parser reached")
+        aegis._beacon_endpoint_classes = boom
+        aegis._tolerance_identity = boom
+        try:
+            rot = aegis._rotating_endpoint_memory(self.db, self.now)
+            tol = aegis._tolerance_memory(self.db, self.now)
+            disputed = aegis._disputed_identities(self.db)
+        finally:
+            aegis._beacon_endpoint_classes, aegis._tolerance_identity = saved
+        self.assertIn("beacon:/bin/app:#ip:443", rot)
+        self.assertIn("process:/bin/tool:adhoc", tol)
+        self.assertIn("process:/bin/tool:adhoc", disputed)
+
+    def test_rows_that_predate_subjects_still_parse_from_the_key(self):
+        row = {"correlation_key": "signal:beacon:/bin/x:1.2.3.4:443",
+               "subject_json": None}
+        ident, classes = aegis._incident_identity(row)
+        self.assertIsNone(ident)
+        self.assertEqual(classes[0][0], "beacon:/bin/x:#ip:443")
+
+    def test_an_existing_store_gains_the_column(self):
+        path = os.path.join(self.tmp, "old.db")
+        con = sqlite3.connect(path)
+        legacy = aegis._EVENT_SCHEMA_SQL.replace(",\n            subject_json TEXT", "")
+        self.assertNotIn("subject_json", legacy)
+        con.executescript(legacy)
+        con.close()
+        saved = (aegis.STATE_DIR, aegis.EVENT_DB)
+        aegis.STATE_DIR, aegis.EVENT_DB = self.tmp, path
+        try:
+            db = aegis._event_connection()
+            cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+            db.close()
+        finally:
+            aegis.STATE_DIR, aegis.EVENT_DB = saved
+        self.assertIn("subject_json", cols)
+
+    def test_the_subject_is_stored_and_a_legacy_row_is_backfilled(self):
+        state = os.path.join(self.tmp, ".aegis")
+        os.makedirs(state)
+        saved = {k: getattr(aegis, k) for k in ("STATE_DIR", "EVENT_DB")}
+        aegis.STATE_DIR = state
+        aegis.EVENT_DB = os.path.join(state, "aegis.db")
+        try:
+            aegis.init_event_store()
+            db = aegis._event_connection()
+            with db:
+                db.execute(
+                    "INSERT INTO incidents(kind,correlation_key,title,severity,"
+                    "status,created_at,first_seen,last_seen,updated_at) VALUES("
+                    "'signal','signal:beacon:/bin/app:1.2.3.4:443','t','HIGH',"
+                    "'OPEN',1,1,1,1)")
+            db.close()
+            aegis.record_security_state(
+                [self._beacon("/bin/app", "1.2.3.4", "443")], now=1787000000)
+            db = aegis._event_connection()
+            rows = db.execute(
+                "SELECT correlation_key, subject_json FROM incidents").fetchall()
+            db.close()
+        finally:
+            for k, v in saved.items():
+                setattr(aegis, k, v)
+        self.assertEqual(len(rows), 1, "must reattach, not open a second case")
+        sub = aegis.json.loads(rows[0]["subject_json"])
+        self.assertEqual((sub["kind"], sub["ip"], sub["port"]),
+                         ("beacon", "1.2.3.4", "443"))
+
+    def test_the_sensors_declare_their_subjects(self):
+        def rec(sha):
+            return {"label": "com.x", "program": "/bin/bash",
+                    "args": ["/bin/bash", "/r.sh"], "args_sha256": "0" * 64,
+                    "sha256": sha, "trust": "unsigned", "run_at_load": True,
+                    "authority": None, "env": None, "script_target": "/r.sh",
+                    "target_sha": None}
+        fs = [f for f in aegis.check_persistence({"/L/x.plist": rec("a" * 64)},
+                                                 {"/L/x.plist": rec("b" * 64)})
+              if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["subject"]["kind"], "persistence")
+        self.assertEqual(aegis._finding_identity(fs[0]),
+                         aegis._tolerance_identity(fs[0]["fingerprint"]))
+        import inspect
+        for fn in (aegis.check_processes, aegis._beacon_recurrence):
+            self.assertIn("subject=_subject(", inspect.getsource(fn), fn.__name__)
 
 
 class ReportLeadsWithAVerdict(unittest.TestCase):

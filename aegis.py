@@ -2304,7 +2304,8 @@ _EVENT_SCHEMA_SQL = """
             reminder_count INTEGER NOT NULL DEFAULT 0,
             next_reminder_at INTEGER,
             last_notified_at INTEGER,
-            resolution TEXT
+            resolution TEXT,
+            subject_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_incidents_active
             ON incidents(status, next_reminder_at);
@@ -2357,6 +2358,12 @@ def _event_connection():
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
     db.executescript(_EVENT_SCHEMA_SQL)
+    # CREATE TABLE IF NOT EXISTS never widens an existing table: a store
+    # created before subject_json existed must gain it here, or every reader
+    # that selects it fails closed into "no memory" without a word.
+    cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+    if "subject_json" not in cols:
+        db.execute("ALTER TABLE incidents ADD COLUMN subject_json TEXT")
     db.commit()
     try:
         os.chmod(EVENT_DB, 0o600)
@@ -2463,7 +2470,8 @@ def _incident_fingerprints(db, incident_id):
 
 
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
-                     initially_notified=False):
+                     initially_notified=False, subject=None):
+    subject_json = json.dumps(subject, sort_keys=True) if subject else None
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     row = db.execute(
         "SELECT * FROM incidents WHERE correlation_key=? AND status IN (%s) "
@@ -2475,9 +2483,12 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
         new_status = "OPEN" if (row["status"] == "ACK" and
                                 SEV_ORDER[new_sev] > SEV_ORDER[row["severity"]]) \
             else row["status"]
+        # A row that predates subjects acquires one from the first evidence
+        # that carries it, so the fingerprint-parsing fallback retires itself.
         db.execute("UPDATE incidents SET severity=?, status=?, last_seen=?, "
-                   "updated_at=? WHERE id=?",
-                   (new_sev, new_status, now, now, incident_id))
+                   "updated_at=?, subject_json=COALESCE(subject_json,?) "
+                   "WHERE id=?",
+                   (new_sev, new_status, now, now, subject_json, incident_id))
     else:
         # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
         # a permanent mute on the whole entity. Keep genuinely-recurring evidence
@@ -2511,10 +2522,10 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
             cur = db.execute(
                 "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
                 "created_at,first_seen,last_seen,updated_at,reminder_count,"
-                "next_reminder_at,last_notified_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "next_reminder_at,last_notified_at,subject_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-                 now + _REMINDER_DELAYS[0], last_notified))
+                 now + _REMINDER_DELAYS[0], last_notified, subject_json))
             incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
@@ -2846,6 +2857,98 @@ def _beacon_endpoint_classes(fingerprint):
             ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
 
 
+# --- structured subject identity ---------------------------------------------
+# The three sensors whose identity churned (persistence CHANGED, process exec,
+# net-beacon) declare WHAT a finding is about as fields, not as a string to be
+# regexed back apart. The identity strings the tolerance layer keys on are
+# RENDERINGS of the subject — byte-identical to what _tolerance_identity and
+# _beacon_endpoint_classes derive from the fingerprint, so rows that predate
+# subjects and rows that carry one build ONE memory. The subject is stored on
+# the incident, and that is what ends the migration treadmill: when a sensor
+# next changes how it spells a fingerprint, the identity the operator's
+# verdicts attach to does not move, so nothing is orphaned and no one-time
+# closer is needed. The string parsers remain only as the fallback for rows
+# that predate this, and for sensors that have not declared a subject.
+
+def _subject(kind, path, **fields):
+    """Build a finding subject. `path` is version-normalized HERE so every
+    consumer sees exactly one spelling of "same software, new version"; the
+    raw path is kept so 'did normalization change anything' stays answerable
+    without re-parsing."""
+    sub = {"kind": kind, "raw_path": path, "path": _program_subject(path)}
+    sub.update({k: v for k, v in fields.items() if v is not None})
+    return sub
+
+
+def _subject_identity(sub):
+    """Tolerance identity rendered from a subject, or None when it has nothing
+    to generalize over (no content hash, no version churn) — the same rule
+    _tolerance_identity applies to a fingerprint string, so plain recurrence
+    stays with the exact-key reattach."""
+    if not isinstance(sub, dict):
+        return None
+    kind, path = sub.get("kind"), sub.get("path")
+    if not path:
+        return None
+    generalizes = bool(sub.get("content")) or path != sub.get("raw_path")
+    if kind == "persistence" and generalizes:
+        return "persistence:changed:%s" % path
+    if kind == "process" and generalizes:
+        return "process:%s:%s" % (path, sub.get("trust") or "")
+    return None
+
+
+def _subject_endpoint_classes(sub):
+    """Beacon endpoint classes from a subject's structured endpoint. A
+    hostname is a fact and refuses to generalize, exactly as in the string
+    path — but an IPv6 address needs no parsing-from-the-right here, because
+    it never went through a ':'-joined string in the first place."""
+    if not isinstance(sub, dict) or sub.get("kind") != "beacon":
+        return []
+    path = sub.get("path")
+    ip, port = str(sub.get("ip") or ""), str(sub.get("port") or "")
+    try:
+        ipaddress.ip_address(ip)
+        if not 1 <= int(port) <= 65535:
+            return []
+    except ValueError:
+        return []
+    if not path:
+        return []
+    return [("beacon:%s:#ip:%s" % (path, port), ip),
+            ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
+
+
+def _finding_identity(f):
+    """Subject first; the fingerprint string only for a finding without one."""
+    sub = f.get("subject")
+    if sub:
+        return _subject_identity(sub)
+    return _tolerance_identity(f.get("fingerprint"))
+
+
+def _finding_endpoint_classes(f):
+    sub = f.get("subject")
+    if sub:
+        return _subject_endpoint_classes(sub)
+    return _beacon_endpoint_classes(f.get("fingerprint"))
+
+
+def _incident_identity(row):
+    """(identity, endpoint_classes) for a stored incident: from its stored
+    subject when it has one, else parsed from its correlation key (rows that
+    predate subjects, and every sensor that has not declared one)."""
+    raw = row["subject_json"] if "subject_json" in row.keys() else None
+    if raw:
+        try:
+            sub = json.loads(raw)
+            return _subject_identity(sub), _subject_endpoint_classes(sub)
+        except Exception:
+            pass
+    fp = (row["correlation_key"] or "")[len("signal:"):]
+    return _tolerance_identity(fp), _beacon_endpoint_classes(fp)
+
+
 def _rotating_endpoint_memory(db, now):
     """{endpoint_class: (verdicts, max_reviewed_sev)} for classes the operator
     has dismissed across enough DISTINCT endpoints to establish rotation.
@@ -2858,7 +2961,8 @@ def _rotating_endpoint_memory(db, now):
     memory = {}
     try:
         rows = db.execute(
-            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
             "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
             "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
             "AND d.correlation_key LIKE 'signal:beacon:%'",
@@ -2867,8 +2971,7 @@ def _rotating_endpoint_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        for klass, observed in _beacon_endpoint_classes(
-                row["correlation_key"][len("signal:"):]):
+        for klass, observed in _incident_identity(row)[1]:
             bucket = seen.setdefault(klass, {"obs": set(), "ports": set(),
                                              "inc": set(), "sev": -1})
             bucket["obs"].add(observed)
@@ -2893,7 +2996,8 @@ def _tolerance_memory(db, now):
     memory = {}
     try:
         rows = db.execute(
-            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
             "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
             "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
             "AND d.correlation_key LIKE 'signal:%'",
@@ -2902,7 +3006,7 @@ def _tolerance_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        ident = _incident_identity(row)[0]
         if not ident:
             continue
         bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
@@ -2922,14 +3026,13 @@ def _disputed_identities(db):
     idents = set()
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     for row in db.execute(
-            "SELECT correlation_key FROM incidents WHERE status IN (%s) "
-            "AND correlation_key LIKE 'signal:%%'" % marks,
+            "SELECT correlation_key, subject_json FROM incidents "
+            "WHERE status IN (%s) AND correlation_key LIKE 'signal:%%'" % marks,
             _ACTIVE_INCIDENT_STATES):
-        fp = row["correlation_key"][len("signal:"):]
-        ident = _tolerance_identity(fp)
+        ident, classes = _incident_identity(row)
         if ident:
             idents.add(ident)
-        for klass, _observed in _beacon_endpoint_classes(fp):
+        for klass, _observed in classes:
             idents.add(klass)
     return idents
 
@@ -3240,16 +3343,16 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         verdicts = 0
         if f.get("category") in _TOLERANCE_CATEGORIES \
                 and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]:
-            fp = f.get("fingerprint")
             # Two generalizations, same guards: the exact identity (hash and
             # version churn), then — only for beacons, and only once rotation
             # is evidenced across distinct addresses — the endpoint class.
+            # Both read the finding's SUBJECT where it carries one.
             candidates = []
-            ident = _tolerance_identity(fp)
+            ident = _finding_identity(f)
             if ident:
                 candidates.append((ident, tolerance))
             if rotating:
-                for klass, _observed in _beacon_endpoint_classes(fp):
+                for klass, _observed in _finding_endpoint_classes(f):
                     candidates.append((klass, rotating))
             for ident, memory in candidates:
                 if ident in disputed:
@@ -3287,7 +3390,8 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         incident_id = _upsert_incident(
             db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
             f["title"], f["severity"], "signal", now, [event_id],
-            initially_notified or bool(verdicts) or in_learning)
+            initially_notified or bool(verdicts) or in_learning,
+            subject=f.get("subject"))
         if verdicts:
             _auto_tolerate(db, incident_id, verdicts, now)
         elif in_learning:
@@ -4733,6 +4837,7 @@ def check_persistence(baseline_snap, current_snap):
                     detail,
                     "persistence:changed:%s:%s" % (path, fp),
                     case_fingerprint="persistence:changed:%s" % path,
+                    subject=_subject("persistence", path, content=fp),
                     path=path, program=rec.get("program"), trust=rec.get("trust"),
                     custody=prov,
                     script_target=_script_target(rec.get("args"),
@@ -5194,6 +5299,8 @@ def check_processes():
                                   ("\n" + note) if note else ""),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
                 case_fingerprint="process:%s" % _program_subject(comm),
+                subject=_subject("process", comm, trust=sig["trust"],
+                                 content=sha),
                 path=comm, trust=sig["trust"], sha256=sha, custody=rung))
     return findings
 
@@ -7944,6 +8051,7 @@ def _beacon_recurrence(history, current_rows):
             "beacon:%s:%s:%s" % (_program_subject(path), rip, rport),
             case_fingerprint=dev_case or ("beacon:%s:%s:%s" % (
                 _program_subject(path), rip, rport)),
+            subject=_subject("beacon", path, ip=rip, port=rport),
             path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
