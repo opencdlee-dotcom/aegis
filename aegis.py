@@ -3432,11 +3432,8 @@ def _retire_legacy_exec_incidents(db, now):
 
     They are closed as SUPERSEDED, with their evidence intact: whatever they
     described, if it is still true, re-alerts under the new identity on the very
-    next scan. Guarded by a meta key so it runs once per upgrade, not per scan.
+    next scan. Run once per store by _run_store_migrations.
     """
-    if db.execute("SELECT value FROM meta WHERE key='exec_identity_migrated'"
-                  ).fetchone():
-        return 0
     aged = [row["id"] for row in db.execute(
         "SELECT id,correlation_key FROM incidents WHERE status IN "
         "('OPEN','ACK') AND correlation_key LIKE 'signal:agent-surface:%'")
@@ -3450,9 +3447,6 @@ def _retire_legacy_exec_incidents(db, now):
             ("superseded: exec entries are now identified by the command they "
              "run, not their position in the config — re-alerts under the new "
              "identity if still present", now) + tuple(aged))
-    db.execute("INSERT INTO meta(key,value) VALUES('exec_identity_migrated',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (str(now),))
     return len(aged)
 
 
@@ -3461,6 +3455,16 @@ _LEGACY_PERSIST_CASE_RE = re.compile(
 
 
 _LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:.*:[0-9a-f]{64}$")
+# FROZEN copies of _BEACON_FP_RE / _TOLERANCE_VERSION_RE as they stood when this
+# migration shipped (2026-08-23). A migration's meaning must not drift when the
+# live detection patterns evolve: a store restored from backup, or a second
+# machine upgrading late, must migrate exactly the way the first one did.
+_MIG_BEACON_FP_RE = re.compile(
+    r"^beacon:(?P<path>.+?):"
+    r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*):"
+    r"(?P<port>\d+)$")
+_MIG_VERSION_RE = re.compile(
+    r"(?<![0-9A-Za-z])\d+(?:\.\d+){1,3}(?![0-9A-Za-z])")
 
 
 def _is_orphaned_program_key(key):
@@ -3485,8 +3489,8 @@ def _is_orphaned_program_key(key):
         fp = key[len("signal:"):]
         if fp.startswith("outbound:"):
             fp = "beacon:" + fp[len("outbound:"):]
-        match = _BEACON_FP_RE.match(fp)
-        return bool(match and _TOLERANCE_VERSION_RE.search(match.group("path")))
+        match = _MIG_BEACON_FP_RE.match(fp)
+        return bool(match and _MIG_VERSION_RE.search(match.group("path")))
     return False
 
 
@@ -3502,11 +3506,8 @@ def _retire_orphaned_program_incidents(db, now):
     Closed as SUPERSEDED with evidence intact. Nothing is being judged benign:
     whatever these described, if it is still true, re-alerts on the very next
     scan under the new identity — collapsed by program instead of multiplied by
-    version. Guarded by a meta key so it runs once per upgrade, not per scan.
+    version. Run once per store by _run_store_migrations.
     """
-    if db.execute("SELECT value FROM meta WHERE key='program_case_migrated'"
-                  ).fetchone():
-        return 0
     aged = [row["id"] for row in db.execute(
         "SELECT id,correlation_key FROM incidents WHERE status IN "
         "('OPEN','ACK')") if _is_orphaned_program_key(row["correlation_key"])]
@@ -3518,9 +3519,6 @@ def _retire_orphaned_program_incidents(db, now):
             ("superseded: process/outbound/beacon cases are now keyed on the "
              "PROGRAM, not the versioned path it lives at — re-alerts under "
              "the new identity if still present", now) + tuple(aged))
-    db.execute("INSERT INTO meta(key,value) VALUES('program_case_migrated',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (str(now),))
     return len(aged)
 
 
@@ -3540,11 +3538,8 @@ def _merge_legacy_persistence_cases(db, now):
     therefore inherits a real history instead of starting empty, and any file
     that is still changing keeps alerting under the same case.
 
-    Guarded by a meta key so it runs once per upgrade, not per scan.
+    Run once per store by _run_store_migrations.
     """
-    if db.execute("SELECT value FROM meta WHERE key='persistence_case_merged'"
-                  ).fetchone():
-        return 0
     groups = {}
     for row in db.execute(
             "SELECT id,correlation_key FROM incidents WHERE status IN "
@@ -3581,10 +3576,53 @@ def _merge_legacy_persistence_cases(db, now):
                  "persistence item is now one case per FILE, not one per "
                  "content hash", now, dupe))
             merged += 1
-    db.execute("INSERT INTO meta(key,value) VALUES('persistence_case_merged',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (str(now),))
     return merged
+
+
+# One-time event-store migrations, in ship order. Every incident-identity
+# redesign orphans the keys minted under the old scheme, and the first three
+# each shipped their own hand-rolled shim — recognizer regex, retire/merge
+# function, private meta key, call-site guard, ~70 lines apiece. This table is
+# the shared runner that scaffold should have been. Rules:
+#   * A migration runs ONCE per store, stamped under its meta key. Existing
+#     stores keep the stamps they already hold, so nothing re-runs on upgrade.
+#   * Its recognizer patterns are FROZEN copies (see _MIG_*), never the live
+#     detection regexes, so its meaning cannot drift after it ships.
+#   * A migration that raises is logged and NOT stamped, so it retries next
+#     scan; the others still run — each is independent.
+#   * A migration older than a reasonable deprecation window may simply be
+#     deleted with its row: a store that skipped it falls back to age-out,
+#     which already closes stale OPEN incidents (with a blander resolution).
+# Row shape: (meta_key, fn(db, now) -> count, log template taking that count).
+_STORE_MIGRATIONS = (
+    ("exec_identity_migrated", _retire_legacy_exec_incidents,
+     "retired %d incident(s) keyed on the old positional exec identity"),
+    ("persistence_case_merged", _merge_legacy_persistence_cases,
+     "folded %d duplicate persistence incident(s) into one case per file"),
+    ("program_case_migrated", _retire_orphaned_program_incidents,
+     "retired %d incident(s) keyed on the old versioned-path program identity"),
+)
+
+
+def _run_store_migrations(db, now):
+    """Run every _STORE_MIGRATIONS entry this store has not yet been stamped
+    for. Returns the number of migrations that ran (not rows touched)."""
+    ran = 0
+    for key, fn, log_tmpl in _STORE_MIGRATIONS:
+        try:
+            if db.execute("SELECT value FROM meta WHERE key=?",
+                          (key,)).fetchone():
+                continue
+            count = fn(db, now)
+            db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (key, str(now)))
+            ran += 1
+            if count:
+                log_run(log_tmpl % count)
+        except Exception as e:
+            log_run("store migration %s skipped: %s" % (key, e))
+    return ran
 
 
 def record_security_state(findings, sensor_health=(), now=None,
@@ -3627,27 +3665,7 @@ def record_security_state(findings, sensor_health=(), now=None,
             # just had updated_at refreshed, so only genuinely quiet incidents
             # are candidates. Ordering matters — the reverse would age out an
             # incident in the same breath as its new evidence.
-            try:
-                retired = _retire_legacy_exec_incidents(db, now)
-                if retired:
-                    log_run("retired %d incident(s) keyed on the old positional "
-                            "exec identity" % retired)
-            except Exception as e:
-                log_run("exec-identity migration skipped: %s" % e)
-            try:
-                folded = _merge_legacy_persistence_cases(db, now)
-                if folded:
-                    log_run("folded %d duplicate persistence incident(s) into "
-                            "one case per file" % folded)
-            except Exception as e:
-                log_run("persistence-case migration skipped: %s" % e)
-            try:
-                orphaned = _retire_orphaned_program_incidents(db, now)
-                if orphaned:
-                    log_run("retired %d incident(s) keyed on the old versioned-"
-                            "path program identity" % orphaned)
-            except Exception as e:
-                log_run("program-case migration skipped: %s" % e)
+            _run_store_migrations(db, now)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)

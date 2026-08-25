@@ -199,6 +199,74 @@ class LegacyProgramIncidentsRetire(_DBCase):
         self.assertEqual(self._status(outbound), "OPEN")
 
 
+class StoreMigrationsRunOnce(_DBCase):
+    """The shared migration runner. Every incident-identity redesign used to
+    ship its own recognizer + retire function + private meta key + call-site
+    try/except; this pins the one runner that replaced that scaffold, and the
+    properties each hand-rolled copy had to remember by itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.executescript(
+            "CREATE TABLE incident_events(incident_id INT, event_id INT);")
+        self.logged = []
+        self._saved_log = aegis.log_run
+        aegis.log_run = self.logged.append
+
+    def tearDown(self):
+        aegis.log_run = self._saved_log
+        super().tearDown()
+
+    def _stamps(self):
+        return {r[0] for r in self.db.execute("SELECT key FROM meta")}
+
+    def test_each_migration_runs_once_and_is_stamped(self):
+        old = self._inc(
+            "x", key="signal:agent-surface:newexec:/c.json:hooks.A[0]|node srv")
+        self.assertEqual(aegis._run_store_migrations(self.db, self.now),
+                         len(aegis._STORE_MIGRATIONS))
+        self.assertEqual(self._status(old), "FALSE_POSITIVE")
+        self.assertEqual(self._stamps(),
+                         {k for k, _fn, _log in aegis._STORE_MIGRATIONS})
+        # Second pass: nothing runs. The STAMP is the guard, not the data.
+        self.assertEqual(aegis._run_store_migrations(self.db, self.now), 0)
+
+    def test_a_store_stamped_under_the_old_per_shim_guards_does_not_rerun(self):
+        """Live stores were stamped by the hand-rolled shims under these same
+        keys; the runner must honour them or every upgrade re-migrates."""
+        self.db.execute(
+            "INSERT INTO meta VALUES('exec_identity_migrated','1')")
+        old = self._inc(
+            "x", key="signal:agent-surface:newexec:/c.json:hooks.A[0]|node srv")
+        aegis._run_store_migrations(self.db, self.now)
+        self.assertEqual(self._status(old), "OPEN")
+
+    def test_a_failing_migration_is_not_stamped_and_blocks_nothing(self):
+        def boom(db, now):
+            raise RuntimeError("nope")
+        saved = aegis._STORE_MIGRATIONS
+        aegis._STORE_MIGRATIONS = (("m_boom", boom, "%d"),) + saved
+        try:
+            ran = aegis._run_store_migrations(self.db, self.now)
+        finally:
+            aegis._STORE_MIGRATIONS = saved
+        self.assertEqual(ran, len(saved))
+        self.assertNotIn("m_boom", self._stamps(),
+                         "a failed migration must retry next scan")
+        self.assertTrue({k for k, _fn, _log in saved} <= self._stamps())
+        self.assertTrue(any("m_boom" in m for m in self.logged))
+
+    def test_recognizers_are_frozen_not_the_live_patterns(self):
+        """The orphaned-program migration once evaluated legacy keys through
+        the LIVE beacon/version regexes, so its meaning moved whenever
+        detection did. A migration's patterns are its own objects."""
+        import inspect
+        src = inspect.getsource(aegis._is_orphaned_program_key)
+        self.assertNotRegex(src, r"(?<!_MIG)_BEACON_FP_RE")
+        self.assertNotIn("_TOLERANCE_VERSION_RE", src)
+        self.assertIn("_MIG_BEACON_FP_RE", src)
+
+
 class RotatingEndpointsNeedEvidence(_DBCase):
     """Fix 2b — a rotating service generalizes only once rotation is
     demonstrated, and the shape of the evidence decides how far it generalizes."""
