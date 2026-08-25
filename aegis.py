@@ -203,7 +203,7 @@ FLEET_SIGNERS = os.path.join(STATE_DIR, "allowed_signers")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
-BASELINE_SCHEMA_VERSION = 2
+BASELINE_SCHEMA_VERSION = 3
 HOSTS_FILE = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                            "System32", "drivers", "etc", "hosts")
               if IS_WIN else "/etc/hosts")
@@ -1554,7 +1554,11 @@ def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
 def _quarantine_fields(path):
     """One `xattr` read of com.apple.quarantine → (present, agent, event_uuid).
     Single-call so the hot-dir sweep does not spawn three subprocesses per file.
-    Value layout: flags;hex-timestamp;AgentName;event-UUID."""
+    Value layout: flags;hex-timestamp;AgentName;event-UUID. Uses Apple's `xattr`
+    CLI because Python's os.getxattr is Linux-only (verified absent on macOS).
+    ABSENCE on a freshly-dropped executable is itself a signal — the file
+    arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
+    the exact side-load path AMOS/DMG-lure chains use."""
     out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
     if rc != 0 or not out.strip():
         return (False, None, None)
@@ -1562,18 +1566,6 @@ def _quarantine_fields(path):
     agent = fields[2].strip() if len(fields) >= 3 and fields[2].strip() else None
     uuid = fields[3].strip() if len(fields) >= 4 and fields[3].strip() else None
     return (True, agent, uuid)
-
-
-def quarantine_origin(path):
-    """Provenance from the com.apple.quarantine xattr, via Apple's `xattr` CLI
-    (Python's os.getxattr is Linux-only — verified absent on macOS). Returns
-    (present, agent): whether the file carries a Gatekeeper quarantine flag and
-    the downloading agent name (Safari, Google Chrome, curl, Terminal, …).
-    ABSENCE on a freshly-dropped executable is itself a signal — it means the
-    file arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
-    the exact side-load path AMOS/DMG-lure chains use."""
-    present, agent, _uuid = _quarantine_fields(path)
-    return (present, agent)
 
 
 # The central download-provenance store — LSQuarantineEvent rows in the user's
@@ -2312,7 +2304,8 @@ _EVENT_SCHEMA_SQL = """
             reminder_count INTEGER NOT NULL DEFAULT 0,
             next_reminder_at INTEGER,
             last_notified_at INTEGER,
-            resolution TEXT
+            resolution TEXT,
+            subject_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_incidents_active
             ON incidents(status, next_reminder_at);
@@ -2365,6 +2358,12 @@ def _event_connection():
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
     db.executescript(_EVENT_SCHEMA_SQL)
+    # CREATE TABLE IF NOT EXISTS never widens an existing table: a store
+    # created before subject_json existed must gain it here, or every reader
+    # that selects it fails closed into "no memory" without a word.
+    cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+    if "subject_json" not in cols:
+        db.execute("ALTER TABLE incidents ADD COLUMN subject_json TEXT")
     db.commit()
     try:
         os.chmod(EVENT_DB, 0o600)
@@ -2471,7 +2470,8 @@ def _incident_fingerprints(db, incident_id):
 
 
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
-                     initially_notified=False):
+                     initially_notified=False, subject=None):
+    subject_json = json.dumps(subject, sort_keys=True) if subject else None
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     row = db.execute(
         "SELECT * FROM incidents WHERE correlation_key=? AND status IN (%s) "
@@ -2483,9 +2483,12 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
         new_status = "OPEN" if (row["status"] == "ACK" and
                                 SEV_ORDER[new_sev] > SEV_ORDER[row["severity"]]) \
             else row["status"]
+        # A row that predates subjects acquires one from the first evidence
+        # that carries it, so the fingerprint-parsing fallback retires itself.
         db.execute("UPDATE incidents SET severity=?, status=?, last_seen=?, "
-                   "updated_at=? WHERE id=?",
-                   (new_sev, new_status, now, now, incident_id))
+                   "updated_at=?, subject_json=COALESCE(subject_json,?) "
+                   "WHERE id=?",
+                   (new_sev, new_status, now, now, subject_json, incident_id))
     else:
         # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
         # a permanent mute on the whole entity. Keep genuinely-recurring evidence
@@ -2519,10 +2522,10 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
             cur = db.execute(
                 "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
                 "created_at,first_seen,last_seen,updated_at,reminder_count,"
-                "next_reminder_at,last_notified_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "next_reminder_at,last_notified_at,subject_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-                 now + _REMINDER_DELAYS[0], last_notified))
+                 now + _REMINDER_DELAYS[0], last_notified, subject_json))
             incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
@@ -2854,6 +2857,98 @@ def _beacon_endpoint_classes(fingerprint):
             ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
 
 
+# --- structured subject identity ---------------------------------------------
+# The three sensors whose identity churned (persistence CHANGED, process exec,
+# net-beacon) declare WHAT a finding is about as fields, not as a string to be
+# regexed back apart. The identity strings the tolerance layer keys on are
+# RENDERINGS of the subject — byte-identical to what _tolerance_identity and
+# _beacon_endpoint_classes derive from the fingerprint, so rows that predate
+# subjects and rows that carry one build ONE memory. The subject is stored on
+# the incident, and that is what ends the migration treadmill: when a sensor
+# next changes how it spells a fingerprint, the identity the operator's
+# verdicts attach to does not move, so nothing is orphaned and no one-time
+# closer is needed. The string parsers remain only as the fallback for rows
+# that predate this, and for sensors that have not declared a subject.
+
+def _subject(kind, path, **fields):
+    """Build a finding subject. `path` is version-normalized HERE so every
+    consumer sees exactly one spelling of "same software, new version"; the
+    raw path is kept so 'did normalization change anything' stays answerable
+    without re-parsing."""
+    sub = {"kind": kind, "raw_path": path, "path": _program_subject(path)}
+    sub.update({k: v for k, v in fields.items() if v is not None})
+    return sub
+
+
+def _subject_identity(sub):
+    """Tolerance identity rendered from a subject, or None when it has nothing
+    to generalize over (no content hash, no version churn) — the same rule
+    _tolerance_identity applies to a fingerprint string, so plain recurrence
+    stays with the exact-key reattach."""
+    if not isinstance(sub, dict):
+        return None
+    kind, path = sub.get("kind"), sub.get("path")
+    if not path:
+        return None
+    generalizes = bool(sub.get("content")) or path != sub.get("raw_path")
+    if kind == "persistence" and generalizes:
+        return "persistence:changed:%s" % path
+    if kind == "process" and generalizes:
+        return "process:%s:%s" % (path, sub.get("trust") or "")
+    return None
+
+
+def _subject_endpoint_classes(sub):
+    """Beacon endpoint classes from a subject's structured endpoint. A
+    hostname is a fact and refuses to generalize, exactly as in the string
+    path — but an IPv6 address needs no parsing-from-the-right here, because
+    it never went through a ':'-joined string in the first place."""
+    if not isinstance(sub, dict) or sub.get("kind") != "beacon":
+        return []
+    path = sub.get("path")
+    ip, port = str(sub.get("ip") or ""), str(sub.get("port") or "")
+    try:
+        ipaddress.ip_address(ip)
+        if not 1 <= int(port) <= 65535:
+            return []
+    except ValueError:
+        return []
+    if not path:
+        return []
+    return [("beacon:%s:#ip:%s" % (path, port), ip),
+            ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
+
+
+def _finding_identity(f):
+    """Subject first; the fingerprint string only for a finding without one."""
+    sub = f.get("subject")
+    if sub:
+        return _subject_identity(sub)
+    return _tolerance_identity(f.get("fingerprint"))
+
+
+def _finding_endpoint_classes(f):
+    sub = f.get("subject")
+    if sub:
+        return _subject_endpoint_classes(sub)
+    return _beacon_endpoint_classes(f.get("fingerprint"))
+
+
+def _incident_identity(row):
+    """(identity, endpoint_classes) for a stored incident: from its stored
+    subject when it has one, else parsed from its correlation key (rows that
+    predate subjects, and every sensor that has not declared one)."""
+    raw = row["subject_json"] if "subject_json" in row.keys() else None
+    if raw:
+        try:
+            sub = json.loads(raw)
+            return _subject_identity(sub), _subject_endpoint_classes(sub)
+        except Exception:
+            pass
+    fp = (row["correlation_key"] or "")[len("signal:"):]
+    return _tolerance_identity(fp), _beacon_endpoint_classes(fp)
+
+
 def _rotating_endpoint_memory(db, now):
     """{endpoint_class: (verdicts, max_reviewed_sev)} for classes the operator
     has dismissed across enough DISTINCT endpoints to establish rotation.
@@ -2866,7 +2961,8 @@ def _rotating_endpoint_memory(db, now):
     memory = {}
     try:
         rows = db.execute(
-            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
             "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
             "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
             "AND d.correlation_key LIKE 'signal:beacon:%'",
@@ -2875,8 +2971,7 @@ def _rotating_endpoint_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        for klass, observed in _beacon_endpoint_classes(
-                row["correlation_key"][len("signal:"):]):
+        for klass, observed in _incident_identity(row)[1]:
             bucket = seen.setdefault(klass, {"obs": set(), "ports": set(),
                                              "inc": set(), "sev": -1})
             bucket["obs"].add(observed)
@@ -2901,7 +2996,8 @@ def _tolerance_memory(db, now):
     memory = {}
     try:
         rows = db.execute(
-            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
             "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
             "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
             "AND d.correlation_key LIKE 'signal:%'",
@@ -2910,7 +3006,7 @@ def _tolerance_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        ident = _incident_identity(row)[0]
         if not ident:
             continue
         bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
@@ -2930,14 +3026,13 @@ def _disputed_identities(db):
     idents = set()
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     for row in db.execute(
-            "SELECT correlation_key FROM incidents WHERE status IN (%s) "
-            "AND correlation_key LIKE 'signal:%%'" % marks,
+            "SELECT correlation_key, subject_json FROM incidents "
+            "WHERE status IN (%s) AND correlation_key LIKE 'signal:%%'" % marks,
             _ACTIVE_INCIDENT_STATES):
-        fp = row["correlation_key"][len("signal:"):]
-        ident = _tolerance_identity(fp)
+        ident, classes = _incident_identity(row)
         if ident:
             idents.add(ident)
-        for klass, _observed in _beacon_endpoint_classes(fp):
+        for klass, _observed in classes:
             idents.add(klass)
     return idents
 
@@ -3030,6 +3125,163 @@ def _accumulate_risk(db, now, new_ids):
                 % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
                    "" if len(b["cats"]) == 1 else "s", score),
                 "HIGH", "risk", now, sorted(b["ids"]))
+
+
+# --------------------------------------------------------------------------- #
+# The routing gate — ONE verdict per finding, consulted by BOTH tiers.
+#
+# The interrupt tier (emit: allowlist, seen-ledger, adoption, notify floor,
+# confidence) and the incident tier (acquired tolerance, the learning period)
+# were disjoint state machines coupled by a single per-scan boolean. Three
+# things followed, each measured on the live store: acquired tolerance never
+# muted the desktop notification (a tolerated identity with a new content hash
+# interrupted FIRST and only then opened pre-closed); the learning period
+# never muted it either, despite the doc's promise; an allowlisted fingerprint
+# still opened and refreshed incidents and drove reminders; and one genuine
+# new HIGH marked every incident created that scan as already-notified.
+# route_findings is the one place the order is written down; emit and
+# record_security_state read it, and a caller without a routing (replay, the
+# tests) decides in place with the same function over the same memory.
+# --------------------------------------------------------------------------- #
+
+ROUTE_INTERRUPT = "interrupt"   # notify now
+ROUTE_DIGEST = "digest"         # logged and recorded; no interrupt
+ROUTE_SEEN = "seen"             # already reported; record only
+ROUTE_SILENT = "silent"         # allowlisted by the operator
+
+
+def _suppression_memory(db, now):
+    """Everything the incident tier knows that can quiet a signal, read once
+    per scan: (tolerance, rotating, disputed, learning)."""
+    tolerance = _tolerance_memory(db, now)
+    rotating = _rotating_endpoint_memory(db, now)
+    disputed = _disputed_identities(db) if (tolerance or rotating) \
+        else frozenset()
+    return tolerance, rotating, disputed, _in_learning_period(now)
+
+
+def _signal_decision(f, memory):
+    """(decision, verdicts) for a finding reaching the incident tier:
+    ("tolerated", n) under acquired tolerance, ("learning", 0) inside the
+    learning period, (None, 0) otherwise. The same guards wherever it is
+    called: never CRITICAL, never attack-defined, never a disputed identity,
+    never above the severity the operator actually reviewed."""
+    if not memory:
+        return None, 0
+    tolerance, rotating, disputed, learning = memory
+    sev = SEV_ORDER.get(f.get("severity"), -1)
+    if sev >= SEV_ORDER["CRITICAL"]:
+        return None, 0
+    if f.get("category") in _TOLERANCE_CATEGORIES:
+        # Two generalizations, same guards: the exact identity (hash and
+        # version churn), then — only for beacons, and only once rotation
+        # is evidenced across distinct addresses — the endpoint class.
+        # Both read the finding's SUBJECT where it carries one.
+        candidates = []
+        ident = _finding_identity(f)
+        if ident:
+            candidates.append((ident, tolerance))
+        if rotating:
+            for klass, _observed in _finding_endpoint_classes(f):
+                candidates.append((klass, rotating))
+        for ident, mem in candidates:
+            if ident in disputed:
+                continue
+            count, reviewed_sev = mem.get(ident, (0, -1))
+            if count and sev <= reviewed_sev:
+                return "tolerated", count
+    # The learning period closes what tolerance has no verdict for yet.
+    # Checked AFTER tolerance so an identity the operator actually reviewed
+    # is still credited to tolerance in the audit trail; attack-defined
+    # evidence is excluded here exactly as it is from tolerance.
+    if learning and not str(f.get("fingerprint") or "").startswith(
+            _NEVER_TOLERATE_PREFIXES):
+        return "learning", 0
+    return None, 0
+
+
+def route_findings(findings, first_run=False, adopt=frozenset(), memory=None):
+    """{fingerprint: {"route", "why", "decision", "verdicts"}} for a batch.
+
+    `route` is the interrupt-tier outcome. `decision` is the incident-tier
+    outcome ("allowlisted", "tolerated", "learning" or None), carried
+    separately because a finding the seen-ledger already knows still needs
+    its incident decided. `memory` is _suppression_memory(...) or None, in
+    which case only the interrupt-tier checks apply.
+
+    First-run silence is the KnockKnock "trust what's already installed" rule
+    — it applies to PERSISTENCE and SHELL-HISTORY only, the two surfaces made
+    of accreted-over-time RESIDUE (a launchd item, a months-old `curl|sh`
+    install line). A payload already sitting in a hot dir, a suspicious
+    RUNNING process, an XProtect detection, /tmp staging, a modified canary,
+    or a weak hardening setting is a LIVE risk the user must hear about even
+    on the very first scan. `adopt` is the same rule for a surface an upgrade
+    sees for the first time. Confidence is the second routing axis: a
+    high-impact-but-noisy hit (explicit confidence='low') is logged and
+    correlated but routed to the digest instead of interrupting."""
+    seen = load_json(SEEN, {})
+    allow = set(load_json(ALLOWLIST, []))
+    out = {}
+    for f in findings:
+        fp = f["fingerprint"]
+        if fp in out:
+            continue
+        decision, verdicts = _signal_decision(f, memory)
+        if fp in allow:
+            route, why, decision = ROUTE_SILENT, "allowlisted", "allowlisted"
+        elif fp in seen:
+            route, why = ROUTE_SEEN, "seen"
+        elif (first_run and f["category"] in ("persistence", "shell-history")) \
+                or f["category"] in adopt:
+            route, why = ROUTE_DIGEST, "adopted"
+        elif CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0:
+            route, why = ROUTE_DIGEST, "low-confidence"
+        elif SEV_ORDER[f["severity"]] < SEV_ORDER[NOTIFY_MIN_SEV]:
+            route, why = ROUTE_DIGEST, "below-floor"
+        elif decision:
+            route, why = ROUTE_DIGEST, decision
+        else:
+            route, why = ROUTE_INTERRUPT, "new"
+        out[fp] = {"route": route, "why": why, "decision": decision,
+                   "verdicts": verdicts}
+    return out
+
+
+def _route_for_scan(findings, first_run, adopt, now=None):
+    """route_findings with the incident tier's memory. A store that cannot be
+    read routes without it — the pre-gate behaviour — and says so."""
+    memory = None
+    try:
+        db = _event_connection()
+        try:
+            memory = _suppression_memory(db, _epoch(now))
+        finally:
+            db.close()
+    except Exception as e:
+        log_run("routing without incident memory: %s" % e)
+    return route_findings(findings, first_run, adopt, memory)
+
+
+def _close_allowlisted(db, incident_id, now):
+    """Close an incident whose fingerprint the operator allowlisted. Unlike
+    _auto_tolerate this may close an incident created on an EARLIER pass: the
+    allowlist is the operator's own standing verdict, not a machine one, so an
+    incident left open from before the entry was made is exactly what it
+    silences. Writes no dismissals row — an allowlist entry carries no typed
+    reason, so it must not feed tolerance or backtest precision."""
+    row = db.execute("SELECT status FROM incidents WHERE id=? AND kind='signal'",
+                     (incident_id,)).fetchone()
+    if not row or row["status"] not in _ACTIVE_INCIDENT_STATES:
+        return
+    db.execute(
+        "UPDATE incidents SET status='FALSE_POSITIVE',resolution='allowlisted',"
+        "updated_at=?,next_reminder_at=NULL WHERE id=?", (now, incident_id))
+    db.execute(
+        "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+        "incident_id,data_json) VALUES(?,?,?,?,?,?)",
+        (now, now, "incident", "incident.lifecycle", incident_id,
+         json.dumps({"from": row["status"], "to": "FALSE_POSITIVE",
+                     "reason_code": "allowlisted"})))
 
 
 # --------------------------------------------------------------------------- #
@@ -3137,7 +3389,7 @@ def _apply_path_lineage(db, new_events, now, initially_notified=False,
 
 
 def _apply_correlations(db, new_events, now, initially_notified=False,
-                        suppressed_categories=frozenset()):
+                        suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
     rows = db.execute(
         "SELECT id,observed_at,data_json FROM events "
@@ -3234,48 +3486,28 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
 
     # Every uncorrelated HIGH+ signal still becomes one actionable incident —
     # but an identity the operator has repeatedly reviewed as benign-positive
-    # opens pre-closed under acquired tolerance instead of re-alerting.
-    tolerance = _tolerance_memory(db, now)
-    rotating = _rotating_endpoint_memory(db, now)
-    disputed = _disputed_identities(db) if (tolerance or rotating) \
-        else frozenset()
-    learning = _in_learning_period(now)
+    # opens pre-closed under acquired tolerance, the learning period closes
+    # what tolerance has no verdict for, and an allowlisted fingerprint closes
+    # as allowlisted. The decision comes from the same gate that routed the
+    # notification (route_findings); a caller without a routing decides here
+    # with the same function over the same memory.
+    memory = None
     for event_id, f in new_events:
         if f.get("category") in suppressed_categories or event_id in attached \
                 or SEV_ORDER.get(f.get("severity"), -1) \
                 < SEV_ORDER["HIGH"]:
             continue
-        verdicts = 0
-        if f.get("category") in _TOLERANCE_CATEGORIES \
-                and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]:
-            fp = f.get("fingerprint")
-            # Two generalizations, same guards: the exact identity (hash and
-            # version churn), then — only for beacons, and only once rotation
-            # is evidenced across distinct addresses — the endpoint class.
-            candidates = []
-            ident = _tolerance_identity(fp)
-            if ident:
-                candidates.append((ident, tolerance))
-            if rotating:
-                for klass, _observed in _beacon_endpoint_classes(fp):
-                    candidates.append((klass, rotating))
-            for ident, memory in candidates:
-                if ident in disputed:
-                    continue
-                count, reviewed_sev = memory.get(ident, (0, -1))
-                if count and SEV_ORDER.get(f.get("severity"), -1) \
-                        <= reviewed_sev:
-                    verdicts = count
-                    break
-        # The learning period closes what tolerance has no verdict for yet.
-        # Same exclusions as every other machine verdict: never CRITICAL, never
-        # attack-defined. Checked AFTER tolerance so an identity the operator
-        # actually reviewed is still credited to tolerance in the audit trail.
-        in_learning = bool(
-            learning and not verdicts
-            and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]
-            and not str(f.get("fingerprint") or "").startswith(
-                _NEVER_TOLERATE_PREFIXES))
+        verdict = (routing or {}).get(f.get("fingerprint"))
+        if verdict is None:
+            if memory is None:
+                memory = _suppression_memory(db, now)
+            decision, verdicts = _signal_decision(f, memory)
+            notified = initially_notified
+        else:
+            decision, verdicts = verdict["decision"], verdict["verdicts"]
+            # Per FINDING, not per scan: one genuine new HIGH must not mark a
+            # digest-routed sibling as already told to a human.
+            notified = verdict["route"] == ROUTE_INTERRUPT
         # The incident is keyed on the SUBJECT where a sensor names one, and
         # on the raw fingerprint everywhere else. The two are different
         # questions: the fingerprint identifies THIS observation (content-
@@ -3295,12 +3527,13 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         incident_id = _upsert_incident(
             db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
             f["title"], f["severity"], "signal", now, [event_id],
-            initially_notified or bool(verdicts) or in_learning)
-        if verdicts:
+            notified or bool(decision), subject=f.get("subject"))
+        if decision == "allowlisted":
+            _close_allowlisted(db, incident_id, now)
+        elif decision == "tolerated":
             _auto_tolerate(db, incident_id, verdicts, now)
-        elif in_learning:
+        elif decision == "learning":
             _auto_tolerate(db, incident_id, 0, now, reason="learning-period")
-
 
 def _record_health(db, health, now):
     for item in health:
@@ -3440,11 +3673,8 @@ def _retire_legacy_exec_incidents(db, now):
 
     They are closed as SUPERSEDED, with their evidence intact: whatever they
     described, if it is still true, re-alerts under the new identity on the very
-    next scan. Guarded by a meta key so it runs once per upgrade, not per scan.
+    next scan. Run once per store by _run_store_migrations.
     """
-    if db.execute("SELECT value FROM meta WHERE key='exec_identity_migrated'"
-                  ).fetchone():
-        return 0
     aged = [row["id"] for row in db.execute(
         "SELECT id,correlation_key FROM incidents WHERE status IN "
         "('OPEN','ACK') AND correlation_key LIKE 'signal:agent-surface:%'")
@@ -3458,9 +3688,6 @@ def _retire_legacy_exec_incidents(db, now):
             ("superseded: exec entries are now identified by the command they "
              "run, not their position in the config — re-alerts under the new "
              "identity if still present", now) + tuple(aged))
-    db.execute("INSERT INTO meta(key,value) VALUES('exec_identity_migrated',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (str(now),))
     return len(aged)
 
 
@@ -3469,6 +3696,16 @@ _LEGACY_PERSIST_CASE_RE = re.compile(
 
 
 _LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:.*:[0-9a-f]{64}$")
+# FROZEN copies of _BEACON_FP_RE / _TOLERANCE_VERSION_RE as they stood when this
+# migration shipped (2026-08-23). A migration's meaning must not drift when the
+# live detection patterns evolve: a store restored from backup, or a second
+# machine upgrading late, must migrate exactly the way the first one did.
+_MIG_BEACON_FP_RE = re.compile(
+    r"^beacon:(?P<path>.+?):"
+    r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*):"
+    r"(?P<port>\d+)$")
+_MIG_VERSION_RE = re.compile(
+    r"(?<![0-9A-Za-z])\d+(?:\.\d+){1,3}(?![0-9A-Za-z])")
 
 
 def _is_orphaned_program_key(key):
@@ -3493,8 +3730,8 @@ def _is_orphaned_program_key(key):
         fp = key[len("signal:"):]
         if fp.startswith("outbound:"):
             fp = "beacon:" + fp[len("outbound:"):]
-        match = _BEACON_FP_RE.match(fp)
-        return bool(match and _TOLERANCE_VERSION_RE.search(match.group("path")))
+        match = _MIG_BEACON_FP_RE.match(fp)
+        return bool(match and _MIG_VERSION_RE.search(match.group("path")))
     return False
 
 
@@ -3510,11 +3747,8 @@ def _retire_orphaned_program_incidents(db, now):
     Closed as SUPERSEDED with evidence intact. Nothing is being judged benign:
     whatever these described, if it is still true, re-alerts on the very next
     scan under the new identity — collapsed by program instead of multiplied by
-    version. Guarded by a meta key so it runs once per upgrade, not per scan.
+    version. Run once per store by _run_store_migrations.
     """
-    if db.execute("SELECT value FROM meta WHERE key='program_case_migrated'"
-                  ).fetchone():
-        return 0
     aged = [row["id"] for row in db.execute(
         "SELECT id,correlation_key FROM incidents WHERE status IN "
         "('OPEN','ACK')") if _is_orphaned_program_key(row["correlation_key"])]
@@ -3526,9 +3760,6 @@ def _retire_orphaned_program_incidents(db, now):
             ("superseded: process/outbound/beacon cases are now keyed on the "
              "PROGRAM, not the versioned path it lives at — re-alerts under "
              "the new identity if still present", now) + tuple(aged))
-    db.execute("INSERT INTO meta(key,value) VALUES('program_case_migrated',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (str(now),))
     return len(aged)
 
 
@@ -3548,11 +3779,8 @@ def _merge_legacy_persistence_cases(db, now):
     therefore inherits a real history instead of starting empty, and any file
     that is still changing keeps alerting under the same case.
 
-    Guarded by a meta key so it runs once per upgrade, not per scan.
+    Run once per store by _run_store_migrations.
     """
-    if db.execute("SELECT value FROM meta WHERE key='persistence_case_merged'"
-                  ).fetchone():
-        return 0
     groups = {}
     for row in db.execute(
             "SELECT id,correlation_key FROM incidents WHERE status IN "
@@ -3589,15 +3817,58 @@ def _merge_legacy_persistence_cases(db, now):
                  "persistence item is now one case per FILE, not one per "
                  "content hash", now, dupe))
             merged += 1
-    db.execute("INSERT INTO meta(key,value) VALUES('persistence_case_merged',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (str(now),))
     return merged
+
+
+# One-time event-store migrations, in ship order. Every incident-identity
+# redesign orphans the keys minted under the old scheme, and the first three
+# each shipped their own hand-rolled shim — recognizer regex, retire/merge
+# function, private meta key, call-site guard, ~70 lines apiece. This table is
+# the shared runner that scaffold should have been. Rules:
+#   * A migration runs ONCE per store, stamped under its meta key. Existing
+#     stores keep the stamps they already hold, so nothing re-runs on upgrade.
+#   * Its recognizer patterns are FROZEN copies (see _MIG_*), never the live
+#     detection regexes, so its meaning cannot drift after it ships.
+#   * A migration that raises is logged and NOT stamped, so it retries next
+#     scan; the others still run — each is independent.
+#   * A migration older than a reasonable deprecation window may simply be
+#     deleted with its row: a store that skipped it falls back to age-out,
+#     which already closes stale OPEN incidents (with a blander resolution).
+# Row shape: (meta_key, fn(db, now) -> count, log template taking that count).
+_STORE_MIGRATIONS = (
+    ("exec_identity_migrated", _retire_legacy_exec_incidents,
+     "retired %d incident(s) keyed on the old positional exec identity"),
+    ("persistence_case_merged", _merge_legacy_persistence_cases,
+     "folded %d duplicate persistence incident(s) into one case per file"),
+    ("program_case_migrated", _retire_orphaned_program_incidents,
+     "retired %d incident(s) keyed on the old versioned-path program identity"),
+)
+
+
+def _run_store_migrations(db, now):
+    """Run every _STORE_MIGRATIONS entry this store has not yet been stamped
+    for. Returns the number of migrations that ran (not rows touched)."""
+    ran = 0
+    for key, fn, log_tmpl in _STORE_MIGRATIONS:
+        try:
+            if db.execute("SELECT value FROM meta WHERE key=?",
+                          (key,)).fetchone():
+                continue
+            count = fn(db, now)
+            db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (key, str(now)))
+            ran += 1
+            if count:
+                log_run(log_tmpl % count)
+        except Exception as e:
+            log_run("store migration %s skipped: %s" % (key, e))
+    return ran
 
 
 def record_security_state(findings, sensor_health=(), now=None,
                           initially_notified=False,
-                          suppressed_categories=frozenset()):
+                          suppressed_categories=frozenset(), routing=None):
     now = _epoch(now)
     db = _event_connection()
     new_events = []
@@ -3630,32 +3901,12 @@ def record_security_state(findings, sensor_health=(), now=None,
                 new_events.append((cur.lastrowid, f))
             _record_health(db, sensor_health, now)
             _apply_correlations(db, new_events, now, initially_notified,
-                                frozenset(suppressed_categories))
+                                frozenset(suppressed_categories), routing)
             # AFTER correlation: anything that produced evidence this scan has
             # just had updated_at refreshed, so only genuinely quiet incidents
             # are candidates. Ordering matters — the reverse would age out an
             # incident in the same breath as its new evidence.
-            try:
-                retired = _retire_legacy_exec_incidents(db, now)
-                if retired:
-                    log_run("retired %d incident(s) keyed on the old positional "
-                            "exec identity" % retired)
-            except Exception as e:
-                log_run("exec-identity migration skipped: %s" % e)
-            try:
-                folded = _merge_legacy_persistence_cases(db, now)
-                if folded:
-                    log_run("folded %d duplicate persistence incident(s) into "
-                            "one case per file" % folded)
-            except Exception as e:
-                log_run("persistence-case migration skipped: %s" % e)
-            try:
-                orphaned = _retire_orphaned_program_incidents(db, now)
-                if orphaned:
-                    log_run("retired %d incident(s) keyed on the old versioned-"
-                            "path program identity" % orphaned)
-            except Exception as e:
-                log_run("program-case migration skipped: %s" % e)
+            _run_store_migrations(db, now)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
@@ -4723,6 +4974,7 @@ def check_persistence(baseline_snap, current_snap):
                     detail,
                     "persistence:changed:%s:%s" % (path, fp),
                     case_fingerprint="persistence:changed:%s" % path,
+                    subject=_subject("persistence", path, content=fp),
                     path=path, program=rec.get("program"), trust=rec.get("trust"),
                     custody=prov,
                     script_target=_script_target(rec.get("args"),
@@ -5184,6 +5436,8 @@ def check_processes():
                                   ("\n" + note) if note else ""),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
                 case_fingerprint="process:%s" % _program_subject(comm),
+                subject=_subject("process", comm, trust=sig["trust"],
+                                 content=sha),
                 path=comm, trust=sig["trust"], sha256=sha, custody=rung))
     return findings
 
@@ -6924,28 +7178,22 @@ def _ext_cap_finding(label, rec, gained, is_new):
 
 
 def diff_ext_caps(prior, cur):
-    findings = []
-    prior = prior or {}
-    for label, rec in cur.items():
-        try:
-            old = prior.get(label)
-            caps = set(rec.get("caps") or [])
-            if old is None:
-                f = _ext_cap_finding(label, rec, sorted(caps), True)
-            else:
-                gained = caps - set(old.get("caps") or [])
-                # A narrow->broad host widening is itself the escalation, even
-                # with no new API permission.
-                if not gained and rec.get("broad") and not old.get("broad"):
-                    gained = caps
-                if not gained:
-                    continue
-                f = _ext_cap_finding(label, rec, sorted(gained), False)
-            if f:
-                findings.append(f)
-        except Exception:
-            continue
-    return findings
+    def new_fn(label, rec):
+        return _ext_cap_finding(label, rec, sorted(set(rec.get("caps") or [])),
+                                True)
+
+    def changed_fn(label, rec, old):
+        caps = set(rec.get("caps") or [])
+        gained = caps - set(old.get("caps") or [])
+        # A narrow->broad host widening is itself the escalation, even
+        # with no new API permission.
+        if not gained and rec.get("broad") and not old.get("broad"):
+            gained = caps
+        if not gained:
+            return None
+        return _ext_cap_finding(label, rec, sorted(gained), False)
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
 
 
 def _firefox_exts(root):
@@ -7940,6 +8188,7 @@ def _beacon_recurrence(history, current_rows):
             "beacon:%s:%s:%s" % (_program_subject(path), rip, rport),
             case_fingerprint=dev_case or ("beacon:%s:%s:%s" % (
                 _program_subject(path), rip, rport)),
+            subject=_subject("beacon", path, ip=rip, port=rport),
             path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
@@ -10229,7 +10478,6 @@ VOUCH_SIGNERS = os.path.join(STATE_DIR, "vouch_signers")
 _VOUCH_NAMESPACE = "aegis-vouch"
 _VOUCH_GENESIS = "0" * 64
 _VOUCH_DEFAULT_TTL = 180 * 86400
-_VOUCH_NET_SCOPE = ("net-outbound", "net-beacon", "net-listener")
 
 
 def _vouch_canonical(rec):
@@ -11252,13 +11500,21 @@ def diff_agent_surface(prior, cur):
     for path, rec in cur.items():
         old = prior.get(path)
         try:
-            # BOTH sides are normalized onto _exec_identity. The current side
-            # is already in that form when it comes from snapshot_agent_surface,
-            # so this is a no-op there — but it makes the diff independent of
-            # the caller's key vintage rather than silently mis-diffing a
-            # legacy-shaped snapshot as "everything is new".
-            execs = _migrate_exec_keys(rec.get("execs") or {})
-            old_execs = _migrate_exec_keys((old or {}).get("execs") or {})
+            # Exec keys are settled in the STORE (baseline schema v3 re-keys a
+            # legacy positional snapshot once, at load), so the steady state
+            # is a plain compare — no per-scan re-hashing of every entry on
+            # both sides. The in-memory fallback survives for the one path
+            # that deliberately skips the store rewrite: a watermark mismatch
+            # keeps a tampered baseline byte-identical for evidence, and a
+            # legacy-shaped prior reaching here must be re-keyed rather than
+            # mis-diffed as "everything is new". Both sides are re-keyed
+            # together so a hand-built legacy pair still compares equal.
+            execs = rec.get("execs") or {}
+            old_execs = (old or {}).get("execs") or {}
+            if any(not _NEW_EXEC_ID_RE.search(str(k)) for k in old_execs) \
+                    or any(not _NEW_EXEC_ID_RE.search(str(k)) for k in execs):
+                execs = _migrate_exec_keys(execs)
+                old_execs = _migrate_exec_keys(old_execs)
             for key, e in execs.items():
                 oe = old_execs.get(key)
                 if old is not None and oe is None:
@@ -11882,20 +12138,30 @@ def cmd_glean(mode="new"):
 # Baseline-diffed surfaces. Portable ones run everywhere; a surface with no
 # meaning on a platform is simply ABSENT from its registry rather than reported
 # as a failed sensor (a launchd LoginHook check on Linux is not a coverage gap).
+# One registry row per baseline-diffed surface. Row shape:
+#   (key, snapshot_fn, diff_fn[, writ_scope[, never_adopt_live]])
+# The trailing fields default to ("persistence", False) via _surface_row, so a
+# plain 3-tuple — including the ones tests patch in — is a fully governed row.
+# The scope and the adopt policy live ON the row deliberately: they used to be
+# two hand-maintained side-maps keyed on a THIRD spelling of the surface name,
+# and a key/category/scope spelling drift has already shipped one bug (benign
+# notes that silently never rendered). One row, one vocabulary.
 SURFACES = [
-    ("shellrc", snapshot_shellrc, diff_shellrc),
+    ("shellrc", snapshot_shellrc, diff_shellrc, "shellrc"),
     ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
-    ("browserext", snapshot_browserext, diff_browserext),
-    ("ide_ext", snapshot_ide_ext, diff_ide_ext),
+    ("browserext", snapshot_browserext, diff_browserext, "browserext"),
+    ("ide_ext", snapshot_ide_ext, diff_ide_ext, "browserext"),
     ("wallet", snapshot_wallet, diff_wallet),
-    ("listeners", snapshot_listeners, diff_listeners),
-    ("agent_skills", snapshot_agent_skills, diff_agent_skills),
+    ("listeners", snapshot_listeners, diff_listeners, "listeners"),
+    ("agent_skills", snapshot_agent_skills, diff_agent_skills,
+     "agent_surface"),
     # The AI-agent trust surface. Registered here rather than as a standalone
     # sensor so it inherits the whole managed pipeline for free: silent
     # first-sight adoption, sensor health, dedup, dismissals, and a baseline
     # already covered by the notary state digest (so an attacker who edits an
     # MCP registration AND Aegis's baseline breaks the hash chain).
-    ("agent_surface", snapshot_agent_surface, diff_agent_surface),
+    ("agent_surface", snapshot_agent_surface, diff_agent_surface,
+     "agent_surface"),
     ("session_binding", snapshot_session_binding, diff_session_binding),
     ("ext_caps", snapshot_ext_caps, diff_ext_caps),
 ]
@@ -11905,11 +12171,17 @@ if IS_MAC:
         ("loginhooks", snapshot_loginhooks, diff_loginhooks),
         ("profiles", snapshot_profiles, diff_profiles),
         ("btm", snapshot_btm, diff_btm),
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+        # never_adopt_live: an active remote login present at install/upgrade
+        # time is a CURRENT-ACCESS threat, not installed-residue — the README's
+        # live-vs-residue rule says the user must hear about it immediately,
+        # so this surface is never silently adopted (see _scan_surfaces).
+        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+         "persistence", True),
     ]
 elif IS_LINUX:
     SURFACES += [
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+         "persistence", True),
         ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
         ("suid_binaries", snapshot_suid, diff_suid),
     ]
@@ -11924,11 +12196,17 @@ else:
         ("win_appinit", snapshot_appinit, diff_appinit),
     ]
 
-# Surfaces whose first-sight items are LIVE risks, not installed-residue: they
-# must NOT be silently adopted on the very first scan (see _scan_surfaces). An
-# active remote login present at install/upgrade time is a current-access threat
-# the README's live-vs-residue rule says the user must hear about immediately.
-_NEVER_ADOPT_LIVE = {"auth_sessions"}
+
+def _surface_row(row):
+    """Normalize a SURFACES row to (key, snap_fn, diff_fn, writ_scope,
+    never_adopt_live). A surface with no explicit scope falls back to
+    "persistence", so a newly added surface is governed by default rather than
+    silently ungoverned — the failure that would otherwise grow a hole every
+    time someone adds a sensor."""
+    key, snap_fn, diff_fn = row[0], row[1], row[2]
+    scope = row[3] if len(row) > 3 else "persistence"
+    live = bool(row[4]) if len(row) > 4 else False
+    return key, snap_fn, diff_fn, scope, live
 
 
 # --------------------------------------------------------------------------- #
@@ -12235,22 +12513,10 @@ def check_canaries():
     return findings
 
 
-# Which writ scope governs each baseline-diffed surface. A surface with no
-# entry falls back to "persistence", so a newly added surface is governed by
-# default rather than silently ungoverned — the failure that would otherwise
-# grow a hole every time someone adds a sensor.
-_SURFACE_WRIT_SCOPE = {
-    "shellrc": "shellrc",
-    "browserext": "browserext",
-    "ide_ext": "browserext",
-    "listeners": "listeners",
-    "agent_surface": "agent_surface",
-    "agent_skills": "agent_surface",
-}
-
-
-def _apply_writ(findings, surface_key):
-    """Mark changes that happened with NO open writ.
+def _apply_writ(findings, scope):
+    """Mark changes that happened with NO open writ. `scope` is the writ scope
+    governing the batch — each SURFACES row carries its own (defaulting to
+    "persistence" via _surface_row).
 
     This is the call site that makes `writ enforce on` mean something. Without
     it the command existed, the state file was written, and the documentation
@@ -12263,7 +12529,6 @@ def _apply_writ(findings, surface_key):
     data = load_json(WRIT_FILE, {})
     if not isinstance(data, dict) or not data.get("enforcing"):
         return findings
-    scope = _SURFACE_WRIT_SCOPE.get(surface_key, "persistence")
     covered = _writ_data_covers(data, scope)
     out = []
     for f in findings:
@@ -12307,7 +12572,8 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
     if baseline is None:
         baseline = {}
     dirty = False
-    for key, snap_fn, diff_fn in SURFACES:
+    for row in SURFACES:
+        key, snap_fn, diff_fn, writ_scope, never_adopt = _surface_row(row)
         started = time.monotonic()
         try:
             cur = snap_fn()
@@ -12348,12 +12614,12 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             # first scan (an intruder logged in at install/upgrade time must not
             # be blessed as known-good). Diff against empty to surface it, then
             # record so it does not re-alert next scan.
-            if key in _NEVER_ADOPT_LIVE:
-                findings += _apply_writ(diff_fn({}, cur), key)
+            if never_adopt:
+                findings += _apply_writ(diff_fn({}, cur), writ_scope)
             baseline[key] = cur
             dirty = True
         else:
-            findings += _apply_writ(diff_fn(prior, cur), key)
+            findings += _apply_writ(diff_fn(prior, cur), writ_scope)
     if dirty and not first_run:
         save_json(BASELINE, baseline)
     return findings, baseline
@@ -12371,7 +12637,14 @@ def gather_all(baseline_snap, current_snap, health=None):
     # sensors only it can answer. A sensor that cannot exist here is absent
     # rather than permanently DEGRADED.
     sensors = [
-        ("persistence.diff", check_persistence, (baseline_snap, current_snap)),
+        # Writ-wrapped like every registry surface: launchd/systemd/Run-key
+        # persistence is the flagship change-shaped sensor, yet only the
+        # _scan_surfaces registry flowed through _apply_writ — so
+        # `writ enforce on` governed shellrc and browser extensions while the
+        # primary persistence diff bypassed enforcement entirely.
+        ("persistence.diff",
+         lambda b, c: _apply_writ(check_persistence(b, c), "persistence"),
+         (baseline_snap, current_snap)),
         ("process", check_processes, ()),
         ("behavior", check_behavior, ()),
         ("shell-history", check_shell_history, ()),
@@ -12521,7 +12794,7 @@ def _report_self_check(verdict, new_findings, findings, incidents):
 
 
 def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
-                  learning_days, aged):
+                  learning_days, aged, quiet=0):
     """The one-line-verdict report. Detail lives behind `report --full`."""
     counts = {}
     for f in findings:
@@ -12582,6 +12855,9 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
                                          total_sensors))
     if aged:
         ctx.append("%d aged out as ambient" % aged)
+    if quiet:
+        ctx.append("%d new but auto-closed (tolerated/learning/allowlisted)"
+                   % quiet)
     lines += ["- " + " · ".join(ctx), ""]
 
     if first_run:
@@ -12673,7 +12949,7 @@ def _full_report(payload):
 
 
 def write_report(findings, first_run, incidents=None, sensor_health=None,
-                 prior_seen=None, aged=0):
+                 prior_seen=None, aged=0, routing=None):
     """Write the brief report to latest.md and the full payload to latest.json.
 
     The report this replaced opened with ninety red bullets and ran 208 lines,
@@ -12688,11 +12964,18 @@ def write_report(findings, first_run, incidents=None, sensor_health=None,
     else:                               # which can only over-report, never under
         new_findings = [f for f in findings
                         if f.get("fingerprint") not in prior_seen]
+    # A finding the gate closed (tolerated, learning, allowlisted) is not
+    # "new and needs you": the headline must agree with the notification and
+    # the incident it summarizes. Still in `findings`, still counted below.
+    closed = {fp for fp, v in (routing or {}).items() if v.get("decision")}
+    quiet = len([f for f in new_findings if f.get("fingerprint") in closed])
+    new_findings = [f for f in new_findings
+                    if f.get("fingerprint") not in closed]
     now = int(_epoch())
     until = _learning_until()
     learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
     md = _brief_report(findings, new_findings, incidents, sensor_health,
-                       first_run, learning_days, aged)
+                       first_run, learning_days, aged, quiet=quiet)
     with open(LATEST_MD, "w", encoding="utf-8") as f:
         f.write(md)
     save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings,
@@ -12715,49 +12998,26 @@ def _cap_seen(seen):
     return dict(newest)
 
 
-def emit(findings, first_run, adopt=frozenset()):
-    """Append new findings to the durable log; notify on new >= HIGH.
-
-    `adopt` is the set of categories being SILENTLY ADOPTED on this scan (an
-    upgrade seeing a live, non-baseline surface for the first time — e.g. an
-    install predating shell-history support). Their findings are still logged but
-    never notified, so the residue they hold is not re-alerted as if it were new.
-    """
+def emit(findings, first_run, adopt=frozenset(), routing=None):
+    """Append new findings to the durable log; notify on what the gate routes
+    to the interrupt tier. `routing` is route_findings(...) — computed with
+    the incident tier's memory on the scan path, or here without it for a
+    direct caller (see route_findings for the rules)."""
+    if routing is None:
+        routing = route_findings(findings, first_run, adopt)
     seen = load_json(SEEN, {})
-    allow = set(load_json(ALLOWLIST, []))
     new_high = []
     _rotate_log(FINDINGS_LOG)
     with open(FINDINGS_LOG, "a", encoding="utf-8") as log:
         for f in findings:
             fp = f["fingerprint"]
-            if fp in allow:
-                continue
-            if fp in seen:
+            verdict = routing.get(fp) or {"route": ROUTE_SEEN}
+            # `fp in seen` also folds a fingerprint repeated within one batch.
+            if verdict["route"] in (ROUTE_SILENT, ROUTE_SEEN) or fp in seen:
                 continue
             seen[fp] = f["ts"]
             log.write(json.dumps(f) + "\n")
-            # First-run silence is the KnockKnock "trust what's already installed"
-            # rule — it applies to PERSISTENCE and SHELL-HISTORY only, the two
-            # surfaces made of accreted-over-time RESIDUE (a launchd item, or a
-            # months-old `curl|sh` install line). Suppressing them on the first
-            # scan adopts the existing state silently (still LOGGED) so upgrading
-            # Aegis on a busy machine is not an alert storm; NEW ones thereafter
-            # alert. A payload already sitting in a hot dir, a suspicious RUNNING
-            # process (behavior), an XProtect detection, /tmp staging, a modified
-            # canary, or a weak hardening setting is a LIVE risk the user must
-            # hear about even on the very first scan — those are never suppressed.
-            suppressed = (
-                (first_run and f["category"] in ("persistence", "shell-history"))
-                or f["category"] in adopt)
-            # Two-axis routing gate: notify only when severity clears the floor
-            # AND confidence is not 'low'. A high-impact-but-noisy hit (explicit
-            # confidence='low') is still logged/correlated but routed to the
-            # digest tier instead of interrupting — the anti-fatigue rule that
-            # keeps the tool trusted. Default 'medium' keeps every existing
-            # finding's notify behavior byte-identical.
-            low_conf = CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0
-            if not suppressed and not low_conf \
-                    and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
+            if verdict["route"] == ROUTE_INTERRUPT:
                 new_high.append(f)
     save_json(SEEN, _cap_seen(seen))
 
@@ -12767,7 +13027,6 @@ def emit(findings, first_run, adopt=frozenset()):
         notify("Aegis: %s" % top["severity"],
                "%s%s" % (top["title"], extra))
     return new_high
-
 
 def load_baseline():
     """Return (baseline_or_None, corrupt). Distinguishes 'no baseline yet' (a
@@ -12785,13 +13044,23 @@ def load_baseline():
 
 
 def _migrate_baseline(data):
-    """Upgrade legacy raw-argv baselines without laundering tamper evidence."""
+    """Upgrade a legacy baseline IN THE STORE, once, without laundering tamper
+    evidence. `schema_version` is the gate: a file already at the current
+    version is returned without a single record inspected.
+
+      v2  raw argv -> args_sha256, record redacted (a secret in
+          ProgramArguments must not persist in plaintext)
+      v3  agent_surface exec entries re-keyed from the retired positional
+          identity onto _exec_identity — settled in the store once, so
+          diff_agent_surface no longer re-hashes both sides on every scan
+    """
     if not isinstance(data, dict):
         return data
-    records = data.get("persistence")
-    if not isinstance(records, dict) or not any(
-            isinstance(rec, dict) and "args_sha256" not in rec
-            for rec in records.values()):
+    try:
+        version = int(data.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= BASELINE_SCHEMA_VERSION:
         return data
 
     # Rewrite only when the existing self-protection watermark agrees. If an
@@ -12803,24 +13072,30 @@ def _migrate_baseline(data):
     if recorded and recorded != current:
         return data
 
-    for key, rec in list(records.items()):
-        if not isinstance(rec, dict):
-            continue
-        raw_args = rec.get("args")
-        if "args_sha256" not in rec:
+    records = data.get("persistence")
+    if isinstance(records, dict):
+        for key, rec in list(records.items()):
+            if not isinstance(rec, dict) or "args_sha256" in rec:
+                continue
+            raw_args = rec.get("args")
             if raw_args is None:
                 rec["args_sha256"] = None
             else:
                 encoded = json.dumps(raw_args, sort_keys=True, default=str)
                 rec["args_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
-        records[key] = _redact_value(rec)
+            records[key] = _redact_value(rec)
+    surface = data.get("agent_surface")
+    if isinstance(surface, dict):
+        for rec in surface.values():
+            if isinstance(rec, dict) and isinstance(rec.get("execs"), dict):
+                rec["execs"] = _migrate_exec_keys(rec["execs"])
     data["schema_version"] = BASELINE_SCHEMA_VERSION
     data["trust"] = data.get("trust") or "unverified"
     save_json(BASELINE, data)
     state["baseline_sha"] = sha256(BASELINE)
     save_json(SELFSTATE, state)
-    log_run("migrated baseline schema to v%d (legacy argv redacted)" %
-            BASELINE_SCHEMA_VERSION)
+    log_run("migrated baseline schema v%d -> v%d"
+            % (version, BASELINE_SCHEMA_VERSION))
     return data
 
 
@@ -12947,7 +13222,8 @@ def _cmd_scan_locked(quiet=False):
     # the previous scan had already reported, and the difference against it is
     # the report's "new since last scan".
     prior_seen = set(load_json(SEEN, {}))
-    new_high = emit(findings, first_run, adopt=adopt)
+    routing = _route_for_scan(findings, first_run, adopt)
+    new_high = emit(findings, first_run, adopt=adopt, routing=routing)
     # Pre-authorized reversible response, if the operator armed any. Runs
     # AFTER emit so the report is written before anything acts on it, and is
     # wrapped because a standing order that could fail a scan — and so blind
@@ -12964,7 +13240,7 @@ def _cmd_scan_locked(quiet=False):
     try:
         record_security_state(
             findings, sensor_health=health, initially_notified=bool(new_high),
-            suppressed_categories=suppressed_categories)
+            suppressed_categories=suppressed_categories, routing=routing)
         reminders = [] if new_high else claim_due_incident_reminders()
         if reminders:
             top = reminders[0]
@@ -12981,7 +13257,7 @@ def _cmd_scan_locked(quiet=False):
         incidents, persisted_health = [], health
     md = write_report(findings, first_run, incidents=incidents,
                       sensor_health=persisted_health, prior_seen=prior_seen,
-                      aged=_LAST_AGED_OUT)
+                      aged=_LAST_AGED_OUT, routing=routing)
     flush_sigcache()
     record_selfstate()
     # Extend the tamper-evidence chain AFTER state is settled, so the link
@@ -13026,7 +13302,7 @@ def _cmd_baseline_locked(trust="verified"):
     current = snapshot_persistence()
     b = {"created": now_iso(), "schema_version": BASELINE_SCHEMA_VERSION,
          "persistence": current, "trust": trust}
-    for key, snap_fn, _diff in SURFACES:
+    for key, snap_fn, _diff, _scope, _live in map(_surface_row, SURFACES):
         try:
             snap = snap_fn()
         except Exception:
@@ -16024,12 +16300,20 @@ _FREEZE_NEVER_COMMS = _PROTECTED_COMMS - frozenset((
 def _process_owner_and_names(pid):
     """(owner, names) for `pid` from ONE process-table walk.
 
-    Deliberately not `_process_identity()` + `_process_names()`: those are two
-    full enumerations, and _freeze_refusal is called once per descendant during
-    a tree sweep. On Windows a single enumeration is a CIM query this codebase
-    measured at 41s for 135 processes, so the doubled version turns freezing a
-    small tree into minutes of latency — for a verb whose entire value is that
-    it lands before the payload finishes."""
+    Deliberately one combined walk, not an owner lookup plus a name lookup:
+    those would be two full enumerations, and _freeze_refusal is called once
+    per descendant during a tree sweep. On Windows a single enumeration is a
+    CIM query this codebase measured at 41s for 135 processes, so the doubled
+    version turns freezing a small tree into minutes of latency — for a verb
+    whose entire value is that it lands before the payload finishes.
+
+    Names come from BOTH the exe column and argv tokens because macOS `ps`
+    truncates the `comm` column to 16 characters WHEN `args` is requested in
+    the same call (exactly how _iter_processes queries it) — so
+    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames
+    to `Applicat`, matching nothing in _PROTECTED_COMMS. The full argv[0] is
+    NOT truncated, so it is the reliable source; either one matching is enough
+    to refuse — a guard should over-refuse, never under-refuse."""
     owner, names = None, set()
     for p, o, exe, argv in _iter_processes():
         if p != str(pid):
@@ -16046,20 +16330,6 @@ def _process_owner_and_names(pid):
                 names.add(os.path.basename(tok))
         break
     return owner, {n for n in names if n}
-
-
-def _process_names(pid):
-    """Every plausible name for `pid`, for matching against _PROTECTED_COMMS.
-
-    Why this exists rather than just using _process_identity's `comm`: macOS
-    `ps` truncates the `comm` column to 16 characters WHEN `args` is requested
-    in the same call, which is exactly how _iter_processes queries it. So
-    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames to
-    `Applicat`, which matches nothing in _PROTECTED_COMMS. The full argv[0] is
-    NOT truncated, so it is the reliable source. Both are returned because
-    either one matching is enough to refuse — a guard should over-refuse, never
-    under-refuse."""
-    return _process_owner_and_names(pid)[1]
 
 
 def _freeze_refusal(pid, parents=None):

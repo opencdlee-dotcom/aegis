@@ -19,6 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from conftest import SUSPICIOUS_TRUST  # noqa: E402
 
 
 class ExecIdentityIsWhatRuns(unittest.TestCase):
@@ -53,6 +54,26 @@ class ExecIdentityIsWhatRuns(unittest.TestCase):
         self.assertEqual(len(fs), 1)
         self.assertEqual(fs[0]["severity"], "HIGH")
 
+    def test_a_settled_baseline_is_a_plain_compare(self):
+        """Exec keys are settled in the store (baseline v3), so the steady-
+        state diff must not re-hash every entry on both sides each scan — a
+        forever-tax paid for a baseline vintage most installs never had. A
+        legacy-shaped prior is still re-keyed in memory, because the
+        watermark-mismatch path leaves a tampered file untouched on disk."""
+        calls = []
+        real = aegis._migrate_exec_keys
+        aegis._migrate_exec_keys = lambda execs: (calls.append(1), real(execs))[1]
+        try:
+            aegis.diff_agent_surface(self._snap(["a"]), self._snap(["a", "b"]))
+            self.assertEqual(calls, [], "steady state must not re-key")
+            legacy = {"/cfg/settings.json": {"sha256": "x" * 64, "execs": {
+                "hooks.SessionStart[0].hooks[0]|a": {"cmd": "a", "args": []}}}}
+            fs = self._new_execs(legacy, self._snap(["a"]))
+            self.assertTrue(calls, "a legacy-shaped prior must be re-keyed")
+            self.assertEqual(fs, [], "re-keyed legacy prior must match")
+        finally:
+            aegis._migrate_exec_keys = real
+
     def test_reordering_alone_is_silent(self):
         before, after = ["a", "b", "c"], ["c", "a", "b"]
         self.assertEqual(self._new_execs(self._snap(before),
@@ -84,7 +105,7 @@ class _DBCase(unittest.TestCase):
               title TEXT, severity TEXT, kind TEXT, status TEXT,
               resolution TEXT, created_at INT, updated_at INT,
               next_reminder_at INT, reminder_count INT DEFAULT 0,
-              last_notified_at INT);
+              last_notified_at INT, subject_json TEXT);
             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE events(id INTEGER PRIMARY KEY, occurred_at INT,
               observed_at INT, source TEXT, event_type TEXT, signal_id INT,
@@ -199,6 +220,74 @@ class LegacyProgramIncidentsRetire(_DBCase):
         self.assertEqual(self._status(outbound), "OPEN")
 
 
+class StoreMigrationsRunOnce(_DBCase):
+    """The shared migration runner. Every incident-identity redesign used to
+    ship its own recognizer + retire function + private meta key + call-site
+    try/except; this pins the one runner that replaced that scaffold, and the
+    properties each hand-rolled copy had to remember by itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.executescript(
+            "CREATE TABLE incident_events(incident_id INT, event_id INT);")
+        self.logged = []
+        self._saved_log = aegis.log_run
+        aegis.log_run = self.logged.append
+
+    def tearDown(self):
+        aegis.log_run = self._saved_log
+        super().tearDown()
+
+    def _stamps(self):
+        return {r[0] for r in self.db.execute("SELECT key FROM meta")}
+
+    def test_each_migration_runs_once_and_is_stamped(self):
+        old = self._inc(
+            "x", key="signal:agent-surface:newexec:/c.json:hooks.A[0]|node srv")
+        self.assertEqual(aegis._run_store_migrations(self.db, self.now),
+                         len(aegis._STORE_MIGRATIONS))
+        self.assertEqual(self._status(old), "FALSE_POSITIVE")
+        self.assertEqual(self._stamps(),
+                         {k for k, _fn, _log in aegis._STORE_MIGRATIONS})
+        # Second pass: nothing runs. The STAMP is the guard, not the data.
+        self.assertEqual(aegis._run_store_migrations(self.db, self.now), 0)
+
+    def test_a_store_stamped_under_the_old_per_shim_guards_does_not_rerun(self):
+        """Live stores were stamped by the hand-rolled shims under these same
+        keys; the runner must honour them or every upgrade re-migrates."""
+        self.db.execute(
+            "INSERT INTO meta VALUES('exec_identity_migrated','1')")
+        old = self._inc(
+            "x", key="signal:agent-surface:newexec:/c.json:hooks.A[0]|node srv")
+        aegis._run_store_migrations(self.db, self.now)
+        self.assertEqual(self._status(old), "OPEN")
+
+    def test_a_failing_migration_is_not_stamped_and_blocks_nothing(self):
+        def boom(db, now):
+            raise RuntimeError("nope")
+        saved = aegis._STORE_MIGRATIONS
+        aegis._STORE_MIGRATIONS = (("m_boom", boom, "%d"),) + saved
+        try:
+            ran = aegis._run_store_migrations(self.db, self.now)
+        finally:
+            aegis._STORE_MIGRATIONS = saved
+        self.assertEqual(ran, len(saved))
+        self.assertNotIn("m_boom", self._stamps(),
+                         "a failed migration must retry next scan")
+        self.assertTrue({k for k, _fn, _log in saved} <= self._stamps())
+        self.assertTrue(any("m_boom" in m for m in self.logged))
+
+    def test_recognizers_are_frozen_not_the_live_patterns(self):
+        """The orphaned-program migration once evaluated legacy keys through
+        the LIVE beacon/version regexes, so its meaning moved whenever
+        detection did. A migration's patterns are its own objects."""
+        import inspect
+        src = inspect.getsource(aegis._is_orphaned_program_key)
+        self.assertNotRegex(src, r"(?<!_MIG)_BEACON_FP_RE")
+        self.assertNotIn("_TOLERANCE_VERSION_RE", src)
+        self.assertIn("_MIG_BEACON_FP_RE", src)
+
+
 class RotatingEndpointsNeedEvidence(_DBCase):
     """Fix 2b — a rotating service generalizes only once rotation is
     demonstrated, and the shape of the evidence decides how far it generalizes."""
@@ -285,6 +374,178 @@ class RotatingEndpointsNeedEvidence(_DBCase):
         """Repetition is not rotation — the exact-key reattach covers that."""
         self.assertEqual(
             self._dismiss([("1.1.1.1", "443")] * 3), {})
+
+
+class SubjectIdentityIsStructured(_DBCase):
+    """Identity is declared as FIELDS by the three sensors whose identity
+    churned, rendered to the same strings the fingerprint parsers derive, and
+    stored on the incident — so the operator's verdicts attach to what a
+    finding is ABOUT rather than to how a sensor happened to spell it. The
+    fingerprint regexes remain only as the fallback for rows that predate
+    subjects."""
+
+    @staticmethod
+    def _beacon(path, ip, port):
+        return aegis.finding(
+            "HIGH", "net-beacon", "b", "d",
+            "beacon:%s:%s:%s" % (aegis._program_subject(path), ip, port),
+            subject=aegis._subject("beacon", path, ip=ip, port=port))
+
+    @staticmethod
+    def _process(comm, trust, sha):
+        return aegis.finding(
+            "HIGH", "process", "p", "d", "process:%s:%s:%s" % (comm, trust, sha),
+            subject=aegis._subject("process", comm, trust=trust, content=sha))
+
+    @staticmethod
+    def _persist(path, content):
+        return aegis.finding(
+            "HIGH", "persistence", "Persistence item CHANGED", "d",
+            "persistence:changed:%s:%s" % (path, content),
+            subject=aegis._subject("persistence", path, content=content))
+
+    def test_rendered_identity_agrees_with_the_string_derivation(self):
+        """ONE memory: a row that carries a subject and a row that predates
+        one must render the same identity for the same finding, or the
+        operator's older verdicts stop counting the day this ships."""
+        cases = [
+            self._beacon("/opt/homebrew/opt/syncthing/bin/syncthing",
+                         "fd7a:115c:a1e0::", "22000"),
+            self._beacon("/app-1.2.3/bin/x", "1.2.3.4", "443"),
+            self._process("/Users/me/.vscode/extensions/pub.tool-1.4.2/bin/tool",
+                          SUSPICIOUS_TRUST, "a" * 64),
+            self._process("/tmp/plain", "unsigned", "b" * 64),
+            self._process("/tmp/nohash", "unsigned", None),
+            self._persist("/L/app-2.0/x.plist", "c" * 12),
+        ]
+        for f in cases:
+            fp = f["fingerprint"]
+            self.assertEqual(aegis._finding_identity(f),
+                             aegis._tolerance_identity(fp), fp)
+            self.assertEqual(aegis._finding_endpoint_classes(f),
+                             aegis._beacon_endpoint_classes(fp), fp)
+        # and the no-hash, no-version process really has nothing to generalize
+        self.assertIsNone(aegis._finding_identity(cases[4]))
+
+    def test_a_hostname_endpoint_never_generalizes_from_fields(self):
+        self.assertEqual(aegis._finding_endpoint_classes(
+            self._beacon("/bin/x", "evil.example.com", "443")), [])
+        self.assertEqual(aegis._subject_endpoint_classes(
+            aegis._subject("beacon", "/bin/x", ip="1.2.3.4", port="70000")), [])
+
+    def _stored(self, key, subject, sev="HIGH"):
+        i = self._inc("s", sev=sev, key=key)
+        self.db.execute("UPDATE incidents SET subject_json=? WHERE id=?",
+                        (aegis.json.dumps(subject), i))
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS dismissals(id INTEGER PRIMARY KEY,"
+            "incident_id INT, correlation_key TEXT, reason_code TEXT,"
+            "category TEXT, dismissed_at INT)")
+        self.db.execute(
+            "INSERT INTO dismissals(incident_id,correlation_key,reason_code,"
+            "category,dismissed_at) VALUES(?,?,?,?,?)",
+            (i, key, "benign-positive", "x", self.now))
+        return i
+
+    def test_memory_is_built_from_the_stored_subject_not_the_key(self):
+        """The string parsers are unreachable for a row that carries a
+        subject: beacons and processes stored under deliberately UNPARSEABLE
+        keys still generalize, and still count as disputed while open."""
+        for n, ip in enumerate(("fd7a::1", "fd7a::2", "fd7a::3")):
+            self._stored("signal:beacon:garbage-%d" % n,
+                         aegis._subject("beacon", "/bin/app", ip=ip, port="443"))
+        for n in range(3):
+            self._stored("signal:process:garbage-%d" % n,
+                         aegis._subject("process", "/bin/tool",
+                                        trust=SUSPICIOUS_TRUST,
+                                        content="%064x" % n))
+        saved = (aegis._beacon_endpoint_classes, aegis._tolerance_identity)
+
+        def boom(_fp):
+            raise AssertionError("string parser reached")
+        aegis._beacon_endpoint_classes = boom
+        aegis._tolerance_identity = boom
+        try:
+            rot = aegis._rotating_endpoint_memory(self.db, self.now)
+            tol = aegis._tolerance_memory(self.db, self.now)
+            disputed = aegis._disputed_identities(self.db)
+        finally:
+            aegis._beacon_endpoint_classes, aegis._tolerance_identity = saved
+        self.assertIn("beacon:/bin/app:#ip:443", rot)
+        self.assertIn("process:/bin/tool:" + SUSPICIOUS_TRUST, tol)
+        self.assertIn("process:/bin/tool:" + SUSPICIOUS_TRUST, disputed)
+
+    def test_rows_that_predate_subjects_still_parse_from_the_key(self):
+        row = {"correlation_key": "signal:beacon:/bin/x:1.2.3.4:443",
+               "subject_json": None}
+        ident, classes = aegis._incident_identity(row)
+        self.assertIsNone(ident)
+        self.assertEqual(classes[0][0], "beacon:/bin/x:#ip:443")
+
+    def test_an_existing_store_gains_the_column(self):
+        path = os.path.join(self.tmp, "old.db")
+        con = sqlite3.connect(path)
+        legacy = aegis._EVENT_SCHEMA_SQL.replace(",\n            subject_json TEXT", "")
+        self.assertNotIn("subject_json", legacy)
+        con.executescript(legacy)
+        con.close()
+        saved = (aegis.STATE_DIR, aegis.EVENT_DB)
+        aegis.STATE_DIR, aegis.EVENT_DB = self.tmp, path
+        try:
+            db = aegis._event_connection()
+            cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+            db.close()
+        finally:
+            aegis.STATE_DIR, aegis.EVENT_DB = saved
+        self.assertIn("subject_json", cols)
+
+    def test_the_subject_is_stored_and_a_legacy_row_is_backfilled(self):
+        state = os.path.join(self.tmp, ".aegis")
+        os.makedirs(state)
+        saved = {k: getattr(aegis, k) for k in ("STATE_DIR", "EVENT_DB")}
+        aegis.STATE_DIR = state
+        aegis.EVENT_DB = os.path.join(state, "aegis.db")
+        try:
+            aegis.init_event_store()
+            db = aegis._event_connection()
+            with db:
+                db.execute(
+                    "INSERT INTO incidents(kind,correlation_key,title,severity,"
+                    "status,created_at,first_seen,last_seen,updated_at) VALUES("
+                    "'signal','signal:beacon:/bin/app:1.2.3.4:443','t','HIGH',"
+                    "'OPEN',1,1,1,1)")
+            db.close()
+            aegis.record_security_state(
+                [self._beacon("/bin/app", "1.2.3.4", "443")], now=1787000000)
+            db = aegis._event_connection()
+            rows = db.execute(
+                "SELECT correlation_key, subject_json FROM incidents").fetchall()
+            db.close()
+        finally:
+            for k, v in saved.items():
+                setattr(aegis, k, v)
+        self.assertEqual(len(rows), 1, "must reattach, not open a second case")
+        sub = aegis.json.loads(rows[0]["subject_json"])
+        self.assertEqual((sub["kind"], sub["ip"], sub["port"]),
+                         ("beacon", "1.2.3.4", "443"))
+
+    def test_the_sensors_declare_their_subjects(self):
+        def rec(sha):
+            return {"label": "com.x", "program": "/bin/bash",
+                    "args": ["/bin/bash", "/r.sh"], "args_sha256": "0" * 64,
+                    "sha256": sha, "trust": "unsigned", "run_at_load": True,
+                    "authority": None, "env": None, "script_target": "/r.sh",
+                    "target_sha": None}
+        fs = [f for f in aegis.check_persistence({"/L/x.plist": rec("a" * 64)},
+                                                 {"/L/x.plist": rec("b" * 64)})
+              if f["title"] == "Persistence item CHANGED"]
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["subject"]["kind"], "persistence")
+        self.assertEqual(aegis._finding_identity(fs[0]),
+                         aegis._tolerance_identity(fs[0]["fingerprint"]))
+        import inspect
+        for fn in (aegis.check_processes, aegis._beacon_recurrence):
+            self.assertIn("subject=_subject(", inspect.getsource(fn), fn.__name__)
 
 
 class ReportLeadsWithAVerdict(unittest.TestCase):

