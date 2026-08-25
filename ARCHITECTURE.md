@@ -421,6 +421,30 @@ detector's first weeks on a real machine are its worst: every ordinary thing it
 has not yet seen is new by construction. CRITICAL chains and tripped
 decoys/latches always alert.
 
+**One routing gate, consulted by both tiers.** The interrupt tier (`emit`:
+allowlist, seen-ledger, adoption, notify floor, confidence) and the incident
+tier (acquired tolerance, the learning period) were disjoint state machines
+coupled by a single per-scan boolean, and three things followed. Acquired
+tolerance never muted the desktop notification: a tolerated identity with a
+new content hash interrupted *first*, then opened pre-closed — the most
+careful suppression model in the file did not touch the tier alert fatigue
+lives in. The learning period never muted it either, despite the paragraph
+above. An allowlisted fingerprint still opened and refreshed incidents and
+drove reminders, because `emit` skipped it while every finding flowed into
+the incident tier untouched. And one genuine new HIGH marked every incident
+created that scan as already-notified, so a digest-routed sibling lost the
+reminder that was its only path to a human.
+
+`route_findings` is the one place the order is written down: allowlisted →
+seen → adopted → low-confidence → below-floor → tolerated/learning → new.
+The scan path computes it once with the incident tier's memory and hands the
+same verdicts to `emit`, to `record_security_state` (which now marks
+"notified" per finding and closes an allowlisted incident as `allowlisted`,
+writing no dismissal row), and to the report, whose headline must not call a
+finding "new and needs you" when the gate closed it. A caller without a
+routing — replay, the tests — decides in place with the same function over
+the same memory, so there is one decision procedure with two entry points.
+
 **The report leads with a verdict.** `latest.md` is the brief report — one
 verdict line, what is new since the last scan, open CRITICALs, degraded
 coverage; `aegis.py report --full` renders everything from `latest.json`. The
@@ -476,6 +500,18 @@ migrates existing incidents once, folding duplicates into the survivor with
 their evidence intact (verified on a copy of the live store: 46 → 37, 9 folded,
 17,908 evidence rows preserved, idempotent).
 
+**One-time store migrations share one runner.** Three identity redesigns in
+four days each hand-rolled the same scaffold — recognizer regex, retire/merge
+function, private meta key, call-site guard. `_STORE_MIGRATIONS` is the table
+that scaffold should have been, and `_run_store_migrations` stamps each entry
+once under the same meta keys the shims already wrote, so a live store never
+re-migrates. A migration's recognizer patterns are *frozen copies* of the live
+regexes at ship time (`_MIG_*`): its meaning must not drift when detection
+does, or a restored backup migrates differently from the first machine. A
+migration that raises is logged and not stamped, so it retries next scan
+without blocking the others; one older than a reasonable window may simply be
+deleted with its row, because age-out already closes what it would have.
+
 #### The outbound sensor: the endpoint is evidence, not identity
 
 `net-outbound` became the largest sensor in the report, and every one of its
@@ -518,6 +554,29 @@ against 64 stored signals, while the HIGH beacon sensor beside it had 36. A
 fold like `_merge_legacy_persistence_cases` would have been guarding an empty
 set. If an outbound case ever does open under the old shape, the 7-day age-out
 tier already closes a stale signal case — no new mechanism is required.
+
+### Identity is declared, not parsed
+
+Every one of those migrations existed for the same reason: identity lived
+*inside* the fingerprint string, and every consumer that needed it — acquired
+tolerance, the rotating-endpoint classes, the dispute check — regexed the
+string back apart. Each time a sensor changed how it spelled a fingerprint,
+the operator's verdicts stopped attaching to anything and a one-time closer
+had to be written (the IPv6 beacon bug was this failing silently: a
+colon-joined string cannot be split on colons).
+
+The three sensors whose identity churned (persistence CHANGED, process exec,
+`net-beacon`) now declare a **subject** on the finding — `kind`, the
+version-normalized `path`, the raw path, a `content` hash, an `ip`/`port` —
+and `_upsert_incident` stores it on the incident. The identity strings the
+tolerance layer keys on are *renderings* of that subject, byte-identical to
+what the string parsers derive (pinned by test), so rows that predate
+subjects and rows that carry one build one memory. The parsers remain only as
+the fallback for rows without a subject, and a legacy row acquires one from
+the first new evidence that reattaches to it, so the fallback retires itself.
+The next time a sensor respells a fingerprint, nothing is orphaned and no
+migration is needed — which is the actual fix for the class, not for the
+instance.
 
 ### The vouch tier (what the operator can say that nothing else can)
 

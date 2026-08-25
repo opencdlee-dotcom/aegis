@@ -19,6 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from conftest import SUSPICIOUS_TRUST  # noqa: E402
 
 
 class ExecIdentityIsWhatRuns(unittest.TestCase):
@@ -412,7 +413,7 @@ class SubjectIdentityIsStructured(_DBCase):
                          "fd7a:115c:a1e0::", "22000"),
             self._beacon("/app-1.2.3/bin/x", "1.2.3.4", "443"),
             self._process("/Users/me/.vscode/extensions/pub.tool-1.4.2/bin/tool",
-                          "adhoc", "a" * 64),
+                          SUSPICIOUS_TRUST, "a" * 64),
             self._process("/tmp/plain", "unsigned", "b" * 64),
             self._process("/tmp/nohash", "unsigned", None),
             self._persist("/L/app-2.0/x.plist", "c" * 12),
@@ -455,7 +456,8 @@ class SubjectIdentityIsStructured(_DBCase):
                          aegis._subject("beacon", "/bin/app", ip=ip, port="443"))
         for n in range(3):
             self._stored("signal:process:garbage-%d" % n,
-                         aegis._subject("process", "/bin/tool", trust="adhoc",
+                         aegis._subject("process", "/bin/tool",
+                                        trust=SUSPICIOUS_TRUST,
                                         content="%064x" % n))
         saved = (aegis._beacon_endpoint_classes, aegis._tolerance_identity)
 
@@ -470,8 +472,8 @@ class SubjectIdentityIsStructured(_DBCase):
         finally:
             aegis._beacon_endpoint_classes, aegis._tolerance_identity = saved
         self.assertIn("beacon:/bin/app:#ip:443", rot)
-        self.assertIn("process:/bin/tool:adhoc", tol)
-        self.assertIn("process:/bin/tool:adhoc", disputed)
+        self.assertIn("process:/bin/tool:" + SUSPICIOUS_TRUST, tol)
+        self.assertIn("process:/bin/tool:" + SUSPICIOUS_TRUST, disputed)
 
     def test_rows_that_predate_subjects_still_parse_from_the_key(self):
         row = {"correlation_key": "signal:beacon:/bin/x:1.2.3.4:443",

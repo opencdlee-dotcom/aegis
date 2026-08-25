@@ -3128,6 +3128,163 @@ def _accumulate_risk(db, now, new_ids):
 
 
 # --------------------------------------------------------------------------- #
+# The routing gate — ONE verdict per finding, consulted by BOTH tiers.
+#
+# The interrupt tier (emit: allowlist, seen-ledger, adoption, notify floor,
+# confidence) and the incident tier (acquired tolerance, the learning period)
+# were disjoint state machines coupled by a single per-scan boolean. Three
+# things followed, each measured on the live store: acquired tolerance never
+# muted the desktop notification (a tolerated identity with a new content hash
+# interrupted FIRST and only then opened pre-closed); the learning period
+# never muted it either, despite the doc's promise; an allowlisted fingerprint
+# still opened and refreshed incidents and drove reminders; and one genuine
+# new HIGH marked every incident created that scan as already-notified.
+# route_findings is the one place the order is written down; emit and
+# record_security_state read it, and a caller without a routing (replay, the
+# tests) decides in place with the same function over the same memory.
+# --------------------------------------------------------------------------- #
+
+ROUTE_INTERRUPT = "interrupt"   # notify now
+ROUTE_DIGEST = "digest"         # logged and recorded; no interrupt
+ROUTE_SEEN = "seen"             # already reported; record only
+ROUTE_SILENT = "silent"         # allowlisted by the operator
+
+
+def _suppression_memory(db, now):
+    """Everything the incident tier knows that can quiet a signal, read once
+    per scan: (tolerance, rotating, disputed, learning)."""
+    tolerance = _tolerance_memory(db, now)
+    rotating = _rotating_endpoint_memory(db, now)
+    disputed = _disputed_identities(db) if (tolerance or rotating) \
+        else frozenset()
+    return tolerance, rotating, disputed, _in_learning_period(now)
+
+
+def _signal_decision(f, memory):
+    """(decision, verdicts) for a finding reaching the incident tier:
+    ("tolerated", n) under acquired tolerance, ("learning", 0) inside the
+    learning period, (None, 0) otherwise. The same guards wherever it is
+    called: never CRITICAL, never attack-defined, never a disputed identity,
+    never above the severity the operator actually reviewed."""
+    if not memory:
+        return None, 0
+    tolerance, rotating, disputed, learning = memory
+    sev = SEV_ORDER.get(f.get("severity"), -1)
+    if sev >= SEV_ORDER["CRITICAL"]:
+        return None, 0
+    if f.get("category") in _TOLERANCE_CATEGORIES:
+        # Two generalizations, same guards: the exact identity (hash and
+        # version churn), then — only for beacons, and only once rotation
+        # is evidenced across distinct addresses — the endpoint class.
+        # Both read the finding's SUBJECT where it carries one.
+        candidates = []
+        ident = _finding_identity(f)
+        if ident:
+            candidates.append((ident, tolerance))
+        if rotating:
+            for klass, _observed in _finding_endpoint_classes(f):
+                candidates.append((klass, rotating))
+        for ident, mem in candidates:
+            if ident in disputed:
+                continue
+            count, reviewed_sev = mem.get(ident, (0, -1))
+            if count and sev <= reviewed_sev:
+                return "tolerated", count
+    # The learning period closes what tolerance has no verdict for yet.
+    # Checked AFTER tolerance so an identity the operator actually reviewed
+    # is still credited to tolerance in the audit trail; attack-defined
+    # evidence is excluded here exactly as it is from tolerance.
+    if learning and not str(f.get("fingerprint") or "").startswith(
+            _NEVER_TOLERATE_PREFIXES):
+        return "learning", 0
+    return None, 0
+
+
+def route_findings(findings, first_run=False, adopt=frozenset(), memory=None):
+    """{fingerprint: {"route", "why", "decision", "verdicts"}} for a batch.
+
+    `route` is the interrupt-tier outcome. `decision` is the incident-tier
+    outcome ("allowlisted", "tolerated", "learning" or None), carried
+    separately because a finding the seen-ledger already knows still needs
+    its incident decided. `memory` is _suppression_memory(...) or None, in
+    which case only the interrupt-tier checks apply.
+
+    First-run silence is the KnockKnock "trust what's already installed" rule
+    — it applies to PERSISTENCE and SHELL-HISTORY only, the two surfaces made
+    of accreted-over-time RESIDUE (a launchd item, a months-old `curl|sh`
+    install line). A payload already sitting in a hot dir, a suspicious
+    RUNNING process, an XProtect detection, /tmp staging, a modified canary,
+    or a weak hardening setting is a LIVE risk the user must hear about even
+    on the very first scan. `adopt` is the same rule for a surface an upgrade
+    sees for the first time. Confidence is the second routing axis: a
+    high-impact-but-noisy hit (explicit confidence='low') is logged and
+    correlated but routed to the digest instead of interrupting."""
+    seen = load_json(SEEN, {})
+    allow = set(load_json(ALLOWLIST, []))
+    out = {}
+    for f in findings:
+        fp = f["fingerprint"]
+        if fp in out:
+            continue
+        decision, verdicts = _signal_decision(f, memory)
+        if fp in allow:
+            route, why, decision = ROUTE_SILENT, "allowlisted", "allowlisted"
+        elif fp in seen:
+            route, why = ROUTE_SEEN, "seen"
+        elif (first_run and f["category"] in ("persistence", "shell-history")) \
+                or f["category"] in adopt:
+            route, why = ROUTE_DIGEST, "adopted"
+        elif CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0:
+            route, why = ROUTE_DIGEST, "low-confidence"
+        elif SEV_ORDER[f["severity"]] < SEV_ORDER[NOTIFY_MIN_SEV]:
+            route, why = ROUTE_DIGEST, "below-floor"
+        elif decision:
+            route, why = ROUTE_DIGEST, decision
+        else:
+            route, why = ROUTE_INTERRUPT, "new"
+        out[fp] = {"route": route, "why": why, "decision": decision,
+                   "verdicts": verdicts}
+    return out
+
+
+def _route_for_scan(findings, first_run, adopt, now=None):
+    """route_findings with the incident tier's memory. A store that cannot be
+    read routes without it — the pre-gate behaviour — and says so."""
+    memory = None
+    try:
+        db = _event_connection()
+        try:
+            memory = _suppression_memory(db, _epoch(now))
+        finally:
+            db.close()
+    except Exception as e:
+        log_run("routing without incident memory: %s" % e)
+    return route_findings(findings, first_run, adopt, memory)
+
+
+def _close_allowlisted(db, incident_id, now):
+    """Close an incident whose fingerprint the operator allowlisted. Unlike
+    _auto_tolerate this may close an incident created on an EARLIER pass: the
+    allowlist is the operator's own standing verdict, not a machine one, so an
+    incident left open from before the entry was made is exactly what it
+    silences. Writes no dismissals row — an allowlist entry carries no typed
+    reason, so it must not feed tolerance or backtest precision."""
+    row = db.execute("SELECT status FROM incidents WHERE id=? AND kind='signal'",
+                     (incident_id,)).fetchone()
+    if not row or row["status"] not in _ACTIVE_INCIDENT_STATES:
+        return
+    db.execute(
+        "UPDATE incidents SET status='FALSE_POSITIVE',resolution='allowlisted',"
+        "updated_at=?,next_reminder_at=NULL WHERE id=?", (now, incident_id))
+    db.execute(
+        "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+        "incident_id,data_json) VALUES(?,?,?,?,?,?)",
+        (now, now, "incident", "incident.lifecycle", incident_id,
+         json.dumps({"from": row["status"], "to": "FALSE_POSITIVE",
+                     "reason_code": "allowlisted"})))
+
+
+# --------------------------------------------------------------------------- #
 # Durable PATH LINEAGE — the fix for entity-hopping and slow-burn persistence.
 #
 # The time-boxed same-entity chains below cannot see the dominant 2025-26 shape:
@@ -3232,7 +3389,7 @@ def _apply_path_lineage(db, new_events, now, initially_notified=False,
 
 
 def _apply_correlations(db, new_events, now, initially_notified=False,
-                        suppressed_categories=frozenset()):
+                        suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
     rows = db.execute(
         "SELECT id,observed_at,data_json FROM events "
@@ -3329,48 +3486,28 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
 
     # Every uncorrelated HIGH+ signal still becomes one actionable incident —
     # but an identity the operator has repeatedly reviewed as benign-positive
-    # opens pre-closed under acquired tolerance instead of re-alerting.
-    tolerance = _tolerance_memory(db, now)
-    rotating = _rotating_endpoint_memory(db, now)
-    disputed = _disputed_identities(db) if (tolerance or rotating) \
-        else frozenset()
-    learning = _in_learning_period(now)
+    # opens pre-closed under acquired tolerance, the learning period closes
+    # what tolerance has no verdict for, and an allowlisted fingerprint closes
+    # as allowlisted. The decision comes from the same gate that routed the
+    # notification (route_findings); a caller without a routing decides here
+    # with the same function over the same memory.
+    memory = None
     for event_id, f in new_events:
         if f.get("category") in suppressed_categories or event_id in attached \
                 or SEV_ORDER.get(f.get("severity"), -1) \
                 < SEV_ORDER["HIGH"]:
             continue
-        verdicts = 0
-        if f.get("category") in _TOLERANCE_CATEGORIES \
-                and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]:
-            # Two generalizations, same guards: the exact identity (hash and
-            # version churn), then — only for beacons, and only once rotation
-            # is evidenced across distinct addresses — the endpoint class.
-            # Both read the finding's SUBJECT where it carries one.
-            candidates = []
-            ident = _finding_identity(f)
-            if ident:
-                candidates.append((ident, tolerance))
-            if rotating:
-                for klass, _observed in _finding_endpoint_classes(f):
-                    candidates.append((klass, rotating))
-            for ident, memory in candidates:
-                if ident in disputed:
-                    continue
-                count, reviewed_sev = memory.get(ident, (0, -1))
-                if count and SEV_ORDER.get(f.get("severity"), -1) \
-                        <= reviewed_sev:
-                    verdicts = count
-                    break
-        # The learning period closes what tolerance has no verdict for yet.
-        # Same exclusions as every other machine verdict: never CRITICAL, never
-        # attack-defined. Checked AFTER tolerance so an identity the operator
-        # actually reviewed is still credited to tolerance in the audit trail.
-        in_learning = bool(
-            learning and not verdicts
-            and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]
-            and not str(f.get("fingerprint") or "").startswith(
-                _NEVER_TOLERATE_PREFIXES))
+        verdict = (routing or {}).get(f.get("fingerprint"))
+        if verdict is None:
+            if memory is None:
+                memory = _suppression_memory(db, now)
+            decision, verdicts = _signal_decision(f, memory)
+            notified = initially_notified
+        else:
+            decision, verdicts = verdict["decision"], verdict["verdicts"]
+            # Per FINDING, not per scan: one genuine new HIGH must not mark a
+            # digest-routed sibling as already told to a human.
+            notified = verdict["route"] == ROUTE_INTERRUPT
         # The incident is keyed on the SUBJECT where a sensor names one, and
         # on the raw fingerprint everywhere else. The two are different
         # questions: the fingerprint identifies THIS observation (content-
@@ -3390,13 +3527,13 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         incident_id = _upsert_incident(
             db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
             f["title"], f["severity"], "signal", now, [event_id],
-            initially_notified or bool(verdicts) or in_learning,
-            subject=f.get("subject"))
-        if verdicts:
+            notified or bool(decision), subject=f.get("subject"))
+        if decision == "allowlisted":
+            _close_allowlisted(db, incident_id, now)
+        elif decision == "tolerated":
             _auto_tolerate(db, incident_id, verdicts, now)
-        elif in_learning:
+        elif decision == "learning":
             _auto_tolerate(db, incident_id, 0, now, reason="learning-period")
-
 
 def _record_health(db, health, now):
     for item in health:
@@ -3731,7 +3868,7 @@ def _run_store_migrations(db, now):
 
 def record_security_state(findings, sensor_health=(), now=None,
                           initially_notified=False,
-                          suppressed_categories=frozenset()):
+                          suppressed_categories=frozenset(), routing=None):
     now = _epoch(now)
     db = _event_connection()
     new_events = []
@@ -3764,7 +3901,7 @@ def record_security_state(findings, sensor_health=(), now=None,
                 new_events.append((cur.lastrowid, f))
             _record_health(db, sensor_health, now)
             _apply_correlations(db, new_events, now, initially_notified,
-                                frozenset(suppressed_categories))
+                                frozenset(suppressed_categories), routing)
             # AFTER correlation: anything that produced evidence this scan has
             # just had updated_at refreshed, so only genuinely quiet incidents
             # are candidates. Ordering matters — the reverse would age out an
@@ -12657,7 +12794,7 @@ def _report_self_check(verdict, new_findings, findings, incidents):
 
 
 def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
-                  learning_days, aged):
+                  learning_days, aged, quiet=0):
     """The one-line-verdict report. Detail lives behind `report --full`."""
     counts = {}
     for f in findings:
@@ -12718,6 +12855,9 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
                                          total_sensors))
     if aged:
         ctx.append("%d aged out as ambient" % aged)
+    if quiet:
+        ctx.append("%d new but auto-closed (tolerated/learning/allowlisted)"
+                   % quiet)
     lines += ["- " + " · ".join(ctx), ""]
 
     if first_run:
@@ -12809,7 +12949,7 @@ def _full_report(payload):
 
 
 def write_report(findings, first_run, incidents=None, sensor_health=None,
-                 prior_seen=None, aged=0):
+                 prior_seen=None, aged=0, routing=None):
     """Write the brief report to latest.md and the full payload to latest.json.
 
     The report this replaced opened with ninety red bullets and ran 208 lines,
@@ -12824,11 +12964,18 @@ def write_report(findings, first_run, incidents=None, sensor_health=None,
     else:                               # which can only over-report, never under
         new_findings = [f for f in findings
                         if f.get("fingerprint") not in prior_seen]
+    # A finding the gate closed (tolerated, learning, allowlisted) is not
+    # "new and needs you": the headline must agree with the notification and
+    # the incident it summarizes. Still in `findings`, still counted below.
+    closed = {fp for fp, v in (routing or {}).items() if v.get("decision")}
+    quiet = len([f for f in new_findings if f.get("fingerprint") in closed])
+    new_findings = [f for f in new_findings
+                    if f.get("fingerprint") not in closed]
     now = int(_epoch())
     until = _learning_until()
     learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
     md = _brief_report(findings, new_findings, incidents, sensor_health,
-                       first_run, learning_days, aged)
+                       first_run, learning_days, aged, quiet=quiet)
     with open(LATEST_MD, "w", encoding="utf-8") as f:
         f.write(md)
     save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings,
@@ -12851,49 +12998,26 @@ def _cap_seen(seen):
     return dict(newest)
 
 
-def emit(findings, first_run, adopt=frozenset()):
-    """Append new findings to the durable log; notify on new >= HIGH.
-
-    `adopt` is the set of categories being SILENTLY ADOPTED on this scan (an
-    upgrade seeing a live, non-baseline surface for the first time — e.g. an
-    install predating shell-history support). Their findings are still logged but
-    never notified, so the residue they hold is not re-alerted as if it were new.
-    """
+def emit(findings, first_run, adopt=frozenset(), routing=None):
+    """Append new findings to the durable log; notify on what the gate routes
+    to the interrupt tier. `routing` is route_findings(...) — computed with
+    the incident tier's memory on the scan path, or here without it for a
+    direct caller (see route_findings for the rules)."""
+    if routing is None:
+        routing = route_findings(findings, first_run, adopt)
     seen = load_json(SEEN, {})
-    allow = set(load_json(ALLOWLIST, []))
     new_high = []
     _rotate_log(FINDINGS_LOG)
     with open(FINDINGS_LOG, "a", encoding="utf-8") as log:
         for f in findings:
             fp = f["fingerprint"]
-            if fp in allow:
-                continue
-            if fp in seen:
+            verdict = routing.get(fp) or {"route": ROUTE_SEEN}
+            # `fp in seen` also folds a fingerprint repeated within one batch.
+            if verdict["route"] in (ROUTE_SILENT, ROUTE_SEEN) or fp in seen:
                 continue
             seen[fp] = f["ts"]
             log.write(json.dumps(f) + "\n")
-            # First-run silence is the KnockKnock "trust what's already installed"
-            # rule — it applies to PERSISTENCE and SHELL-HISTORY only, the two
-            # surfaces made of accreted-over-time RESIDUE (a launchd item, or a
-            # months-old `curl|sh` install line). Suppressing them on the first
-            # scan adopts the existing state silently (still LOGGED) so upgrading
-            # Aegis on a busy machine is not an alert storm; NEW ones thereafter
-            # alert. A payload already sitting in a hot dir, a suspicious RUNNING
-            # process (behavior), an XProtect detection, /tmp staging, a modified
-            # canary, or a weak hardening setting is a LIVE risk the user must
-            # hear about even on the very first scan — those are never suppressed.
-            suppressed = (
-                (first_run and f["category"] in ("persistence", "shell-history"))
-                or f["category"] in adopt)
-            # Two-axis routing gate: notify only when severity clears the floor
-            # AND confidence is not 'low'. A high-impact-but-noisy hit (explicit
-            # confidence='low') is still logged/correlated but routed to the
-            # digest tier instead of interrupting — the anti-fatigue rule that
-            # keeps the tool trusted. Default 'medium' keeps every existing
-            # finding's notify behavior byte-identical.
-            low_conf = CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0
-            if not suppressed and not low_conf \
-                    and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
+            if verdict["route"] == ROUTE_INTERRUPT:
                 new_high.append(f)
     save_json(SEEN, _cap_seen(seen))
 
@@ -12903,7 +13027,6 @@ def emit(findings, first_run, adopt=frozenset()):
         notify("Aegis: %s" % top["severity"],
                "%s%s" % (top["title"], extra))
     return new_high
-
 
 def load_baseline():
     """Return (baseline_or_None, corrupt). Distinguishes 'no baseline yet' (a
@@ -13099,7 +13222,8 @@ def _cmd_scan_locked(quiet=False):
     # the previous scan had already reported, and the difference against it is
     # the report's "new since last scan".
     prior_seen = set(load_json(SEEN, {}))
-    new_high = emit(findings, first_run, adopt=adopt)
+    routing = _route_for_scan(findings, first_run, adopt)
+    new_high = emit(findings, first_run, adopt=adopt, routing=routing)
     # Pre-authorized reversible response, if the operator armed any. Runs
     # AFTER emit so the report is written before anything acts on it, and is
     # wrapped because a standing order that could fail a scan — and so blind
@@ -13116,7 +13240,7 @@ def _cmd_scan_locked(quiet=False):
     try:
         record_security_state(
             findings, sensor_health=health, initially_notified=bool(new_high),
-            suppressed_categories=suppressed_categories)
+            suppressed_categories=suppressed_categories, routing=routing)
         reminders = [] if new_high else claim_due_incident_reminders()
         if reminders:
             top = reminders[0]
@@ -13133,7 +13257,7 @@ def _cmd_scan_locked(quiet=False):
         incidents, persisted_health = [], health
     md = write_report(findings, first_run, incidents=incidents,
                       sensor_health=persisted_health, prior_seen=prior_seen,
-                      aged=_LAST_AGED_OUT)
+                      aged=_LAST_AGED_OUT, routing=routing)
     flush_sigcache()
     record_selfstate()
     # Extend the tamper-evidence chain AFTER state is settled, so the link
