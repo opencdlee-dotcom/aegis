@@ -135,7 +135,7 @@ class TestFreeze(ProtectiveSandbox):
         saved = aegis._iter_processes
         aegis._iter_processes = lambda: iter(fake)
         try:
-            self.assertIn("Dock", aegis._process_names("4242"))
+            self.assertIn("Dock", aegis._process_owner_and_names("4242")[1])
             refusal = aegis._freeze_refusal("4242")
         finally:
             aegis._iter_processes = saved

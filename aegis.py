@@ -1554,7 +1554,11 @@ def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
 def _quarantine_fields(path):
     """One `xattr` read of com.apple.quarantine → (present, agent, event_uuid).
     Single-call so the hot-dir sweep does not spawn three subprocesses per file.
-    Value layout: flags;hex-timestamp;AgentName;event-UUID."""
+    Value layout: flags;hex-timestamp;AgentName;event-UUID. Uses Apple's `xattr`
+    CLI because Python's os.getxattr is Linux-only (verified absent on macOS).
+    ABSENCE on a freshly-dropped executable is itself a signal — the file
+    arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
+    the exact side-load path AMOS/DMG-lure chains use."""
     out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
     if rc != 0 or not out.strip():
         return (False, None, None)
@@ -1562,18 +1566,6 @@ def _quarantine_fields(path):
     agent = fields[2].strip() if len(fields) >= 3 and fields[2].strip() else None
     uuid = fields[3].strip() if len(fields) >= 4 and fields[3].strip() else None
     return (True, agent, uuid)
-
-
-def quarantine_origin(path):
-    """Provenance from the com.apple.quarantine xattr, via Apple's `xattr` CLI
-    (Python's os.getxattr is Linux-only — verified absent on macOS). Returns
-    (present, agent): whether the file carries a Gatekeeper quarantine flag and
-    the downloading agent name (Safari, Google Chrome, curl, Terminal, …).
-    ABSENCE on a freshly-dropped executable is itself a signal — it means the
-    file arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
-    the exact side-load path AMOS/DMG-lure chains use."""
-    present, agent, _uuid = _quarantine_fields(path)
-    return (present, agent)
 
 
 # The central download-provenance store — LSQuarantineEvent rows in the user's
@@ -6924,28 +6916,22 @@ def _ext_cap_finding(label, rec, gained, is_new):
 
 
 def diff_ext_caps(prior, cur):
-    findings = []
-    prior = prior or {}
-    for label, rec in cur.items():
-        try:
-            old = prior.get(label)
-            caps = set(rec.get("caps") or [])
-            if old is None:
-                f = _ext_cap_finding(label, rec, sorted(caps), True)
-            else:
-                gained = caps - set(old.get("caps") or [])
-                # A narrow->broad host widening is itself the escalation, even
-                # with no new API permission.
-                if not gained and rec.get("broad") and not old.get("broad"):
-                    gained = caps
-                if not gained:
-                    continue
-                f = _ext_cap_finding(label, rec, sorted(gained), False)
-            if f:
-                findings.append(f)
-        except Exception:
-            continue
-    return findings
+    def new_fn(label, rec):
+        return _ext_cap_finding(label, rec, sorted(set(rec.get("caps") or [])),
+                                True)
+
+    def changed_fn(label, rec, old):
+        caps = set(rec.get("caps") or [])
+        gained = caps - set(old.get("caps") or [])
+        # A narrow->broad host widening is itself the escalation, even
+        # with no new API permission.
+        if not gained and rec.get("broad") and not old.get("broad"):
+            gained = caps
+        if not gained:
+            return None
+        return _ext_cap_finding(label, rec, sorted(gained), False)
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
 
 
 def _firefox_exts(root):
@@ -10229,7 +10215,6 @@ VOUCH_SIGNERS = os.path.join(STATE_DIR, "vouch_signers")
 _VOUCH_NAMESPACE = "aegis-vouch"
 _VOUCH_GENESIS = "0" * 64
 _VOUCH_DEFAULT_TTL = 180 * 86400
-_VOUCH_NET_SCOPE = ("net-outbound", "net-beacon", "net-listener")
 
 
 def _vouch_canonical(rec):
@@ -16024,12 +16009,20 @@ _FREEZE_NEVER_COMMS = _PROTECTED_COMMS - frozenset((
 def _process_owner_and_names(pid):
     """(owner, names) for `pid` from ONE process-table walk.
 
-    Deliberately not `_process_identity()` + `_process_names()`: those are two
-    full enumerations, and _freeze_refusal is called once per descendant during
-    a tree sweep. On Windows a single enumeration is a CIM query this codebase
-    measured at 41s for 135 processes, so the doubled version turns freezing a
-    small tree into minutes of latency — for a verb whose entire value is that
-    it lands before the payload finishes."""
+    Deliberately one combined walk, not an owner lookup plus a name lookup:
+    those would be two full enumerations, and _freeze_refusal is called once
+    per descendant during a tree sweep. On Windows a single enumeration is a
+    CIM query this codebase measured at 41s for 135 processes, so the doubled
+    version turns freezing a small tree into minutes of latency — for a verb
+    whose entire value is that it lands before the payload finishes.
+
+    Names come from BOTH the exe column and argv tokens because macOS `ps`
+    truncates the `comm` column to 16 characters WHEN `args` is requested in
+    the same call (exactly how _iter_processes queries it) — so
+    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames
+    to `Applicat`, matching nothing in _PROTECTED_COMMS. The full argv[0] is
+    NOT truncated, so it is the reliable source; either one matching is enough
+    to refuse — a guard should over-refuse, never under-refuse."""
     owner, names = None, set()
     for p, o, exe, argv in _iter_processes():
         if p != str(pid):
@@ -16046,20 +16039,6 @@ def _process_owner_and_names(pid):
                 names.add(os.path.basename(tok))
         break
     return owner, {n for n in names if n}
-
-
-def _process_names(pid):
-    """Every plausible name for `pid`, for matching against _PROTECTED_COMMS.
-
-    Why this exists rather than just using _process_identity's `comm`: macOS
-    `ps` truncates the `comm` column to 16 characters WHEN `args` is requested
-    in the same call, which is exactly how _iter_processes queries it. So
-    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames to
-    `Applicat`, which matches nothing in _PROTECTED_COMMS. The full argv[0] is
-    NOT truncated, so it is the reliable source. Both are returned because
-    either one matching is enough to refuse — a guard should over-refuse, never
-    under-refuse."""
-    return _process_owner_and_names(pid)[1]
 
 
 def _freeze_refusal(pid, parents=None):

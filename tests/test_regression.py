@@ -830,10 +830,10 @@ class TestQuarantineProvenance(Sandbox):
         p = os.path.join(self.tmp, "f")
         with open(p, "w") as f:
             f.write("x")
-        self.assertEqual(aegis.quarantine_origin(p), (False, None))
+        self.assertEqual(aegis._quarantine_fields(p), (False, None, None))
         subprocess.run(["xattr", "-w", "com.apple.quarantine",
                         "0081;00000000;Safari;ABC", p], check=False)
-        present, agent = aegis.quarantine_origin(p)
+        present, agent, _uuid = aegis._quarantine_fields(p)
         self.assertTrue(present)
         self.assertEqual(agent, "Safari")
 
