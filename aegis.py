@@ -1783,6 +1783,46 @@ def classify_signature(path):
     return result
 
 
+_LINUX_PKG_CACHE = {}
+
+
+def _linux_pkg_owner(real):
+    """"<manager>:<package>" for the distro package that owns `real`, else None.
+
+    ONE spelling, two callers: _classify_linux turns it into the `os-managed`
+    trust verdict, and _os_package_receipt turns the same fact into a custody
+    receipt. Before this it existed only inside the classifier, so custody
+    could not see it and every apt/rpm-installed binary was scored as if it had
+    no provenance at all.
+
+    Cached per resolved path: this is up to three subprocesses, and the custody
+    layer asks about the same handful of programs repeatedly within one scan.
+    """
+    if not real:
+        return None
+    if real in _LINUX_PKG_CACHE:
+        return _LINUX_PKG_CACHE[real]
+    # Package managers never own $HOME/tmp content — skip the subprocess.
+    if any(real.startswith(p) for p in
+           (HOME + "/", "/home/", "/root/", "/tmp/", "/var/tmp/", "/dev/shm/",
+            "/run/")):
+        return None
+    owner = None
+    out, _, rc = run(["dpkg-query", "-S", real], timeout=10)
+    if rc == 0 and ":" in (out or ""):
+        owner = "dpkg:" + out.split(":", 1)[0].strip()
+    if owner is None:
+        out, _, rc = run(["rpm", "-qf", real], timeout=10)
+        if rc == 0 and out.strip() and "not owned" not in out:
+            owner = "rpm:" + out.strip().splitlines()[0]
+    if owner is None:
+        out, _, rc = run(["pacman", "-Qqo", real], timeout=10)
+        if rc == 0 and out.strip():
+            owner = "pacman:" + out.strip().splitlines()[0]
+    _LINUX_PKG_CACHE[real] = owner
+    return owner
+
+
 def _classify_linux(path):
     """Linux has no ambient code-signing; the honest analog is package-manager
     ownership: a file dpkg/rpm/pacman accounts for was installed by root through
@@ -1790,27 +1830,10 @@ def _classify_linux(path):
     behavior, not treated as malign by itself (every locally-built dev binary is
     unmanaged)."""
     result = {"trust": "unmanaged", "team": None, "authority": None}
-    real = os.path.realpath(path)
-    # Package managers never own $HOME/tmp content — skip the subprocess.
-    if any(real.startswith(p) for p in
-           (HOME + "/", "/home/", "/root/", "/tmp/", "/var/tmp/", "/dev/shm/",
-            "/run/")):
-        return result
-    out, _, rc = run(["dpkg-query", "-S", real], timeout=10)
-    if rc == 0 and ":" in (out or ""):
+    owner = _linux_pkg_owner(os.path.realpath(path))
+    if owner:
         result["trust"] = "os-managed"
-        result["authority"] = "dpkg:" + out.split(":", 1)[0].strip()
-        return result
-    out, _, rc = run(["rpm", "-qf", real], timeout=10)
-    if rc == 0 and out.strip() and "not owned" not in out:
-        result["trust"] = "os-managed"
-        result["authority"] = "rpm:" + out.strip().splitlines()[0]
-        return result
-    out, _, rc = run(["pacman", "-Qqo", real], timeout=10)
-    if rc == 0 and out.strip():
-        result["trust"] = "os-managed"
-        result["authority"] = "pacman:" + out.strip().splitlines()[0]
-        return result
+        result["authority"] = owner
     return result
 
 
@@ -10043,8 +10066,63 @@ def _uv_python_receipt(real):
     return None
 
 
+def _winget_receipt(real):
+    """A file winget put on disk. Path-shaped, no subprocess — winget installs
+    into %LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\<Package.Id>_<hash>\\ and
+    shims into ...\\WinGet\\Links\\.
+
+    Separators are normalized rather than using os.sep, so this is exercisable
+    from any body — the same reason tests/test_cross_platform.py parses captured
+    Windows output on a Mac. The other portable probes predate that lesson.
+    """
+    p = (real or "").replace("\\", "/")
+    low = p.lower()
+    marker = "/microsoft/winget/packages/"
+    i = low.find(marker)
+    if i >= 0:
+        head = p[i + len(marker):].split("/")[0]
+        if head:
+            # Directory is "<Package.Id>_<install hash>"; the id is the fact.
+            return "winget:%s" % head.split("_")[0]
+    if "/microsoft/winget/links/" in low:
+        return "winget:link"
+    return None
+
+
+def _choco_receipt(real):
+    """A file Chocolatey put on disk: <ProgramData>\\chocolatey\\lib\\<pkg>\\."""
+    p = (real or "").replace("\\", "/")
+    marker = "/chocolatey/lib/"
+    i = p.lower().find(marker)
+    if i >= 0:
+        head = p[i + len(marker):].split("/")[0]
+        if head:
+            return "choco:%s" % head
+    return None
+
+
+def _os_package_receipt(real):
+    """The OS-NATIVE package manager's claim on `real`.
+
+    The gap this closes: `_grade_binary` offers non-mac bodies exactly two
+    custody rungs, and the second consulted only Homebrew, VS Code, pipx and uv
+    — so an apt/rpm/winget-installed binary, the ordinary shape of a
+    developer's toolchain, was scored at full severity with custody=None on
+    Linux and Windows while its Homebrew equivalent on macOS was demoted a
+    step. macOS needs no entry here: Homebrew IS its native manager and
+    _homebrew_receipt already covers it.
+    """
+    if IS_LINUX:
+        return _linux_pkg_owner(real)
+    return None
+
+
+# _os_package_receipt is LAST on purpose: the probes above it are pure path
+# arithmetic, while it can cost up to three subprocesses on Linux. Cheap
+# questions first, so the expensive one is only asked when no cheap answer won.
 _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
-                     _uv_python_receipt)
+                     _uv_python_receipt, _winget_receipt, _choco_receipt,
+                     _os_package_receipt)
 
 
 def _package_receipt(path):

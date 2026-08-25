@@ -664,13 +664,14 @@ class NoTestHardCodesOneBodysTrustVocabulary(unittest.TestCase):
         # change what a macOS assertion means (one of them is literally about
         # vendor impersonation), which is a worse bug than the one being fixed.
         # They need a per-case reading, not a mechanical rewrite.
-        "test_regression.py:TestVendorImpersonation",
-        "test_regression.py:TestPersistenceEnvDiff",
-        # Same reasoning: `_target_change` defaults both sides to
-        # "developer-id" to compare TEAM identity across a target swap, and
-        # PUBLISHER_TRUST is "apple" on macOS — a mechanical swap would change
-        # what the macOS assertion compares.
-        "test_custody.py:CustodyGrading",
+        # Empty, and it must stay that way by shrinking rather than by
+        # deletion: the stale-entry check above fails on any name left here
+        # that no longer offends, so this list cannot quietly become an
+        # exemption list. All nine original entries were resolved by
+        # 2026-08-24 — seven mechanically, and the last two by mutation
+        # testing that proved their "developer-id" default inert (only
+        # TestHotDirAppBundle's was load-bearing, and that class is
+        # macOS-gated).
     ))
 
     def test_no_ungated_test_stubs_a_macos_only_trust_verdict(self):
@@ -791,6 +792,92 @@ class StubbedTrustQualifiesOnEveryBody(unittest.TestCase):
             aegis.IS_WIN, aegis.IS_LINUX = saved_flags
             for n, fn in saved_fns.items():
                 setattr(aegis, n, fn)
+
+
+class NativePackageManagersEarnAReceipt(unittest.TestCase):
+    """The second custody rung, on the bodies that are not macOS.
+
+    `_grade_binary` offers a sensor exactly two demotions: operator-vouched and
+    package-managed. The second consulted Homebrew, VS Code, pipx and uv only —
+    so an apt/rpm/winget-installed binary, which is the ordinary shape of a
+    developer's toolchain, was scored at full severity with custody=None on
+    Linux and Windows while its Homebrew equivalent on macOS was demoted a
+    step. Both rungs available off-mac were narrower than on mac.
+
+    The Linux half needed no new machinery: `_classify_linux` had shelled out
+    to dpkg/rpm/pacman since forever to decide `os-managed`, and custody simply
+    never asked. That query is now `_linux_pkg_owner`, one spelling with two
+    callers.
+    """
+
+    def setUp(self):
+        self._flags = aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC
+        self._run = aegis.run
+        aegis._LINUX_PKG_CACHE.clear()
+
+    def tearDown(self):
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = self._flags
+        aegis.run = self._run
+        aegis._LINUX_PKG_CACHE.clear()
+
+    def _win_tree(self, rel):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+        return path
+
+    def test_winget_and_chocolatey_paths_earn_a_receipt(self):
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = True, False, False
+        for rel, want in (
+                ("Local/Microsoft/WinGet/Packages/Foo.Bar_1.2.3/tool.exe", "winget:Foo.Bar"),
+                ("Local/Microsoft/WinGet/Links/tool.exe", "winget:link"),
+                ("ProgramData/chocolatey/lib/ripgrep/tools/rg.exe", "choco:ripgrep")):
+            self.assertEqual(aegis._package_receipt(self._win_tree(rel)), want, rel)
+
+    def test_an_unrelated_windows_path_earns_nothing(self):
+        """The probes must not be a blanket amnesty for anything under a
+        user-writable root — that would turn a demotion into a blind spot."""
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = True, False, False
+        self.assertIsNone(aegis._package_receipt(
+            self._win_tree("Local/Temp/payload/tool.exe")))
+
+    def test_a_distro_package_earns_a_receipt_on_linux(self):
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = False, True, False
+        aegis.run = lambda cmd, **k: (("curl: /usr/bin/curl", "", 0)
+                                      if cmd[0] == "dpkg-query" else ("", "", 1))
+        # A real file OUTSIDE $HOME: _linux_pkg_owner skips the subprocess for
+        # $HOME/tmp paths (package managers never own them), and
+        # _package_receipt only probes candidates that exist on disk.
+        probe = "/usr/bin/curl"
+        if not os.path.exists(probe):
+            self.skipTest("no /usr/bin/curl on this body")
+        self.assertEqual(aegis._package_receipt(probe), "dpkg:curl")
+
+    def test_the_distro_query_is_asked_once_per_path(self):
+        """Up to three subprocesses per path, asked about the same handful of
+        programs repeatedly within one scan."""
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = False, True, False
+        calls = []
+
+        def counting(cmd, **k):
+            calls.append(cmd[0])
+            return ("curl: /usr/bin/curl", "", 0) if cmd[0] == "dpkg-query" else ("", "", 1)
+
+        aegis.run = counting
+        for _ in range(4):
+            aegis._linux_pkg_owner("/usr/bin/curl")
+        self.assertEqual(calls, ["dpkg-query"])
+
+    def test_the_classifier_and_the_receipt_agree(self):
+        """One spelling, two callers — a split here is how the custody layer
+        went blind to a fact the trust layer already had."""
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = False, True, False
+        aegis.run = lambda cmd, **k: (("curl: /usr/bin/curl", "", 0)
+                                      if cmd[0] == "dpkg-query" else ("", "", 1))
+        self.assertEqual(aegis._classify_linux("/usr/bin/curl")["authority"],
+                         aegis._linux_pkg_owner("/usr/bin/curl"))
 
 
 class PublisherStableIsReachableOnEveryBody(unittest.TestCase):

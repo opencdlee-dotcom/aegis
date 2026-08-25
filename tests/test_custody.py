@@ -363,8 +363,8 @@ class CustodyGrading(CustodySandbox):
         self.assertEqual(len(fs), 1)
         self.assertEqual(fs[0]["severity"], "HIGH")
 
-    def _target_change(self, old_team, new_team, old_trust="developer-id",
-                       new_trust="developer-id"):
+    def _target_change(self, old_team, new_team, old_trust=PUBLISHER_TRUST,
+                       new_trust=PUBLISHER_TRUST):
         cfg = "/nonexistent-custody/.mcp.json"
         key = "mcpServers.probe|node"
 
