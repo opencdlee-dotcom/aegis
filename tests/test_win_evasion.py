@@ -455,14 +455,14 @@ class EvasionRegistryIntegrity(unittest.TestCase):
 
     @unittest.skipUnless(aegis.IS_WIN, "surface registry is per-platform")
     def test_windows_registers_the_evasion_surfaces(self):
-        keys = {k for k, _s, _d in aegis.SURFACES}
+        keys = {r[0] for r in aegis.SURFACES}
         for key in ("win_com_hijack", "win_ifeo", "win_appinit"):
             self.assertIn(key, keys)
 
     def test_posix_does_not_register_the_evasion_surfaces(self):
         if aegis.IS_WIN:
             self.skipTest("windows host")
-        keys = {k for k, _s, _d in aegis.SURFACES}
+        keys = {r[0] for r in aegis.SURFACES}
         for key in ("win_com_hijack", "win_ifeo", "win_appinit"):
             self.assertNotIn(key, keys)
 

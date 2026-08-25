@@ -778,10 +778,14 @@ class TestWritEnforcementIsActuallyWired(AgentSandbox):
     def test_unknown_surface_falls_back_to_a_governed_scope(self):
         """A newly added surface must default to GOVERNED, not ungoverned —
         otherwise the enforcement model grows a hole every time someone adds
-        a sensor."""
-        self.assertEqual("persistence",
-                         aegis._SURFACE_WRIT_SCOPE.get("brand_new_surface",
-                                                       "persistence"))
+        a sensor. A bare 3-tuple registry row (the shape tests patch in, and
+        the shape a hurried new surface will be added as) must normalize to
+        the default writ scope, never to no scope."""
+        row = ("brand_new_surface", lambda: {}, lambda p, c: [])
+        key, _snap, _diff, scope, live = aegis._surface_row(row)
+        self.assertEqual("brand_new_surface", key)
+        self.assertEqual("persistence", scope)
+        self.assertFalse(live)
 
     def test_the_primary_persistence_sensor_is_governed(self):
         """check_persistence is the flagship change-shaped sensor, yet only

@@ -312,6 +312,33 @@ Guards, because grading is where an attacker would want to stand:
   layer's problem, and it is exactly as detectable as it was before custody
   grading existed.
 
+#### Severity layering order
+
+Each grading layer is monotonic on its own, but they push in different
+directions, and the order they compose in is a contract, not an accident of
+call sequence:
+
+1. **Sensor ladder** sets the base severity (e.g. `_persistence_severity`,
+   with a HIGH floor for program/target swaps).
+2. **Custody** (`_demote`) only ever steps DOWN, and never touches
+   attack-defined evidence.
+3. **Writ enforcement** (`_apply_writ`) runs AFTER custody and is deliberately
+   bidirectional: a covered change drops to INFO, an uncovered change is
+   promoted to at least HIGH — under enforcement, the *absence of a record*
+   outranks provenance, which is the entire point of opting in.
+4. **The notify floor** (`emit`) routes by the final severity; it never
+   changes one.
+5. **The incident ratchet** (`_severity_max`) only ever steps UP: once an
+   incident opened HIGH, a later regrade of the same subject cannot quietly
+   lower it — de-escalation is the operator's verdict to give, not custody's.
+
+One known asymmetry, stated so it is a decision rather than a surprise: a
+custody demotion below HIGH keeps a finding out of the *standalone-signal*
+incident path (the uncorrelated-signal floor). That is routing, not erasure —
+the finding is still logged, still joins chains and lineage, and still
+accumulates risk — but "grading demotes, it never suppresses" is true at the
+report tier and only mostly true at the incident tier.
+
 #### Hashing the payload, not the interpreter
 
 Custody's relocation rung forced a gap in the persistence sensor into the open.

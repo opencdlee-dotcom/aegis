@@ -1394,16 +1394,18 @@ class ListenerAttribution(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class RegistryIntegrity(unittest.TestCase):
     def test_all_surface_callables_are_defined(self):
-        for key, snap_fn, diff_fn in aegis.SURFACES:
+        for row in aegis.SURFACES:
+            key, snap_fn, diff_fn, scope, live = aegis._surface_row(row)
             self.assertTrue(callable(snap_fn), "%s snapshot" % key)
             self.assertTrue(callable(diff_fn), "%s diff" % key)
+            self.assertTrue(scope, "%s writ scope" % key)
 
     def test_surface_keys_are_unique(self):
-        keys = [k for k, _s, _d in aegis.SURFACES]
+        keys = [r[0] for r in aegis.SURFACES]
         self.assertEqual(len(keys), len(set(keys)))
 
     def test_platform_specific_surfaces_are_registered(self):
-        keys = {k for k, _s, _d in aegis.SURFACES}
+        keys = {r[0] for r in aegis.SURFACES}
         if aegis.IS_LINUX:
             self.assertIn("kernel_modules", keys)
             self.assertIn("suid_binaries", keys)

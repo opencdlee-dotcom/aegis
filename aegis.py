@@ -11867,20 +11867,30 @@ def cmd_glean(mode="new"):
 # Baseline-diffed surfaces. Portable ones run everywhere; a surface with no
 # meaning on a platform is simply ABSENT from its registry rather than reported
 # as a failed sensor (a launchd LoginHook check on Linux is not a coverage gap).
+# One registry row per baseline-diffed surface. Row shape:
+#   (key, snapshot_fn, diff_fn[, writ_scope[, never_adopt_live]])
+# The trailing fields default to ("persistence", False) via _surface_row, so a
+# plain 3-tuple — including the ones tests patch in — is a fully governed row.
+# The scope and the adopt policy live ON the row deliberately: they used to be
+# two hand-maintained side-maps keyed on a THIRD spelling of the surface name,
+# and a key/category/scope spelling drift has already shipped one bug (benign
+# notes that silently never rendered). One row, one vocabulary.
 SURFACES = [
-    ("shellrc", snapshot_shellrc, diff_shellrc),
+    ("shellrc", snapshot_shellrc, diff_shellrc, "shellrc"),
     ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
-    ("browserext", snapshot_browserext, diff_browserext),
-    ("ide_ext", snapshot_ide_ext, diff_ide_ext),
+    ("browserext", snapshot_browserext, diff_browserext, "browserext"),
+    ("ide_ext", snapshot_ide_ext, diff_ide_ext, "browserext"),
     ("wallet", snapshot_wallet, diff_wallet),
-    ("listeners", snapshot_listeners, diff_listeners),
-    ("agent_skills", snapshot_agent_skills, diff_agent_skills),
+    ("listeners", snapshot_listeners, diff_listeners, "listeners"),
+    ("agent_skills", snapshot_agent_skills, diff_agent_skills,
+     "agent_surface"),
     # The AI-agent trust surface. Registered here rather than as a standalone
     # sensor so it inherits the whole managed pipeline for free: silent
     # first-sight adoption, sensor health, dedup, dismissals, and a baseline
     # already covered by the notary state digest (so an attacker who edits an
     # MCP registration AND Aegis's baseline breaks the hash chain).
-    ("agent_surface", snapshot_agent_surface, diff_agent_surface),
+    ("agent_surface", snapshot_agent_surface, diff_agent_surface,
+     "agent_surface"),
     ("session_binding", snapshot_session_binding, diff_session_binding),
     ("ext_caps", snapshot_ext_caps, diff_ext_caps),
 ]
@@ -11890,11 +11900,17 @@ if IS_MAC:
         ("loginhooks", snapshot_loginhooks, diff_loginhooks),
         ("profiles", snapshot_profiles, diff_profiles),
         ("btm", snapshot_btm, diff_btm),
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+        # never_adopt_live: an active remote login present at install/upgrade
+        # time is a CURRENT-ACCESS threat, not installed-residue — the README's
+        # live-vs-residue rule says the user must hear about it immediately,
+        # so this surface is never silently adopted (see _scan_surfaces).
+        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+         "persistence", True),
     ]
 elif IS_LINUX:
     SURFACES += [
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
+        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+         "persistence", True),
         ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
         ("suid_binaries", snapshot_suid, diff_suid),
     ]
@@ -11909,11 +11925,17 @@ else:
         ("win_appinit", snapshot_appinit, diff_appinit),
     ]
 
-# Surfaces whose first-sight items are LIVE risks, not installed-residue: they
-# must NOT be silently adopted on the very first scan (see _scan_surfaces). An
-# active remote login present at install/upgrade time is a current-access threat
-# the README's live-vs-residue rule says the user must hear about immediately.
-_NEVER_ADOPT_LIVE = {"auth_sessions"}
+
+def _surface_row(row):
+    """Normalize a SURFACES row to (key, snap_fn, diff_fn, writ_scope,
+    never_adopt_live). A surface with no explicit scope falls back to
+    "persistence", so a newly added surface is governed by default rather than
+    silently ungoverned — the failure that would otherwise grow a hole every
+    time someone adds a sensor."""
+    key, snap_fn, diff_fn = row[0], row[1], row[2]
+    scope = row[3] if len(row) > 3 else "persistence"
+    live = bool(row[4]) if len(row) > 4 else False
+    return key, snap_fn, diff_fn, scope, live
 
 
 # --------------------------------------------------------------------------- #
@@ -12220,22 +12242,10 @@ def check_canaries():
     return findings
 
 
-# Which writ scope governs each baseline-diffed surface. A surface with no
-# entry falls back to "persistence", so a newly added surface is governed by
-# default rather than silently ungoverned — the failure that would otherwise
-# grow a hole every time someone adds a sensor.
-_SURFACE_WRIT_SCOPE = {
-    "shellrc": "shellrc",
-    "browserext": "browserext",
-    "ide_ext": "browserext",
-    "listeners": "listeners",
-    "agent_surface": "agent_surface",
-    "agent_skills": "agent_surface",
-}
-
-
-def _apply_writ(findings, surface_key):
-    """Mark changes that happened with NO open writ.
+def _apply_writ(findings, scope):
+    """Mark changes that happened with NO open writ. `scope` is the writ scope
+    governing the batch — each SURFACES row carries its own (defaulting to
+    "persistence" via _surface_row).
 
     This is the call site that makes `writ enforce on` mean something. Without
     it the command existed, the state file was written, and the documentation
@@ -12248,7 +12258,6 @@ def _apply_writ(findings, surface_key):
     data = load_json(WRIT_FILE, {})
     if not isinstance(data, dict) or not data.get("enforcing"):
         return findings
-    scope = _SURFACE_WRIT_SCOPE.get(surface_key, "persistence")
     covered = _writ_data_covers(data, scope)
     out = []
     for f in findings:
@@ -12292,7 +12301,8 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
     if baseline is None:
         baseline = {}
     dirty = False
-    for key, snap_fn, diff_fn in SURFACES:
+    for row in SURFACES:
+        key, snap_fn, diff_fn, writ_scope, never_adopt = _surface_row(row)
         started = time.monotonic()
         try:
             cur = snap_fn()
@@ -12333,12 +12343,12 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             # first scan (an intruder logged in at install/upgrade time must not
             # be blessed as known-good). Diff against empty to surface it, then
             # record so it does not re-alert next scan.
-            if key in _NEVER_ADOPT_LIVE:
-                findings += _apply_writ(diff_fn({}, cur), key)
+            if never_adopt:
+                findings += _apply_writ(diff_fn({}, cur), writ_scope)
             baseline[key] = cur
             dirty = True
         else:
-            findings += _apply_writ(diff_fn(prior, cur), key)
+            findings += _apply_writ(diff_fn(prior, cur), writ_scope)
     if dirty and not first_run:
         save_json(BASELINE, baseline)
     return findings, baseline
@@ -13018,7 +13028,7 @@ def _cmd_baseline_locked(trust="verified"):
     current = snapshot_persistence()
     b = {"created": now_iso(), "schema_version": BASELINE_SCHEMA_VERSION,
          "persistence": current, "trust": trust}
-    for key, snap_fn, _diff in SURFACES:
+    for key, snap_fn, _diff, _scope, _live in map(_surface_row, SURFACES):
         try:
             snap = snap_fn()
         except Exception:
