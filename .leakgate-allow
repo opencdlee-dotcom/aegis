@@ -1,0 +1,20 @@
+# aegis's own test suite deliberately contains synthetic OS paths (fixture
+# data for deterministic cross-platform tests) and fake secrets (fixture data
+# proving redact_sensitive() strips them) — the exact "a secret SCANNER whose
+# test suite must contain fake secrets" case leakgate.py's own docstring
+# names. Narrowed per its guidance: an identity rule that structurally trips
+# on this repo's content is disabled by class; a secret-shaped rule is never
+# disabled by class, only allowed by the exact synthetic value it matched.
+
+rule:posix-home-path
+rule:windows-user-path
+
+# Fake credentials that exist specifically to prove redact_sensitive() strips
+# them (tests/test_battle_20260812.py, tests/test_regression.py,
+# tests/test_protective_tier.py) — not real. sk-live- is this suite's own
+# naming convention for synthetic OpenAI-shaped fixtures (self-describing
+# names like "ThisMustNeverReachDisk" — never how a real key looks).
+CorrectHorseBatteryStaple9x
+hunter2verylongsecret
+correct-horse-battery-staple
+sk-live-
