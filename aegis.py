@@ -2445,43 +2445,48 @@ def _severity_max(a, b):
     return a if SEV_ORDER.get(a, -1) >= SEV_ORDER.get(b, -1) else b
 
 
-def _event_fingerprints(db, event_ids):
-    """The set of finding fingerprints behind `event_ids` (from each event's
-    stored finding JSON). Used to tell genuine recurrence from new evidence."""
+def _event_identities(db, event_ids):
+    """The set of RECURRENCE IDENTITIES behind `event_ids` (from each event's
+    stored finding JSON). Used to tell genuine recurrence from new evidence.
+
+    Identities, not raw fingerprints, because a beacon fingerprint names the
+    address it was seen talking to: see `_recurrence_identity`. Every caller
+    here is asking "is this something this incident has already seen?", and a
+    rotated address is not."""
     if not event_ids:
         return set()
     marks = ",".join("?" for _ in event_ids)
-    fps = set()
+    idents = set()
     for row in db.execute("SELECT data_json FROM events WHERE id IN (%s)" % marks,
                           tuple(event_ids)).fetchall():
         try:
-            fp = json.loads(row["data_json"]).get("fingerprint")
+            ident = _recurrence_identity(json.loads(row["data_json"]))
         except Exception:
-            fp = None
-        if fp:
-            fps.add(fp)
-    return fps
+            ident = None
+        if ident:
+            idents.add(ident)
+    return idents
 
 
-def _incident_fingerprints(db, incident_id):
-    """Every finding fingerprint ever attached to `incident_id`."""
-    fps = set()
+def _incident_identities(db, incident_id):
+    """Every recurrence identity ever attached to `incident_id`."""
+    idents = set()
     for row in db.execute(
             "SELECT e.data_json FROM incident_events ie "
             "JOIN events e ON ie.event_id=e.id WHERE ie.incident_id=?",
             (incident_id,)).fetchall():
         try:
-            fp = json.loads(row["data_json"]).get("fingerprint")
+            ident = _recurrence_identity(json.loads(row["data_json"]))
         except Exception:
-            fp = None
-        if fp:
-            fps.add(fp)
-    return fps
+            ident = None
+        if ident:
+            idents.add(ident)
+    return idents
 
 
 def _mark_novelty(db, incident_id, event_ids, now):
     """Advance an incident's novelty clock when the incoming evidence carries
-    a fingerprint it has never held before.
+    a recurrence identity it has never held before.
 
     The distinction this draws is the whole of the age-out fix. `updated_at`
     answers "when did this incident last receive evidence", and for anything
@@ -2496,9 +2501,9 @@ def _mark_novelty(db, incident_id, event_ids, now):
     string has always claimed to measure."""
     if not event_ids:
         return
-    incoming = _event_fingerprints(db, event_ids)
+    incoming = _event_identities(db, event_ids)
     if incoming and not incoming.issubset(
-            _incident_fingerprints(db, incident_id)):
+            _incident_identities(db, incident_id)):
         db.execute("UPDATE incidents SET last_novel_at=? WHERE id=?",
                    (now, incident_id))
 
@@ -2544,9 +2549,9 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
         reattach = bool(reviewed) and SEV_ORDER.get(severity, -1) <= \
             SEV_ORDER.get(reviewed["severity"], -1)
         if reattach:
-            incoming = _event_fingerprints(db, event_ids)
+            incoming = _event_identities(db, event_ids)
             if incoming and not incoming.issubset(
-                    _incident_fingerprints(db, reviewed["id"])):
+                    _incident_identities(db, reviewed["id"])):
                 reattach = False
         if reattach:
             incident_id = reviewed["id"]
@@ -3024,6 +3029,49 @@ def _finding_endpoint_classes(f):
     return _beacon_endpoint_classes(f.get("fingerprint"))
 
 
+def _recurrence_identity(f):
+    """The identity under which a finding counts as the SAME FACT recurring.
+
+    A fingerprint answers "which exact observation is this"; three consumers
+    needed the coarser question "is this something I have already seen", and
+    were using the fingerprint for it. For a beacon those differ, because the
+    fingerprint names the endpoint: a program that rotates destinations — a
+    CDN client, a sync daemon, an update channel, an editor extension —
+    presents an observation nothing has ever seen on every scan. Measured on
+    the reference store, 85 beacon fingerprints over 30 days were 27 actual
+    (program, port) pairs, and Zotero's eight were one.
+
+    Each consumer failed differently, which is why this read as four unrelated
+    complaints rather than one defect:
+
+      · `_mark_novelty` refreshed `last_novel_at` every scan, so age-out could
+        never retire the incidents it was written to retire.
+      · the FALSE_POSITIVE reattachment subset test could never match, so a
+        `risk:` incident the operator had judged benign re-opened under the
+        SAME correlation key — `risk:765ed268822cb174` did it three times, and
+        Zotero cost three separate verdicts for one fact.
+      · `_accumulate_risk` counted each rotated address as another distinct
+        signal, so churn alone carried an entity past RISK_MIN_SIGNALS and
+        RISK_THRESHOLD.
+
+    The generalization is the narrowest endpoint class the tolerance layer
+    already trusts (`beacon:<program>:#ip:<port>`): same program, same port,
+    rotating address. The port is deliberately kept — it names the service,
+    and a program that starts talking on a new one is a new fact. Anything
+    with no endpoint class keeps its exact fingerprint, so no other sensor
+    generalizes by accident.
+
+    This widens what counts as "already seen", so it can only ever attach
+    evidence to an incident that is already open or already reviewed — it
+    never suppresses a fingerprint the operator has not seen in some form,
+    and a rotating program that starts doing something ELSE still opens its
+    own case under that new identity."""
+    if not isinstance(f, dict):
+        return None
+    classes = _finding_endpoint_classes(f)
+    return classes[0][0] if classes else f.get("fingerprint")
+
+
 def _incident_identity(row):
     """(identity, endpoint_classes) for a stored incident: from its stored
     subject when it has one, else parsed from its correlation key (rows that
@@ -3256,7 +3304,11 @@ def _accumulate_risk(db, now, new_ids):
         b = by_entity.setdefault(ek, {"weight": 0.0, "fps": set(), "ids": set(),
                                       "cats": set(), "entity": entity,
                                       "new": False})
-        fp = f.get("fingerprint")
+        # Distinct SIGNALS, which is not the same as distinct fingerprints:
+        # a beacon fingerprint names the endpoint, so a program that rotates
+        # destinations was scoring one fresh signal per scan forever and could
+        # reach the threshold on churn alone (_recurrence_identity).
+        fp = _recurrence_identity(f)
         if fp in b["fps"]:
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
@@ -13002,7 +13054,8 @@ def gather_all(baseline_snap, current_snap, health=None):
     return findings
 
 
-VERDICT_ICON = {"alert": "🔴", "minor": "🟡", "clear": "🟢", "learning": "🔵"}
+VERDICT_ICON = {"alert": "🔴", "minor": "🟡", "clear": "🟢", "learning": "🔵",
+                "review": "🟡"}
 
 
 def _report_self_check(verdict, new_findings, findings, incidents):
@@ -13024,6 +13077,11 @@ def _report_self_check(verdict, new_findings, findings, incidents):
     if verdict == "clear" and new_findings:
         problems.append("headline says nothing new, but %d finding(s) are new"
                         % len(new_findings))
+    if verdict == "clear" and incidents:
+        problems.append("headline says nothing is waiting, but %d incident(s) "
+                        "are open" % len(incidents))
+    if verdict == "review" and not incidents:
+        problems.append("headline claims items are waiting with none open")
     if verdict in ("clear", "minor") and worst_new >= SEV_ORDER["HIGH"]:
         problems.append("headline is not an alert, but a new finding is %s"
                         % SEV_NAMES[worst_new])
@@ -13144,6 +13202,13 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
         verdict = "learning"
     elif new_findings:
         verdict = "minor"
+    elif incidents:
+        # Green with a queue is the worst state this report can show. "Nothing
+        # new" was TRUE with fourteen incidents waiting — and a reader who
+        # sees green stops looking, so a true sentence became the thing that
+        # hid the backlog. Clear now means clear: nothing arrived AND nothing
+        # is waiting on you.
+        verdict = "review"
     else:
         verdict = "clear"
     live, stale, permanent, degraded = _coverage_split(sensor_health)
@@ -13166,14 +13231,23 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
                 "everything; alerting only on CRITICAL chains and tripped "
                 "decoys." % (VERDICT_ICON["learning"], learning_days,
                              "" if learning_days == 1 else "s"))
+    elif verdict == "review":
+        head = "%s **%d item%s waiting on you.** Nothing new this scan." % (
+            VERDICT_ICON["review"], len(incidents),
+            "" if len(incidents) == 1 else "s")
     else:
-        head = "%s **Nothing new.**" % VERDICT_ICON["clear"]
+        head = ("%s **Protected.** Nothing new, nothing waiting."
+                % VERDICT_ICON["clear"])
     lines += [head, ""]
 
-    ctx = ["%d finding%s this scan" % (len(findings),
-                                       "" if len(findings) == 1 else "s")]
-    ctx.append("%d incident%s open" % (len(incidents),
-                                       "" if len(incidents) == 1 else "s"))
+    # Actionable first. "N findings this scan" is an observation count that
+    # never reaches zero on a live machine — leading with it made every report
+    # read like a problem list, and it is still published verbatim by the
+    # self-check line at the foot, so nothing is lost by moving it out of the
+    # headline's supporting facts.
+    ctx = []
+    if incidents:
+        ctx.append("%d waiting" % len(incidents))
     if crit:
         ctx.append("**%d CRITICAL**" % len(crit))
     if total_sensors:
@@ -13331,7 +13405,12 @@ def write_report(findings, first_run, incidents=None, sensor_health=None,
                             "incidents": incidents,
                             "sensor_health": list(sensor_health or []),
                             "new_fingerprints": [f.get("fingerprint")
-                                                 for f in new_findings]})
+                                                 for f in new_findings],
+                            # Everything else the brief report is built from, so
+                            # `report` can re-render faithfully instead of
+                            # serving a snapshot that stopped being true.
+                            "scan_at": _epoch(), "first_run": bool(first_run),
+                            "aged": aged, "quiet": quiet})
     return md
 
 SEEN_MAX = 10000  # bound the dedup ledger; findings.jsonl is the durable record
@@ -13798,18 +13877,49 @@ def cmd_canary(action="plant"):
 
 
 def cmd_report(full=False):
-    if full:
-        payload = load_json(LATEST_JSON, None)
-        if not payload:
+    """Render the report NOW, from the last scan's observations and the LIVE
+    incident state.
+
+    It used to `cat` latest.md, a file frozen at scan time — so the moment the
+    operator resolved anything, the report went on describing a world that no
+    longer existed until the next hourly scan. On the reference machine that
+    meant closing the one open CRITICAL and still being told, in red, "1
+    CRITICAL incident still open". Telling someone their machine is on fire
+    after they put it out is the fastest way to teach them not to read the
+    report at all — the same lesson the stale coverage rows taught, one layer
+    up.
+
+    Only the incident state is re-read: findings, sensor health and the
+    new-since-last-scan set are properties OF that scan and would be
+    falsified, not refreshed, by recomputing them here. latest.md is still
+    written at scan time for anything that tails the file."""
+    payload = load_json(LATEST_JSON, None)
+    if not payload:
+        if os.path.exists(LATEST_MD):
+            with open(LATEST_MD, encoding="utf-8") as f:
+                sys.stdout.write(f.read())
+        else:
             print("No report yet. Run: aegis.py scan")
-            return 0
+        return 0
+    if full:
         sys.stdout.write(_full_report(payload))
         return 0
-    if os.path.exists(LATEST_MD):
-        with open(LATEST_MD, encoding="utf-8") as f:
-            sys.stdout.write(f.read())
-    else:
-        print("No report yet. Run: aegis.py scan")
+    findings = payload.get("findings") or []
+    fresh = set(payload.get("new_fingerprints") or [])
+    new_findings = [f for f in findings if f.get("fingerprint") in fresh]
+    try:
+        incidents = list_incidents()
+    except Exception:
+        incidents = payload.get("incidents") or []
+    until = _learning_until()
+    now = _epoch()
+    learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
+    sys.stdout.write(_brief_report(
+        findings, new_findings, incidents,
+        payload.get("sensor_health") or [], bool(payload.get("first_run")),
+        learning_days, payload.get("aged") or 0,
+        quiet=payload.get("quiet") or 0,
+        prev_scan_at=payload.get("scan_at")))
     return 0
 
 
@@ -14702,9 +14812,26 @@ def cmd_mark_uninstalled():
 
 
 def cmd_status():
+    """Posture, led by a verdict.
+
+    This printed forty-odd lines in source order, so its one real problem —
+    XProtect definitions 93 days stale, on the reference machine — sat eighth
+    in a column of green ticks. An operator checking "am I OK?" has to audit
+    every row to answer it, which is the same failure the report had: the
+    surface knew, and made the reader do the finding. Lines are buffered, the
+    ✗ and ? rows are collected, and the answer is printed BEFORE the evidence.
+    Nothing is removed — the full column still follows."""
     ensure_state()
     findings = check_hardening()
-    print("# Aegis hardening posture - %s\n" % now_iso())
+    out, problems = [], []
+
+    def emit(line):
+        out.append(line)
+        mark = line.strip()[:1]
+        if mark in ("✗", "?"):
+            problems.append(line)
+
+    emit("# Aegis hardening posture - %s\n" % now_iso())
     checks = [
         ("System Integrity Protection", "hardening:sip:off", "hardening:sip:unknown"),
         ("Gatekeeper", "hardening:gatekeeper:off", "hardening:gatekeeper:unknown"),
@@ -14716,11 +14843,11 @@ def cmd_status():
     bad = {f["fingerprint"]: f for f in findings}
     for label, fp, unknown_fp in checks:
         if fp in bad:
-            print("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
+            emit("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
         elif unknown_fp in bad:
-            print("  ? %-32s %s" % (label, bad[unknown_fp]["detail"]))
+            emit("  ? %-32s %s" % (label, bad[unknown_fp]["detail"]))
         else:
-            print("  ✓ %-32s ok" % label)
+            emit("  ✓ %-32s ok" % label)
 
     # Apple's own engine: report XProtect definition version/age (piggybacks the
     # professionally-maintained signature pipeline; a stale value is a red flag).
@@ -14739,46 +14866,74 @@ def cmd_status():
     if newest is not None:
         age = (time.time() - newest) / 86400.0
         mark = "✓" if age <= XPROTECT_STALE_DAYS else "✗"
-        print("  %s %-32s v%s, updated %.0f days ago"
+        emit("  %s %-32s v%s, updated %.0f days ago"
               % (mark, "XProtect definitions", version or "?", age))
     health = get_sensor_health()
     if health:
-        print("\n# Sensor coverage")
+        emit("\n# Sensor coverage")
+        # Same staleness rule the report applies: a sensor that did not run
+        # this scan has NOT reported OK, whatever its stored row still says.
+        # Reading get_sensor_health() raw here showed a dead sensor as a green
+        # tick, which is the failure `doctor`'s "unknown is never green" rule
+        # exists to prevent — and status is where an operator goes to check
+        # exactly that.
+        live, stale, permanent, degraded = _coverage_split(health)
+        stale_ids = {h.get("sensor_id") for h in stale}
         for item in health:
+            if item["sensor_id"] in stale_ids:
+                emit("  ✗ %-32s DID NOT RUN — last reported %s"
+                      % (item["sensor_id"], _ago(item.get("last_run_at"))))
+                continue
             mark = {"OK": "✓", "PRIVILEGED": "i"}.get(item["status"], "?")
-            print("  %s %-32s %s%s" % (
+            emit("  %s %-32s %s%s" % (
                 mark, item["sensor_id"], item["status"],
                 (" — " + item["detail"]) if item["detail"] else ""))
-    print("\n# Incidents\n  %d active" % len(list_incidents()))
+    active = list_incidents()
+    emit("\n# Incidents\n  %d active" % len(active))
 
     # Survivability (dead-man's switch) + capability posture.
-    print("\n# Survivability")
+    emit("\n# Survivability")
     beat = read_heartbeat()
     if beat.get("epoch"):
         age = int(time.time()) - int(beat["epoch"])
         mark = "✓" if age <= HEARTBEAT_STALE_SECS else "✗"
-        print("  %s %-32s last beat %d min ago (pid %s)"
+        emit("  %s %-32s last beat %d min ago (pid %s)"
               % (mark, "Heartbeat", age // 60, beat.get("pid", "?")))
     else:
-        print("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
-    print("  %s %-32s %s" % (
+        emit("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
+    emit("  %s %-32s %s" % (
         "✓" if _heartbeat_url() else "·", "Off-host heartbeat",
         "configured (out-of-band alerting on)" if _heartbeat_url()
         else "off (local-only; set AEGIS_HEARTBEAT_URL to enable)"))
     intel_mark, intel_text = _intel_summary()
-    print("  %s %-32s %s" % (intel_mark, "Intel feeds", intel_text))
+    emit("  %s %-32s %s" % (intel_mark, "Intel feeds", intel_text))
     if os.path.exists(WATCHDOG_ALERT):
         try:
             with open(WATCHDOG_ALERT, encoding="utf-8") as f:
                 last = f.read().strip().splitlines()[-1]
         except Exception:
             last = "(unreadable)"
-        print("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
+        emit("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
     fda = _has_full_disk_access()
-    print("  %s %-32s %s" % (
+    emit("  %s %-32s %s" % (
         "✓" if fda else "·", "Full Disk Access",
         "granted (Downloads/Desktop/Bastion in scope)" if fda
         else "not granted (Downloads/Desktop scan degraded; grant to python3)"))
+    checked = len([l for l in out if l.strip()[:1] in ("✓", "✗", "?", "i")])
+    if problems:
+        print("%s **%d of %d checks need attention.**\n"
+              % (VERDICT_ICON["alert"], len(problems), checked))
+        for line in problems:
+            print(line)
+        print()
+    elif active:
+        print("%s **Posture clean — %d checks pass.** %d incident(s) waiting.\n"
+              % (VERDICT_ICON["review"], checked, len(active)))
+    else:
+        print("%s **Protected — %d checks pass, nothing waiting.**\n"
+              % (VERDICT_ICON["clear"], checked))
+    for line in out:
+        print(line)
     return 0
 
 

@@ -560,6 +560,51 @@ fold like `_merge_legacy_persistence_cases` would have been guarding an empty
 set. If an outbound case ever does open under the old shape, the 7-day age-out
 tier already closes a stale signal case — no new mechanism is required.
 
+#### A rotated address is one fact recurring
+
+The outbound section above ends by keeping endpoint identity for `net-beacon`,
+and that is still right where it applies: a beacon's *detection* is persistence
+at one fixed endpoint, so its signal key names the endpoint and a new address
+opens its own reviewable case. What was wrong is that three places asking a
+DIFFERENT question — "is this something this incident has already seen?" — were
+answering it with that same string.
+
+They are the same defect the outbound sensor was fixed for, surviving in the
+one sensor that could not be fixed the same way. A program that rotates
+destinations presents a fingerprint nothing has ever seen on every scan, so:
+
+- `_mark_novelty` refreshed `last_novel_at` every scan, which is precisely the
+  renewal the age-out fix above exists to stop — it closed the `updated_at`
+  hole and left this one open.
+- the `FALSE_POSITIVE` reattachment subset test could never match, so an
+  entity-keyed `risk:` incident the operator had judged benign re-opened under
+  the SAME correlation key. `risk:765ed268822cb174` did it three times.
+- `_accumulate_risk` counted each rotated address as another distinct signal,
+  so churn alone carried an entity past `RISK_MIN_SIGNALS` and
+  `RISK_THRESHOLD`.
+
+`_recurrence_identity` answers that second question. It generalizes exactly one
+thing — the narrowest endpoint class the tolerance layer already trusts,
+`beacon:<program>:#ip:<port>` — and everything with no endpoint class keeps its
+exact fingerprint, so no other sensor generalizes by accident. The port is
+deliberately kept: it names the service, and a program that starts talking on a
+new one is a new fact.
+
+It only ever widens what counts as "already seen", so it can attach evidence to
+an incident that is already open or already reviewed and can never suppress a
+case the operator has not seen in some form. A rotating program that starts
+doing something *else* still opens its own case under that new identity — the
+test file holds both poles.
+
+Measured by replaying all 27 entity-keyed incidents on the reference store: 4
+would never have opened (rotation was the entire case; three had already cost
+the operator a verdict, and one was open at the time of the fix), 5 more still
+open but on real evidence rather than inflated counts (Syncthing's 70 signals
+are 56, and `claude`'s 10 are 6), and 18 are untouched. The signal layer is
+unchanged, so a rotating beacon still opens one case per endpoint until
+`_rotating_endpoint_memory` has the three verdicts it needs — that tier is
+where per-endpoint noise is answered, and this one is not a substitute for it.
+
 ### Identity is declared, not parsed
 
 Every one of those migrations existed for the same reason: identity lived
@@ -628,6 +673,43 @@ an attacker who can rewrite `aegis.py`, its verifier and the pinned roster under
 the same uid defeats any local scheme. This buys tamper **evidence**, not
 tamper-proofing. Resistance beyond that needs a hardware-backed key or a
 root-owned anchor — a deliberate future rung, not this one.
+
+## Every surface answers the question before it shows the evidence
+
+Not one defect in this tier was a missed detection. Every one was a surface
+asserting something that was not true at the moment it was read — which is the
+failure that costs the alerts that *are* real, because it teaches the operator
+that this output does not repay attention.
+
+**The report is rendered when READ, from live incident state.** `cmd_report`
+used to `cat` latest.md, a file frozen at scan time, so resolving anything left
+the report describing a world that no longer existed until the next hourly
+scan: on the reference machine, "1 CRITICAL incident still open" in red, after
+the operator had closed it. Only the incident state is re-read — findings,
+sensor health and the new-since-last-scan set are properties OF that scan and
+would be falsified, not refreshed, by recomputing them at read time.
+latest.md is still written at scan time for anything tailing the file.
+
+**Green means green.** The verdict ladder gained a `review` rung, because its
+worst state was a true sentence that misled: with fourteen incidents waiting
+and nothing new, the headline read "Nothing new" over a green dot. Stale red is
+annoying; misleading green is what stops a reader looking. `clear` now requires
+nothing new AND nothing waiting, and reads *Protected*. The self-check asserts
+both directions — green over a queue, and "waiting" with none open.
+
+**The headline leads with what needs action.** It opened with "N findings this
+scan", an observation count that never reaches zero on a live machine, so every
+report read like a problem list. The count is still published verbatim by the
+self-check line, so nothing was hidden to make the surface look calmer.
+
+**`status` answers before it enumerates.** Forty-odd rows printed in source
+order meant its real problems sat among green ticks — XProtect definitions 93
+days stale was line 8 of 45, and stale intel feeds were not noticed by anyone
+until the verdict counted them. Problem rows are collected and printed above
+the fold; the full column still follows. It also applies the same staleness
+rule as the report, because reading the stored health rows raw showed a
+sensor that had stopped running as a green tick, in the one command an
+operator uses to ask whether coverage is intact.
 
 ## A report that is true of the scan you are reading
 
@@ -805,9 +887,9 @@ could never be retired. On the reference machine all 27 open incidents had
 refreshed `updated_at` on the final scan, one of them across 2,122 evidence
 events over 17 days: the queue was unreachable, and age-out could only ever
 close incidents that had already gone quiet by themselves. `_mark_novelty`
-advances `last_novel_at` only when evidence arrives carrying a fingerprint the
-incident has never held, which is what the resolution string always claimed to
-measure. Age-out is additionally gated on the reminder ladder being exhausted,
+advances `last_novel_at` only when evidence arrives carrying a recurrence
+IDENTITY the incident has never held (see *A rotated address is one fact
+recurring*), which is what the resolution string always claimed to measure. Age-out is additionally gated on the reminder ladder being exhausted,
 so nothing is retired before the operator was surfaced it the full three
 times, and new evidence still reopens it through the ordinary reattach path.
 
