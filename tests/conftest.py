@@ -238,6 +238,13 @@ _POSIX_ONLY_TESTS = frozenset((
     "test_interpreter_aimed_at_a_temp_script_is_high",
     "test_script_payload_is_joinable_to_its_drop",
     "test_interpreter_fronted_persistence_joins_its_script",
+    # WHO_CMD-specific: snapshot_auth_sessions() no longer even LOOKS at
+    # WHO_CMD when IS_WIN — it dispatches to _snapshot_auth_sessions_win()
+    # instead (2026-08-30, the RDP/WinRM sensor). The equivalent invariant
+    # (a failed probe is a non-answer, never a false-empty) is covered on
+    # Windows by test_cross_platform.py's
+    # test_auth_session_win_probe_failure_is_a_non_answer.
+    "test_snapshot_none_on_hard_fail",
 ))
 
 

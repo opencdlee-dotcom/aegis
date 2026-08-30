@@ -725,6 +725,33 @@ class AcceptedStateIsDurable(unittest.TestCase):
         self.assertTrue(never, "fixture assumes at least one such surface")
         self.assertFalse(never & keys)
 
+    def test_every_platform_has_a_never_adopted_surface(self):
+        """The assumption the test above only checks on WHICHEVER platform
+        happens to be running it — this checks all three, on any body,
+        directly against _build_surfaces rather than the live aegis.SURFACES.
+
+        2026-08-30: Windows had none. auth_sessions (mac/linux's live-access
+        surface) was registered only in the IS_MAC/IS_LINUX branches; the
+        Windows branch had five sensors and zero never_adopt_live=True rows.
+        No non-Windows test caught it (simbody flips flags AFTER import, so
+        it can't see a module-level branch built at import time), and no
+        Windows test caught it either (nothing asserted this INVARIANT, only
+        that individual Windows sensors parse). It shipped invisibly until a
+        real windows-latest CI run finally exercised the assertion for real.
+        This is the platform-parameterized version so it can never do that
+        again from any single body."""
+        for is_mac, is_linux, label in (
+                (True, False, "mac"), (False, True, "linux"),
+                (False, False, "windows")):
+            with self.subTest(platform=label):
+                surfaces = aegis._build_surfaces(is_mac, is_linux)
+                never = {aegis._surface_row(r)[0] for r in surfaces
+                         if aegis._surface_row(r)[4]}
+                self.assertTrue(
+                    never, "%s has no never_adopt_live surface — an active "
+                    "remote session there would be silently adopted as "
+                    "residue instead of alerting on first sight" % label)
+
     def test_a_surface_with_no_resolvable_entity_fails_closed(self):
         """xprotect_corpus is one RECORD ({rules, count}) about Apple's
         malware definitions, not a set of entities the operator owns — its

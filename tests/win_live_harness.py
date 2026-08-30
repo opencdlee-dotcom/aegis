@@ -453,6 +453,13 @@ try:
     lis = aegis._snapshot_listeners_windows()
     check("the netstat listener snapshot parsed", isinstance(lis, dict),
           "%d listener(s): %s" % (len(lis), ", ".join(list(lis)[:6])))
+
+    sess = aegis.snapshot_auth_sessions()
+    check("the RDP/WinRM auth-session probe returned a snapshot, not a "
+          "DEGRADED None (Get-NetTCPConnection ran)", isinstance(sess, dict),
+          "%r" % (sess if sess != {} else "{} (no active remote session)"))
+    if sess:
+        note("live remote session(s) on this runner: %s" % ", ".join(sess))
 except Exception:
     check("PowerShell probe block completed", False, traceback.format_exc())
 

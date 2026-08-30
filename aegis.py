@@ -9835,10 +9835,51 @@ def _parse_who_remote(text):
     return out
 
 
+# Windows has no `who` — the closest analog to "a remote login session is
+# CURRENTLY active" is an ESTABLISHED inbound TCP connection to a remote-
+# control port: RDP (3389) or PowerShell Remoting/WinRM (5985/5986, HTTP and
+# HTTPS listeners). Get-NetTCPConnection needs no elevation and ships on every
+# Windows 8+/Server 2012+ box, so this costs no new privilege the way reading
+# the Security event log for logon type 10 would.
+_WIN_REMOTE_SESSION_PS = (
+    "$ports=3389,5985,5986;"
+    "Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |"
+    "Where-Object { $ports -contains $_.LocalPort } |"
+    "ForEach-Object { Write-Output ('remote=' + $_.RemoteAddress + '=' + "
+    "$_.LocalPort) }")
+
+
+def _snapshot_auth_sessions_win():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_REMOTE_SESSION_PS], timeout=30)
+    # Probe failure ⇒ non-answer, same rule every other Windows PS-backed
+    # surface here follows (snapshot_win_exclusions et al.) — never a false
+    # empty that would storm the moment the probe next succeeds.
+    if rc != 0:
+        return None
+    snap = {}
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("remote="):
+            continue
+        host, _, port = line[len("remote="):].partition("=")
+        host = host.strip()
+        # Same loopback exclusion as the POSIX side: a local RDP/WinRM test
+        # against 127.0.0.1 is routine tooling, not a remote actor.
+        if not host or host in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            continue
+        snap["rdp@%s:%s" % (host, port.strip())] = host
+    return snap
+
+
 def snapshot_auth_sessions():
     """{session_key: origin_host} of active REMOTE login sessions, or None if
-    `who` could not be read (a non-answer, not 'no sessions' — never adopt/diff a
-    false-empty)."""
+    the backing probe could not be read (a non-answer, not 'no sessions' —
+    never adopt/diff a false-empty). POSIX: `who`, filtered to sessions
+    carrying a remote origin. Windows: established TCP connections to
+    RDP/WinRM ports — see _snapshot_auth_sessions_win."""
+    if IS_WIN:
+        return _snapshot_auth_sessions_win()
     out, _, rc = run(WHO_CMD, timeout=8)
     if rc in (124, 127):
         return None
@@ -9847,13 +9888,14 @@ def snapshot_auth_sessions():
 
 def diff_auth_sessions(prior, cur):
     def new_fn(key, host):
+        channel = "RDP / PowerShell Remoting" if IS_WIN else "ssh / screen-sharing"
         return finding(
             "HIGH", "auth-session", "New remote login session",
-            "%s — a remote (ssh / screen-sharing) session appeared from %s. A "
-            "personal Mac rarely has an active remote login; verify this is you "
-            "(and that Remote Login / Screen Sharing being on is intended)."
-            % (key, host), "auth-session:%s" % key, session=key, origin=host,
-            confidence="medium", markers=["remote-access"])
+            "%s — a remote (%s) session appeared from %s. This machine rarely "
+            "has an active remote login; verify this is you (and that remote "
+            "access being enabled at all is intended)."
+            % (key, channel, host), "auth-session:%s" % key, session=key,
+            origin=host, confidence="medium", markers=["remote-access"])
     return _diff_map(prior, cur, new_fn)
 
 
@@ -12768,55 +12810,82 @@ def cmd_glean(mode="new"):
 # two hand-maintained side-maps keyed on a THIRD spelling of the surface name,
 # and a key/category/scope spelling drift has already shipped one bug (benign
 # notes that silently never rendered). One row, one vocabulary.
-SURFACES = [
-    ("shellrc", snapshot_shellrc, diff_shellrc, "shellrc"),
-    ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
-    ("browserext", snapshot_browserext, diff_browserext, "browserext"),
-    ("ide_ext", snapshot_ide_ext, diff_ide_ext, "browserext"),
-    ("wallet", snapshot_wallet, diff_wallet),
-    ("listeners", snapshot_listeners, diff_listeners, "listeners"),
-    ("agent_skills", snapshot_agent_skills, diff_agent_skills,
-     "agent_surface"),
-    # The AI-agent trust surface. Registered here rather than as a standalone
-    # sensor so it inherits the whole managed pipeline for free: silent
-    # first-sight adoption, sensor health, dedup, dismissals, and a baseline
-    # already covered by the notary state digest (so an attacker who edits an
-    # MCP registration AND Aegis's baseline breaks the hash chain).
-    ("agent_surface", snapshot_agent_surface, diff_agent_surface,
-     "agent_surface"),
-    ("session_binding", snapshot_session_binding, diff_session_binding),
-    ("ext_caps", snapshot_ext_caps, diff_ext_caps),
-]
-if IS_MAC:
-    SURFACES += [
-        ("xprotect_corpus", snapshot_xprotect_corpus, diff_xprotect_corpus),
-        ("loginhooks", snapshot_loginhooks, diff_loginhooks),
-        ("profiles", snapshot_profiles, diff_profiles),
-        ("btm", snapshot_btm, diff_btm),
-        # never_adopt_live: an active remote login present at install/upgrade
-        # time is a CURRENT-ACCESS threat, not installed-residue — the README's
-        # live-vs-residue rule says the user must hear about it immediately,
-        # so this surface is never silently adopted (see _scan_surfaces).
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
-         "persistence", True),
+def _build_surfaces(is_mac, is_linux):
+    """Pure builder for the SURFACES registry, parameterized on platform
+    rather than reading the IS_MAC/IS_LINUX globals directly. This is what
+    makes the platform-specific branches unit-testable without a real machine
+    of that OS or faking sys.platform before import: `_build_surfaces(False,
+    False)` gets you exactly what a Windows box would register, on any body.
+
+    That gap was real, not theoretical: `SURFACES = [...]` used to be built
+    directly from the module-level IS_MAC/IS_LINUX at import time, so it was
+    fixed the instant `aegis` was first imported. Neither simbody (flips the
+    flags AFTER import — its own docstring's "verdict, a flag, a branch, and
+    nothing else" caveat) nor any Windows-specific test exercised this
+    branch's CONTENT on non-Windows CI, so a real gap — Windows had no
+    `never_adopt_live` surface at all, unlike mac/linux's auth_sessions — went
+    undetected until a real windows-latest run caught it (2026-08-30)."""
+    surfaces = [
+        ("shellrc", snapshot_shellrc, diff_shellrc, "shellrc"),
+        ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
+        ("browserext", snapshot_browserext, diff_browserext, "browserext"),
+        ("ide_ext", snapshot_ide_ext, diff_ide_ext, "browserext"),
+        ("wallet", snapshot_wallet, diff_wallet),
+        ("listeners", snapshot_listeners, diff_listeners, "listeners"),
+        ("agent_skills", snapshot_agent_skills, diff_agent_skills,
+         "agent_surface"),
+        # The AI-agent trust surface. Registered here rather than as a
+        # standalone sensor so it inherits the whole managed pipeline for
+        # free: silent first-sight adoption, sensor health, dedup,
+        # dismissals, and a baseline already covered by the notary state
+        # digest (so an attacker who edits an MCP registration AND Aegis's
+        # baseline breaks the hash chain).
+        ("agent_surface", snapshot_agent_surface, diff_agent_surface,
+         "agent_surface"),
+        ("session_binding", snapshot_session_binding, diff_session_binding),
+        ("ext_caps", snapshot_ext_caps, diff_ext_caps),
     ]
-elif IS_LINUX:
-    SURFACES += [
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
-         "persistence", True),
-        ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
-        ("suid_binaries", snapshot_suid, diff_suid),
-    ]
-else:
-    SURFACES += [
-        ("win_defender_exclusions", snapshot_win_exclusions,
-         diff_win_exclusions),
-        ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
-         diff_wmi_subscriptions),
-        ("win_com_hijack", snapshot_com_hijack, diff_com_hijack),
-        ("win_ifeo", snapshot_ifeo, diff_ifeo),
-        ("win_appinit", snapshot_appinit, diff_appinit),
-    ]
+    if is_mac:
+        surfaces += [
+            ("xprotect_corpus", snapshot_xprotect_corpus, diff_xprotect_corpus),
+            ("loginhooks", snapshot_loginhooks, diff_loginhooks),
+            ("profiles", snapshot_profiles, diff_profiles),
+            ("btm", snapshot_btm, diff_btm),
+            # never_adopt_live: an active remote login present at
+            # install/upgrade time is a CURRENT-ACCESS threat, not
+            # installed-residue — the README's live-vs-residue rule says the
+            # user must hear about it immediately, so this surface is never
+            # silently adopted (see _scan_surfaces).
+            ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+             "persistence", True),
+        ]
+    elif is_linux:
+        surfaces += [
+            ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+             "persistence", True),
+            ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
+            ("suid_binaries", snapshot_suid, diff_suid),
+        ]
+    else:
+        surfaces += [
+            ("win_defender_exclusions", snapshot_win_exclusions,
+             diff_win_exclusions),
+            ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
+             diff_wmi_subscriptions),
+            ("win_com_hijack", snapshot_com_hijack, diff_com_hijack),
+            ("win_ifeo", snapshot_ifeo, diff_ifeo),
+            ("win_appinit", snapshot_appinit, diff_appinit),
+            # never_adopt_live: see the identical mac/linux comment above —
+            # an active RDP/WinRM connection present at install/upgrade time
+            # is CURRENT ACCESS, not residue, so it must alert on the very
+            # first scan.
+            ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+             "persistence", True),
+        ]
+    return surfaces
+
+
+SURFACES = _build_surfaces(IS_MAC, IS_LINUX)
 
 
 def _surface_row(row):

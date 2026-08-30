@@ -686,6 +686,39 @@ trusted ones leaves severity untouched and attaches
 `unrecognized_key_fingerprints` — naming exactly the key that needs a verdict,
 rather than the whole file's hash.
 
+#### Windows had no live-access surface at all
+
+Writing this section's tests surfaced a real, pre-existing gap: `auth_sessions`
+— the ONE surface every platform is supposed to register with
+`never_adopt_live=True` (an active remote session is current access, never
+silently-adopted residue) — was only ever added to `SURFACES` in the
+`IS_MAC`/`IS_LINUX` branches. The Windows branch had five sensors and zero.
+Nothing caught it: simbody flips platform FLAGS after `aegis` is already
+imported, so it cannot see a module-level `if IS_MAC: ... elif IS_LINUX: ...
+else: ...` branch that already ran; no Windows test asserted the INVARIANT
+itself, only that individual Windows sensors parse their own output. It
+shipped invisibly until a real `windows-latest` CI run finally exercised
+`test_a_never_adopted_surface_is_never_accepted` for real and failed.
+
+The fix is the Windows analog of `auth_sessions`, not a new mechanism: Windows
+has no `who`, so the closest fact to "a remote login session is CURRENTLY
+active" is an ESTABLISHED inbound TCP connection to a remote-control port —
+RDP (3389) or PowerShell Remoting/WinRM (5985/5986) — read via
+`Get-NetTCPConnection`, which needs no elevation. `snapshot_auth_sessions()`
+now dispatches on `IS_WIN`; `diff_auth_sessions()` is unchanged and already
+platform-agnostic, so a Windows RDP/WinRM finding is a plain `category ==
+"auth-session"` finding exactly like macOS/Linux — meaning the SSH identity
+trust mechanism above (`_apply_identity_trust` → `_apply_origin_trust`) covers
+Windows remote sessions for free, no new trust plumbing required.
+
+`SURFACES` itself moved from a fixed module-level list to `_build_surfaces(is_mac,
+is_linux)`, a pure function the old list is now just one call of
+(`SURFACES = _build_surfaces(IS_MAC, IS_LINUX)`). That is what makes the
+regression guard (`test_every_platform_has_a_never_adopted_surface`, parameterized
+over all three platforms) possible from a single body — the exact test that
+would have caught this gap on day one, on any OS, without a real Windows
+machine.
+
 ### Identity is declared, not parsed
 
 Every one of those migrations existed for the same reason: identity lived

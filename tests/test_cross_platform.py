@@ -1325,6 +1325,9 @@ class ProbeFailureIsNeverClean(unittest.TestCase):
     def test_defender_exclusion_probe_failure_is_a_non_answer(self):
         self.assertIsNone(self._with_run(aegis.snapshot_win_exclusions))
 
+    def test_auth_session_win_probe_failure_is_a_non_answer(self):
+        self.assertIsNone(self._with_run(aegis._snapshot_auth_sessions_win))
+
     def test_wmi_probe_failure_is_a_non_answer(self):
         self.assertIsNone(self._with_run(aegis.snapshot_wmi_subscriptions))
 
@@ -1341,6 +1344,23 @@ class ProbeFailureIsNeverClean(unittest.TestCase):
                                             out="", err="", rc=0))
         self.assertEqual({}, self._with_run(aegis.snapshot_wmi_subscriptions,
                                             out="", err="", rc=0))
+        self.assertEqual({}, self._with_run(aegis._snapshot_auth_sessions_win,
+                                            out="", err="", rc=0))
+
+    def test_auth_session_win_parses_established_connections(self):
+        out = "remote=203.0.113.9=3389\nremote=198.51.100.4=5985\n"
+        snap = self._with_run(aegis._snapshot_auth_sessions_win, out=out,
+                              err="", rc=0)
+        self.assertEqual({"rdp@203.0.113.9:3389": "203.0.113.9",
+                          "rdp@198.51.100.4:5985": "198.51.100.4"}, snap)
+
+    def test_auth_session_win_drops_loopback(self):
+        # A local RDP/WinRM smoke test against 127.0.0.1 is routine tooling,
+        # not a remote actor — same exclusion the POSIX `who` parser applies.
+        out = "remote=127.0.0.1=3389\nremote=::1=5986\n"
+        snap = self._with_run(aegis._snapshot_auth_sessions_win, out=out,
+                              err="", rc=0)
+        self.assertEqual({}, snap)
 
     def test_readable_but_empty_journal_is_coverage_not_a_gap(self):
         # auth.log is root-only on most distros; falling back to a journal that
