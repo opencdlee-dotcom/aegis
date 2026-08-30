@@ -192,7 +192,12 @@ guards because they answer the same adversarial pressures:
   identity inside 180 days, so one hasty dismissal teaches nothing.
 - **Inflammation overrides**: never `CRITICAL`, never above the severity the
   operator actually reviewed, never for attack-defined evidence (decoys,
-  latches, canaries), and never while any incident on the identity is active.
+  latches, canaries), and never while the operator is *in dispute* with the
+  identity — a status they moved an incident to, or an explicit `reopen`.
+  Dispute used to mean any active incident, which read silence as objection:
+  a noisy identity was suppressed by its own untriaged backlog, so verdicts
+  on it could never take effect and tolerance engaged only where it was not
+  needed. On the reference machine that put all 27 open incidents in dispute.
 - **Visible and disputable**: the incident is still created with its full
   evidence, closed as `auto-tolerated` citing the precedent count, counted in a
   footer on the active listing, and one `reopen` both re-alerts and revokes the
@@ -623,6 +628,82 @@ an attacker who can rewrite `aegis.py`, its verifier and the pinned roster under
 the same uid defeats any local scheme. This buys tamper **evidence**, not
 tamper-proofing. Resistance beyond that needs a hardware-backed key or a
 root-owned anchor — a deliberate future rung, not this one.
+
+## Provenance tier
+
+Measured on the reference machine 2026-08-29, after the signal-to-noise and
+precision tiers had done their work: incident creation had fallen from 35/day
+to under 5, but 27 incidents stood open, every one of them the operator's own
+infrastructure, and the lifetime true-positive count was still zero. The
+remaining noise had one shape the earlier tiers cannot reach by construction —
+**a thing the operator installed, that has never been seen before**. Acquired
+tolerance is antigen-specific to the path, so each new item is a genuinely
+novel identity and the operator's verdicts on its siblings cannot apply. Six
+of the 27 were six launchd jobs from one scheduler kit: same launcher binary,
+same payload script, differing only in the job name passed as an argument.
+
+**A producer is (launcher bytes, payload path, trust class).** Once the
+operator has dismissed `benign-positive` on `_PRODUCER_MIN_SIBLINGS` items
+that share all three, the next one opens pre-closed as tolerated. Breadth over
+*distinct paths* is the evidence, exactly as distinct endpoints are for
+rotation — three dismissals of the same job teach nothing, because the
+exact-key reattach already covers that. Only `new` generalizes: an existing
+job MUTATING is the shape a payload swap presents as, and keeps its own
+identity.
+
+Why this is narrow enough to be a tolerance and not a trust root. The class
+names the launcher by its **SHA**, so a swapped binary at the same path is a
+different producer. It names the **payload the launcher actually runs**, so
+`uv` alone generalizes nothing and an unrelated kit using the same runner is
+unrelated. It carries the **trust class**, so an adhoc sibling never inherits
+a signed one's verdicts. An item with no resolvable payload has no producer at
+all, which is what stops `/bin/bash` becoming the tolerated producer of
+everything. And it inherits every guard the tolerance layer already holds:
+human `benign-positive` verdicts only, never `CRITICAL`, never above the
+reviewed severity, never a disputed producer, never attack-defined evidence.
+To abuse it an attacker must already be able to write the reviewed payload —
+at which point they own the jobs the operator approved, and the tolerance
+grants them nothing they did not already have.
+
+**Runner subcommands no longer hide the payload.** The tier is inert without
+this, and it is a detection fix before it is a noise one. `uv run app.py` is
+an interpreter driving a payload, but `_script_target` took the first argument
+after the binary, got the subcommand `run`, and returned `None` — so for every
+`uv`/`poetry`/`npx`-launched job the payload was never identified, its bytes
+were never hashed into `target_sha`, and a swapped payload under an unchanged
+plist was invisible to the CHANGED sensor. `_RUNNER_SUBCOMMANDS` consumes only
+a subcommand the named runner actually declares, so no ordinary interpreter's
+first argument is ever skipped. It is POSIX-shaped, like the rest of
+`_script_target`, and deliberately inert on Windows rather than carrying a
+half-working `.exe` path no test on a mac could fail.
+
+**A blessed fact cannot manufacture a `CRITICAL`.** Chains are built from
+events and so were blind to the routing gate: the six launchd jobs of one
+reviewed kit correlated with their own scheduled execution into a permanent
+`chain:persistence-execution`, which is what every legitimate scheduled task
+looks like — and because chains are never tolerated and never aged out, that
+banner could not clear and re-formed for every job the kit added. Findings the
+gate decided are `tolerated` or `allowlisted` are removed from the chain
+*trigger* set only, never from the observations: a tolerated persistence item
+is still available as the other leg, so an unreviewed process executing from
+it still chains at `CRITICAL`. Only the case where the sole new thing is one
+the operator already reviewed stops firing. `learning` is deliberately not
+quieted here, because the learning period's documented promise is that
+`CRITICAL` chains alert throughout it.
+
+**Age-out measures novelty, not evidence.** The 7-day ambient close was keyed
+on `updated_at`, which `_upsert_incident` refreshes on every re-observation —
+so any condition that is *continuously* true (a launchd job that still exists,
+a config file still being written) renewed its own reprieve on every scan and
+could never be retired. On the reference machine all 27 open incidents had
+refreshed `updated_at` on the final scan, one of them across 2,122 evidence
+events over 17 days: the queue was unreachable, and age-out could only ever
+close incidents that had already gone quiet by themselves. `_mark_novelty`
+advances `last_novel_at` only when evidence arrives carrying a fingerprint the
+incident has never held, which is what the resolution string always claimed to
+measure. Age-out is additionally gated on the reminder ladder being exhausted,
+so nothing is retired before the operator was surfaced it the full three
+times, and new evidence still reopens it through the ordinary reattach path.
 
 ## Transactional quarantine
 
