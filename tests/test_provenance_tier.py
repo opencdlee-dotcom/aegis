@@ -387,5 +387,112 @@ class BlessedFactsDoNotManufactureChains(unittest.TestCase):
             self._run(fs, self._routing(fs, ["learning", "learning"])), 1)
 
 
+class FamiliesAreTheAdjudicationSurface(unittest.TestCase):
+    """The root issue: every tier here learns from the operator's verdicts,
+    and on the reference machine those arrived in three bursts (33, 70, 15)
+    and then stopped for nine days while the queue rebuilt to 27. Adjudicating
+    meant one command per incident after working out by eye which were the
+    same fact. Grouping uses ONLY identities the tolerance layer already keys
+    on, so the view cannot invent a resemblance to look tidy."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_fam_")
+        self.saved = (aegis.STATE_DIR, aegis.EVENT_DB)
+        aegis.STATE_DIR = self.tmp
+        aegis.EVENT_DB = os.path.join(self.tmp, "t.db")
+        self.now = aegis._epoch()
+
+    def tearDown(self):
+        aegis.STATE_DIR, aegis.EVENT_DB = self.saved
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _open(self, finding):
+        db = aegis._event_connection()
+        with db:
+            cur = db.execute(
+                "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                "data_json) VALUES(?,?,?,?,?)",
+                (self.now, self.now, finding["category"],
+                 "observation.finding", aegis.json.dumps(finding)))
+            i = aegis._upsert_incident(
+                db, "signal:" + finding["fingerprint"], finding["title"],
+                finding["severity"], "signal", self.now, [cur.lastrowid],
+                subject=finding.get("subject"))
+        db.close()
+        return i
+
+    @staticmethod
+    def _kit(name, **kw):
+        path, rec = _job(name, **kw)
+        return [f for f in aegis.check_persistence({}, {path: rec})
+                if f["title"] == "New persistence item"][0]
+
+    def _families(self):
+        db = aegis._event_connection()
+        try:
+            return aegis._incident_families(db)
+        finally:
+            db.close()
+
+    def test_one_toolkit_is_one_decision(self):
+        for n in ("alpha", "bravo", "charlie", "delta"):
+            self._open(self._kit(n))
+        fams = self._families()
+        self.assertEqual(len(fams), 1, "four jobs of one kit are one fact")
+        self.assertEqual(len(fams[0][2]), 4)
+        self.assertIn("one installed toolkit", fams[0][1])
+
+    def test_an_unrelated_job_is_never_folded_in(self):
+        """The safety half. Grouping is only ever the judgement the tolerance
+        layer already makes; a different launcher or payload is a separate
+        decision, however tidy one row would look."""
+        for n in ("alpha", "bravo"):
+            self._open(self._kit(n))
+        self._open(self._kit("evil", sha="ff" + "1" * 62))
+        self._open(self._kit("other", target="/Users/me/other/run.py"))
+        self.assertEqual(len(self._families()), 3)
+
+    def test_a_fact_that_cannot_generalize_stands_alone(self):
+        self._open(aegis.finding("HIGH", "behavior", "b", "d",
+                                 "behavior:bash:weird-thing:" + "a" * 16))
+        fams = self._families()
+        self.assertEqual(len(fams), 1)
+        self.assertEqual(len(fams[0][2]), 1)
+
+    def test_one_verdict_writes_one_dismissal_per_incident(self):
+        """The saving is clerical only. The rows written must be identical to
+        having typed the per-incident commands, or precision and tolerance
+        counts would quietly diverge from the operator's actual judgements."""
+        ids = [self._open(self._kit(n))
+               for n in ("alpha", "bravo", "charlie")]
+        self.assertEqual(aegis.cmd_family("1", "benign-positive"), 0)
+        db = aegis._event_connection()
+        rows = db.execute(
+            "SELECT incident_id, reason_code FROM dismissals").fetchall()
+        statuses = {r[0] for r in db.execute(
+            "SELECT status FROM incidents WHERE id IN (%s)"
+            % ",".join(str(i) for i in ids))}
+        db.close()
+        self.assertEqual(sorted(r["incident_id"] for r in rows), sorted(ids))
+        self.assertTrue(all(r["reason_code"] == "benign-positive" for r in rows))
+        self.assertEqual(statuses, {"FALSE_POSITIVE"})
+
+    def test_the_verdict_establishes_the_tolerance_it_should(self):
+        for n in ("alpha", "bravo", "charlie"):
+            self._open(self._kit(n))
+        aegis.cmd_family("1", "benign-positive")
+        db = aegis._event_connection()
+        decision = aegis._signal_decision(
+            self._kit("delta"), aegis._suppression_memory(db, self.now))
+        db.close()
+        self.assertEqual(decision[0], "tolerated")
+
+    def test_an_out_of_range_family_is_refused(self):
+        self._open(self._kit("alpha"))
+        self.assertEqual(aegis.cmd_family("7", "benign-positive"), 2)
+        self.assertEqual(aegis.cmd_family("1", "not-a-verdict"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

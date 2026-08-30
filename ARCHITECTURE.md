@@ -691,6 +691,28 @@ the operator already reviewed stops firing. `learning` is deliberately not
 quieted here, because the learning period's documented promise is that
 `CRITICAL` chains alert throughout it.
 
+**Families: a verdict nobody gives teaches nothing.** Every mechanism above
+learns from the operator's own `benign-positive` verdicts, and on the reference
+machine those arrived in three bursts (33, then 70, then 15) and stopped — nine
+days of silence while the queue rebuilt to 27. That is arithmetic, not neglect:
+adjudicating meant one command per incident, after working out by eye which of
+them were the same fact, so six launchd jobs from one kit read as six problems.
+The learning starved between bursts, which is exactly when it was needed.
+
+`aegis.py families` groups active incidents into DECISIONS. A family is a set
+sharing an identity this codebase *already trusts for tolerance* — a producer
+class, an endpoint class, or a tolerance identity — so the grouping asserts
+nothing new: it is the same judgement the tolerance layer makes, surfaced
+before the verdict instead of after it. An incident sharing none of those is
+its own family, so the view can never lump unrelated things together to look
+tidy. `aegis.py family <n> benign-positive` writes exactly the rows the
+per-incident commands write — one dismissal each, through the same transition
+— so precision math, tolerance counts, and the audit trail are unchanged. What
+collapses is the clerical work, which is the part that was actually stopping.
+Measured on the live queue: 27 incidents, 20 decisions, and one verdict on the
+largest family establishes the producer that silences every future job of that
+kit.
+
 **Age-out measures novelty, not evidence.** The 7-day ambient close was keyed
 on `updated_at`, which `_upsert_incident` refreshes on every re-observation —
 so any condition that is *continuously* true (a launchd job that still exists,

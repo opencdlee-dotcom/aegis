@@ -13693,6 +13693,167 @@ def cmd_report(full=False):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# FAMILIES — the adjudication surface, because a verdict nobody gives teaches
+# nothing.
+#
+# Every suppression mechanism in this file learns from the operator's own
+# `benign-positive` verdicts, and on the reference machine those arrived in
+# three bursts (33, then 70, then 15) and stopped — nine days of silence while
+# the queue rebuilt to 27. That is not neglect, it is arithmetic: adjudicating
+# meant issuing one command per incident, after working out by eye which of
+# them were the same fact. Six launchd jobs from one kit read as six problems.
+# So the learning starved between bursts, which is exactly when it was needed,
+# and every tier built on it shipped inert.
+#
+# A family is a set of active incidents that share an identity THIS FILE
+# ALREADY TRUSTS for tolerance — a producer class, an endpoint class, or a
+# tolerance identity. Nothing new is asserted to be "the same thing": the
+# grouping is the same judgement the tolerance layer makes, surfaced before the
+# verdict instead of after it. An incident sharing none of those stays a
+# singleton, so the view can never lump unrelated things together to look tidy.
+#
+# The verdict is still one human judgement per FACT, and it still writes one
+# dismissals row per incident — byte-identical to issuing the commands by hand,
+# so precision math and tolerance counts are unchanged. What collapses is the
+# clerical work, which is the part that was actually stopping.
+# --------------------------------------------------------------------------- #
+
+def _family_label(key, rows):
+    """A one-line human name for what the operator is being asked about."""
+    paths = []
+    for row in rows:
+        raw = row.get("subject_json")
+        if raw:
+            try:
+                sub = json.loads(raw)
+                paths.append(sub.get("raw_path") or sub.get("path") or "")
+            except Exception:
+                pass
+    paths = [p for p in paths if p]
+    if key.startswith("persistence:#producer:"):
+        bits = key.split(":")
+        return "%d job(s) from one installed toolkit -> %s [%s]" % (
+            len(rows), bits[-2], bits[-1] or "?")
+    if key.startswith("beacon:") and ":#ip:" in key:
+        return "%d endpoint(s) of one program -> %s" % (
+            len(rows), key.split(":#ip:")[0][len("beacon:"):])
+    if paths:
+        common = os.path.dirname(os.path.commonprefix(paths)) or paths[0]
+        return "%d incident(s) on %s" % (len(rows), common)
+    return "%d incident(s) sharing %s" % (len(rows), key)
+
+
+def _incident_families(db):
+    """[(key, label, [rows])] over ACTIVE incidents, widest family first.
+
+    An incident joins the FIRST identity it has, narrowest generalization
+    last: a producer class, then an endpoint class, then its plain tolerance
+    identity. Anything with none of those is its own family keyed on its
+    correlation_key, because a fact that cannot generalize is a fact the
+    operator has to look at on its own terms."""
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    rows = _dict_rows(db.execute(
+        "SELECT * FROM incidents WHERE status IN (%s) "
+        "ORDER BY id" % marks, _ACTIVE_INCIDENT_STATES).fetchall())
+    groups = {}
+    for row in rows:
+        key = None
+        raw = row.get("subject_json")
+        if raw:
+            try:
+                sub = json.loads(raw)
+                producer = _subject_producer_classes(sub)
+                key = producer[0][0] if producer else None
+            except Exception:
+                key = None
+        if key is None:
+            ident, classes = _incident_identity(row)
+            key = classes[0][0] if classes else ident
+        groups.setdefault(key or ("incident:%s" % row["id"]), []).append(row)
+    out = [(k, _family_label(k, v), v) for k, v in groups.items()]
+    out.sort(key=lambda t: (-len(t[2]), t[0]))
+    return out
+
+
+def cmd_families():
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        families = _incident_families(db)
+    finally:
+        db.close()
+    if not families:
+        print("No active incidents.")
+        return 0
+    total = sum(len(rows) for _k, _l, rows in families)
+    print("# Aegis incident families — %d active incident(s), %d decision(s)\n"
+          % (total, len(families)))
+    for n, (_key, label, rows) in enumerate(families, 1):
+        worst = max(rows, key=lambda r: SEV_ORDER.get(r["severity"], -1))
+        ids = " ".join("#%s" % r["id"] for r in rows)
+        print("  [%d] %-8s %s\n      %s" % (n, worst["severity"], label, ids))
+    print("\nOne verdict per family: aegis.py family <n> "
+          "[benign-positive|false-positive]")
+    print("A family is grouped ONLY on an identity acquired tolerance already "
+          "keys on;\nanything that cannot generalize is listed on its own.")
+    return 0
+
+
+def cmd_family(number, action=None, reason=None):
+    """Apply ONE verdict to every incident in a family.
+
+    Deliberately writes the same rows the per-incident commands write — one
+    dismissal each, through the same transition — so nothing about precision,
+    tolerance counts, or the audit trail differs from having typed them out.
+    The saving is clerical, and the clerical work is what was stopping."""
+    try:
+        n = int(number)
+    except (TypeError, ValueError):
+        print("usage: aegis.py family <n> [benign-positive|false-positive]")
+        return 2
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        families = _incident_families(db)
+    finally:
+        db.close()
+    if not 1 <= n <= len(families):
+        print("No family %d. Current families: aegis.py families" % n)
+        return 2
+    key, label, rows = families[n - 1]
+    if action is None:
+        print("Family %d — %s\n" % (n, label))
+        for row in rows:
+            print("  #%-4s %-8s %-14s %s" % (row["id"], row["severity"],
+                                             row["status"], row["title"]))
+        print("\nIdentity: %s" % key)
+        print("Verdict:  aegis.py family %d benign-positive" % n)
+        return 0
+    verb = str(action).lower()
+    if verb not in ("benign-positive", "false-positive"):
+        print("usage: aegis.py family <n> [benign-positive|false-positive]")
+        return 2
+    done, refused = [], []
+    for row in rows:
+        if transition_incident(row["id"], "FALSE_POSITIVE", reason_code=verb):
+            done.append(row["id"])
+        else:
+            refused.append(row["id"])
+    print("Family %d — %s" % (n, label))
+    print("  %s recorded on %d incident(s): %s"
+          % (verb, len(done), " ".join("#%s" % i for i in done) or "none"))
+    if refused:
+        print("  refused (not in a dismissable state): %s"
+              % " ".join("#%s" % i for i in refused))
+    if verb == "benign-positive" and len(done) >= _TOLERANCE_MIN_VERDICTS:
+        print("  this identity now carries %d verdicts — future members open "
+              "pre-closed" % len(done))
+    return 0 if done else 1
+
+
 def cmd_incidents(show_all=False):
     incidents = list_incidents(active_only=not show_all)
     tolerated = _recent_tolerated_count()
@@ -13714,6 +13875,8 @@ def cmd_incidents(show_all=False):
         print("\n" + _tolerated_footer(tolerated))
     print("\nDetails/actions: aegis.py incident <id> [ack|investigate|contain|"
           "recover|monitor|resolve|false-positive|benign-positive|reopen]")
+    if not show_all:
+        print("One verdict per FACT instead of per row: aegis.py families")
     return 0
 
 
@@ -20437,6 +20600,18 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   status           print hardening, XProtect, sensor coverage, and incidents
   doctor           verify actual coverage/liveness (unknown is never green)
   incidents [all]  list active incidents (or complete history)
+  families         group active incidents into DECISIONS: members of one
+                   family share an identity acquired tolerance already keys
+                   on (a producer, an endpoint class, a tolerance identity),
+                   so six launchd jobs from one kit read as one fact instead
+                   of six problems. Anything that cannot generalize is listed
+                   on its own — the view never invents a resemblance
+  family <n> [benign-positive|false-positive]
+                   one verdict for the whole family. Writes exactly the rows
+                   the per-incident commands write (one dismissal each), so
+                   precision and tolerance counts are unchanged; what
+                   collapses is the clerical work. Bare `family <n>` prints
+                   its members and identity without deciding anything
   incident <id> [ack|investigate|contain|recover|monitor|resolve|reopen|
                  false-positive|benign-positive]
                    ...the two dismissals are recorded separately and feed
@@ -20659,7 +20834,14 @@ def main(argv):
     if cmd == "mark-uninstalled":  # uninstaller-only
         return cmd_mark_uninstalled()
     if cmd == "incidents":
+        if len(argv) > 2 and argv[2] == "families":
+            return cmd_families()
         return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
+    if cmd == "families":
+        return cmd_families()
+    if cmd == "family" and len(argv) > 2:
+        return cmd_family(argv[2], argv[3] if len(argv) > 3 else None,
+                          argv[4] if len(argv) > 4 else None)
     if cmd == "incident" and len(argv) > 2:
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
