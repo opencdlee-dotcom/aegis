@@ -590,6 +590,28 @@ exact fingerprint, so no other sensor generalizes by accident. The port is
 deliberately kept: it names the service, and a program that starts talking on a
 new one is a new fact.
 
+**The port was doing what the address used to.** Collapsing only the address
+fixed the CDN shape and left the peer-to-peer one standing: Syncthing re-opened
+its judged `risk:` case on ports 50695 and 62429 within hours of that fix
+landing, because a P2P client varies address and port together by design. The
+port stays in the identity — for ordinary software a new port is a new service
+and a real fact — so the exception is made where the evidence for it exists:
+`_carries_new_evidence` lets an incident absorb another port for a program it
+has *itself* already watched across `_ROTATING_MIN_ENDPOINTS` distinct ports.
+The reference incident had sixteen. Two ports establish nothing, which is what
+keeps a service on 80 and 443 reading its next port as news, and rotation is
+established per PROGRAM, so one rotator never covers another. A rotating
+program that starts doing something else — a new sensor, a changed binary —
+is unseen exactly as before.
+
+That bar is `_ROTATING_MIN_ENDPOINTS` rather than the port-named
+`_ROTATING_MIN_PORTS` on purpose: `_rotating_endpoint_memory` demands breadth
+in two dimensions before it grants trust ACROSS incidents, and this set can
+only show one because the classes have already collapsed the addresses — so it
+takes the stricter of the two constants. The question is also narrower than
+that memory's: not "may I tolerate this elsewhere" but "is this port new *to
+this incident*".
+
 It only ever widens what counts as "already seen", so it can attach evidence to
 an incident that is already open or already reviewed and can never suppress a
 case the operator has not seen in some form. A rotating program that starts
@@ -871,7 +893,12 @@ class, an endpoint class, or a tolerance identity — so the grouping asserts
 nothing new: it is the same judgement the tolerance layer makes, surfaced
 before the verdict instead of after it. An incident sharing none of those is
 its own family, so the view can never lump unrelated things together to look
-tidy. `aegis.py family <n> benign-positive` writes exactly the rows the
+tidy — and it says so in as many words, because the synthetic key it mints for
+such a row is unique to that row BY CONSTRUCTION and was being rendered through
+the generic "N incident(s) sharing <key>" branch. On the live queue that was 9
+of 14 lines claiming a shared identity none of them had, in the one view whose
+whole purpose is to show the operator what a single verdict covers.
+`aegis.py family <n> benign-positive` writes exactly the rows the
 per-incident commands write — one dismissal each, through the same transition
 — so precision math, tolerance counts, and the audit trail are unchanged. What
 collapses is the clerical work, which is the part that was actually stopping.

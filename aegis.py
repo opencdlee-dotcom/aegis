@@ -2502,8 +2502,7 @@ def _mark_novelty(db, incident_id, event_ids, now):
     if not event_ids:
         return
     incoming = _event_identities(db, event_ids)
-    if incoming and not incoming.issubset(
-            _incident_identities(db, incident_id)):
+    if _carries_new_evidence(incoming, _incident_identities(db, incident_id)):
         db.execute("UPDATE incidents SET last_novel_at=? WHERE id=?",
                    (now, incident_id))
 
@@ -2550,8 +2549,8 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
             SEV_ORDER.get(reviewed["severity"], -1)
         if reattach:
             incoming = _event_identities(db, event_ids)
-            if incoming and not incoming.issubset(
-                    _incident_identities(db, reviewed["id"])):
+            if _carries_new_evidence(
+                    incoming, _incident_identities(db, reviewed["id"])):
                 reattach = False
         if reattach:
             incident_id = reviewed["id"]
@@ -3070,6 +3069,69 @@ def _recurrence_identity(f):
         return None
     classes = _finding_endpoint_classes(f)
     return classes[0][0] if classes else f.get("fingerprint")
+
+
+# `beacon:<program>:#ip:<port>` — parsed from the RIGHT, because a program
+# path is arbitrary text and `:#ip:` is the only reliable separator in it.
+_BEACON_CLASS_RE = re.compile(r"^beacon:(?P<prog>.+):#ip:(?P<port>\d{1,5})$")
+
+
+def _beacon_class_program(identity):
+    """The program a beacon endpoint class names, or None for anything else."""
+    m = _BEACON_CLASS_RE.match(str(identity or ""))
+    return m.group("prog") if m else None
+
+
+def _port_rotating_programs(identities):
+    """Programs an identity set has ITSELF demonstrated port rotation for.
+
+    A peer-to-peer client varies address and port together by design, so
+    collapsing only the address leaves the port doing exactly what the address
+    used to: Syncthing re-opened a judged `risk:` case on ports 50695 and
+    62429 after the address fix had already landed.
+
+    `_beacon_endpoint_classes` documents this shape and carries a broader
+    `#ip:#port` class for it, but that class is a grant of trust ACROSS
+    incidents and is deliberately hard to earn. The question here is narrower —
+    "is this port new *to this incident*" — and the incident answers it out of
+    what it already holds. Breadth is still the evidence: one program seen on
+    one or two ports generalizes nothing, which is what keeps an ordinary
+    service on 443 (or 80 and 443) reading its next port as the new fact it is.
+
+    The bar is `_ROTATING_MIN_ENDPOINTS`, not `_ROTATING_MIN_PORTS`. The
+    rotation memory demands breadth in two dimensions and this set can only
+    show one — the classes have already collapsed the addresses — so it takes
+    the stricter of the two constants rather than the one that happens to be
+    named for ports."""
+    ports = {}
+    for ident in identities:
+        m = _BEACON_CLASS_RE.match(str(ident or ""))
+        if m:
+            ports.setdefault(m.group("prog"), set()).add(m.group("port"))
+    return {prog for prog, seen in ports.items()
+            if len(seen) >= _ROTATING_MIN_ENDPOINTS}
+
+
+
+
+
+def _carries_new_evidence(incoming, held):
+    """True when `incoming` holds an identity `held` has never seen.
+
+    The plain subset test, plus the one exception above: for a program this
+    incident has already watched rotate across ports, another port is not
+    news. Everything else — a different program, a different sensor, a changed
+    binary — is unseen exactly as before."""
+    if not incoming:
+        return False
+    unseen = incoming - held
+    if not unseen:
+        return False
+    rotating = _port_rotating_programs(held)
+    if rotating:
+        unseen = {i for i in unseen
+                  if _beacon_class_program(i) not in rotating}
+    return bool(unseen)
 
 
 def _incident_identity(row):
@@ -14126,7 +14188,19 @@ def _family_label(key, rows):
     if paths:
         common = os.path.dirname(os.path.commonprefix(paths)) or paths[0]
         return "%d incident(s) on %s" % (len(rows), common)
+    if key.startswith(_FAMILY_UNGROUPED_PREFIX):
+        # The synthetic key `_incident_families` mints for an incident that
+        # generalizes to nothing. It is unique to that row BY CONSTRUCTION, so
+        # rendering it through the "sharing <key>" branch told the operator
+        # these rows shared an identity — the exact opposite of why they are
+        # listed apart, and on this machine that was 9 of 14 lines.
+        return "1 incident, no shared identity — judge it on its own terms"
     return "%d incident(s) sharing %s" % (len(rows), key)
+
+
+# Marks a family of one that generalizes to nothing. Distinct from any real
+# identity, and never rendered as a shared one.
+_FAMILY_UNGROUPED_PREFIX = "incident:"
 
 
 def _incident_families(db):
@@ -14155,7 +14229,9 @@ def _incident_families(db):
         if key is None:
             ident, classes = _incident_identity(row)
             key = classes[0][0] if classes else ident
-        groups.setdefault(key or ("incident:%s" % row["id"]), []).append(row)
+        groups.setdefault(
+            key or ("%s%s" % (_FAMILY_UNGROUPED_PREFIX, row["id"])),
+            []).append(row)
     out = [(k, _family_label(k, v), v) for k, v in groups.items()]
     out.sort(key=lambda t: (-len(t[2]), t[0]))
     return out

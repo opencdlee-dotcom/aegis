@@ -234,3 +234,125 @@ class RotationDoesNotRefreshTheNoveltyClock(Sandbox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PortRotationIsBreadthEarnedInsideTheIncident(unittest.TestCase):
+    """Collapsing the address left the PORT doing what the address used to.
+
+    Syncthing re-opened a judged `risk:` case on ports 50695 and 62429 hours
+    after the address fix landed, because a peer-to-peer client varies address
+    and port together by design. The incident that had already watched it on
+    sixteen ports is the one entitled to say a seventeenth is not news.
+    """
+
+    def held(self, prog, ports):
+        return {"beacon:%s:#ip:%s" % (prog, p) for p in ports}
+
+    def test_a_program_watched_across_many_ports_absorbs_another(self):
+        held = self.held("/opt/st/syncthing", ("22000", "22067", "49803", "54842"))
+        self.assertFalse(aegis._carries_new_evidence(
+            {"beacon:/opt/st/syncthing:#ip:50695"}, held))
+
+    def test_two_ports_is_not_yet_rotation(self):
+        """The discriminating case, and the reason the bar is not
+        `_ROTATING_MIN_PORTS`: an ordinary service answering on 80 and 443 has
+        demonstrated nothing, and its next port is the new fact it is."""
+        held = self.held("/opt/app/svc", ("80", "443"))
+        self.assertTrue(aegis._carries_new_evidence(
+            {"beacon:/opt/app/svc:#ip:4444"}, held))
+
+    def test_rotation_is_established_per_program_not_per_incident(self):
+        held = self.held("/opt/st/syncthing", ("22000", "22067", "49803"))
+        self.assertTrue(aegis._carries_new_evidence(
+            {"beacon:/opt/other/tool:#ip:4444"}, held),
+            "one program's rotation must not cover another's new port")
+
+    def test_a_rotating_program_doing_something_else_still_alerts(self):
+        """The safety pole. Absorbing ports must not absorb the program."""
+        held = self.held("/opt/st/syncthing", ("22000", "22067", "49803"))
+        self.assertTrue(aegis._carries_new_evidence(
+            {"persistence:new:/opt/st/syncthing:abc"}, held))
+
+    def test_an_empty_incoming_set_is_never_new(self):
+        self.assertFalse(aegis._carries_new_evidence(set(), self.held("/x", ("1",))))
+
+
+class AJudgedRotatorStaysJudged(Sandbox):
+    """End to end, on the shape that actually recurred on the reference
+    machine: a peer-to-peer client judged benign must not re-open its case
+    every time it picks a fresh ephemeral port."""
+
+    def _active_risk(self):
+        return [i for i in aegis.list_incidents()
+                if i["title"].startswith("Accumulated risk")
+                and i.get("status") != "FALSE_POSITIVE"]
+
+    def _batch(self, p, port, host=1):
+        # Distinct, VALID addresses: a leading zero ("10.0.0.03") is rejected
+        # by ipaddress, so such a beacon yields no endpoint class at all and
+        # the rotation this test is about would never be established.
+        return [beacon(p, "10.0.0.%d" % host, port),
+                aegis.finding("MEDIUM", "process", "exec", "d",
+                              "process:%s:adhoc:aaa" % p, path=p),
+                aegis.finding("MEDIUM", "net-outbound", "out", "d",
+                              "outbound:%s" % p, path=p)]
+
+    def test_a_new_ephemeral_port_does_not_reopen_the_judged_case(self):
+        p = "/opt/st/syncthing"
+        t0 = 1_700_000_000
+        for i, port in enumerate(("22000", "22067", "49803")):
+            aegis.record_security_state(self._batch(p, port, host=i + 1),
+                                        now=t0 + i * 60)
+        risk = self._active_risk()
+        self.assertEqual(1, len(risk), "setup: the rotator should escalate once")
+        aegis.transition_incident(risk[0]["id"], "FALSE_POSITIVE",
+                                  reason_code="benign-positive")
+
+        aegis.record_security_state(self._batch(p, "50695", host=9),
+                                    now=t0 + 3600)
+        self.assertEqual([], self._active_risk(),
+                         "a fresh ephemeral port re-opened a judged case")
+
+    def test_a_new_SENSOR_on_the_same_rotator_still_opens(self):
+        p = "/opt/st/syncthing2"
+        t0 = 1_700_000_000
+        for i, port in enumerate(("22000", "22067", "49803")):
+            aegis.record_security_state(self._batch(p, port, host=i + 1),
+                                        now=t0 + i * 60)
+        risk = self._active_risk()
+        self.assertEqual(1, len(risk))
+        aegis.transition_incident(risk[0]["id"], "FALSE_POSITIVE",
+                                  reason_code="benign-positive")
+
+        fresh = [aegis.finding("MEDIUM", c, "s%d" % i, "d", "new-%d" % i,
+                               path=p, confidence="medium")
+                 for i, c in enumerate(("persistence", "hot-dir", "behavior"))]
+        aegis.record_security_state(fresh, now=t0 + 30 * 86400)
+        self.assertEqual(1, len(self._active_risk()),
+                         "new evidence on a forgiven rotator was swallowed")
+
+
+class AFamilyOfOneDoesNotClaimAnIdentity(unittest.TestCase):
+    """`families` groups incidents by an identity tolerance already keys on,
+    and lists whatever cannot generalize on its own. The synthetic key it mints
+    for those is unique to one row by construction — but it was rendered through
+    the generic "N incident(s) sharing <key>" branch, so the command reported
+    nine of fourteen live rows as sharing an identity none of them had."""
+
+    def test_the_ungrouped_key_is_never_rendered_as_shared(self):
+        label = aegis._family_label("%s285" % aegis._FAMILY_UNGROUPED_PREFIX,
+                                    [{"id": 285}])
+        self.assertNotIn("sharing", label)
+        self.assertIn("no shared identity", label)
+
+    def test_a_real_shared_identity_still_says_so(self):
+        rows = [{"id": 1}, {"id": 2}]
+        label = aegis._family_label("behavior:bash:fileless-fetch-exec", rows)
+        self.assertIn("sharing", label)
+        self.assertIn("2 incident(s)", label)
+
+    def test_an_endpoint_family_still_names_its_program(self):
+        label = aegis._family_label("beacon:/opt/st/syncthing:#ip:443",
+                                    [{"id": 1}, {"id": 2}])
+        self.assertIn("/opt/st/syncthing", label)
+        self.assertIn("endpoint(s) of one program", label)
