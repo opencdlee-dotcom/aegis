@@ -629,6 +629,48 @@ the same uid defeats any local scheme. This buys tamper **evidence**, not
 tamper-proofing. Resistance beyond that needs a hardware-backed key or a
 root-owned anchor — a deliberate future rung, not this one.
 
+## A report that is true of the scan you are reading
+
+Three defects found together on the live store 2026-08-29, all the same shape:
+the report stated things about THIS scan that were not true of this scan. A
+coverage section that is wrong on most scans is one the reader learns to skip,
+and then the warning that matters is skipped with it — which is how a monitor
+loses its reader without ever missing a detection.
+
+**A recovered sensor clears.** `process.enumerate` emitted health only when it
+FAILED, so a single bad scan on 2026-08-26 pinned its stored row to DEGRADED
+and the report told the operator "the process table could not be read this
+scan" every hour for three days while it was reading fine. Health is now
+reported on every scan, not only on the bad ones. `process.argv` is
+deliberately left unreported when the table could not be read at all: its
+completeness is genuinely unknown then, and the staleness rule below is what
+stops the previous verdict standing in for one nobody took.
+
+**Stale coverage is never green.** Health is stored per sensor and read back
+whole (`get_sensor_health`), so a sensor that stops running keeps its last row
+forever — and one that stopped while OK kept counting toward "38/40 sensors
+OK" indefinitely. That is silent coverage loss rendered green: the exact
+failure `doctor`'s "unknown is never green" rule exists to prevent, never
+applied by the report, which is the surface the operator actually reads.
+`_coverage_split` sorts the stored rows four ways — live, stale, permanent,
+degraded — by comparing each row's `last_run_at` against the newest in the same
+batch. A stale row is named as DID NOT RUN with the age of its last report,
+and counted apart from both the healthy and the failing.
+
+**A permanent gap is stated once.** An OS privilege wall (`PRIVILEGED`) is a
+permanent fact about the machine, so it is named in the one-line context —
+which surface it costs, still counted against the sensor total — rather than
+re-explained in full every hour for months. A transient `DEGRADED` keeps its
+whole explanation, because that is the one the operator can act on.
+
+**The report says whether it is running at all.** A monitor that silently
+stopped is its worst failure and was the one thing the report could not show:
+every line described the scan being read, so a scan that never happened
+produced no line. The heartbeat is written AFTER the report, so the file on
+disk during rendering is the PREVIOUS scan's — liveness for free, with no new
+state. A normal cadence reads as `Watched · previous scan 1 hour ago`; a gap
+over `_SCAN_GAP_ALARM` is called out as unobserved time.
+
 ## Provenance tier
 
 Measured on the reference machine 2026-08-29, after the signal-to-noise and
