@@ -32,6 +32,20 @@ AIKIT_RUN = "/Users/me/Ai/Universe/tools/aikit/schedule/run.py"
 UV_SHA = "94" + "1" * 62
 
 
+def _baseline_shaped(rec):
+    """A record as snapshot_persistence() really emits it — args AND
+    args_sha256, script_target and target_sha. A fixture that omits them does
+    not model the store, and check_persistence compares exactly those fields."""
+    out = dict(rec)
+    out["args_sha256"] = aegis.hashlib.sha256(
+        aegis.json.dumps(out.get("args"), sort_keys=True,
+                         default=str).encode()).hexdigest()
+    out.setdefault("script_target",
+                   aegis._script_target(out.get("args"), out.get("program")))
+    out.setdefault("target_sha", "9" * 64)
+    return out
+
+
 def _job(name, program=AIKIT_UV, sha=UV_SHA, target=AIKIT_RUN, trust=None):
     """A launchd record for one job of a scheduler kit. The trust class comes
     from conftest, not from a macOS literal: "adhoc" is not suspicious on
@@ -492,6 +506,210 @@ class FamiliesAreTheAdjudicationSurface(unittest.TestCase):
         self._open(self._kit("alpha"))
         self.assertEqual(aegis.cmd_family("7", "benign-positive"), 2)
         self.assertEqual(aegis.cmd_family("1", "not-a-verdict"), 2)
+
+
+class AcceptedStateIsDurable(unittest.TestCase):
+    """The core defect the mute layers were standing in for.
+
+    `cmd_scan` writes baseline["persistence"] only on `first_run`, so an item
+    installed later is absent from it permanently and re-emits
+    `persistence:new` on EVERY scan — one such item on the reference machine
+    carried 68 evidence events for something new exactly once, and re-fed
+    correlation each time. Every downstream mechanism (seen ledger, tolerance,
+    age-out, families) was buying silence for a fact the sensor would not stop
+    asserting. A verdict that never reaches the baseline ends nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_accept_")
+        self.saved = tuple(getattr(aegis, n) for n in
+                           ("STATE_DIR", "EVENT_DB", "BASELINE", "SELFSTATE",
+                            "RUN_LOG"))
+        aegis.STATE_DIR = self.tmp
+        for name, fn in (("EVENT_DB", "t.db"), ("BASELINE", "baseline.json"),
+                         ("SELFSTATE", "selfstate.json"), ("RUN_LOG", "run.log")):
+            setattr(aegis, name, os.path.join(self.tmp, fn))
+        self.now = aegis._epoch()
+        self.path, rec = _job("alpha")
+        self.rec = _baseline_shaped(rec)
+        self.live = {self.path: self.rec}
+        aegis.save_json(aegis.BASELINE, {"persistence": {}, "created": "x"})
+        self._patch_snapshot(self.live)
+
+    def tearDown(self):
+        aegis.snapshot_persistence = self._real_snapshot
+        for name, value in zip(("STATE_DIR", "EVENT_DB", "BASELINE",
+                                "SELFSTATE", "RUN_LOG"), self.saved):
+            setattr(aegis, name, value)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_snapshot(self, live):
+        self._real_snapshot = aegis.snapshot_persistence
+        aegis.snapshot_persistence = lambda: live
+
+    def _findings(self):
+        base = aegis.load_baseline()[0].get("persistence") or {}
+        return aegis.check_persistence(base, aegis.snapshot_persistence())
+
+    def _open_incident(self, finding):
+        db = aegis._event_connection()
+        with db:
+            cur = db.execute(
+                "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                "data_json) VALUES(?,?,?,?,?)",
+                (self.now, self.now, "persistence", "observation.finding",
+                 aegis.json.dumps(finding)))
+            i = aegis._upsert_incident(
+                db, "signal:" + finding["fingerprint"], finding["title"],
+                finding["severity"], "signal", self.now, [cur.lastrowid],
+                subject=finding.get("subject"))
+        db.close()
+        return i
+
+    def test_a_verdict_stops_the_fact_being_asserted(self):
+        f = self._findings()[0]
+        self.assertEqual(f["title"], "New persistence item")
+        i = self._open_incident(f)
+        self.assertEqual(aegis._accept_into_baseline([i]), [self.path])
+        self.assertEqual(self._findings(), [],
+                         "an accepted item must stop being reported at all, "
+                         "not be reported and then muted")
+
+    def test_a_change_to_an_accepted_item_still_alerts(self):
+        """The safety half, and the reason accepting BYTES rather than a path
+        is the whole design: accepting a job must never accept its next
+        mutation."""
+        i = self._open_incident(self._findings()[0])
+        aegis._accept_into_baseline([i])
+        for field, value in (("sha256", "ff" + "1" * 62),
+                             ("target_sha", "ab" * 32),
+                             ("env", {"DYLD_INSERT_LIBRARIES": "/tmp/x.dylib"})):
+            self.live[self.path] = dict(self.rec, **{field: value})
+            titles = [f["title"] for f in self._findings()]
+            self.assertEqual(titles, ["Persistence item CHANGED"], field)
+        self.live[self.path] = self.rec
+
+    def test_accepting_upgrades_a_record_that_could_not_see_payload_swaps(self):
+        """`target_changed` needs the payload hash on BOTH sides, so that a
+        field merely appearing is not read as a swap. Every baseline record
+        written before runner subcommands were understood therefore carries
+        target_sha None for a uv/poetry/npx job and is PERMANENTLY blind to a
+        payload swap — verified on the live store, where the one aikit job
+        that reached the baseline has script_target None. Accepting rewrites
+        the record from a current snapshot, so the verdict that quiets the
+        noise is also what turns that detection on."""
+        legacy = dict(self.rec, script_target=None, target_sha=None)  # pre-fix
+        aegis.save_json(aegis.BASELINE,
+                        {"persistence": {self.path: legacy}, "created": "x"})
+        swapped = dict(self.rec, target_sha="ab" * 32)
+        self.live[self.path] = swapped
+        self.assertEqual(self._findings(), [],
+                         "a legacy record cannot see a payload swap")
+        # the operator accepts the item; the record is rewritten from the snapshot
+        self.live[self.path] = dict(self.rec, target_sha="cd" * 32)
+        f = aegis.finding("HIGH", "persistence", "New persistence item", "d",
+                          "persistence:new:%s:%s" % (self.path,
+                                                     self.rec["sha256"]))
+        aegis.save_json(aegis.BASELINE, {"persistence": {}, "created": "x"})
+        i = self._open_incident(self._findings()[0])
+        aegis._accept_into_baseline([i])
+        stored = aegis.load_baseline()[0]["persistence"][self.path]
+        self.assertEqual(stored.get("target_sha"), "cd" * 32)
+        self.live[self.path] = dict(self.rec, target_sha="ef" * 32)
+        self.assertEqual([x["title"] for x in self._findings()],
+                         ["Persistence item CHANGED"],
+                         "the upgraded record now sees the swap")
+        self.live[self.path] = self.rec
+
+    def test_a_fact_that_no_longer_holds_is_not_promoted(self):
+        """If the item changed between the alert and the verdict, the operator
+        reviewed something that is no longer true — promoting the CURRENT
+        bytes would bless an unreviewed change."""
+        i = self._open_incident(self._findings()[0])
+        self.live[self.path] = dict(self.rec, sha256="ee" + "1" * 62)
+        self.assertEqual(aegis._accept_into_baseline([i]), [])
+        self.assertNotEqual(self._findings(), [])
+
+    def test_the_deliberate_write_is_watermarked(self):
+        """An unwatermarked baseline write reads as tampering on the very next
+        scan — the machine's own 'baseline modified out-of-band' HIGH."""
+        i = self._open_incident(self._findings()[0])
+        aegis._accept_into_baseline([i])
+        state = aegis.load_json(aegis.SELFSTATE, {})
+        self.assertEqual(state.get("baseline_sha"),
+                         aegis.sha256(aegis.BASELINE))
+
+    def test_only_a_human_benign_verdict_promotes(self):
+        """The first-run rule exists so a planted job is never laundered into
+        known-good. Nothing here may promote on a machine verdict, and
+        attack-defined evidence never promotes at all."""
+        db = aegis._event_connection()
+        with db:
+            db.execute(
+                "INSERT INTO incidents(kind,correlation_key,title,severity,"
+                "status,created_at,first_seen,last_seen,updated_at,"
+                "reminder_count) VALUES('signal',?,'t','HIGH','OPEN',?,?,?,?,0)",
+                ("signal:decoy:tripped:" + self.path, self.now, self.now,
+                 self.now, self.now))
+            decoy = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.close()
+        self.assertEqual(aegis._accept_into_baseline([decoy]), [])
+        self.assertEqual(aegis._accept_into_baseline([]), [])
+
+    def test_a_corrupt_baseline_is_never_written_over(self):
+        with open(aegis.BASELINE, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        i = self._open_incident(aegis.finding(
+            "HIGH", "persistence", "New persistence item", "d",
+            "persistence:new:%s:%s" % (self.path, "a" * 64)))
+        self.assertEqual(aegis._accept_into_baseline([i]), [])
+        with open(aegis.BASELINE, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{not json")
+
+    def test_acceptance_covers_every_baseline_diffed_surface(self):
+        """Persistence is 13 of the 64 facts the live store re-asserted every
+        scan; 38 were `AI-agent skill changed` and 11 more agent-surface. A
+        fix wired to one sensor would have left 50 in place and the headline
+        count pinned far above zero, so acceptance walks the same registry the
+        scan does."""
+        keys = {k for k, _s, _d in aegis._acceptable_surfaces()}
+        self.assertIn("persistence", keys)
+        for expected in ("agent_skills", "agent_surface", "shellrc"):
+            self.assertIn(expected, keys)
+
+    def test_a_never_adopted_surface_is_never_accepted(self):
+        """The live-vs-residue rule: an active remote login is CURRENT ACCESS,
+        not installed residue, so it is the one surface where 'stop telling
+        me' must not be honoured."""
+        never = {aegis._surface_row(r)[0] for r in aegis.SURFACES
+                 if aegis._surface_row(r)[4]}
+        keys = {k for k, _s, _d in aegis._acceptable_surfaces()}
+        self.assertTrue(never, "fixture assumes at least one such surface")
+        self.assertFalse(never & keys)
+
+    def test_a_surface_with_no_resolvable_entity_fails_closed(self):
+        """xprotect_corpus is one RECORD ({rules, count}) about Apple's
+        malware definitions, not a set of entities the operator owns — its
+        fingerprint names a rule digest, so nothing resolves and a verdict
+        cannot bless a corpus change."""
+        f = {"fingerprint": "xprotect-corpus:added:d66923ad3f7d", "path": None}
+        self.assertIsNone(aegis._accepted_entry_key(
+            f, {"rules": {}, "count": 1}, {"rules": {}, "count": 2}))
+
+    def test_the_longest_matching_key_wins(self):
+        """`skills/archive` must not shadow `skills/archive-tool`."""
+        snap = {"skills/archive": {}, "skills/archive-tool": {}}
+        f = {"fingerprint": "agent-skill:changed:skills/archive-tool:abcdef",
+             "path": None}
+        self.assertEqual(aegis._accepted_entry_key(f, snap, snap),
+                         "skills/archive-tool")
+
+    def test_an_unreadable_surface_promotes_nothing(self):
+        """A non-answer is not an empty world — the same rule _scan_surfaces
+        holds for a sensor that could not read."""
+        i = self._open_incident(self._findings()[0])
+        aegis.snapshot_persistence = lambda: None
+        self.assertEqual(aegis._accept_into_baseline([i]), [])
 
 
 if __name__ == "__main__":

@@ -691,6 +691,48 @@ the operator already reviewed stops firing. `learning` is deliberately not
 quieted here, because the learning period's documented promise is that
 `CRITICAL` chains alert throughout it.
 
+**Accepted state is durable — the defect the mute layers stood in for.**
+`cmd_scan` writes `baseline["persistence"]` only on `first_run`, and every
+other baseline-diffed surface is adopted once and never again. Anything
+installed after that is absent from the baseline permanently, so its sensor
+re-emits the same finding on EVERY scan: one launchd item on the reference
+machine carried 68 evidence events for something that was new exactly once,
+and re-fed correlation each time. Everything above — the seen ledger, acquired
+tolerance, age-out, families — was buying silence for facts the sensors would
+not stop asserting. A verdict that never reaches the baseline ends nothing.
+
+A human `benign-positive` promotes the item into the baseline
+(`_accept_into_baseline`). This is not the hole the first-run rule exists to
+prevent: silently absorbing an unreviewed item would launder a planted job
+into known-good, which is why the baseline is written once — promoting on the
+operator's explicit verdict is the difference between a machine deciding
+something is normal and a human saying so. Two guards make the write safe: the
+fact must still be EXACTLY true (the whole diff is recomputed and the
+incident's own fingerprint must still appear in it, so an item that changed
+between the alert and the verdict promotes nothing), and the accepted BYTES
+are what land, so accepting a job never accepts its next mutation. The
+baseline is re-watermarked, or the deliberate write reads as tampering on the
+next scan.
+
+It walks the same surface registry the scan does, because persistence was only
+13 of the 64 facts the live store re-asserted every scan — 38 were `AI-agent
+skill changed` and 11 more agent-surface, so a fix wired to one sensor would
+have left 50 in place. Measured on the live store: **64 re-asserted findings
+-> 1**. The survivor is `xprotect_corpus`, correctly: it is one RECORD
+describing Apple's malware definitions rather than a set of entities the
+operator owns, its fingerprint names a rule digest, and
+`_accepted_entry_key` fails closed rather than let a verdict bless a corpus
+change. Never-adopted surfaces (an active remote login is CURRENT ACCESS, not
+installed residue), attack-defined evidence, and any surface whose backing
+command could not be read are all refused.
+
+One security gain falls out of it. `target_changed` requires the payload hash
+on BOTH sides so a newly-appearing field is not read as a swap — so every
+baseline record written before runner subcommands were understood carries
+`target_sha` None for a uv/poetry/npx job and is permanently blind to a
+payload swap. Accepting rewrites the record from a current snapshot, so the
+verdict that quiets the noise is also what turns that detection on.
+
 **Families: a verdict nobody gives teaches nothing.** Every mechanism above
 learns from the operator's own `benign-positive` verdicts, and on the reference
 machine those arrived in three bursts (33, then 70, then 15) and stopped — nine
