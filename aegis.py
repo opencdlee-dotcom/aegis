@@ -13719,6 +13719,161 @@ def cmd_report(full=False):
 # clerical work, which is the part that was actually stopping.
 # --------------------------------------------------------------------------- #
 
+def _accept_into_baseline(incident_ids):
+    """Promote persistence items the operator just called benign into the
+    baseline, and return the paths accepted.
+
+    This is the fix the mute layers were standing in for. `cmd_scan` writes
+    baseline["persistence"] only on `first_run`, so an item installed later is
+    absent from it permanently and `check_persistence` re-emits
+    `persistence:new` for it on EVERY scan, forever — one such item on the
+    reference machine had accumulated 68 evidence events for something that
+    was new exactly once, and re-fed the correlation engine each time. Every
+    mechanism downstream (the seen ledger, acquired tolerance, age-out,
+    families) was compensating for a sensor whose "new" could never become
+    "known". A verdict that does not reach the baseline does not end anything;
+    it only buys silence, and it has to keep buying it.
+
+    Why this is not the hole the first-run rule exists to prevent. Silently
+    absorbing an unreviewed persistence item would launder a planted job into
+    known-good — that is why the baseline is written once. This promotes ONLY
+    on the operator's explicit `benign-positive`, which is the difference
+    between a machine deciding something is normal and a human saying so.
+
+    Two guards make it safe to write:
+
+    · The fact must still be EXACTLY true. Rather than trusting a parsed path,
+      the whole persistence diff is recomputed and the incident's own
+      fingerprint must still appear in it. If the item changed between the
+      alert and the verdict, the fingerprint is gone, nothing is promoted, and
+      the change stands as its own unreviewed fact.
+    · The accepted BYTES are what lands. The baseline record carries the
+      program hash, args, env and payload hash, so `check_persistence` still
+      diffs against exactly what was reviewed — accepting a job does not
+      accept its next mutation, which is the whole point of a baseline.
+
+    The baseline is re-watermarked, or the deliberate write would read as
+    tampering on the very next scan (`_record_baseline_watermark`, the same
+    discipline `learn` already uses).
+    """
+    if not incident_ids:
+        return []
+    baseline, corrupt = load_baseline()
+    if corrupt or not baseline:
+        return []
+    db = _event_connection()
+    try:
+        marks = ",".join("?" for _ in incident_ids)
+        wanted = {row[0][len("signal:"):] for row in db.execute(
+            "SELECT correlation_key FROM incidents WHERE id IN (%s)" % marks,
+            tuple(incident_ids)).fetchall()
+            if (row[0] or "").startswith("signal:")}
+    finally:
+        db.close()
+    if not wanted or any(w.startswith(_NEVER_TOLERATE_PREFIXES) for w in wanted):
+        return []
+    wanted = set(wanted)
+    accepted, dirty = [], False
+    # Every baseline-diffed surface has the same defect, so acceptance walks
+    # the same registry the scan does rather than knowing about persistence
+    # alone. Measured on the live store: 38 of 93 findings per scan were
+    # `AI-agent skill changed` and 12 more were agent-surface — a fix wired
+    # only to persistence would have left 50 permanently-re-asserted facts in
+    # place and the headline count still pinned far above zero.
+    #
+    # Surfaces are snapshotted LAZILY and the walk stops as soon as every
+    # accepted fingerprint is accounted for: a verdict is interactive, and a
+    # family is almost always one surface, so the usual cost is one snapshot
+    # rather than a whole scan's worth of I/O.
+    for key, snap_fn, diff_fn in _acceptable_surfaces():
+        if not wanted:
+            break
+        prior = baseline.get(key)
+        if not isinstance(prior, dict):
+            continue
+        try:
+            live = snap_fn()
+        except Exception as e:
+            log_run("baseline acceptance skipped %s: %s" % (key, e))
+            continue
+        if not isinstance(live, dict):
+            # A non-answer is not an empty world — never accept over a surface
+            # whose backing command could not be read this run.
+            continue
+        for f in diff_fn(prior, live):
+            if f["fingerprint"] not in wanted:
+                continue
+            entry = _accepted_entry_key(f, prior, live)
+            if entry is None:
+                continue
+            if entry in live:
+                # Stored verbatim from the snapshot, which is ALREADY in
+                # baseline shape (persistence emits args_sha256 alongside args,
+                # exactly as the store holds it). Re-deriving the shape here
+                # would make the accepted record differ from every other one,
+                # and the diffs compare those fields like-for-like — so the
+                # item would report CHANGED on every scan from then on, which
+                # is the noise this whole path exists to end.
+                prior[entry] = live[entry]
+            else:
+                prior.pop(entry, None)
+            baseline[key] = prior
+            wanted.discard(f["fingerprint"])
+            accepted.append(entry)
+            dirty = True
+    if not dirty:
+        return []
+    save_json(BASELINE, baseline)
+    _record_baseline_watermark()
+    log_run("accepted %d item(s) into the baseline" % len(accepted))
+    return accepted
+
+
+def _acceptable_surfaces():
+    """(key, snapshot_fn, diff_fn) for every baseline-diffed surface, core
+    persistence first because it is the one that is not in SURFACES."""
+    rows = [("persistence", snapshot_persistence, check_persistence)]
+    for row in SURFACES:
+        key, snap_fn, diff_fn, _scope, never_adopt = _surface_row(row)
+        # A surface that is never silently adopted is one the README's
+        # live-vs-residue rule says the operator must keep hearing about (an
+        # active remote login is CURRENT ACCESS, not installed residue). An
+        # explicit verdict is a stronger signal than adoption, but this is the
+        # one place where "stop telling me" is the wrong thing to honour.
+        if not never_adopt:
+            rows.append((key, snap_fn, diff_fn))
+    return rows
+
+
+def _accepted_entry_key(f, prior, live):
+    """Which snapshot entry a finding is about.
+
+    Most diffs name it as `path`, but the snapshots are keyed differently per
+    surface (agent_skills by `skills/<name>`, shellrc by absolute path), so a
+    path-only rule would silently accept nothing on half of them. The
+    fingerprint always embeds the key, so the fallback is the longest snapshot
+    key it contains — longest so `skills/archive` cannot shadow
+    `skills/archive-tool`.
+
+    Fails CLOSED, and that matters: not every baseline surface is a set of
+    entities the operator owns. `xprotect_corpus` is one RECORD describing
+    Apple's malware definitions ({rules, count}), and its fingerprint names a
+    rule digest rather than a snapshot key — so nothing resolves, nothing is
+    accepted, and a verdict cannot quietly bless a change to the corpus. A
+    surface whose keys this cannot find keeps reporting, which is the right
+    failure direction for an accept path."""
+    path = f.get("path")
+    if path and (path in live or path in prior):
+        return path
+    fp = f.get("fingerprint") or ""
+    best = None
+    for candidate in list(live) + list(prior):
+        if candidate and candidate in fp and (
+                best is None or len(candidate) > len(best)):
+            best = candidate
+    return best
+
+
 def _family_label(key, rows):
     """A one-line human name for what the operator is being asked about."""
     paths = []
@@ -13842,9 +13997,14 @@ def cmd_family(number, action=None, reason=None):
             done.append(row["id"])
         else:
             refused.append(row["id"])
+    accepted = _accept_into_baseline(done) if verb == "benign-positive" else []
     print("Family %d — %s" % (n, label))
     print("  %s recorded on %d incident(s): %s"
           % (verb, len(done), " ".join("#%s" % i for i in done) or "none"))
+    if accepted:
+        print("  %d item(s) accepted into the baseline — the sensor stops "
+              "reporting them (a CHANGE to any of them still alerts)"
+              % len(accepted))
     if refused:
         print("  refused (not in a dismissable state): %s"
               % " ".join("#%s" % i for i in refused))
@@ -14105,6 +14265,10 @@ def cmd_incident(incident_id, action=None, reason=None):
             print("refuse: invalid transition from %s to %s" %
                   ((current or {}).get("status", "missing"), new_status))
             return 1
+        if reason_code == "benign-positive":
+            for path in _accept_into_baseline([incident_id]):
+                print("accepted into the baseline: %s\n  the sensor stops "
+                      "reporting it; a CHANGE to it still alerts" % path)
     item = incident_detail(incident_id)
     if not item:
         print("no such incident: %s" % incident_id)
