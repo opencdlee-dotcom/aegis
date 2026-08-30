@@ -629,6 +629,43 @@ the same uid defeats any local scheme. This buys tamper **evidence**, not
 tamper-proofing. Resistance beyond that needs a hardware-backed key or a
 root-owned anchor — a deliberate future rung, not this one.
 
+## Every surface answers the question before it shows the evidence
+
+Not one defect in this tier was a missed detection. Every one was a surface
+asserting something that was not true at the moment it was read — which is the
+failure that costs the alerts that *are* real, because it teaches the operator
+that this output does not repay attention.
+
+**The report is rendered when READ, from live incident state.** `cmd_report`
+used to `cat` latest.md, a file frozen at scan time, so resolving anything left
+the report describing a world that no longer existed until the next hourly
+scan: on the reference machine, "1 CRITICAL incident still open" in red, after
+the operator had closed it. Only the incident state is re-read — findings,
+sensor health and the new-since-last-scan set are properties OF that scan and
+would be falsified, not refreshed, by recomputing them at read time.
+latest.md is still written at scan time for anything tailing the file.
+
+**Green means green.** The verdict ladder gained a `review` rung, because its
+worst state was a true sentence that misled: with fourteen incidents waiting
+and nothing new, the headline read "Nothing new" over a green dot. Stale red is
+annoying; misleading green is what stops a reader looking. `clear` now requires
+nothing new AND nothing waiting, and reads *Protected*. The self-check asserts
+both directions — green over a queue, and "waiting" with none open.
+
+**The headline leads with what needs action.** It opened with "N findings this
+scan", an observation count that never reaches zero on a live machine, so every
+report read like a problem list. The count is still published verbatim by the
+self-check line, so nothing was hidden to make the surface look calmer.
+
+**`status` answers before it enumerates.** Forty-odd rows printed in source
+order meant its real problems sat among green ticks — XProtect definitions 93
+days stale was line 8 of 45, and stale intel feeds were not noticed by anyone
+until the verdict counted them. Problem rows are collected and printed above
+the fold; the full column still follows. It also applies the same staleness
+rule as the report, because reading the stored health rows raw showed a
+sensor that had stopped running as a green tick, in the one command an
+operator uses to ask whether coverage is intact.
+
 ## A report that is true of the scan you are reading
 
 Three defects found together on the live store 2026-08-29, all the same shape:

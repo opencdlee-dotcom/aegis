@@ -18,8 +18,11 @@ report stated things about THIS scan that were not true of this scan.
 A coverage section that is wrong on most scans is one the reader learns to
 skip — and then the warning that matters gets skipped with it.
 """
+import contextlib
+import io
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -131,6 +134,120 @@ class TheReportSaysWhetherItIsRunning(unittest.TestCase):
             self.assertEqual(aegis._liveness_line(value), "")
 
 
+class GreenMeansGreen(unittest.TestCase):
+    """The verdict ladder's worst state was a true sentence that misled.
+
+    With fourteen incidents waiting and nothing new that scan, the headline
+    read "Nothing new" over a green dot — accurate, and exactly the thing that
+    stops a reader looking. Stale red is annoying; misleading green is what
+    costs you the next real alert."""
+
+    @staticmethod
+    def _inc(n, severity="HIGH"):
+        return [{"id": i, "severity": severity, "status": "OPEN",
+                 "title": "t", "evidence_count": 1} for i in range(n)]
+
+    def _head(self, new_findings, incidents):
+        return aegis._brief_report([], new_findings, incidents, [], False,
+                                   0, 0).splitlines()[2]
+
+    def test_a_backlog_is_never_green(self):
+        head = self._head([], self._inc(14))
+        self.assertIn("14 items waiting on you", head)
+        self.assertNotIn(aegis.VERDICT_ICON["clear"], head)
+
+    def test_clear_means_nothing_new_and_nothing_waiting(self):
+        head = self._head([], [])
+        self.assertIn("Protected", head)
+        self.assertIn(aegis.VERDICT_ICON["clear"], head)
+
+    def test_one_waiting_item_reads_singular(self):
+        self.assertIn("1 item waiting on you", self._head([], self._inc(1)))
+
+    def test_a_new_alert_still_outranks_the_backlog(self):
+        """The safety half: a fresh HIGH must not be demoted to 'waiting'."""
+        f = aegis.finding("HIGH", "process", "t", "d", "process:x:y:z")
+        self.assertIn("NEW alert", self._head([f], self._inc(14)))
+
+    def test_an_open_critical_still_outranks_the_backlog(self):
+        head = self._head([], self._inc(3, severity="CRITICAL"))
+        self.assertIn("CRITICAL", head)
+
+    def test_the_self_check_catches_a_green_headline_over_a_queue(self):
+        problems = aegis._report_self_check("clear", [], [], self._inc(4))
+        self.assertTrue(any("waiting" in p for p in problems))
+        self.assertEqual(aegis._report_self_check("review", [], [],
+                                                  self._inc(4)), [])
+        self.assertTrue(aegis._report_self_check("review", [], [], []))
+
+
+class TheReportIsTrueWhenRead(unittest.TestCase):
+    """cmd_report used to `cat` a file frozen at scan time, so resolving an
+    incident left the report insisting it was still open until the next hourly
+    scan — on the reference machine, "1 CRITICAL incident still open" in red,
+    after the operator had closed it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_rep_")
+        self.saved = tuple(getattr(aegis, n) for n in
+                           ("STATE_DIR", "EVENT_DB", "LATEST_JSON", "LATEST_MD",
+                            "BASELINE"))
+        aegis.STATE_DIR = self.tmp
+        for name, fn in (("EVENT_DB", "t.db"), ("LATEST_JSON", "latest.json"),
+                         ("LATEST_MD", "latest.md"),
+                         ("BASELINE", "baseline.json")):
+            setattr(aegis, name, os.path.join(self.tmp, fn))
+
+    def tearDown(self):
+        for name, value in zip(("STATE_DIR", "EVENT_DB", "LATEST_JSON",
+                                "LATEST_MD", "BASELINE"), self.saved):
+            setattr(aegis, name, value)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _render(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            aegis.cmd_report()
+        return buf.getvalue()
+
+    def test_resolving_an_incident_changes_the_report_without_a_rescan(self):
+        now = aegis._epoch()
+        db = aegis._event_connection()
+        with db:
+            db.execute(
+                "INSERT INTO incidents(kind,correlation_key,title,severity,"
+                "status,created_at,first_seen,last_seen,updated_at,"
+                "reminder_count) VALUES('signal',?,?,'HIGH','OPEN',?,?,?,?,0)",
+                ("signal:x:y", "a thing", now, now, now, now))
+            iid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.close()
+        aegis.save_json(aegis.LATEST_JSON, {
+            "ts": "t", "findings": [], "incidents": [], "sensor_health": [],
+            "new_fingerprints": [], "scan_at": now, "first_run": False,
+            "aged": 0, "quiet": 0})
+        self.assertIn("1 item waiting on you", self._render())
+        aegis.transition_incident(iid, "FALSE_POSITIVE",
+                                  reason_code="benign-positive")
+        after = self._render()
+        self.assertIn("Protected", after)
+        self.assertNotIn("waiting on you", after)
+
+    def test_scan_properties_are_not_recomputed_at_read_time(self):
+        """Only the incident state is live. The findings and the
+        new-since-last-scan set are properties OF that scan; recomputing them
+        here would falsify them, not refresh them."""
+        now = aegis._epoch()
+        f = aegis.finding("MEDIUM", "process", "t", "d", "process:a:b:c")
+        aegis.save_json(aegis.LATEST_JSON, {
+            "ts": "t", "findings": [f], "incidents": [], "sensor_health": [],
+            "new_fingerprints": [f["fingerprint"]], "scan_at": now,
+            "first_run": False, "aged": 0, "quiet": 0})
+        out = self._render()
+        self.assertIn("1 new finding", out)
+        self.assertIn("against 1 finding(s)", out)
+
+
 class TheBriefReportRendersAllOfIt(unittest.TestCase):
     def _render(self, health, prev=None):
         return aegis._brief_report([], [], [], health, False, 0, 0,
@@ -159,6 +276,74 @@ class TheBriefReportRendersAllOfIt(unittest.TestCase):
         self.assertIn("Watched", self._render([_h("a")],
                                               prev=aegis._epoch() - 600))
         self.assertNotIn("Watched", self._render([_h("a")]))
+
+
+class StatusLeadsWithTheAnswer(unittest.TestCase):
+    """`status` printed forty-odd rows in source order, so its real problems
+    sat among green ticks: on the reference machine XProtect definitions 93
+    days stale was line 8 of 45, and stale intel feeds were never noticed at
+    all until the verdict counted them. An operator asking "am I OK?" had to
+    audit every row to answer it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_status_")
+        self.saved = tuple(getattr(aegis, n) for n in
+                           ("STATE_DIR", "EVENT_DB", "BASELINE"))
+        aegis.STATE_DIR = self.tmp
+        aegis.EVENT_DB = os.path.join(self.tmp, "t.db")
+        aegis.BASELINE = os.path.join(self.tmp, "baseline.json")
+
+    def tearDown(self):
+        for name, value in zip(("STATE_DIR", "EVENT_DB", "BASELINE"),
+                               self.saved):
+            setattr(aegis, name, value)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _status(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            aegis.cmd_status()
+        return buf.getvalue()
+
+    def test_the_verdict_is_the_first_line(self):
+        first = self._status().splitlines()[0]
+        self.assertTrue(
+            any(icon in first for icon in ("🔴", "🟡", "🟢")),
+            "the answer must precede the evidence, not follow 45 rows of it")
+
+    def test_every_problem_row_is_repeated_at_the_top(self):
+        out = self._status()
+        head, _sep, _rest = out.partition("# Aegis hardening posture")
+        for line in out.splitlines():
+            if line.strip()[:1] == "✗":
+                self.assertIn(line, head,
+                              "a problem must appear above the fold")
+
+    def test_the_full_column_is_still_printed(self):
+        """Nothing is removed to make the surface look calmer — the verdict is
+        an index into the evidence, not a replacement for it."""
+        out = self._status()
+        self.assertIn("# Aegis hardening posture", out)
+        self.assertIn("# Survivability", out)
+
+    def test_a_stale_sensor_is_not_a_green_tick(self):
+        """status reads the stored health rows, so without the staleness rule
+        a sensor that stopped running showed OK forever — in the one place an
+        operator goes to check exactly that."""
+        now = aegis._epoch()
+        db = aegis._event_connection()
+        with db:
+            for sid, at in (("alive", now), ("dead", now - 5 * 86400)):
+                db.execute(
+                    "INSERT INTO sensor_status(sensor_id,status,last_run_at,"
+                    "last_ok_at,duration_ms,item_count,detail,"
+                    "consecutive_failures) VALUES(?,?,?,?,0,0,'',0)",
+                    (sid, "OK", at, at))
+        db.close()
+        out = self._status()
+        self.assertRegex(out, r"✗\s+dead\s+DID NOT RUN")
+        self.assertRegex(out, r"✓\s+alive")
 
 
 if __name__ == "__main__":
