@@ -2445,43 +2445,48 @@ def _severity_max(a, b):
     return a if SEV_ORDER.get(a, -1) >= SEV_ORDER.get(b, -1) else b
 
 
-def _event_fingerprints(db, event_ids):
-    """The set of finding fingerprints behind `event_ids` (from each event's
-    stored finding JSON). Used to tell genuine recurrence from new evidence."""
+def _event_identities(db, event_ids):
+    """The set of RECURRENCE IDENTITIES behind `event_ids` (from each event's
+    stored finding JSON). Used to tell genuine recurrence from new evidence.
+
+    Identities, not raw fingerprints, because a beacon fingerprint names the
+    address it was seen talking to: see `_recurrence_identity`. Every caller
+    here is asking "is this something this incident has already seen?", and a
+    rotated address is not."""
     if not event_ids:
         return set()
     marks = ",".join("?" for _ in event_ids)
-    fps = set()
+    idents = set()
     for row in db.execute("SELECT data_json FROM events WHERE id IN (%s)" % marks,
                           tuple(event_ids)).fetchall():
         try:
-            fp = json.loads(row["data_json"]).get("fingerprint")
+            ident = _recurrence_identity(json.loads(row["data_json"]))
         except Exception:
-            fp = None
-        if fp:
-            fps.add(fp)
-    return fps
+            ident = None
+        if ident:
+            idents.add(ident)
+    return idents
 
 
-def _incident_fingerprints(db, incident_id):
-    """Every finding fingerprint ever attached to `incident_id`."""
-    fps = set()
+def _incident_identities(db, incident_id):
+    """Every recurrence identity ever attached to `incident_id`."""
+    idents = set()
     for row in db.execute(
             "SELECT e.data_json FROM incident_events ie "
             "JOIN events e ON ie.event_id=e.id WHERE ie.incident_id=?",
             (incident_id,)).fetchall():
         try:
-            fp = json.loads(row["data_json"]).get("fingerprint")
+            ident = _recurrence_identity(json.loads(row["data_json"]))
         except Exception:
-            fp = None
-        if fp:
-            fps.add(fp)
-    return fps
+            ident = None
+        if ident:
+            idents.add(ident)
+    return idents
 
 
 def _mark_novelty(db, incident_id, event_ids, now):
     """Advance an incident's novelty clock when the incoming evidence carries
-    a fingerprint it has never held before.
+    a recurrence identity it has never held before.
 
     The distinction this draws is the whole of the age-out fix. `updated_at`
     answers "when did this incident last receive evidence", and for anything
@@ -2496,9 +2501,9 @@ def _mark_novelty(db, incident_id, event_ids, now):
     string has always claimed to measure."""
     if not event_ids:
         return
-    incoming = _event_fingerprints(db, event_ids)
+    incoming = _event_identities(db, event_ids)
     if incoming and not incoming.issubset(
-            _incident_fingerprints(db, incident_id)):
+            _incident_identities(db, incident_id)):
         db.execute("UPDATE incidents SET last_novel_at=? WHERE id=?",
                    (now, incident_id))
 
@@ -2544,9 +2549,9 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
         reattach = bool(reviewed) and SEV_ORDER.get(severity, -1) <= \
             SEV_ORDER.get(reviewed["severity"], -1)
         if reattach:
-            incoming = _event_fingerprints(db, event_ids)
+            incoming = _event_identities(db, event_ids)
             if incoming and not incoming.issubset(
-                    _incident_fingerprints(db, reviewed["id"])):
+                    _incident_identities(db, reviewed["id"])):
                 reattach = False
         if reattach:
             incident_id = reviewed["id"]
@@ -3024,6 +3029,49 @@ def _finding_endpoint_classes(f):
     return _beacon_endpoint_classes(f.get("fingerprint"))
 
 
+def _recurrence_identity(f):
+    """The identity under which a finding counts as the SAME FACT recurring.
+
+    A fingerprint answers "which exact observation is this"; three consumers
+    needed the coarser question "is this something I have already seen", and
+    were using the fingerprint for it. For a beacon those differ, because the
+    fingerprint names the endpoint: a program that rotates destinations — a
+    CDN client, a sync daemon, an update channel, an editor extension —
+    presents an observation nothing has ever seen on every scan. Measured on
+    the reference store, 85 beacon fingerprints over 30 days were 27 actual
+    (program, port) pairs, and Zotero's eight were one.
+
+    Each consumer failed differently, which is why this read as four unrelated
+    complaints rather than one defect:
+
+      · `_mark_novelty` refreshed `last_novel_at` every scan, so age-out could
+        never retire the incidents it was written to retire.
+      · the FALSE_POSITIVE reattachment subset test could never match, so a
+        `risk:` incident the operator had judged benign re-opened under the
+        SAME correlation key — `risk:765ed268822cb174` did it three times, and
+        Zotero cost three separate verdicts for one fact.
+      · `_accumulate_risk` counted each rotated address as another distinct
+        signal, so churn alone carried an entity past RISK_MIN_SIGNALS and
+        RISK_THRESHOLD.
+
+    The generalization is the narrowest endpoint class the tolerance layer
+    already trusts (`beacon:<program>:#ip:<port>`): same program, same port,
+    rotating address. The port is deliberately kept — it names the service,
+    and a program that starts talking on a new one is a new fact. Anything
+    with no endpoint class keeps its exact fingerprint, so no other sensor
+    generalizes by accident.
+
+    This widens what counts as "already seen", so it can only ever attach
+    evidence to an incident that is already open or already reviewed — it
+    never suppresses a fingerprint the operator has not seen in some form,
+    and a rotating program that starts doing something ELSE still opens its
+    own case under that new identity."""
+    if not isinstance(f, dict):
+        return None
+    classes = _finding_endpoint_classes(f)
+    return classes[0][0] if classes else f.get("fingerprint")
+
+
 def _incident_identity(row):
     """(identity, endpoint_classes) for a stored incident: from its stored
     subject when it has one, else parsed from its correlation key (rows that
@@ -3256,7 +3304,11 @@ def _accumulate_risk(db, now, new_ids):
         b = by_entity.setdefault(ek, {"weight": 0.0, "fps": set(), "ids": set(),
                                       "cats": set(), "entity": entity,
                                       "new": False})
-        fp = f.get("fingerprint")
+        # Distinct SIGNALS, which is not the same as distinct fingerprints:
+        # a beacon fingerprint names the endpoint, so a program that rotates
+        # destinations was scoring one fresh signal per scan forever and could
+        # reach the threshold on churn alone (_recurrence_identity).
+        fp = _recurrence_identity(f)
         if fp in b["fps"]:
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
