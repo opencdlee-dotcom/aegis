@@ -2347,6 +2347,19 @@ _EVENT_SCHEMA_SQL = """
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             episode_started_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS trusted_identities (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            disposition TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            source_incident_id INTEGER,
+            UNIQUE(kind, fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trusted_identities_kind
+            ON trusted_identities(kind, disposition);
 """
 
 
@@ -3534,6 +3547,156 @@ def _route_for_scan(findings, first_run, adopt, now=None):
     except Exception as e:
         log_run("routing without incident memory: %s" % e)
     return route_findings(findings, first_run, adopt, memory)
+
+
+# --------------------------------------------------------------------------- #
+# Identity trust — an operator-confirmed allowlist of SSH keys/origins.
+#
+# Aegis's SSH surfaces (a changed authorized_keys, a new remote login session)
+# have no notion of "known good actor": the operator's own second machine and
+# an attacker's implant look identical, so every legitimate SSH touch alerts
+# exactly like a compromise. This table is the fix — a durable, local,
+# fingerprint-keyed roster the operator builds with `aegis.py identity trust`
+# or by marking a real incident benign-positive (_trust_identities_from_incident,
+# next to cmd_incident). A match never deletes the finding, only downgrades
+# severity/confidence to LOW so it reports at digest tier instead of
+# interrupting (route_findings routes confidence='low' to the digest) — a
+# compromised trust anchor stays reviewable, the same reasoning
+# never_adopt_live already applies to the live-auth-session surface itself.
+# A CA (Teleport/step-ca) was considered and rejected for this scale: it adds
+# a new trust root and compromise surface a 3-6 machine personal fleet does
+# not need — a flat fingerprint table costs nothing extra to run or attack.
+# --------------------------------------------------------------------------- #
+
+def _identity_lookup(db, kind, fingerprint):
+    row = db.execute(
+        "SELECT disposition FROM trusted_identities WHERE kind=? AND "
+        "fingerprint=?", (kind, fingerprint)).fetchone()
+    return row["disposition"] if row else None
+
+
+def _identity_touch(db, kind, fingerprint, now):
+    db.execute("UPDATE trusted_identities SET last_seen=? WHERE kind=? AND "
+              "fingerprint=?", (now, kind, fingerprint))
+
+
+def trust_identity(kind, fingerprint, disposition, label="",
+                   source_incident_id=None, now=None):
+    """Record (or update) an operator verdict on one fingerprinted identity.
+    `disposition` is 'trusted' or 'blocked'. Returns the row id."""
+    if disposition not in ("trusted", "blocked"):
+        raise ValueError("disposition must be 'trusted' or 'blocked'")
+    now = _epoch(now)
+    db = _event_connection()
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO trusted_identities(kind,fingerprint,label,"
+                "disposition,created_at,last_seen,source_incident_id) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(kind,fingerprint) DO "
+                "UPDATE SET disposition=excluded.disposition,label=CASE WHEN "
+                "excluded.label!='' THEN excluded.label ELSE "
+                "trusted_identities.label END,last_seen=excluded.last_seen",
+                (kind, fingerprint, label or "", disposition, now, now,
+                 source_incident_id))
+        row = db.execute(
+            "SELECT id FROM trusted_identities WHERE kind=? AND fingerprint=?",
+            (kind, fingerprint)).fetchone()
+        return row["id"]
+    finally:
+        db.close()
+
+
+def forget_identity(kind, fingerprint):
+    db = _event_connection()
+    try:
+        with db:
+            cur = db.execute(
+                "DELETE FROM trusted_identities WHERE kind=? AND fingerprint=?",
+                (kind, fingerprint))
+        return cur.rowcount
+    finally:
+        db.close()
+
+
+def list_identities():
+    db = _event_connection()
+    try:
+        return _dict_rows(db.execute(
+            "SELECT * FROM trusted_identities ORDER BY kind,disposition,"
+            "last_seen DESC").fetchall())
+    finally:
+        db.close()
+
+
+def _apply_origin_trust(db, f, now):
+    disposition = _identity_lookup(db, "ssh-origin", f["origin"])
+    if disposition == "trusted":
+        f["severity"], f["confidence"] = "LOW", "low"
+        f["known_identity"] = True
+        _identity_touch(db, "ssh-origin", f["origin"], now)
+    elif disposition == "blocked":
+        f["severity"] = "CRITICAL"
+        f["known_identity_blocked"] = True
+
+
+def _apply_authorized_keys_trust(db, f, now):
+    path = f.get("path")
+    if not path or not os.path.isfile(path):
+        return
+    keys = _parse_authorized_keys(_read_text(path) or "")
+    if not keys:
+        return
+    fps = [fp for _kt, fp, _c in keys]
+    placeholders = ",".join("?" for _ in fps)
+    rows = {r["fingerprint"]: r["disposition"] for r in db.execute(
+        "SELECT fingerprint,disposition FROM trusted_identities WHERE kind="
+        "'ssh-key' AND fingerprint IN (%s)" % placeholders, fps).fetchall()}
+    if any(rows.get(fp) == "blocked" for fp in fps):
+        f["severity"] = "CRITICAL"
+        f["known_identity_blocked"] = True
+        return
+    if all(rows.get(fp) == "trusted" for fp in fps):
+        f["severity"], f["confidence"] = "LOW", "low"
+        f["known_identity"] = True
+        for fp in fps:
+            _identity_touch(db, "ssh-key", fp, now)
+    else:
+        f["unrecognized_key_fingerprints"] = [
+            fp for fp in fps if rows.get(fp) != "trusted"]
+
+
+def _apply_identity_trust(findings, now=None):
+    """Mutate `findings` in place: an auth-session whose origin, or an
+    authorized_keys whose every current key, matches an operator-confirmed
+    'trusted' identity is downgraded to LOW/low-confidence; a match against
+    'blocked' is escalated to CRITICAL. Anything with no match, or whose
+    lookup itself fails, is left untouched — a store that cannot be read must
+    never manufacture trust. Must run BEFORE _route_for_scan, which is what
+    actually turns confidence='low' into a digest routing instead of an
+    interrupt."""
+    now = _epoch(now)
+    try:
+        db = _event_connection()
+    except Exception as e:
+        log_run("identity-trust check skipped: %s" % e)
+        return findings
+    try:
+        for f in findings:
+            try:
+                if f.get("category") == "auth-session" and f.get("origin"):
+                    _apply_origin_trust(db, f, now)
+                elif f.get("category") == "persistence" and \
+                        (f.get("path") or "").endswith(
+                            os.path.join(".ssh", "authorized_keys")):
+                    _apply_authorized_keys_trust(db, f, now)
+            except Exception as e:
+                log_run("identity-trust check failed for %s: %s" %
+                       (f.get("fingerprint"), e))
+        db.commit()
+    finally:
+        db.close()
+    return findings
 
 
 def _close_allowlisted(db, incident_id, now):
@@ -7334,6 +7497,56 @@ def snapshot_extra_persistence():
                 if seen_entries >= MAX_ENTRIES:
                     return snap
     return snap
+
+
+# --- SSH identity fingerprints (per-key, not whole-file) ----------------------
+# authorized_keys is hashed WHOLE-FILE above (any edit is itself worth knowing
+# about — T1098.004). This is the finer-grained identity underneath that hash:
+# the same SHA256 fingerprint `ssh-keygen -lf` prints for a single key, so the
+# operator's own device key can be told apart from a stranger's without adding
+# a CA or any new infrastructure (see _apply_identity_trust below).
+_SSH_KEY_TYPES = ("ssh-rsa", "ssh-ed25519", "ssh-dss",
+                  "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+                  "ecdsa-sha2-nistp521", "sk-ecdsa-sha2-nistp256@openssh.com",
+                  "sk-ssh-ed25519@openssh.com")
+
+
+def _ssh_key_fingerprint(b64_blob):
+    """OpenSSH's own SHA256 fingerprint format: base64(sha256(key blob)),
+    unpadded — `ssh-keygen -lf` prints the identical string. None on anything
+    that does not decode as a key, so a malformed line degrades to 'unknown',
+    never to a false fingerprint."""
+    try:
+        raw = base64.b64decode(b64_blob, validate=True)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _parse_authorized_keys(text):
+    """[(keytype, fingerprint, comment), ...] for every key line in an
+    authorized_keys-shaped file. Blank/comment lines are skipped; an options
+    prefix (from="...",no-pty ssh-ed25519 AAAA... name@host) is handled by
+    scanning for the first recognized key-type token rather than assuming
+    column 0, since options are optional and freeform."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        idx = next((i for i, p in enumerate(parts) if p in _SSH_KEY_TYPES), None)
+        if idx is None or idx + 1 >= len(parts):
+            continue
+        fp = _ssh_key_fingerprint(parts[idx + 1])
+        if not fp:
+            continue
+        comment = " ".join(parts[idx + 2:]) if idx + 2 < len(parts) else ""
+        out.append((parts[idx], fp, comment))
+    return out
 
 
 def diff_extra_persistence(prior, cur):
@@ -11327,6 +11540,55 @@ def cmd_signers(argv):
     return 2
 
 
+def cmd_identity(argv):
+    """`identity` — the operator's own confirm-once roster of SSH
+    keys/origins (see _apply_identity_trust). `trust`/`block` are the only
+    ways a fingerprint enters this table, aside from a `benign-positive`
+    verdict on the incident it raised — nothing here is inferred."""
+    sub = argv[2] if len(argv) > 2 else "list"
+    if sub == "list":
+        rows = list_identities()
+        if not rows:
+            print("no trusted/blocked identities recorded.")
+            print("  aegis.py identity trust <ssh-key|ssh-origin> "
+                  "<fingerprint> [label]")
+            return 0
+        for r in rows:
+            print("  [%s] %-11s %-55s %s%s" % (
+                r["disposition"], r["kind"], r["fingerprint"],
+                r.get("label") or "",
+                " (last seen %s)" %
+                datetime.fromtimestamp(r["last_seen"]).isoformat()))
+        return 0
+    if sub in ("trust", "block"):
+        if len(argv) < 5:
+            print("usage: aegis.py identity %s <ssh-key|ssh-origin> "
+                  "<fingerprint> [label]" % sub)
+            return 2
+        kind, fingerprint = argv[3], argv[4]
+        if kind not in ("ssh-key", "ssh-origin"):
+            print("unknown identity kind: %s (expected ssh-key or "
+                  "ssh-origin)" % kind)
+            return 2
+        label = " ".join(argv[5:])
+        disposition = "trusted" if sub == "trust" else "blocked"
+        trust_identity(kind, fingerprint, disposition, label=label)
+        print("%s: %s %s%s" % (disposition, kind, fingerprint,
+                               " (%s)" % label if label else ""))
+        return 0
+    if sub == "forget":
+        if len(argv) < 5:
+            print("usage: aegis.py identity forget <ssh-key|ssh-origin> "
+                  "<fingerprint>")
+            return 2
+        removed = forget_identity(argv[3], argv[4])
+        print("removed" if removed else "no such identity recorded")
+        return 0 if removed else 1
+    print("usage: aegis.py identity [list | trust <kind> <fp> [label] | "
+          "block <kind> <fp> [label] | forget <kind> <fp>]")
+    return 2
+
+
 def _custody(path, content_sha):
     """(provenance, note) for a changed delegate-surface object.
 
@@ -13682,6 +13944,12 @@ def _cmd_scan_locked(quiet=False):
         baseline["shell_history_adopted"] = True
         save_json(BASELINE, baseline)
 
+    # Downgrade any finding whose actor is an operator-confirmed identity
+    # (a trusted SSH key/origin) BEFORE routing/sort, so a known "this was me"
+    # recurrence routes to the digest instead of interrupting — see
+    # _apply_identity_trust.
+    _apply_identity_trust(findings)
+
     # Re-sort: surface findings (and any corrupt-baseline finding) were appended
     # after gather_all's sort.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
@@ -14419,7 +14687,13 @@ _INCIDENT_ACTIONS = {
 # one-person SOC. Shown on the incident card next to the evidence.
 SENSOR_BENIGN_NOTES = {
     "persistence": "Homebrew services, Docker/VSCode helpers, backup agents, "
-                   "and printer/VPN vendors all install launchd jobs.",
+                   "and printer/VPN vendors all install launchd jobs. An "
+                   "authorized_keys change from adding your OWN device's key: "
+                   "benign-positive here also trusts that key's fingerprint "
+                   "(aegis.py identity list to review).",
+    "auth-session": "Your own SSH / screen-sharing login from a machine you "
+                    "use. benign-positive trusts that origin host, or set it "
+                    "directly: aegis.py identity trust ssh-origin HOST.",
     "process": "Dev toolchains run unsigned binaries from ~/ (cargo/go build "
                "output, node_modules/.bin, pyenv shims).",
     "behavior": "Installer one-liners (Homebrew/rustup) legitimately pipe curl "
@@ -14586,6 +14860,43 @@ def _finding_techniques(f):
     return tuple(sorted(out))
 
 
+def _trust_identities_from_incident(incident_id):
+    """Confirm-once: a benign-positive verdict on an SSH-identity incident
+    also trusts the exact fingerprint(s) it was about — the origin host of an
+    auth-session, or the specific authorized_keys fingerprint(s) that were not
+    already recognized (_apply_authorized_keys_trust always records these on
+    a finding it does not fully trust, including on first sight, since an
+    empty trust table makes every key 'unrecognized'). Future recurrences of
+    the SAME actor then report at digest tier instead of interrupting — see
+    _apply_identity_trust. Returns the (kind, fingerprint) pairs trusted."""
+    item = incident_detail(incident_id)
+    if not item:
+        return []
+    trusted, seen = [], set()
+    for ev in item.get("evidence", []):
+        try:
+            data = json.loads(ev["data_json"])
+        except Exception:
+            continue
+        if data.get("category") == "auth-session" and data.get("origin"):
+            key = ("ssh-origin", data["origin"])
+            if key not in seen:
+                seen.add(key)
+                trust_identity("ssh-origin", data["origin"], "trusted",
+                               label=data["origin"],
+                               source_incident_id=incident_id)
+                trusted.append(key)
+        elif data.get("category") == "persistence":
+            for fp in data.get("unrecognized_key_fingerprints") or ():
+                key = ("ssh-key", fp)
+                if key not in seen:
+                    seen.add(key)
+                    trust_identity("ssh-key", fp, "trusted",
+                                   source_incident_id=incident_id)
+                    trusted.append(key)
+    return trusted
+
+
 def cmd_incident(incident_id, action=None, reason=None):
     try:
         incident_id = int(incident_id)
@@ -14614,6 +14925,10 @@ def cmd_incident(incident_id, action=None, reason=None):
             for path in _accept_into_baseline([incident_id]):
                 print("accepted into the baseline: %s\n  the sensor stops "
                       "reporting it; a CHANGE to it still alerts" % path)
+            for kind, fp in _trust_identities_from_incident(incident_id):
+                print("trusted identity: %s %s\n  future recurrences report "
+                      "at low severity instead of interrupting; reverse with "
+                      "aegis.py identity block %s %s" % (kind, fp, kind, fp))
     item = incident_detail(incident_id)
     if not item:
         print("no such incident: %s" % incident_id)
@@ -21417,6 +21732,8 @@ def main(argv):
         return cmd_signers(argv)
     if cmd == "vouch":
         return cmd_vouch(argv)
+    if cmd == "identity":
+        return cmd_identity(argv)
     if cmd == "replay":
         try:
             days = int(argv[2]) if len(argv) > 2 else 30

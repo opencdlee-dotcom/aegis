@@ -627,6 +627,65 @@ unchanged, so a rotating beacon still opens one case per endpoint until
 `_rotating_endpoint_memory` has the three verdicts it needs — that tier is
 where per-endpoint noise is answered, and this one is not a substitute for it.
 
+#### SSH identity trust: a confirmed actor is not a stranger
+
+Everything above fixes findings that were about the SAME fact recurring under
+different fingerprints. `authorized_keys` and a new remote login session are a
+different shape of the same underlying problem: the operator's OWN second
+machine and an attacker's implant are, to every sensor that watches SSH, the
+identical event — a changed file, a new session — so a legitimate touch alerts
+exactly like a compromise, on every recurrence, forever. No amount of identity
+collapsing inside one incident fixes this, because there is nothing to
+collapse: it is not the same incident recurring, it is a genuinely new
+fingerprint each time (a new session key, a rotated key in the file) that
+happens to be trustworthy.
+
+`trusted_identities` is a flat, local table — no CA, no infrastructure —
+keyed on `(kind, fingerprint)`: `ssh-origin` for an auth-session's remote host,
+`ssh-key` for one key's `SHA256:...` fingerprint (`_ssh_key_fingerprint`,
+`ssh-keygen -lf`'s own format, computed with stdlib `hashlib`/`base64` — no new
+dependency). A Teleport/step-ca-style certificate authority was the enterprise
+answer researched for this and was deliberately rejected: it replaces
+trust-on-first-use with trust-in-a-new-root, which is a *larger* attack surface
+for a 3-6 machine personal fleet than a table the operator populates by hand.
+
+Two ways an identity enters the table, both requiring an explicit operator
+verdict — nothing here is inferred or learned from repetition:
+
+- `aegis.py identity trust|block <kind> <fingerprint> [label]` — direct.
+- A `benign-positive` verdict on the incident an SSH finding raised also
+  trusts the exact fingerprint(s) that incident was about
+  (`_trust_identities_from_incident`, called from `cmd_incident` exactly where
+  `_accept_into_baseline` already is) — the same "confirm-once" reuse of the
+  existing incident lifecycle the baseline-promotion fix above established,
+  applied to a surface baseline promotion cannot reach.
+
+That last clause matters: `auth_sessions` is `never_adopt_live=True` and
+`_acceptable_surfaces()` excludes it from baseline promotion on purpose — an
+active remote login is CURRENT ACCESS, not residue, and the README's
+live-vs-residue rule says the operator must keep hearing about it. Identity
+trust does not reopen that door. `_apply_identity_trust` never deletes a
+finding or stops it from being recorded: a match only downgrades
+severity/confidence to LOW, which routes it to the digest instead of
+interrupting (`route_findings` already routes `confidence='low'` findings
+below the notify floor). The event is still stored, still visible in `replay`,
+still reviewable — a compromised trust anchor (a stolen key, a hijacked
+Homebrew formula riding in through an already-trusted channel) stays
+recoverable rather than becoming a permanent blind spot. This is deliberately
+a weaker suppression than baseline promotion, and that is the point: it is
+safe to apply to a surface baseline promotion is not allowed to touch.
+
+For `authorized_keys` specifically, the existing whole-file hash finding (this
+section's `xpersist:` fingerprint) is left completely alone — any edit is
+still worth a fingerprint of its own, per T1098.004. `_apply_identity_trust`
+runs a SEPARATE, finer-grained check alongside it: every key currently in the
+file is fingerprinted (`_parse_authorized_keys`, tolerant of an options prefix
+like `from="...",no-pty`) and looked up. Only when EVERY key present is
+already trusted does the finding downgrade; one unrecognized key among several
+trusted ones leaves severity untouched and attaches
+`unrecognized_key_fingerprints` — naming exactly the key that needs a verdict,
+rather than the whole file's hash.
+
 ### Identity is declared, not parsed
 
 Every one of those migrations existed for the same reason: identity lived

@@ -249,6 +249,23 @@ python3 aegis.py signers pin FILE   # pin a device roster (principal ssh-key
                                #   against the PINNED roster grades LOW
                                #   (fleet-signed) instead of poisoned-repo HIGH
 python3 aegis.py signers status # show the pinned roster
+python3 aegis.py identity trust ssh-origin HOST [label]   # your own machine's
+                               #   SSH origin — its remote-login findings
+                               #   downgrade to LOW (digest) instead of paging
+python3 aegis.py identity trust ssh-key FINGERPRINT [label]   # one key's
+                               #   SHA256:... fingerprint (ssh-keygen -lf) —
+                               #   an authorized_keys change downgrades once
+                               #   EVERY key present is trusted; one unknown
+                               #   key still alerts, naming its fingerprint
+python3 aegis.py identity block KIND FINGERPRINT   # the inverse: escalate a
+                               #   known-bad key/origin to CRITICAL on sight
+python3 aegis.py identity list # every trusted/blocked identity + last seen
+python3 aegis.py identity forget KIND FINGERPRINT   # remove a verdict
+                               #   (a `benign-positive` on an SSH incident also
+                               #   trusts the fingerprint it was about, so this
+                               #   never needs a second command in the
+                               #   ordinary case — see `incident ID
+                               #   benign-positive` above)
 python3 aegis.py allow PATH    # stop alerting on findings matching PATH; their
                                #   open incidents close as 'allowlisted' too
 python3 aegis.py vt PATH|SHA   # OPT-IN VirusTotal reputation (BYO key; sends only
