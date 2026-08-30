@@ -1,3 +1,116 @@
+# Aegis — `/doit` closure (2026-08-23)
+
+The residual PID-reuse race and the concurrent alert-identity follow-up are now
+closed and shipped through the same evidence gates. A kill authorization binds
+to owner, executable identity, and the OS process-creation token, then
+revalidates immediately before both graceful and forced termination. A
+replacement PID is refused without receiving a signal. CI actions moved from
+the deprecated Node 20 releases to `checkout@v5` and `setup-python@v6`.
+
+Review of the concurrent incident migration found and fixed one additional
+safety defect before shipment: its version detector searched the whole network
+key, so an endpoint such as `1.2.3.4` could look like a version and auto-close a
+stable-path incident. It now parses the endpoint key and searches only the
+program path. Versioned legacy cases retire once; stable program paths remain
+open. Vouched workloads with unreviewed rotating endpoints batch into one
+workload case without reducing severity, while changed or unvouched binaries
+receive no batching privilege.
+
+Captured final gates: focused fail-before proofs were 2 failures (PID reuse and
+old CI action releases), then 31 focused checks passed; the authoritative suite
+passed **1,014 tests, 4 skipped, 11 subtests**; `selftest.py` passed **7/7**; and
+`git diff --check` passed. The PID check materially narrows but cannot make the
+final user-space check-to-signal instruction atomic on every supported OS; that
+last kernel-scheduling interval remains an honest platform limit.
+
+---
+
+# Aegis — Battle-Test Log (2026-08-21, `/battle-test` siege — 6 fixes, delegated 4-lens hunt)
+
+Full repository siege under the fable-mode gates. Aegis has manually invoked
+quarantine, neutralize, kill, freeze and irreversible destroy paths, so every
+test used inert fixtures, temporary state, mocked process control, or the
+repository's real-state pytest guard. No live scan, response action, install,
+service change, notification, deployment, or network call ran.
+
+## Outcome
+
+**6 genuine defects fixed**: one malformed-input correctness bug, one silent
+sensor-coverage loss, two measured repeated-I/O defects, one missing human
+authorization boundary, and one authorization-audit omission found by the
+mandatory Builder/Reviewer duel. Seven permanent regression tests were added.
+
+Final captured gates:
+
+- `pytest tests/ -q` → **968 passed, 4 skipped, 11 subtests passed** in 357.06s
+  (baseline: 961 passed, 4 skipped, 11 subtests).
+- `selftest.py` → **7/7 passed**.
+- Python compile, `bash -n`, ShellCheck, and `git diff --check` → exit 0.
+- Completeness pre-flight → **0 pass-only / ellipsis stubs**.
+- Mandatory patch duel after the last fix → **two consecutive dry rounds**:
+  5 passed + 7 subtests, then 47 passed + 7 subtests.
+- Battle-log self-check → **PASS**: six finding rows, final/baseline test counts,
+  both dry rounds, and the mutation/cross-OS limits are all published above or
+  below; the numeric claims match the captured command output from this run.
+
+## Findings fixed
+
+| # | Sev | Defect | Reproducer / measured baseline | Fix |
+|---|-----|--------|--------------------------------|-----|
+| F1 | MEDIUM | `_beacon_parts` accepted malformed IP literals and ports outside 1–65535, allowing invalid endpoint evidence into rotating-beacon tolerance state. | Invalid IPv4 `999.999.999.999`, malformed IPv6 `12345::1` / `:`, and ports 0 / 65536 all parsed before the fix. The intent-derived `ipaddress` oracle rejected them and killed the permissive-parser mutation. | Validate with stdlib `ipaddress.ip_address()` and enforce port 1–65535 before generalizing. |
+| F2 | HIGH | On macOS, failure of the second `ps` call (full argv) silently substituted the executable path while leaving process coverage healthy. Behavioral/session-theft sensors then lost their load-bearing input without a DEGRADED health record. | Inert split-`ps` fixture returned a valid executable row plus failed argv query; `_PROC_ARGV_PARTIAL` did not exist and health stayed complete. | Retain useful executable rows, reset a per-scan partial flag, and publish `process.argv` DEGRADED when argv enumeration fails. |
+| F3 | LOW/PERF | Writ enforcement loaded `writs.json` once before its loop and again for every finding. | 100 findings → **101 reads**. | Split the pure snapshot check from the file-loading wrapper; `_apply_writ` now evaluates one loaded snapshot → **1 read**. |
+| F4 | LOW/PERF | Intel grading called `_intel_sets()` once per candidate hash; even cache hits stat both feed files. | Two matching records → 2 set lookups; the 100-record reproducer implied 200 avoidable stats. | Load the hash set once in `check_intel` and pass it through the grading closure → **1 lookup per pass**. |
+| F5 | HIGH | The CLI claimed response was human-reviewed and run by hand, but direct `quarantine`, `restore`, `destroy --yes`, `kill`, `freeze`, `thaw`, and `neutralize` dispatches had no interactive authorization boundary. A same-uid script could invoke them. | A refusal stub still reached every mutating `cmd_*` function. | Gate only the external dispatcher with the existing interactive challenge, bound to the exact verb and argument. Internal functions remain composable and sandbox-testable; `destroy --yes` remains an additional irreversible confirmation. |
+| F6 | MEDIUM | F5's first fix discarded whether approval was out-of-band or merely `tty-only`, violating the architecture rule that the weaker channel must be recorded rather than overstated. | Inert duel captured a successful terminal action with no authorization-channel evidence. | Write a durable audit-before-mutation `response-auth` event for approval and refusal, including verb, argument, result, and exact channel. An unavailable audit log now fails an approval closed. |
+
+Every regression was observed RED before production code changed and GREEN
+afterward. The focused post-fix set was 7 tests; adjacent regression
+neighborhoods were also exercised in both dry duel rounds.
+
+## Four-lens evidence and stop gate
+
+- **Correctness:** F1 reproduced and mutation-validated; no other candidate
+  survived minimization.
+- **Architecture / efficiency:** F2–F4 reproduced. The automated lexical scan
+  produced 252 noisy flags; data-flow triage rejected all of them rather than
+  inflating the finding count.
+- **Security:** `watchdog` was unavailable, so the required inline sink and
+  trust-boundary review ran. It found F5. No hardcoded live secrets, unsafe
+  deserialization, executable `eval`/`exec`, or `shell=True` sink survived.
+- **Adversarial duel:** the initial pass found F6. After its fix, two bounded
+  consecutive rounds were dry, including fail-closed audit-write checks across
+  all seven mutating dispatchers and exact argument/channel binding.
+
+The composite stop gate was met on dry rounds, saturated affected regression
+neighborhoods, and a fully green suite—not on the siege six-round hard cap.
+There is **no repository-wide mutation harness**, so no numeric mutation score
+is claimed; F1 used a targeted killed mutation and every fix has captured
+fail-before evidence.
+
+## End-state checklist
+
+- [x] Bugs found → fixed and regression-pinned (F1, F2, F5, F6).
+- [x] Logic / efficiency errors found → fixed and measured (F3, F4).
+- [x] Edge cases found → permanent tests added.
+- [x] No unimplemented pass-only / ellipsis stubs remain.
+- [x] Security lens run (inline because the watchdog binary was unavailable).
+- [x] Mandatory adversarial duel went dry twice after the final fix.
+
+## Residual risk
+
+- Windows and Linux kernel-specific live harnesses did not run on this macOS
+  host; their CI coverage remains the cross-platform evidence.
+- A same-uid attacker can allocate a pseudo-terminal and read an in-terminal
+  challenge when no separate GUI/notification channel exists. Aegis now records
+  that weaker condition honestly as `tty-only`; it is not equivalent to an
+  out-of-band human channel.
+- The existing PID-reuse interval between process identity verification and
+  signaling remains a review candidate; this run did not produce a safe,
+  reproducible proof, so it was not represented as fixed or cleared.
+
+---
+
 # Aegis — Battle-Test Log (2026-08-12, `/battle-test` siege — 6 fixes, delegated 4-lens hunt)
 
 Full `/battle-test` run under fable-mode gates. **Tier: siege** (blast-radius ×

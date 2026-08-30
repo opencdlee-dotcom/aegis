@@ -778,10 +778,54 @@ class TestWritEnforcementIsActuallyWired(AgentSandbox):
     def test_unknown_surface_falls_back_to_a_governed_scope(self):
         """A newly added surface must default to GOVERNED, not ungoverned —
         otherwise the enforcement model grows a hole every time someone adds
-        a sensor."""
-        self.assertEqual("persistence",
-                         aegis._SURFACE_WRIT_SCOPE.get("brand_new_surface",
-                                                       "persistence"))
+        a sensor. A bare 3-tuple registry row (the shape tests patch in, and
+        the shape a hurried new surface will be added as) must normalize to
+        the default writ scope, never to no scope."""
+        row = ("brand_new_surface", lambda: {}, lambda p, c: [])
+        key, _snap, _diff, scope, live = aegis._surface_row(row)
+        self.assertEqual("brand_new_surface", key)
+        self.assertEqual("persistence", scope)
+        self.assertFalse(live)
+
+    def test_the_primary_persistence_sensor_is_governed(self):
+        """check_persistence is the flagship change-shaped sensor, yet only
+        the _scan_surfaces registry flowed through _apply_writ — so
+        `writ enforce on` governed shellrc and browser extensions while
+        launchd persistence itself bypassed enforcement entirely."""
+        aegis.save_json(aegis.WRIT_FILE, {"enforcing": True, "writs": []})
+        fp = "persistence:changed:/tmp/writ-wire-probe"
+        canned = aegis.finding("MEDIUM", "persistence", "Persistence changed",
+                               "probe", fp)
+        saved = aegis.check_persistence
+        aegis.check_persistence = lambda b, c: [dict(canned)]
+        try:
+            out = aegis.gather_all(None, {}, health=[])
+        finally:
+            aegis.check_persistence = saved
+        mine = [f for f in out if f["fingerprint"] == fp]
+        self.assertEqual(1, len(mine))
+        self.assertEqual("unauthorized", mine[0].get("writ"),
+                         "check_persistence findings bypass writ enforcement")
+        self.assertEqual("HIGH", mine[0]["severity"])
+
+    def test_apply_writ_reads_state_once_for_the_whole_batch(self):
+        aegis.save_json(aegis.WRIT_FILE, {"enforcing": True, "writs": []})
+        findings = [self._finding() for _ in range(100)]
+        real_load = aegis.load_json
+        reads = []
+
+        def counting_load(path, default):
+            if path == aegis.WRIT_FILE:
+                reads.append(path)
+            return real_load(path, default)
+
+        aegis.load_json = counting_load
+        try:
+            out = aegis._apply_writ(findings, "shellrc")
+        finally:
+            aegis.load_json = real_load
+        self.assertEqual(100, len(out))
+        self.assertEqual(1, len(reads), "writ state was re-read per finding")
 
 
 # --------------------------------------------------------------------------- #

@@ -96,6 +96,84 @@ def _forbid_real_state_writes():
 
 IS_MAC = sys.platform == "darwin"
 
+
+# --------------------------------------------------------------------------- #
+# The trust vocabulary is PER-PLATFORM, and a test that hard-codes one body's
+# word reads as platform-neutral while being anything but.
+#
+# Earned 2026-08-24: tests/test_outbound_subject.py stubbed
+# `classify_signature` to return `{"trust": "adhoc"}` and its own class
+# docstring promised the assertions held "on every OS". Ad-hoc signing is a
+# codesign concept with no Authenticode equivalent, so `suspicious_sig()`
+# rightly rejects "adhoc" on Windows -- every sensor gated on it minted ZERO
+# findings there and all 12 cases in the file failed. macOS and Linux were
+# green (Linux never consults the verdict: its branch keys on the structural
+# exec tell), so the only thing that could see it was a Windows runner, and it
+# took 24 minutes of CI to say so.
+#
+# So ask for the CONCEPT, never for one body's spelling. `suspicious_trust_for`
+# mirrors the split in `aegis.suspicious_sig`; a mirror can drift from what it
+# mirrors, which is why tests/test_cross_platform.py asserts it against the
+# real predicate on all three bodies rather than trusting this comment.
+# --------------------------------------------------------------------------- #
+def suspicious_trust_for(is_win, is_linux):
+    """A trust verdict that `aegis.suspicious_sig()` accepts on that body.
+
+    Linux keys on 'broken' alone ('unmanaged' is true of every locally built
+    binary); Windows on Authenticode's 'unsigned'/'broken'; macOS additionally
+    on codesign's 'adhoc'.
+
+    One honest caveat, because the obvious reading of this function is wrong:
+    on Linux `_classify_linux` emits ONLY 'os-managed' and 'unmanaged', so
+    'broken' is a verdict a real Linux host can never produce. The
+    suspicious_sig arm is dead by construction there and Linux takes its signal
+    from structure instead (see _exec_alert). 'broken' is returned so a STUBBED
+    gate opens on all three bodies with one helper; it is not a claim about
+    what Linux observes. A test that means to assert Linux behaviour must
+    exercise the structural arm, not this verdict.
+    """
+    if is_linux:
+        return "broken"
+    return "unsigned" if is_win else "adhoc"
+
+
+def publisher_trust_for(is_win, is_linux):
+    """A trust verdict `aegis.publisher_sig()` accepts on that body — the
+    positive twin of suspicious_trust_for, mirroring aegis.publisher_sig.
+
+    macOS returns "apple" rather than "developer-id" so the conversion of the
+    existing fixtures is a no-op there: those records already said "apple", and
+    a fixture rewrite that silently changes what a macOS assertion means would
+    be a worse bug than the one being fixed.
+    """
+    if is_linux:
+        return "os-managed"
+    return "os-signed" if is_win else "apple"
+
+
+PUBLISHER_TRUST = publisher_trust_for(aegis.IS_WIN, aegis.IS_LINUX)
+
+SUSPICIOUS_TRUST = suspicious_trust_for(aegis.IS_WIN, aegis.IS_LINUX)
+
+# Fail at COLLECTION, not 200 assertions later as an unexplained "0 != 1": if
+# the product's vocabulary moves, the suite says so in the words of the thing
+# that changed.
+#
+# A bare `assert` would be the obvious spelling and the wrong one: `python -O`
+# strips assert statements outright, so the guard would vanish on exactly the
+# invocation nobody thinks to re-check, and the `0 != N` noise it exists to
+# prevent would come back silently. Raise explicitly.
+if not aegis.publisher_sig(PUBLISHER_TRUST):
+    raise RuntimeError(
+        "conftest.PUBLISHER_TRUST is %r, which aegis.publisher_sig() rejects "
+        "on this body -- the trust vocabulary moved and this mirror did not."
+        % (PUBLISHER_TRUST,))
+if not aegis.suspicious_sig(SUSPICIOUS_TRUST):
+    raise RuntimeError(
+        "conftest.SUSPICIOUS_TRUST is %r, which aegis.suspicious_sig() rejects "
+        "on this body -- the trust vocabulary moved and this mirror did not."
+        % (SUSPICIOUS_TRUST,))
+
 # Classes whose assertions are inherently macOS-specific.
 _MAC_ONLY_CLASSES = frozenset((
     # kqueue / live log-stream watch internals
@@ -160,6 +238,13 @@ _POSIX_ONLY_TESTS = frozenset((
     "test_interpreter_aimed_at_a_temp_script_is_high",
     "test_script_payload_is_joinable_to_its_drop",
     "test_interpreter_fronted_persistence_joins_its_script",
+    # WHO_CMD-specific: snapshot_auth_sessions() no longer even LOOKS at
+    # WHO_CMD when IS_WIN — it dispatches to _snapshot_auth_sessions_win()
+    # instead (2026-08-30, the RDP/WinRM sensor). The equivalent invariant
+    # (a failed probe is a non-answer, never a false-empty) is covered on
+    # Windows by test_cross_platform.py's
+    # test_auth_session_win_probe_failure_is_a_non_answer.
+    "test_snapshot_none_on_hard_fail",
 ))
 
 

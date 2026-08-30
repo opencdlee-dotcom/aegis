@@ -29,8 +29,8 @@ jobs:
           - os: macos-latest
             python: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip pytest
@@ -43,31 +43,45 @@ jobs:
   # executed on Windows: the parsers were tested against captured output and the
   # registry plumbing against an injected fake `winreg`. This job runs the real
   # thing on a real Windows kernel.
+  #
+  # Process spawning is far more expensive here than on POSIX, which is why
+  # Windows is always the last leg to report and why work gets called done
+  # while it is still running.
+  #
+  # The job cap was cut 60->30 once on a guess ("observed healthy ~13 min")
+  # that turned out to be stale — the suite had grown substantially since that
+  # number was taken and nobody re-measured. The very next run proved it wrong:
+  # py3.12's Test suite step alone measured 1206s (20:06) and got cut off
+  # mid-report by a 20-minute STEP cap sized on the same stale guess, turning a
+  # clean pass (427 passed, 145 skipped, zero failures) into a reported failure
+  # via KeyboardInterrupt.
+  #
+  # And it kept growing: measured 2026-08-23, Test suite 1424-1467s (23:44 /
+  # 24:27) against that 35-minute step cap. Nothing announced the growth — the
+  # comment asking the next person to "re-measure rather than nudge the
+  # constant" is not a mechanism, and the only signal a cap is outgrown is a
+  # KeyboardInterrupt that reads exactly like a test failure.
+  #
+  # `--durations=25` is NOT a fix for that. Be precise about what it buys,
+  # because crediting it with more is how the next person skips building the
+  # real signal: it publishes the slowest CASES, not the step's total against
+  # its cap, and it prints only when pytest finishes — so on the one run that
+  # actually hits the cap it prints nothing at all. What it does buy is a
+  # per-body cost profile that did not exist before. Its first run already paid
+  # for itself: the top two cases measured 189.41s and 188.25s here against
+  # 35.48s and 35.74s on macOS, a uniform ~5.2x that makes the (cheap, local)
+  # macOS profile a usable model for this (expensive, remote) one.
   windows:
     name: windows-latest / py${{ matrix.python }}
     runs-on: windows-latest
-    # Process spawning is far more expensive here than on POSIX, and the live
-    # harness additionally runs two full scans against the real machine (which
-    # classify real binaries through real PowerShell).
-    #
-    # This value was cut 60->30 once on a guess ("observed healthy ~13 min")
-    # that turned out to be stale — the suite had grown substantially since
-    # that number was taken and nobody re-measured. The very next run proved
-    # it wrong: py3.12's Test suite step alone measured 1206s (20:06) and got
-    # cut off mid-report by a 20-minute STEP cap sized on the same stale
-    # guess, turning a clean pass (427 passed, 145 skipped, zero failures) into
-    # a reported failure via KeyboardInterrupt. Re-measured from that run's own
-    # logs: Test suite ~1176-1206s, harness ~681-767s. Sized below with real
-    # headroom over MEASURED numbers, not a guess — and if this suite keeps
-    # growing, re-measure again rather than nudge the constant.
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         python: ["3.9", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip pytest
@@ -79,16 +93,46 @@ jobs:
       # KeyboardInterrupt failure four seconds past an undersized cap.
       - name: Test suite
         timeout-minutes: 35
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q --durations=25
       - name: selftest.py (real detection logic on this machine)
         timeout-minutes: 5
         run: python selftest.py
+
+  # The live harness is its own JOB, not a step of the one above.
+  #
+  # It was a trailing step guarded by `if: always()` — the guard existed
+  # because this harness is the only evidence the Windows code works on
+  # Windows, so a suite failure must not hide it. But a step cannot start
+  # before the 24-minute suite ahead of it finishes, so its measured ~12.6 min
+  # was pure addition: 37-39 minutes before Windows said anything at all.
+  #
+  # As a job it runs CONCURRENTLY with the suite on a second runner (free for
+  # public repos), which cuts the Windows critical path to roughly max(25, 13)
+  # instead of their sum, and gets the `always()` semantics structurally rather
+  # than by a guard — a failing suite cannot delay or mask it, because they no
+  # longer share a runner. It needs no pytest: the harness is stdlib + aegis.
+  windows-live:
+    name: windows-live / py${{ matrix.python }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      # Measured in THIS position on the first run after the split (2026-08-24):
+      # 625s on py3.9 and 816s on py3.12. That 816s is outside the 681-767s
+      # range this step used to be sized against — those numbers were taken
+      # while it ran third, behind a 24-minute suite, on a warm runner. Sizing
+      # a cap from measurements taken in a different position is the exact
+      # mistake this file has already made twice, so the cap stays at 25 and
+      # the new numbers are recorded here instead of being trimmed toward.
       - name: Live Windows harness (real registry, schtasks, CIM, Authenticode)
         timeout-minutes: 25
-        # `always()`: this harness is the only evidence that the Windows code
-        # works on Windows, so a suite failure must not hide it. It reports its
-        # own pass/fail and still fails the job on its own terms.
-        if: always()
         env:
           AEGIS_WIN_LIVE: "1"
         run: python tests/win_live_harness.py

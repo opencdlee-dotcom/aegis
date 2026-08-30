@@ -556,6 +556,454 @@ class TrustSemantics(unittest.TestCase):
             aegis.IS_LINUX, aegis.IS_WIN = saved
 
 
+class SkipListsHaveNoDeadEntries(unittest.TestCase):
+    """conftest's skip lists must not rot in the direction it never argued.
+
+    tests/conftest.py reasons carefully about ONE direction: a RENAMED class
+    stops being skipped and "fails loudly on Linux/Windows -- a visible failure
+    mode, never a silent loss of coverage." True, and the reverse is not: an
+    entry naming a class or test that no longer exists is inert, and nothing
+    anywhere notices. The lists then read as coverage decisions that were
+    reviewed when they are just residue, which is precisely how a skip list
+    grows until nobody trusts it.
+
+    The same file gained a self-assert for exactly this class of rot ten lines
+    above SUSPICIOUS_TRUST, so this closes the other half.
+    """
+
+    def test_every_skip_list_entry_still_names_something_real(self):
+        import conftest
+        here = os.path.dirname(os.path.abspath(__file__))
+        classes, tests = set(), set()
+        for name in sorted(os.listdir(here)):
+            if not name.startswith("test_") or not name.endswith(".py"):
+                continue
+            with open(os.path.join(here, name), "r", encoding="utf-8") as fh:
+                for line in fh:
+                    stripped = line.lstrip()
+                    if stripped.startswith("class "):
+                        classes.add(stripped[6:].split("(")[0].split(":")[0].strip())
+                    elif stripped.startswith("def test"):
+                        tests.add(stripped[4:].split("(")[0].strip())
+        dead_classes = sorted(conftest._MAC_ONLY_CLASSES - classes)
+        dead_tests = sorted(conftest._POSIX_ONLY_TESTS - tests)
+        self.assertEqual(
+            (dead_classes, dead_tests), ([], []),
+            "conftest skip-list entries name things that no longer exist. "
+            "Delete them: an inert entry looks like a reviewed coverage "
+            "decision and is not one.\n"
+            "  _MAC_ONLY_CLASSES: %s\n  _POSIX_ONLY_TESTS: %s"
+            % (dead_classes, dead_tests))
+
+
+class NoTestHardCodesOneBodysTrustVocabulary(unittest.TestCase):
+    """The source-level guard for the class that actually cost a CI cycle.
+
+    `StubbedTrustQualifiesOnEveryBody` below asserts the conftest HELPER is
+    right. It does not — and by construction cannot — assert that any test
+    FILE uses it, because the helper is per-body-correct by design while the
+    defect is a body-specific LITERAL. Reverting all four SUSPICIOUS_TRUST
+    uses in test_outbound_subject.py to `"adhoc"` leaves this whole suite
+    green on macOS, which is exactly the state that shipped 12 Windows
+    failures on 2026-08-24.
+
+    The only honest detector for "a fixture hard-codes one body's spelling"
+    is a source scan, so this is one. It scans for verdicts only macOS's
+    codesign can produce, used as a stubbed `trust` value, in a test that is
+    NOT gated to macOS. Those words are meaningless on the other two bodies:
+    `_authenticode_record` emits os-signed/signed-valid/unsigned/broken and
+    `_classify_linux` emits os-managed/unmanaged, so a Windows or Linux run
+    of such a fixture silently exercises a branch that can never be taken.
+
+    Milliseconds on any body, and it catches the whole class rather than the
+    one instance that happened to be found.
+    """
+
+    # Verdicts ONLY _classify_mac produces (aegis.py's classify_signature
+    # docstring is the source): the suspicious one, and the trusted ones that
+    # gate custody demotions.
+    _MAC_ONLY_VERDICTS = ("adhoc", "apple", "app-store", "developer-id")
+
+    # A stubbed trust value looks like one of these, which is what makes a
+    # scan viable at all rather than a grep for a bare word in prose.
+    # Both spellings a fixture actually uses. The keyword-default form was
+    # missed on the first pass and cost a full CI cycle to find: tests/
+    # test_custody.py's `_prec(..., trust="developer-id")` fed a macOS word to
+    # every custody assertion in the file while its docstring called itself
+    # "the shape every platform snapshot produces".
+    _STUB_SHAPES = ('"trust": "%s"', "'trust': '%s'", '"trust", "%s"',
+                    'trust="%s"', "trust='%s'")
+
+    # RATCHET, not an exemption list. Found by this guard on 2026-08-24, all
+    # pre-existing. Each of these builds a persistence record with a macOS-only
+    # trusted verdict and is NOT gated to macOS, so on Windows and Linux it
+    # exercises the untrusted branch of whatever it is asserting -- silently,
+    # and today, on green CI.
+    #
+    # They are listed rather than mass-edited because the fix is a per-case
+    # judgement with a real cost either way: moving a class into
+    # _MAC_ONLY_CLASSES DELETES its Linux coverage (that file's own docstring
+    # warns about exactly this), while switching the verdict changes what the
+    # assertion means. Neither is a change to make in bulk on a branch whose
+    # Windows legs just went green.
+    #
+    # The list may only SHRINK: an entry naming a class that no longer offends
+    # fails this test, so a fixed case cannot quietly leave debt behind and a
+    # renamed class cannot quietly keep an exemption.
+    # The one place a body-specific word is the POINT: this module's own
+    # PublisherStableIsReachableOnEveryBody names each body's vocabulary in a
+    # table and flips the flags to match, so it is asserting the split rather
+    # than accidentally depending on one side of it.
+    _BY_DESIGN = frozenset((
+        "test_cross_platform.py:PublisherStableIsReachableOnEveryBody",
+    ))
+
+    _KNOWN_UNTRIAGED = frozenset((
+        # The two remaining entries stub "developer-id" specifically, and
+        # PUBLISHER_TRUST is "apple" on macOS: swapping them would silently
+        # change what a macOS assertion means (one of them is literally about
+        # vendor impersonation), which is a worse bug than the one being fixed.
+        # They need a per-case reading, not a mechanical rewrite.
+        # Empty, and it must stay that way by shrinking rather than by
+        # deletion: the stale-entry check above fails on any name left here
+        # that no longer offends, so this list cannot quietly become an
+        # exemption list. All nine original entries were resolved by
+        # 2026-08-24 — seven mechanically, and the last two by mutation
+        # testing that proved their "developer-id" default inert (only
+        # TestHotDirAppBundle's was load-bearing, and that class is
+        # macOS-gated).
+    ))
+
+    def test_no_ungated_test_stubs_a_macos_only_trust_verdict(self):
+        import conftest
+        here = os.path.dirname(os.path.abspath(__file__))
+        offenders, seen_baseline = [], set()
+        for name in sorted(os.listdir(here)):
+            if not name.startswith("test_") or not name.endswith(".py"):
+                continue
+            path = os.path.join(here, name)
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            cls = None
+            for n, line in enumerate(lines, 1):
+                stripped = line.lstrip()
+                if stripped.startswith("class "):
+                    cls = stripped[6:].split("(")[0].split(":")[0].strip()
+                if stripped.startswith("#"):
+                    continue
+                for verdict in self._MAC_ONLY_VERDICTS:
+                    if not any(shape % verdict in line
+                               for shape in self._STUB_SHAPES):
+                        continue
+                    # Gated to macOS by class, or by the whole file being a
+                    # macOS-only module -> the fixture is honest about itself.
+                    if cls in conftest._MAC_ONLY_CLASSES:
+                        continue
+                    key = "%s:%s" % (name, cls)
+                    if key in self._BY_DESIGN:
+                        continue
+                    seen_baseline.add(key)
+                    if key in self._KNOWN_UNTRIAGED:
+                        continue
+                    offenders.append(
+                        "%s:%d (class %s) stubs trust=%r"
+                        % (name, n, cls, verdict))
+        stale = sorted(self._KNOWN_UNTRIAGED - seen_baseline)
+        self.assertEqual(
+            stale, [],
+            "_KNOWN_UNTRIAGED names entries that no longer offend. Delete "
+            "them -- a ratchet that does not tighten is just an exemption "
+            "list: %s" % (stale,))
+        self.assertEqual(
+            offenders, [],
+            "These fixtures hard-code a macOS-only trust verdict but are not "
+            "gated to macOS, so on Windows/Linux they exercise a branch that "
+            "cannot be reached and assert nothing:\n  "
+            + "\n  ".join(offenders)
+            + "\n\nUse conftest.SUSPICIOUS_TRUST (or "
+              "conftest.suspicious_trust_for) for a verdict that qualifies on "
+              "the running body, or add the class to conftest._MAC_ONLY_CLASSES "
+              "if its assertions really are macOS-specific.")
+
+
+class StubbedTrustQualifiesOnEveryBody(unittest.TestCase):
+    """The gate a stubbed trust verdict has to clear, simulated per body.
+
+    `TrustSemantics` above already pinned that the vocabulary differs by body.
+    What nothing checked was the consequence: a SENSOR whose test feeds it a
+    stubbed verdict inherits that split, and if the test hard-codes one body's
+    word the sensor mints zero findings on the others while every assertion
+    still reads as platform-neutral.
+
+    That is not hypothetical. On 2026-08-24 all 12 cases in
+    tests/test_outbound_subject.py failed on both Windows legs -- `{"trust":
+    "adhoc"}`, a codesign word with no Authenticode equivalent, so
+    `suspicious_sig` rejected it, `_outbound_candidate_trust` returned None for
+    every row, and each assertion failed as an unexplained `0 != 1`. macOS and
+    Linux were green, so only a Windows runner could see it, and it cost 24
+    minutes of CI to say so.
+
+    These two cases cost milliseconds and catch the same class on any body:
+    the first checks the conftest mirror against the real predicate, the second
+    drives the sensor end-to-end through each simulated gate.
+    """
+
+    _BODIES = (("mac", False, False), ("win", True, False),
+               ("linux", False, True))
+
+    def test_the_conftest_mirror_matches_the_real_predicate(self):
+        from conftest import suspicious_trust_for
+        saved = aegis.IS_WIN, aegis.IS_LINUX
+        try:
+            for name, is_win, is_linux in self._BODIES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                verdict = suspicious_trust_for(is_win, is_linux)
+                self.assertTrue(
+                    aegis.suspicious_sig(verdict),
+                    "%s: conftest offers %r, which suspicious_sig rejects "
+                    "there" % (name, verdict))
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved
+
+    def test_the_outbound_sensor_mints_a_finding_on_every_body(self):
+        from conftest import suspicious_trust_for
+        path = "/Users/x/.vscode/extensions/some.ext-1.0.0/native/claude"
+        saved_flags = aegis.IS_WIN, aegis.IS_LINUX
+        saved_fns = {n: getattr(aegis, n) for n in (
+            "classify_signature", "is_risky_location", "_grade_binary",
+            "_vouch_endpoint_deviation")}
+        aegis.is_risky_location = lambda p: True
+        aegis._grade_binary = lambda sev, p, **k: (sev, None, None)
+        aegis._vouch_endpoint_deviation = lambda p, ep: (None, None)
+        try:
+            for name, is_win, is_linux in self._BODIES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                verdict = suspicious_trust_for(is_win, is_linux)
+                aegis.classify_signature = lambda p, **k: {"trust": verdict}
+                fs = aegis._outbound_findings([(path, "1.2.3.4", "443"),
+                                               (path, "5.6.7.8", "443")])
+                self.assertEqual(
+                    len(fs), 1,
+                    "%s: the outbound sensor minted %d findings for a "
+                    "qualifying binary -- the gate rejected the verdict this "
+                    "body actually uses" % (name, len(fs)))
+                self.assertEqual(fs[0]["endpoint_count"], 2)
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved_flags
+            for n, fn in saved_fns.items():
+                setattr(aegis, n, fn)
+
+
+    def test_each_body_row_can_actually_fail(self):
+        """The negative half. Without it the Linux row above asserts nothing.
+
+        Linux's gate is `_exec_alert(path, trust) or is_risky_location(path)`,
+        and the positive test stubs is_risky_location True — so that row passed
+        for a reason unrelated to the verdict and could not fail on a wrong
+        one. A row that cannot fail is not coverage; it is the same shape as
+        the fixture that shipped 12 Windows failures while reading as
+        platform-neutral.
+
+        Each body is driven here to the state where it must mint NOTHING:
+        macOS and Windows on a verdict `suspicious_sig` rejects, and Linux on a
+        path that is neither risky nor a volatile exec — because on Linux the
+        verdict arm is dead by construction (`_classify_linux` emits only
+        os-managed and unmanaged) and structure is the whole signal.
+        """
+        saved_flags = aegis.IS_WIN, aegis.IS_LINUX
+        saved_fns = {n: getattr(aegis, n) for n in (
+            "classify_signature", "is_risky_location", "_grade_binary",
+            "_vouch_endpoint_deviation")}
+        aegis._grade_binary = lambda sev, p, **k: (sev, None, None)
+        aegis._vouch_endpoint_deviation = lambda p, ep: (None, None)
+        # A real, existing, non-volatile file: _exec_alert returns None for it,
+        # which is what makes the Linux row's structural arm testably shut.
+        self.assertTrue(os.path.exists(aegis._SELF_PATH))
+        cases = (
+            # body,   is_win, is_linux, path,              trust,        risky
+            ("mac",   False,  False,    "/Users/x/.vscode/e/claude", "apple",     True),
+            ("win",   True,   False,    "/Users/x/.vscode/e/claude", "os-signed", True),
+            ("linux", False,  True,     aegis._SELF_PATH,            "unmanaged", False),
+        )
+        try:
+            for name, is_win, is_linux, path, trust, risky in cases:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                aegis.classify_signature = lambda p, **k: {"trust": trust}
+                aegis.is_risky_location = lambda p: risky
+                self.assertEqual(
+                    aegis._outbound_findings([(path, "1.2.3.4", "443")]), [],
+                    "%s: a binary this body has no reason to alert on still "
+                    "minted a finding — the row above cannot be trusted to "
+                    "fail either" % name)
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved_flags
+            for n, fn in saved_fns.items():
+                setattr(aegis, n, fn)
+
+
+class NativePackageManagersEarnAReceipt(unittest.TestCase):
+    """The second custody rung, on the bodies that are not macOS.
+
+    `_grade_binary` offers a sensor exactly two demotions: operator-vouched and
+    package-managed. The second consulted Homebrew, VS Code, pipx and uv only —
+    so an apt/rpm/winget-installed binary, which is the ordinary shape of a
+    developer's toolchain, was scored at full severity with custody=None on
+    Linux and Windows while its Homebrew equivalent on macOS was demoted a
+    step. Both rungs available off-mac were narrower than on mac.
+
+    The Linux half needed no new machinery: `_classify_linux` had shelled out
+    to dpkg/rpm/pacman since forever to decide `os-managed`, and custody simply
+    never asked. That query is now `_linux_pkg_owner`, one spelling with two
+    callers.
+    """
+
+    def setUp(self):
+        self._flags = aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC
+        self._run = aegis.run
+        aegis._LINUX_PKG_CACHE.clear()
+
+    def tearDown(self):
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = self._flags
+        aegis.run = self._run
+        aegis._LINUX_PKG_CACHE.clear()
+
+    def _win_tree(self, rel):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+        return path
+
+    def test_winget_and_chocolatey_paths_earn_a_receipt(self):
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = True, False, False
+        for rel, want in (
+                ("Local/Microsoft/WinGet/Packages/Foo.Bar_1.2.3/tool.exe", "winget:Foo.Bar"),
+                ("Local/Microsoft/WinGet/Links/tool.exe", "winget:link"),
+                ("ProgramData/chocolatey/lib/ripgrep/tools/rg.exe", "choco:ripgrep")):
+            self.assertEqual(aegis._package_receipt(self._win_tree(rel)), want, rel)
+
+    def test_an_unrelated_windows_path_earns_nothing(self):
+        """The probes must not be a blanket amnesty for anything under a
+        user-writable root — that would turn a demotion into a blind spot."""
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = True, False, False
+        self.assertIsNone(aegis._package_receipt(
+            self._win_tree("Local/Temp/payload/tool.exe")))
+
+    def test_a_distro_package_earns_a_receipt_on_linux(self):
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = False, True, False
+        aegis.run = lambda cmd, **k: (("curl: /usr/bin/curl", "", 0)
+                                      if cmd[0] == "dpkg-query" else ("", "", 1))
+        # A real file OUTSIDE $HOME: _linux_pkg_owner skips the subprocess for
+        # $HOME/tmp paths (package managers never own them), and
+        # _package_receipt only probes candidates that exist on disk.
+        probe = "/usr/bin/curl"
+        if not os.path.exists(probe):
+            self.skipTest("no /usr/bin/curl on this body")
+        self.assertEqual(aegis._package_receipt(probe), "dpkg:curl")
+
+    def test_the_distro_query_is_asked_once_per_path(self):
+        """Up to three subprocesses per path, asked about the same handful of
+        programs repeatedly within one scan."""
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = False, True, False
+        calls = []
+
+        def counting(cmd, **k):
+            calls.append(cmd[0])
+            return ("curl: /usr/bin/curl", "", 0) if cmd[0] == "dpkg-query" else ("", "", 1)
+
+        aegis.run = counting
+        for _ in range(4):
+            aegis._linux_pkg_owner("/usr/bin/curl")
+        self.assertEqual(calls, ["dpkg-query"])
+
+    def test_the_classifier_and_the_receipt_agree(self):
+        """One spelling, two callers — a split here is how the custody layer
+        went blind to a fact the trust layer already had."""
+        aegis.IS_WIN, aegis.IS_LINUX, aegis.IS_MAC = False, True, False
+        aegis.run = lambda cmd, **k: (("curl: /usr/bin/curl", "", 0)
+                                      if cmd[0] == "dpkg-query" else ("", "", 1))
+        self.assertEqual(aegis._classify_linux("/usr/bin/curl")["authority"],
+                         aegis._linux_pkg_owner("/usr/bin/curl"))
+
+
+class PublisherStableIsReachableOnEveryBody(unittest.TestCase):
+    """The `publisher-stable` custody demotion, per body.
+
+    It used to inline the macOS triple ("apple", "app-store", "developer-id"),
+    so on Windows and Linux the rung was unreachable by construction and every
+    off-mac host paid full severity for a vendor's ordinary in-place update.
+    Nothing caught it because the fixture that pins the rung
+    (tests/test_custody.py `_prec`, default trust="developer-id") hard-codes a
+    macOS word while its docstring calls itself "the shape every platform
+    snapshot produces" — the same defect class as the outbound gate, running
+    green on all three CI bodies.
+
+    So this asserts the rung both FIRES on each body's own trusted vocabulary
+    and stays SHUT on a verdict that body cannot trust.
+    """
+
+    _CASES = (
+        # body,      is_win, is_linux, trusted,        untrusted
+        ("mac",      False,  False,    "developer-id", "unsigned"),
+        ("win",      True,   False,    "signed-valid", "unsigned"),
+        ("win",      True,   False,    "os-signed",    "broken"),
+        ("linux",    False,  True,     "os-managed",   "unmanaged"),
+    )
+
+    @staticmethod
+    def _rec(sha, trust, authority="Vendor Inc"):
+        return {"label": "job", "program": "/opt/vendor/updater",
+                "args": ["/opt/vendor/updater"], "sha256": sha,
+                "trust": trust, "authority": authority,
+                "target": None, "target_sha256": None}
+
+    def test_a_vendor_rebuild_in_place_demotes_on_every_body(self):
+        saved = aegis.IS_WIN, aegis.IS_LINUX
+        try:
+            for body, is_win, is_linux, trusted, untrusted in self._CASES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                old = self._rec("a" * 64, trusted)
+                new = self._rec("b" * 64, trusted)
+                self.assertEqual(
+                    aegis._custody_persistence(old, new), "publisher-stable",
+                    "%s: a same-place same-signer rebuild carrying %r did not "
+                    "earn the demotion — the gate does not speak this body's "
+                    "trust vocabulary" % (body, trusted))
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved
+
+    def test_an_untrusted_verdict_never_earns_the_demotion(self):
+        saved = aegis.IS_WIN, aegis.IS_LINUX
+        try:
+            for body, is_win, is_linux, _trusted, untrusted in self._CASES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                old = self._rec("a" * 64, untrusted)
+                new = self._rec("b" * 64, untrusted)
+                self.assertIsNone(
+                    aegis._custody_persistence(old, new),
+                    "%s: %r earned publisher-stable — the widened gate is too "
+                    "wide on this body" % (body, untrusted))
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved
+
+    def test_a_changed_signer_never_earns_the_demotion(self):
+        """The authority check is the real 'same publisher' test; widening the
+        vocabulary must not weaken it."""
+        saved = aegis.IS_WIN, aegis.IS_LINUX
+        try:
+            for body, is_win, is_linux, trusted, _u in self._CASES:
+                aegis.IS_WIN, aegis.IS_LINUX = is_win, is_linux
+                old = self._rec("a" * 64, trusted, authority="Vendor Inc")
+                new = self._rec("b" * 64, trusted, authority="Someone Else")
+                self.assertIsNone(
+                    aegis._custody_persistence(old, new),
+                    "%s: a rebuild signed by a DIFFERENT authority earned "
+                    "publisher-stable" % body)
+        finally:
+            aegis.IS_WIN, aegis.IS_LINUX = saved
+
+
 class ExecAlertSemantics(unittest.TestCase):
     def test_linux_volatile_exec_alerts_without_any_signature(self):
         saved = aegis.IS_LINUX, aegis.IS_MAC
@@ -877,6 +1325,9 @@ class ProbeFailureIsNeverClean(unittest.TestCase):
     def test_defender_exclusion_probe_failure_is_a_non_answer(self):
         self.assertIsNone(self._with_run(aegis.snapshot_win_exclusions))
 
+    def test_auth_session_win_probe_failure_is_a_non_answer(self):
+        self.assertIsNone(self._with_run(aegis._snapshot_auth_sessions_win))
+
     def test_wmi_probe_failure_is_a_non_answer(self):
         self.assertIsNone(self._with_run(aegis.snapshot_wmi_subscriptions))
 
@@ -893,6 +1344,23 @@ class ProbeFailureIsNeverClean(unittest.TestCase):
                                             out="", err="", rc=0))
         self.assertEqual({}, self._with_run(aegis.snapshot_wmi_subscriptions,
                                             out="", err="", rc=0))
+        self.assertEqual({}, self._with_run(aegis._snapshot_auth_sessions_win,
+                                            out="", err="", rc=0))
+
+    def test_auth_session_win_parses_established_connections(self):
+        out = "remote=203.0.113.9=3389\nremote=198.51.100.4=5985\n"
+        snap = self._with_run(aegis._snapshot_auth_sessions_win, out=out,
+                              err="", rc=0)
+        self.assertEqual({"rdp@203.0.113.9:3389": "203.0.113.9",
+                          "rdp@198.51.100.4:5985": "198.51.100.4"}, snap)
+
+    def test_auth_session_win_drops_loopback(self):
+        # A local RDP/WinRM smoke test against 127.0.0.1 is routine tooling,
+        # not a remote actor — same exclusion the POSIX `who` parser applies.
+        out = "remote=127.0.0.1=3389\nremote=::1=5986\n"
+        snap = self._with_run(aegis._snapshot_auth_sessions_win, out=out,
+                              err="", rc=0)
+        self.assertEqual({}, snap)
 
     def test_readable_but_empty_journal_is_coverage_not_a_gap(self):
         # auth.log is root-only on most distros; falling back to a journal that
@@ -946,16 +1414,18 @@ class ListenerAttribution(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class RegistryIntegrity(unittest.TestCase):
     def test_all_surface_callables_are_defined(self):
-        for key, snap_fn, diff_fn in aegis.SURFACES:
+        for row in aegis.SURFACES:
+            key, snap_fn, diff_fn, scope, live = aegis._surface_row(row)
             self.assertTrue(callable(snap_fn), "%s snapshot" % key)
             self.assertTrue(callable(diff_fn), "%s diff" % key)
+            self.assertTrue(scope, "%s writ scope" % key)
 
     def test_surface_keys_are_unique(self):
-        keys = [k for k, _s, _d in aegis.SURFACES]
+        keys = [r[0] for r in aegis.SURFACES]
         self.assertEqual(len(keys), len(set(keys)))
 
     def test_platform_specific_surfaces_are_registered(self):
-        keys = {k for k, _s, _d in aegis.SURFACES}
+        keys = {r[0] for r in aegis.SURFACES}
         if aegis.IS_LINUX:
             self.assertIn("kernel_modules", keys)
             self.assertIn("suid_binaries", keys)
@@ -1187,12 +1657,14 @@ class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
 
     def setUp(self):
         self._saved = (aegis.run, aegis._PROC_ENUM_FAILED, aegis.IS_WIN,
-                       aegis.IS_MAC, aegis.IS_LINUX)
+                       aegis.IS_MAC, aegis.IS_LINUX,
+                       aegis._PROC_ARGV_PARTIAL)
         aegis._PROC_ENUM_FAILED = False
+        aegis._PROC_ARGV_PARTIAL = False
 
     def tearDown(self):
         (aegis.run, aegis._PROC_ENUM_FAILED, aegis.IS_WIN, aegis.IS_MAC,
-         aegis.IS_LINUX) = self._saved
+         aegis.IS_LINUX, aegis._PROC_ARGV_PARTIAL) = self._saved
 
     def test_a_timed_out_windows_query_is_recorded_not_swallowed(self):
         aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
@@ -1215,6 +1687,19 @@ class ProcessTableNonAnswerIsNotEmptiness(unittest.TestCase):
         aegis.run = lambda *a, **k: ("1\tme\tC:\\W\\x.exe\tx.exe\n", "", 0)
         self.assertEqual(1, len(list(aegis._iter_processes())))
         self.assertFalse(aegis._PROC_ENUM_FAILED)
+
+    def test_mac_argv_partial_answer_is_marked_degraded(self):
+        """A successful executable table plus failed argv table is useful but
+        incomplete: behavioral argv coverage must not be reported healthy."""
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = False, True, False
+        replies = iter([
+            ("42  501  /bin/zsh\n", "", 0),
+            ("", "permission denied", 1),
+        ])
+        aegis.run = lambda *a, **k: next(replies)
+        rows = list(aegis._iter_processes())
+        self.assertEqual([("42", "501", "/bin/zsh", "/bin/zsh")], rows)
+        self.assertTrue(aegis._PROC_ARGV_PARTIAL)
 
 
 class OutboundRowsBatchesPsByPid(unittest.TestCase):
@@ -1558,9 +2043,16 @@ class TextEncodingIsPinned(unittest.TestCase):
             md = aegis.write_report([f], first_run=False)
             with open(aegis.LATEST_MD, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), md)
-            # The icon is the byte sequence cp1252 cannot represent; assert it
-            # actually reached the file rather than being dropped.
-            self.assertIn(aegis.SEV_ICON["MEDIUM"], md)
+            # The brief report leads with a verdict rather than enumerating
+            # every finding, so the per-severity icon now lives in the full
+            # render. Both layers are asserted: each carries a byte sequence
+            # cp1252 cannot represent, and each must reach its file intact.
+            self.assertTrue(any(ord(c) > 0x7F for c in md),
+                            "brief report lost all non-ASCII")
+            full = aegis._full_report(aegis.load_json(aegis.LATEST_JSON, {}))
+            self.assertIn(aegis.SEV_ICON["MEDIUM"], full)
+            # the operator's own non-ASCII text must survive the round trip too
+            self.assertIn("caf\u00e9.exe", full)
         finally:
             (aegis.STATE_DIR, aegis.LATEST_MD, aegis.LATEST_JSON) = saved
             import shutil

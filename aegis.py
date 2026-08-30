@@ -147,9 +147,11 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import hashlib
 import hmac
+import ipaddress
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -196,10 +198,12 @@ LATEST_MD = os.path.join(STATE_DIR, "latest.md")
 LATEST_JSON = os.path.join(STATE_DIR, "latest.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
 SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
+INTENT_FILE = os.path.join(STATE_DIR, "intent.jsonl")
+FLEET_SIGNERS = os.path.join(STATE_DIR, "allowed_signers")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
 EVENT_DB = os.path.join(STATE_DIR, "aegis.db")
-BASELINE_SCHEMA_VERSION = 2
+BASELINE_SCHEMA_VERSION = 3
 HOSTS_FILE = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                            "System32", "drivers", "etc", "hosts")
               if IS_WIN else "/etc/hosts")
@@ -335,6 +339,7 @@ AGENT_SKILL_ROOTS = [os.path.join(HOME, d) for d in (
 _SELF_PATH = os.path.abspath(__file__)
 
 SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+SEV_NAMES = {v: k for k, v in SEV_ORDER.items()}
 SEV_ICON = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦", "INFO": "⬜"}
 NOTIFY_MIN_SEV = "HIGH"  # only >= this AND new gets a desktop notification
 
@@ -1293,6 +1298,11 @@ if IS_MAC:
         # clipboard surface.
         "logger": "/usr/bin/logger", "pbpaste": "/usr/bin/pbpaste",
         "pbcopy": "/usr/bin/pbcopy",
+        # Vouch tier: ssh-keygen -Y is the signature verifier for the operator
+        # vouch log. Pinned to the system path like every other tool here, so a
+        # PATH-shadowing "ssh-keygen" cannot become the thing that decides
+        # whether a vouch is genuine.
+        "ssh-keygen": "/usr/bin/ssh-keygen",
     }
 elif IS_LINUX:
     # Distros disagree on /usr/bin vs /bin (usrmerge) and /usr/sbin vs /sbin;
@@ -1311,7 +1321,9 @@ elif IS_LINUX:
                                 "sestatus", "notify-send",
                                 # protective tier
                                 "logger", "journalctl", "xclip", "wl-paste",
-                                "wl-copy")}
+                                "wl-copy",
+                                # vouch tier: the signature verifier
+                                "ssh-keygen")}
 else:
     _SYS32 = os.path.join(WIN_SYSTEMROOT, "System32")
     _TRUSTED_TOOLS = {
@@ -1366,10 +1378,16 @@ def _service_control_guard(cmd):
                   "with no AEGIS_TEST_LAUNCHCTL stub" % (cmd[0],), 2)
 
 
-def run(cmd, timeout=15, extra_env=None):
+def run(cmd, timeout=15, extra_env=None, stdin_data=None):
     """Run a command, return (stdout, stderr, rc). Never raises. extra_env
     entries are added to the restricted environment — the injection-safe way to
-    hand attacker-influenced strings (paths, titles) to PowerShell."""
+    hand attacker-influenced strings (paths, titles) to PowerShell.
+
+    stdin_data feeds text on standard input for the one tool that requires it
+    (`ssh-keygen -Y verify` reads the signed payload from stdin). It stays in
+    this helper rather than a bare subprocess call so signature verification
+    inherits the same restricted environment and command allowlist as every
+    other command Aegis runs."""
     cmd, refusal = _service_control_guard(cmd)
     if refusal is not None:
         return refusal
@@ -1413,7 +1431,7 @@ def run(cmd, timeout=15, extra_env=None):
             # ANSI/OEM output rather than fix anything.
             _trusted_command(cmd), capture_output=True, text=True,
             errors="replace", timeout=timeout,
-            check=False, env=safe_env
+            check=False, env=safe_env, input=stdin_data
         )
         return p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired:
@@ -1536,7 +1554,11 @@ def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
 def _quarantine_fields(path):
     """One `xattr` read of com.apple.quarantine → (present, agent, event_uuid).
     Single-call so the hot-dir sweep does not spawn three subprocesses per file.
-    Value layout: flags;hex-timestamp;AgentName;event-UUID."""
+    Value layout: flags;hex-timestamp;AgentName;event-UUID. Uses Apple's `xattr`
+    CLI because Python's os.getxattr is Linux-only (verified absent on macOS).
+    ABSENCE on a freshly-dropped executable is itself a signal — the file
+    arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
+    the exact side-load path AMOS/DMG-lure chains use."""
     out, _, rc = run(["xattr", "-p", "com.apple.quarantine", path], timeout=6)
     if rc != 0 or not out.strip():
         return (False, None, None)
@@ -1544,18 +1566,6 @@ def _quarantine_fields(path):
     agent = fields[2].strip() if len(fields) >= 3 and fields[2].strip() else None
     uuid = fields[3].strip() if len(fields) >= 4 and fields[3].strip() else None
     return (True, agent, uuid)
-
-
-def quarantine_origin(path):
-    """Provenance from the com.apple.quarantine xattr, via Apple's `xattr` CLI
-    (Python's os.getxattr is Linux-only — verified absent on macOS). Returns
-    (present, agent): whether the file carries a Gatekeeper quarantine flag and
-    the downloading agent name (Safari, Google Chrome, curl, Terminal, …).
-    ABSENCE on a freshly-dropped executable is itself a signal — it means the
-    file arrived by a channel that bypassed Gatekeeper (curl/scp/AirDrop/torrent),
-    the exact side-load path AMOS/DMG-lure chains use."""
-    present, agent, _uuid = _quarantine_fields(path)
-    return (present, agent)
 
 
 # The central download-provenance store — LSQuarantineEvent rows in the user's
@@ -1765,6 +1775,46 @@ def classify_signature(path):
     return result
 
 
+_LINUX_PKG_CACHE = {}
+
+
+def _linux_pkg_owner(real):
+    """"<manager>:<package>" for the distro package that owns `real`, else None.
+
+    ONE spelling, two callers: _classify_linux turns it into the `os-managed`
+    trust verdict, and _os_package_receipt turns the same fact into a custody
+    receipt. Before this it existed only inside the classifier, so custody
+    could not see it and every apt/rpm-installed binary was scored as if it had
+    no provenance at all.
+
+    Cached per resolved path: this is up to three subprocesses, and the custody
+    layer asks about the same handful of programs repeatedly within one scan.
+    """
+    if not real:
+        return None
+    if real in _LINUX_PKG_CACHE:
+        return _LINUX_PKG_CACHE[real]
+    # Package managers never own $HOME/tmp content — skip the subprocess.
+    if any(real.startswith(p) for p in
+           (HOME + "/", "/home/", "/root/", "/tmp/", "/var/tmp/", "/dev/shm/",
+            "/run/")):
+        return None
+    owner = None
+    out, _, rc = run(["dpkg-query", "-S", real], timeout=10)
+    if rc == 0 and ":" in (out or ""):
+        owner = "dpkg:" + out.split(":", 1)[0].strip()
+    if owner is None:
+        out, _, rc = run(["rpm", "-qf", real], timeout=10)
+        if rc == 0 and out.strip() and "not owned" not in out:
+            owner = "rpm:" + out.strip().splitlines()[0]
+    if owner is None:
+        out, _, rc = run(["pacman", "-Qqo", real], timeout=10)
+        if rc == 0 and out.strip():
+            owner = "pacman:" + out.strip().splitlines()[0]
+    _LINUX_PKG_CACHE[real] = owner
+    return owner
+
+
 def _classify_linux(path):
     """Linux has no ambient code-signing; the honest analog is package-manager
     ownership: a file dpkg/rpm/pacman accounts for was installed by root through
@@ -1772,27 +1822,10 @@ def _classify_linux(path):
     behavior, not treated as malign by itself (every locally-built dev binary is
     unmanaged)."""
     result = {"trust": "unmanaged", "team": None, "authority": None}
-    real = os.path.realpath(path)
-    # Package managers never own $HOME/tmp content — skip the subprocess.
-    if any(real.startswith(p) for p in
-           (HOME + "/", "/home/", "/root/", "/tmp/", "/var/tmp/", "/dev/shm/",
-            "/run/")):
-        return result
-    out, _, rc = run(["dpkg-query", "-S", real], timeout=10)
-    if rc == 0 and ":" in (out or ""):
+    owner = _linux_pkg_owner(os.path.realpath(path))
+    if owner:
         result["trust"] = "os-managed"
-        result["authority"] = "dpkg:" + out.split(":", 1)[0].strip()
-        return result
-    out, _, rc = run(["rpm", "-qf", real], timeout=10)
-    if rc == 0 and out.strip() and "not owned" not in out:
-        result["trust"] = "os-managed"
-        result["authority"] = "rpm:" + out.strip().splitlines()[0]
-        return result
-    out, _, rc = run(["pacman", "-Qqo", real], timeout=10)
-    if rc == 0 and out.strip():
-        result["trust"] = "os-managed"
-        result["authority"] = "pacman:" + out.strip().splitlines()[0]
-        return result
+        result["authority"] = owner
     return result
 
 
@@ -2042,6 +2075,36 @@ def suspicious_sig(trust):
     return trust in ("adhoc", "unsigned", "broken")
 
 
+def publisher_sig(trust):
+    """Does this verdict mean "a trusted publisher vouches for these bytes"?
+
+    The positive twin of suspicious_sig(), per-body for the same reason and
+    kept beside it so there is exactly ONE spelling of each half of the trust
+    vocabulary in this file.
+
+    mac: apple / app-store / developer-id. `signed-other` is deliberately out —
+         a signature that chains to no trusted root vouches for nobody.
+    windows: os-signed / signed-valid — both are Authenticode status "Valid",
+         and `authority` carries the signer CN.
+    linux: os-managed — dpkg/rpm/pacman owns the file, so the distro pipeline
+         is the publisher and `authority` carries "dpkg:<pkg>" (or rpm/pacman).
+
+    Written 2026-08-24. Until then `_custody_persistence` inlined the macOS
+    triple, so the `publisher-stable` demotion was structurally UNREACHABLE on
+    Windows and Linux: `_authenticode_record` emits os-signed/signed-valid and
+    `_classify_linux` emits os-managed, none of which the inlined list
+    contained. Every off-mac host paid full severity for a vendor's ordinary
+    in-place update — the same defect class as the outbound-sensor gate, in the
+    opposite direction (a demotion that never fires rather than an alert that
+    never fires).
+    """
+    if IS_LINUX:
+        return trust == "os-managed"
+    if IS_WIN:
+        return trust in ("os-signed", "signed-valid")
+    return trust in ("apple", "app-store", "developer-id")
+
+
 # --------------------------------------------------------------------------- #
 # Finding model
 # --------------------------------------------------------------------------- #
@@ -2131,6 +2194,17 @@ def _redact_value(value):
 
 
 CONFIDENCE_ORDER = {"high": 2, "medium": 1, "low": 0}
+
+
+def _sha_key(text):
+    """Short stable digest of `text`, for use inside a fingerprint.
+
+    One spelling of the truncated-sha256 idiom that fingerprints already use
+    everywhere, so an identity key can never drift from the length or encoding
+    another call site picked.
+    """
+    return hashlib.sha256(
+        (text or "").encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def finding(severity, category, title, detail, fingerprint, **extra):
@@ -2230,7 +2304,9 @@ _EVENT_SCHEMA_SQL = """
             reminder_count INTEGER NOT NULL DEFAULT 0,
             next_reminder_at INTEGER,
             last_notified_at INTEGER,
-            resolution TEXT
+            resolution TEXT,
+            subject_json TEXT,
+            last_novel_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_incidents_active
             ON incidents(status, next_reminder_at);
@@ -2271,6 +2347,19 @@ _EVENT_SCHEMA_SQL = """
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             episode_started_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS trusted_identities (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            disposition TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            source_incident_id INTEGER,
+            UNIQUE(kind, fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trusted_identities_kind
+            ON trusted_identities(kind, disposition);
 """
 
 
@@ -2283,6 +2372,21 @@ def _event_connection():
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
     db.executescript(_EVENT_SCHEMA_SQL)
+    # CREATE TABLE IF NOT EXISTS never widens an existing table: a store
+    # created before subject_json existed must gain it here, or every reader
+    # that selects it fails closed into "no memory" without a word.
+    cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+    if "subject_json" not in cols:
+        db.execute("ALTER TABLE incidents ADD COLUMN subject_json TEXT")
+    if "last_novel_at" not in cols:
+        db.execute("ALTER TABLE incidents ADD COLUMN last_novel_at INTEGER")
+        # Backfill from creation, not from updated_at: an existing row's
+        # updated_at is the last time it REPEATED itself, which is exactly the
+        # clock this column exists to stop trusting. Seeding it with
+        # created_at means a long-running incident that has said nothing new
+        # is eligible immediately, which is the correct verdict on it.
+        db.execute("UPDATE incidents SET last_novel_at=created_at "
+                   "WHERE last_novel_at IS NULL")
     db.commit()
     try:
         os.chmod(EVENT_DB, 0o600)
@@ -2354,42 +2458,71 @@ def _severity_max(a, b):
     return a if SEV_ORDER.get(a, -1) >= SEV_ORDER.get(b, -1) else b
 
 
-def _event_fingerprints(db, event_ids):
-    """The set of finding fingerprints behind `event_ids` (from each event's
-    stored finding JSON). Used to tell genuine recurrence from new evidence."""
+def _event_identities(db, event_ids):
+    """The set of RECURRENCE IDENTITIES behind `event_ids` (from each event's
+    stored finding JSON). Used to tell genuine recurrence from new evidence.
+
+    Identities, not raw fingerprints, because a beacon fingerprint names the
+    address it was seen talking to: see `_recurrence_identity`. Every caller
+    here is asking "is this something this incident has already seen?", and a
+    rotated address is not."""
     if not event_ids:
         return set()
     marks = ",".join("?" for _ in event_ids)
-    fps = set()
+    idents = set()
     for row in db.execute("SELECT data_json FROM events WHERE id IN (%s)" % marks,
                           tuple(event_ids)).fetchall():
         try:
-            fp = json.loads(row["data_json"]).get("fingerprint")
+            ident = _recurrence_identity(json.loads(row["data_json"]))
         except Exception:
-            fp = None
-        if fp:
-            fps.add(fp)
-    return fps
+            ident = None
+        if ident:
+            idents.add(ident)
+    return idents
 
 
-def _incident_fingerprints(db, incident_id):
-    """Every finding fingerprint ever attached to `incident_id`."""
-    fps = set()
+def _incident_identities(db, incident_id):
+    """Every recurrence identity ever attached to `incident_id`."""
+    idents = set()
     for row in db.execute(
             "SELECT e.data_json FROM incident_events ie "
             "JOIN events e ON ie.event_id=e.id WHERE ie.incident_id=?",
             (incident_id,)).fetchall():
         try:
-            fp = json.loads(row["data_json"]).get("fingerprint")
+            ident = _recurrence_identity(json.loads(row["data_json"]))
         except Exception:
-            fp = None
-        if fp:
-            fps.add(fp)
-    return fps
+            ident = None
+        if ident:
+            idents.add(ident)
+    return idents
+
+
+def _mark_novelty(db, incident_id, event_ids, now):
+    """Advance an incident's novelty clock when the incoming evidence carries
+    a recurrence identity it has never held before.
+
+    The distinction this draws is the whole of the age-out fix. `updated_at`
+    answers "when did this incident last receive evidence", and for anything
+    whose condition is CONTINUOUSLY true — a launchd job that still exists, a
+    config file still being written — that is every scan, forever. Age-out
+    keyed on it could therefore only ever retire incidents that had already
+    gone quiet, which are the ones not bothering anybody. On the reference
+    machine the entire open queue re-touched updated_at on the final scan, one
+    of them carrying 2,122 evidence events over 17 days, so nothing in it was
+    reachable. `last_novel_at` answers "when did this incident last tell me
+    something I did not already know", which is what the age-out resolution
+    string has always claimed to measure."""
+    if not event_ids:
+        return
+    incoming = _event_identities(db, event_ids)
+    if _carries_new_evidence(incoming, _incident_identities(db, incident_id)):
+        db.execute("UPDATE incidents SET last_novel_at=? WHERE id=?",
+                   (now, incident_id))
 
 
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
-                     initially_notified=False):
+                     initially_notified=False, subject=None):
+    subject_json = json.dumps(subject, sort_keys=True) if subject else None
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     row = db.execute(
         "SELECT * FROM incidents WHERE correlation_key=? AND status IN (%s) "
@@ -2401,9 +2534,13 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
         new_status = "OPEN" if (row["status"] == "ACK" and
                                 SEV_ORDER[new_sev] > SEV_ORDER[row["severity"]]) \
             else row["status"]
+        # A row that predates subjects acquires one from the first evidence
+        # that carries it, so the fingerprint-parsing fallback retires itself.
         db.execute("UPDATE incidents SET severity=?, status=?, last_seen=?, "
-                   "updated_at=? WHERE id=?",
-                   (new_sev, new_status, now, now, incident_id))
+                   "updated_at=?, subject_json=COALESCE(subject_json,?) "
+                   "WHERE id=?",
+                   (new_sev, new_status, now, now, subject_json, incident_id))
+        _mark_novelty(db, incident_id, event_ids, now)
     else:
         # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
         # a permanent mute on the whole entity. Keep genuinely-recurring evidence
@@ -2424,23 +2561,25 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
         reattach = bool(reviewed) and SEV_ORDER.get(severity, -1) <= \
             SEV_ORDER.get(reviewed["severity"], -1)
         if reattach:
-            incoming = _event_fingerprints(db, event_ids)
-            if incoming and not incoming.issubset(
-                    _incident_fingerprints(db, reviewed["id"])):
+            incoming = _event_identities(db, event_ids)
+            if _carries_new_evidence(
+                    incoming, _incident_identities(db, reviewed["id"])):
                 reattach = False
         if reattach:
             incident_id = reviewed["id"]
             db.execute("UPDATE incidents SET last_seen=?,updated_at=? WHERE id=?",
                        (now, now, incident_id))
+            _mark_novelty(db, incident_id, event_ids, now)
         else:
             last_notified = now if initially_notified else None
             cur = db.execute(
                 "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
                 "created_at,first_seen,last_seen,updated_at,reminder_count,"
-                "next_reminder_at,last_notified_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "next_reminder_at,last_notified_at,subject_json,"
+                "last_novel_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-                 now + _REMINDER_DELAYS[0], last_notified))
+                 now + _REMINDER_DELAYS[0], last_notified, subject_json, now))
             incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
@@ -2612,6 +2751,24 @@ _TOLERANCE_CATEGORIES = frozenset((
 _NEVER_TOLERATE_PREFIXES = ("decoy:", "latch:", "canary:")
 
 
+def _program_subject(path):
+    """The version-normalized identity of a program on disk.
+
+    `~/.vscode/extensions/openai.chatgpt-26.818.31338-darwin-arm64/bin/codex`
+    and its predecessor at 26.814.41407 are the SAME program to an operator and
+    two unrelated entities to a path-keyed store. Every editor-extension update
+    therefore minted fresh process and beacon incidents forever — on the
+    reference machine `codex` sat open at three versions and `claude` at two,
+    which was most of what remained after the persistence fix.
+
+    Reuses the tolerance layer's version regex so there is exactly ONE spelling
+    of "these two paths are the same software at different versions" in the
+    file. Nothing else is generalized: the digest still identifies the bytes,
+    and this only ever names the CASE those bytes belong to.
+    """
+    return _TOLERANCE_VERSION_RE.sub("#", path or "")
+
+
 def _tolerance_identity(fingerprint):
     """The stable identity of a signal fingerprint, or None when no safe
     generalization exists. Two — and only two — mutations generalize: a
@@ -2641,6 +2798,449 @@ def _tolerance_identity(fingerprint):
     return ":".join(normalized)
 
 
+_LEARNING_DEFAULT_DAYS = 14
+
+
+def _learning_until(baseline=None):
+    """Epoch at which the learning period ends, or 0 when none is active."""
+    if baseline is None:
+        baseline, _corrupt = load_baseline()
+    try:
+        return int((baseline or {}).get("learning_until") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _in_learning_period(now, baseline=None):
+    """Is this machine still building its picture of 'normal'?
+
+    A detector's first weeks on a real machine are its worst: every ordinary
+    thing it has never seen is, by construction, new — and on a development
+    box that is hundreds of things (interpreters under user-writable paths,
+    update channels beaconing, editor extensions rewriting themselves). Alerting
+    on all of it teaches the operator, correctly, that the tool does not know
+    what it is looking at, and that lesson survives every later improvement.
+
+    During the window everything is still RECORDED and correlated — this is not
+    a blind period, and nothing stops being watched. What changes is that a
+    non-CRITICAL signal opens pre-closed as 'learning' instead of alerting, so
+    the envelope of normal gets built from evidence rather than from the
+    operator's patience. Attack-defined evidence and CRITICAL chains are
+    excluded: a tripped decoy on day one is not ordinary, and never was.
+    """
+    return now < _learning_until(baseline)
+
+
+def _set_learning_period(days):
+    """Start/extend/end the learning period; returns the new end epoch."""
+    baseline, corrupt = load_baseline()
+    if corrupt or baseline is None:
+        baseline = baseline or {}
+    until = int(_epoch()) + int(days) * 86400 if days else 0
+    baseline["learning_until"] = until
+    save_json(BASELINE, baseline)
+    # This is an out-of-band write to a watched trust store; re-watermark it or
+    # the next scan correctly reports OUR OWN documented command as tampering.
+    _record_baseline_watermark()
+    return until
+
+
+_ROTATING_MIN_ENDPOINTS = 3
+_ROTATING_MIN_PORTS = 2
+# beacon fingerprints are built as "beacon:<path>:<ip>:<port>", and an IPv6
+# address contains colons — so the address CANNOT be recovered by splitting on
+# ':' and taking the second-to-last field. That is what the first version did,
+# and on real data it silently folded "fd7a:115c:a1e0::" into the path and
+# treated the empty tail as the address, so no IPv6 beacon could ever
+# generalize. Parse from the right instead: a numeric port, preceded by either
+# a dotted quad or a run of hextets.
+_BEACON_FP_RE = re.compile(
+    r"^beacon:(?P<path>.+?):"
+    r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*):"
+    r"(?P<port>\d+)$")
+
+
+def _beacon_parts(fingerprint):
+    """(path, ip, port) for a beacon fingerprint, else None. Version churn in
+    the path is normalized; a hostname is a fact and refuses to parse."""
+    fp = str(fingerprint or "")
+    if fp.startswith(_NEVER_TOLERATE_PREFIXES):
+        return None
+    m = _BEACON_FP_RE.match(fp)
+    if not m:
+        return None
+    ip, port = m.group("ip"), m.group("port")
+    try:
+        ipaddress.ip_address(ip)
+        if not 1 <= int(port) <= 65535:
+            return None
+    except ValueError:
+        return None
+    path = _TOLERANCE_VERSION_RE.sub("#", m.group("path"))
+    if not path:
+        return None
+    return path, ip, port
+
+
+def _beacon_endpoint_classes(fingerprint):
+    """The endpoint classes a beacon fingerprint could be tolerated under,
+    narrowest first, each paired with the observation that would evidence it.
+
+    Two levels, because one shape was not enough for real software:
+
+      * `<path>:#ip:<port>` — a service on a FIXED port answering from rotating
+        addresses. A CDN, an update channel. Evidenced by distinct addresses.
+      * `<path>:#ip:#port`  — a peer-to-peer client, which varies address AND
+        port together by design (Syncthing's dismissed endpoints on this
+        machine spanned five ports and five addresses, so the fixed-port class
+        could never reach its threshold and the operator's verdicts taught
+        nothing). Evidenced by distinct address:port PAIRS across several
+        distinct ports — i.e. the operator has demonstrated this program talks
+        to many peers, not that it moved once.
+
+    The broader level is strictly harder to earn (it needs breadth in two
+    dimensions), and neither level tolerates anything the guards in
+    _apply_correlations already refuse: never CRITICAL, never above the
+    reviewed severity, never a disputed identity, never attack-defined.
+    """
+    parts = _beacon_parts(fingerprint)
+    if not parts:
+        return []
+    path, ip, port = parts
+    return [("beacon:%s:#ip:%s" % (path, port), ip),
+            ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
+
+
+# --- structured subject identity ---------------------------------------------
+# The three sensors whose identity churned (persistence CHANGED, process exec,
+# net-beacon) declare WHAT a finding is about as fields, not as a string to be
+# regexed back apart. The identity strings the tolerance layer keys on are
+# RENDERINGS of the subject — byte-identical to what _tolerance_identity and
+# _beacon_endpoint_classes derive from the fingerprint, so rows that predate
+# subjects and rows that carry one build ONE memory. The subject is stored on
+# the incident, and that is what ends the migration treadmill: when a sensor
+# next changes how it spells a fingerprint, the identity the operator's
+# verdicts attach to does not move, so nothing is orphaned and no one-time
+# closer is needed. The string parsers remain only as the fallback for rows
+# that predate this, and for sensors that have not declared a subject.
+
+def _subject(kind, path, **fields):
+    """Build a finding subject. `path` is version-normalized HERE so every
+    consumer sees exactly one spelling of "same software, new version"; the
+    raw path is kept so 'did normalization change anything' stays answerable
+    without re-parsing."""
+    sub = {"kind": kind, "raw_path": path, "path": _program_subject(path)}
+    sub.update({k: v for k, v in fields.items() if v is not None})
+    return sub
+
+
+def _subject_identity(sub):
+    """Tolerance identity rendered from a subject, or None when it has nothing
+    to generalize over (no content hash, no version churn) — the same rule
+    _tolerance_identity applies to a fingerprint string, so plain recurrence
+    stays with the exact-key reattach."""
+    if not isinstance(sub, dict):
+        return None
+    kind, path = sub.get("kind"), sub.get("path")
+    if not path:
+        return None
+    generalizes = bool(sub.get("content")) or path != sub.get("raw_path")
+    if kind == "persistence" and generalizes:
+        # A subject written before persistence:new declared one describes a
+        # CHANGED item, so an absent `op` must keep rendering exactly that.
+        return "persistence:%s:%s" % (sub.get("op") or "changed", path)
+    if kind == "process" and generalizes:
+        return "process:%s:%s" % (path, sub.get("trust") or "")
+    return None
+
+
+def _subject_endpoint_classes(sub):
+    """Beacon endpoint classes from a subject's structured endpoint. A
+    hostname is a fact and refuses to generalize, exactly as in the string
+    path — but an IPv6 address needs no parsing-from-the-right here, because
+    it never went through a ':'-joined string in the first place."""
+    if not isinstance(sub, dict) or sub.get("kind") != "beacon":
+        return []
+    path = sub.get("path")
+    ip, port = str(sub.get("ip") or ""), str(sub.get("port") or "")
+    try:
+        ipaddress.ip_address(ip)
+        if not 1 <= int(port) <= 65535:
+            return []
+    except ValueError:
+        return []
+    if not path:
+        return []
+    return [("beacon:%s:#ip:%s" % (path, port), ip),
+            ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
+
+
+_PRODUCER_MIN_SIBLINGS = 3
+
+
+def _producer_class(sub):
+    """The producer class a NEW persistence item could be tolerated under, or
+    None. A producer is (launcher bytes, payload path, trust class): the same
+    binary running the same script is one installed toolkit registering
+    another job, which is what a scheduler kit, a language runtime's service
+    manager, or a backup vendor does every time it grows a task.
+
+    Why this is narrow enough to be safe. The class names the launcher by its
+    SHA, not its path, so a swapped binary is a different producer. It names
+    the payload the launcher actually runs — which only exists because
+    _script_target now sees through a runner subcommand — so `uv` alone
+    generalizes nothing; a second aikit-shaped kit under a different script is
+    unrelated. And it carries the trust class, so an adhoc sibling never
+    inherits a signed one's verdicts. To abuse it an attacker must already be
+    able to write the reviewed payload, at which point they own the jobs the
+    operator approved and the tolerance grants them nothing new.
+
+    Only `new` generalizes. An EXISTING job mutating is a different fact and
+    keeps its own identity, which is the fact a payload swap presents as.
+    """
+    if not isinstance(sub, dict) or sub.get("kind") != "persistence":
+        return None
+    if (sub.get("op") or "changed") != "new":
+        return None
+    prog_sha, target = sub.get("program_sha"), sub.get("target")
+    if not prog_sha or not target:
+        return None
+    return "persistence:#producer:%s:%s:%s" % (
+        prog_sha, _program_subject(target), sub.get("trust") or "")
+
+
+def _subject_producer_classes(sub):
+    """[(class, observation)] for a subject, breadth evidenced by DISTINCT
+    persistence paths — the same shape the endpoint classes use. There is
+    deliberately no fingerprint fallback: the old string carries the launcher
+    hash but never the payload, so a producer cannot be recovered from a row
+    that predates subjects. Those rows acquire one from their next evidence
+    (_upsert_incident COALESCEs it in) and join the memory then."""
+    klass = _producer_class(sub)
+    path = sub.get("path") if isinstance(sub, dict) else None
+    return [(klass, path)] if klass and path else []
+
+
+def _finding_producer_classes(f):
+    sub = f.get("subject")
+    return _subject_producer_classes(sub) if sub else []
+
+
+def _finding_identity(f):
+    """Subject first; the fingerprint string only for a finding without one."""
+    sub = f.get("subject")
+    if sub:
+        return _subject_identity(sub)
+    return _tolerance_identity(f.get("fingerprint"))
+
+
+def _finding_endpoint_classes(f):
+    sub = f.get("subject")
+    if sub:
+        return _subject_endpoint_classes(sub)
+    return _beacon_endpoint_classes(f.get("fingerprint"))
+
+
+def _recurrence_identity(f):
+    """The identity under which a finding counts as the SAME FACT recurring.
+
+    A fingerprint answers "which exact observation is this"; three consumers
+    needed the coarser question "is this something I have already seen", and
+    were using the fingerprint for it. For a beacon those differ, because the
+    fingerprint names the endpoint: a program that rotates destinations — a
+    CDN client, a sync daemon, an update channel, an editor extension —
+    presents an observation nothing has ever seen on every scan. Measured on
+    the reference store, 85 beacon fingerprints over 30 days were 27 actual
+    (program, port) pairs, and Zotero's eight were one.
+
+    Each consumer failed differently, which is why this read as four unrelated
+    complaints rather than one defect:
+
+      · `_mark_novelty` refreshed `last_novel_at` every scan, so age-out could
+        never retire the incidents it was written to retire.
+      · the FALSE_POSITIVE reattachment subset test could never match, so a
+        `risk:` incident the operator had judged benign re-opened under the
+        SAME correlation key — `risk:765ed268822cb174` did it three times, and
+        Zotero cost three separate verdicts for one fact.
+      · `_accumulate_risk` counted each rotated address as another distinct
+        signal, so churn alone carried an entity past RISK_MIN_SIGNALS and
+        RISK_THRESHOLD.
+
+    The generalization is the narrowest endpoint class the tolerance layer
+    already trusts (`beacon:<program>:#ip:<port>`): same program, same port,
+    rotating address. The port is deliberately kept — it names the service,
+    and a program that starts talking on a new one is a new fact. Anything
+    with no endpoint class keeps its exact fingerprint, so no other sensor
+    generalizes by accident.
+
+    This widens what counts as "already seen", so it can only ever attach
+    evidence to an incident that is already open or already reviewed — it
+    never suppresses a fingerprint the operator has not seen in some form,
+    and a rotating program that starts doing something ELSE still opens its
+    own case under that new identity."""
+    if not isinstance(f, dict):
+        return None
+    classes = _finding_endpoint_classes(f)
+    return classes[0][0] if classes else f.get("fingerprint")
+
+
+# `beacon:<program>:#ip:<port>` — parsed from the RIGHT, because a program
+# path is arbitrary text and `:#ip:` is the only reliable separator in it.
+_BEACON_CLASS_RE = re.compile(r"^beacon:(?P<prog>.+):#ip:(?P<port>\d{1,5})$")
+
+
+def _beacon_class_program(identity):
+    """The program a beacon endpoint class names, or None for anything else."""
+    m = _BEACON_CLASS_RE.match(str(identity or ""))
+    return m.group("prog") if m else None
+
+
+def _port_rotating_programs(identities):
+    """Programs an identity set has ITSELF demonstrated port rotation for.
+
+    A peer-to-peer client varies address and port together by design, so
+    collapsing only the address leaves the port doing exactly what the address
+    used to: Syncthing re-opened a judged `risk:` case on ports 50695 and
+    62429 after the address fix had already landed.
+
+    `_beacon_endpoint_classes` documents this shape and carries a broader
+    `#ip:#port` class for it, but that class is a grant of trust ACROSS
+    incidents and is deliberately hard to earn. The question here is narrower —
+    "is this port new *to this incident*" — and the incident answers it out of
+    what it already holds. Breadth is still the evidence: one program seen on
+    one or two ports generalizes nothing, which is what keeps an ordinary
+    service on 443 (or 80 and 443) reading its next port as the new fact it is.
+
+    The bar is `_ROTATING_MIN_ENDPOINTS`, not `_ROTATING_MIN_PORTS`. The
+    rotation memory demands breadth in two dimensions and this set can only
+    show one — the classes have already collapsed the addresses — so it takes
+    the stricter of the two constants rather than the one that happens to be
+    named for ports."""
+    ports = {}
+    for ident in identities:
+        m = _BEACON_CLASS_RE.match(str(ident or ""))
+        if m:
+            ports.setdefault(m.group("prog"), set()).add(m.group("port"))
+    return {prog for prog, seen in ports.items()
+            if len(seen) >= _ROTATING_MIN_ENDPOINTS}
+
+
+
+
+
+def _carries_new_evidence(incoming, held):
+    """True when `incoming` holds an identity `held` has never seen.
+
+    The plain subset test, plus the one exception above: for a program this
+    incident has already watched rotate across ports, another port is not
+    news. Everything else — a different program, a different sensor, a changed
+    binary — is unseen exactly as before."""
+    if not incoming:
+        return False
+    unseen = incoming - held
+    if not unseen:
+        return False
+    rotating = _port_rotating_programs(held)
+    if rotating:
+        unseen = {i for i in unseen
+                  if _beacon_class_program(i) not in rotating}
+    return bool(unseen)
+
+
+def _incident_identity(row):
+    """(identity, endpoint_classes) for a stored incident: from its stored
+    subject when it has one, else parsed from its correlation key (rows that
+    predate subjects, and every sensor that has not declared one)."""
+    raw = row["subject_json"] if "subject_json" in row.keys() else None
+    if raw:
+        try:
+            sub = json.loads(raw)
+            return _subject_identity(sub), _subject_endpoint_classes(sub)
+        except Exception:
+            pass
+    fp = (row["correlation_key"] or "")[len("signal:"):]
+    return _tolerance_identity(fp), _beacon_endpoint_classes(fp)
+
+
+def _rotating_endpoint_memory(db, now):
+    """{endpoint_class: (verdicts, max_reviewed_sev)} for classes the operator
+    has dismissed across enough DISTINCT endpoints to establish rotation.
+
+    Breadth is the evidence, and it is what keeps this narrow: dismissing one
+    binary:ip three times teaches nothing here (the exact-key reattach already
+    covers that). It takes three genuinely different endpoints — and, for the
+    port-agnostic level, several different ports — before rotation is an
+    established fact about that program rather than a single move."""
+    memory = {}
+    try:
+        rows = db.execute(
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+            "AND d.correlation_key LIKE 'signal:beacon:%'",
+            (now - _TOLERANCE_WINDOW,)).fetchall()
+    except Exception:
+        return memory
+    seen = {}
+    for row in rows:
+        for klass, observed in _incident_identity(row)[1]:
+            bucket = seen.setdefault(klass, {"obs": set(), "ports": set(),
+                                             "inc": set(), "sev": -1})
+            bucket["obs"].add(observed)
+            bucket["ports"].add(observed.rsplit(":", 1)[-1])
+            bucket["inc"].add(row["incident_id"])
+            bucket["sev"] = max(bucket["sev"],
+                                SEV_ORDER.get(row["severity"], -1))
+    for klass, bucket in seen.items():
+        if len(bucket["obs"]) < _ROTATING_MIN_ENDPOINTS:
+            continue
+        # the port-agnostic level additionally demands breadth ACROSS ports
+        if klass.endswith(":#port") and len(bucket["ports"]) < _ROTATING_MIN_PORTS:
+            continue
+        memory[klass] = (len(bucket["inc"]), bucket["sev"])
+    return memory
+
+
+def _producer_memory(db, now):
+    """{producer_class: (verdicts, max_reviewed_sev)} for producers the
+    operator has dismissed benign-positive across enough DISTINCT persistence
+    paths. Breadth over distinct paths is the evidence, exactly as distinct
+    endpoints are for rotation: three dismissals of the SAME job teach nothing
+    here, because the exact-key reattach already covers that."""
+    memory = {}
+    try:
+        rows = db.execute(
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+            "AND d.correlation_key LIKE 'signal:persistence:%'",
+            (now - _TOLERANCE_WINDOW,)).fetchall()
+    except Exception:
+        return memory
+    seen = {}
+    for row in rows:
+        raw = row["subject_json"] if "subject_json" in row.keys() else None
+        if not raw:
+            continue
+        try:
+            sub = json.loads(raw)
+        except Exception:
+            continue
+        for klass, observed in _subject_producer_classes(sub):
+            bucket = seen.setdefault(klass, {"obs": set(), "inc": set(),
+                                             "sev": -1})
+            bucket["obs"].add(observed)
+            bucket["inc"].add(row["incident_id"])
+            bucket["sev"] = max(bucket["sev"],
+                                SEV_ORDER.get(row["severity"], -1))
+    for klass, bucket in seen.items():
+        if len(bucket["obs"]) >= _PRODUCER_MIN_SIBLINGS:
+            memory[klass] = (len(bucket["inc"]), bucket["sev"])
+    return memory
+
+
 def _tolerance_memory(db, now):
     """{identity: (distinct_verdicts, max_reviewed_sev_order)} from the
     operator's own benign-positive dismissals of signal incidents inside the
@@ -2648,7 +3248,8 @@ def _tolerance_memory(db, now):
     memory = {}
     try:
         rows = db.execute(
-            "SELECT d.incident_id, d.correlation_key, i.severity "
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
             "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
             "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
             "AND d.correlation_key LIKE 'signal:%'",
@@ -2657,7 +3258,7 @@ def _tolerance_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        ident = _incident_identity(row)[0]
         if not ident:
             continue
         bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
@@ -2671,39 +3272,71 @@ def _tolerance_memory(db, now):
 
 
 def _disputed_identities(db):
-    """Identities with ANY incident currently in an active state. An operator
-    who reopened (or has not yet triaged) an incident on an identity is in
-    dispute with tolerance for it, so tolerance stands down there."""
+    """Identities the operator is actually in dispute with, so tolerance
+    stands down there.
+
+    This used to mean "any active incident", with the docstring reading
+    "reopened (or has not yet triaged)" — and that parenthesis was the bug.
+    It reads an operator's silence as an objection. On this machine every
+    identity that was noisy enough to matter therefore sat permanently
+    disputed by its own untriaged backlog: Zotero's open beacons kept the
+    endpoint class suppressed, so verdicts on that class could never take
+    effect and the queue kept growing the evidence of its own deadlock.
+    Tolerance could only ever engage where it was not needed.
+
+    A dispute is an ACT: a status the operator moved the incident to, or an
+    explicit `reopen` (to=OPEN from a closed state — the documented way to
+    revoke tolerance, and still fully honoured). An OPEN incident nobody has
+    touched is a backlog item, not an objection."""
     idents = set()
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    reopened = {r["incident_id"] for r in db.execute(
+        "SELECT DISTINCT incident_id FROM events WHERE "
+        "event_type='incident.lifecycle' AND incident_id IS NOT NULL AND "
+        "data_json LIKE '%\"to\": \"OPEN\"%'")}
     for row in db.execute(
-            "SELECT correlation_key FROM incidents WHERE status IN (%s) "
-            "AND correlation_key LIKE 'signal:%%'" % marks,
+            "SELECT id, status, correlation_key, subject_json FROM incidents "
+            "WHERE status IN (%s) AND correlation_key LIKE 'signal:%%'" % marks,
             _ACTIVE_INCIDENT_STATES):
-        ident = _tolerance_identity(row["correlation_key"][len("signal:"):])
+        if row["status"] == "OPEN" and row["id"] not in reopened:
+            continue
+        ident, classes = _incident_identity(row)
         if ident:
             idents.add(ident)
+        for klass, _observed in classes:
+            idents.add(klass)
+        raw = row["subject_json"] if "subject_json" in row.keys() else None
+        if raw:
+            try:
+                for klass, _obs in _subject_producer_classes(json.loads(raw)):
+                    idents.add(klass)
+            except Exception:
+                pass
     return idents
 
 
-def _auto_tolerate(db, incident_id, verdicts, now):
+def _auto_tolerate(db, incident_id, verdicts, now, reason="auto-tolerated"):
     """Close a just-created incident under acquired tolerance. The guard is in
     the WHERE: only an OPEN incident created THIS pass may be auto-closed, so a
     reattach to something the operator already saw is never swept from under
     them. Deliberately writes NO dismissals row — machine verdicts must never
-    feed backtest precision, category down-weighting, or future tolerance."""
+    feed backtest precision, category down-weighting, or future tolerance.
+
+    `reason` names WHICH machine verdict closed it (acquired tolerance, or the
+    learning period), so `incidents all` can tell them apart — they mean very
+    different things and an operator auditing later needs the distinction."""
     cur = db.execute(
         "UPDATE incidents SET status='FALSE_POSITIVE',"
-        "resolution='auto-tolerated',updated_at=?,next_reminder_at=NULL "
+        "resolution=?,updated_at=?,next_reminder_at=NULL "
         "WHERE id=? AND status='OPEN' AND created_at=?",
-        (now, incident_id, now))
+        (reason, now, incident_id, now))
     if cur.rowcount:
         db.execute(
             "INSERT INTO events(occurred_at,observed_at,source,event_type,"
             "incident_id,data_json) VALUES(?,?,?,?,?,?)",
             (now, now, "incident", "incident.lifecycle", incident_id,
              json.dumps({"from": "OPEN", "to": "FALSE_POSITIVE",
-                         "reason_code": "auto-tolerated",
+                         "reason_code": reason,
                          "prior_verdicts": verdicts})))
 
 
@@ -2746,7 +3379,11 @@ def _accumulate_risk(db, now, new_ids):
         b = by_entity.setdefault(ek, {"weight": 0.0, "fps": set(), "ids": set(),
                                       "cats": set(), "entity": entity,
                                       "new": False})
-        fp = f.get("fingerprint")
+        # Distinct SIGNALS, which is not the same as distinct fingerprints:
+        # a beacon fingerprint names the endpoint, so a program that rotates
+        # destinations was scoring one fresh signal per scan forever and could
+        # reach the threshold on churn alone (_recurrence_identity).
+        fp = _recurrence_identity(f)
         if fp in b["fps"]:
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
@@ -2770,6 +3407,318 @@ def _accumulate_risk(db, now, new_ids):
                 % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
                    "" if len(b["cats"]) == 1 else "s", score),
                 "HIGH", "risk", now, sorted(b["ids"]))
+
+
+# --------------------------------------------------------------------------- #
+# The routing gate — ONE verdict per finding, consulted by BOTH tiers.
+#
+# The interrupt tier (emit: allowlist, seen-ledger, adoption, notify floor,
+# confidence) and the incident tier (acquired tolerance, the learning period)
+# were disjoint state machines coupled by a single per-scan boolean. Three
+# things followed, each measured on the live store: acquired tolerance never
+# muted the desktop notification (a tolerated identity with a new content hash
+# interrupted FIRST and only then opened pre-closed); the learning period
+# never muted it either, despite the doc's promise; an allowlisted fingerprint
+# still opened and refreshed incidents and drove reminders; and one genuine
+# new HIGH marked every incident created that scan as already-notified.
+# route_findings is the one place the order is written down; emit and
+# record_security_state read it, and a caller without a routing (replay, the
+# tests) decides in place with the same function over the same memory.
+# --------------------------------------------------------------------------- #
+
+ROUTE_INTERRUPT = "interrupt"   # notify now
+ROUTE_DIGEST = "digest"         # logged and recorded; no interrupt
+ROUTE_SEEN = "seen"             # already reported; record only
+ROUTE_SILENT = "silent"         # allowlisted by the operator
+
+
+def _suppression_memory(db, now):
+    """Everything the incident tier knows that can quiet a signal, read once
+    per scan: (tolerance, rotating, disputed, learning)."""
+    tolerance = _tolerance_memory(db, now)
+    rotating = _rotating_endpoint_memory(db, now)
+    producer = _producer_memory(db, now)
+    disputed = _disputed_identities(db) if (tolerance or rotating or producer) \
+        else frozenset()
+    return tolerance, rotating, disputed, _in_learning_period(now), producer
+
+
+def _signal_decision(f, memory):
+    """(decision, verdicts) for a finding reaching the incident tier:
+    ("tolerated", n) under acquired tolerance, ("learning", 0) inside the
+    learning period, (None, 0) otherwise. The same guards wherever it is
+    called: never CRITICAL, never attack-defined, never a disputed identity,
+    never above the severity the operator actually reviewed."""
+    if not memory:
+        return None, 0
+    tolerance, rotating, disputed, learning = memory[:4]
+    producer = memory[4] if len(memory) > 4 else {}
+    sev = SEV_ORDER.get(f.get("severity"), -1)
+    if sev >= SEV_ORDER["CRITICAL"]:
+        return None, 0
+    if f.get("category") in _TOLERANCE_CATEGORIES:
+        # Two generalizations, same guards: the exact identity (hash and
+        # version churn), then — only for beacons, and only once rotation
+        # is evidenced across distinct addresses — the endpoint class.
+        # Both read the finding's SUBJECT where it carries one.
+        candidates = []
+        ident = _finding_identity(f)
+        if ident:
+            candidates.append((ident, tolerance))
+        if rotating:
+            for klass, _observed in _finding_endpoint_classes(f):
+                candidates.append((klass, rotating))
+        if producer:
+            for klass, _observed in _finding_producer_classes(f):
+                candidates.append((klass, producer))
+        for ident, mem in candidates:
+            if ident in disputed:
+                continue
+            count, reviewed_sev = mem.get(ident, (0, -1))
+            if count and sev <= reviewed_sev:
+                return "tolerated", count
+    # The learning period closes what tolerance has no verdict for yet.
+    # Checked AFTER tolerance so an identity the operator actually reviewed
+    # is still credited to tolerance in the audit trail; attack-defined
+    # evidence is excluded here exactly as it is from tolerance.
+    if learning and not str(f.get("fingerprint") or "").startswith(
+            _NEVER_TOLERATE_PREFIXES):
+        return "learning", 0
+    return None, 0
+
+
+def route_findings(findings, first_run=False, adopt=frozenset(), memory=None):
+    """{fingerprint: {"route", "why", "decision", "verdicts"}} for a batch.
+
+    `route` is the interrupt-tier outcome. `decision` is the incident-tier
+    outcome ("allowlisted", "tolerated", "learning" or None), carried
+    separately because a finding the seen-ledger already knows still needs
+    its incident decided. `memory` is _suppression_memory(...) or None, in
+    which case only the interrupt-tier checks apply.
+
+    First-run silence is the KnockKnock "trust what's already installed" rule
+    — it applies to PERSISTENCE and SHELL-HISTORY only, the two surfaces made
+    of accreted-over-time RESIDUE (a launchd item, a months-old `curl|sh`
+    install line). A payload already sitting in a hot dir, a suspicious
+    RUNNING process, an XProtect detection, /tmp staging, a modified canary,
+    or a weak hardening setting is a LIVE risk the user must hear about even
+    on the very first scan. `adopt` is the same rule for a surface an upgrade
+    sees for the first time. Confidence is the second routing axis: a
+    high-impact-but-noisy hit (explicit confidence='low') is logged and
+    correlated but routed to the digest instead of interrupting."""
+    seen = load_json(SEEN, {})
+    allow = set(load_json(ALLOWLIST, []))
+    out = {}
+    for f in findings:
+        fp = f["fingerprint"]
+        if fp in out:
+            continue
+        decision, verdicts = _signal_decision(f, memory)
+        if fp in allow:
+            route, why, decision = ROUTE_SILENT, "allowlisted", "allowlisted"
+        elif fp in seen:
+            route, why = ROUTE_SEEN, "seen"
+        elif (first_run and f["category"] in ("persistence", "shell-history")) \
+                or f["category"] in adopt:
+            route, why = ROUTE_DIGEST, "adopted"
+        elif CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0:
+            route, why = ROUTE_DIGEST, "low-confidence"
+        elif SEV_ORDER[f["severity"]] < SEV_ORDER[NOTIFY_MIN_SEV]:
+            route, why = ROUTE_DIGEST, "below-floor"
+        elif decision:
+            route, why = ROUTE_DIGEST, decision
+        else:
+            route, why = ROUTE_INTERRUPT, "new"
+        out[fp] = {"route": route, "why": why, "decision": decision,
+                   "verdicts": verdicts}
+    return out
+
+
+def _route_for_scan(findings, first_run, adopt, now=None):
+    """route_findings with the incident tier's memory. A store that cannot be
+    read routes without it — the pre-gate behaviour — and says so."""
+    memory = None
+    try:
+        db = _event_connection()
+        try:
+            memory = _suppression_memory(db, _epoch(now))
+        finally:
+            db.close()
+    except Exception as e:
+        log_run("routing without incident memory: %s" % e)
+    return route_findings(findings, first_run, adopt, memory)
+
+
+# --------------------------------------------------------------------------- #
+# Identity trust — an operator-confirmed allowlist of SSH keys/origins.
+#
+# Aegis's SSH surfaces (a changed authorized_keys, a new remote login session)
+# have no notion of "known good actor": the operator's own second machine and
+# an attacker's implant look identical, so every legitimate SSH touch alerts
+# exactly like a compromise. This table is the fix — a durable, local,
+# fingerprint-keyed roster the operator builds with `aegis.py identity trust`
+# or by marking a real incident benign-positive (_trust_identities_from_incident,
+# next to cmd_incident). A match never deletes the finding, only downgrades
+# severity/confidence to LOW so it reports at digest tier instead of
+# interrupting (route_findings routes confidence='low' to the digest) — a
+# compromised trust anchor stays reviewable, the same reasoning
+# never_adopt_live already applies to the live-auth-session surface itself.
+# A CA (Teleport/step-ca) was considered and rejected for this scale: it adds
+# a new trust root and compromise surface a 3-6 machine personal fleet does
+# not need — a flat fingerprint table costs nothing extra to run or attack.
+# --------------------------------------------------------------------------- #
+
+def _identity_lookup(db, kind, fingerprint):
+    row = db.execute(
+        "SELECT disposition FROM trusted_identities WHERE kind=? AND "
+        "fingerprint=?", (kind, fingerprint)).fetchone()
+    return row["disposition"] if row else None
+
+
+def _identity_touch(db, kind, fingerprint, now):
+    db.execute("UPDATE trusted_identities SET last_seen=? WHERE kind=? AND "
+              "fingerprint=?", (now, kind, fingerprint))
+
+
+def trust_identity(kind, fingerprint, disposition, label="",
+                   source_incident_id=None, now=None):
+    """Record (or update) an operator verdict on one fingerprinted identity.
+    `disposition` is 'trusted' or 'blocked'. Returns the row id."""
+    if disposition not in ("trusted", "blocked"):
+        raise ValueError("disposition must be 'trusted' or 'blocked'")
+    now = _epoch(now)
+    db = _event_connection()
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO trusted_identities(kind,fingerprint,label,"
+                "disposition,created_at,last_seen,source_incident_id) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(kind,fingerprint) DO "
+                "UPDATE SET disposition=excluded.disposition,label=CASE WHEN "
+                "excluded.label!='' THEN excluded.label ELSE "
+                "trusted_identities.label END,last_seen=excluded.last_seen",
+                (kind, fingerprint, label or "", disposition, now, now,
+                 source_incident_id))
+        row = db.execute(
+            "SELECT id FROM trusted_identities WHERE kind=? AND fingerprint=?",
+            (kind, fingerprint)).fetchone()
+        return row["id"]
+    finally:
+        db.close()
+
+
+def forget_identity(kind, fingerprint):
+    db = _event_connection()
+    try:
+        with db:
+            cur = db.execute(
+                "DELETE FROM trusted_identities WHERE kind=? AND fingerprint=?",
+                (kind, fingerprint))
+        return cur.rowcount
+    finally:
+        db.close()
+
+
+def list_identities():
+    db = _event_connection()
+    try:
+        return _dict_rows(db.execute(
+            "SELECT * FROM trusted_identities ORDER BY kind,disposition,"
+            "last_seen DESC").fetchall())
+    finally:
+        db.close()
+
+
+def _apply_origin_trust(db, f, now):
+    disposition = _identity_lookup(db, "ssh-origin", f["origin"])
+    if disposition == "trusted":
+        f["severity"], f["confidence"] = "LOW", "low"
+        f["known_identity"] = True
+        _identity_touch(db, "ssh-origin", f["origin"], now)
+    elif disposition == "blocked":
+        f["severity"] = "CRITICAL"
+        f["known_identity_blocked"] = True
+
+
+def _apply_authorized_keys_trust(db, f, now):
+    path = f.get("path")
+    if not path or not os.path.isfile(path):
+        return
+    keys = _parse_authorized_keys(_read_text(path) or "")
+    if not keys:
+        return
+    fps = [fp for _kt, fp, _c in keys]
+    placeholders = ",".join("?" for _ in fps)
+    rows = {r["fingerprint"]: r["disposition"] for r in db.execute(
+        "SELECT fingerprint,disposition FROM trusted_identities WHERE kind="
+        "'ssh-key' AND fingerprint IN (%s)" % placeholders, fps).fetchall()}
+    if any(rows.get(fp) == "blocked" for fp in fps):
+        f["severity"] = "CRITICAL"
+        f["known_identity_blocked"] = True
+        return
+    if all(rows.get(fp) == "trusted" for fp in fps):
+        f["severity"], f["confidence"] = "LOW", "low"
+        f["known_identity"] = True
+        for fp in fps:
+            _identity_touch(db, "ssh-key", fp, now)
+    else:
+        f["unrecognized_key_fingerprints"] = [
+            fp for fp in fps if rows.get(fp) != "trusted"]
+
+
+def _apply_identity_trust(findings, now=None):
+    """Mutate `findings` in place: an auth-session whose origin, or an
+    authorized_keys whose every current key, matches an operator-confirmed
+    'trusted' identity is downgraded to LOW/low-confidence; a match against
+    'blocked' is escalated to CRITICAL. Anything with no match, or whose
+    lookup itself fails, is left untouched — a store that cannot be read must
+    never manufacture trust. Must run BEFORE _route_for_scan, which is what
+    actually turns confidence='low' into a digest routing instead of an
+    interrupt."""
+    now = _epoch(now)
+    try:
+        db = _event_connection()
+    except Exception as e:
+        log_run("identity-trust check skipped: %s" % e)
+        return findings
+    try:
+        for f in findings:
+            try:
+                if f.get("category") == "auth-session" and f.get("origin"):
+                    _apply_origin_trust(db, f, now)
+                elif f.get("category") == "persistence" and \
+                        (f.get("path") or "").endswith(
+                            os.path.join(".ssh", "authorized_keys")):
+                    _apply_authorized_keys_trust(db, f, now)
+            except Exception as e:
+                log_run("identity-trust check failed for %s: %s" %
+                       (f.get("fingerprint"), e))
+        db.commit()
+    finally:
+        db.close()
+    return findings
+
+
+def _close_allowlisted(db, incident_id, now):
+    """Close an incident whose fingerprint the operator allowlisted. Unlike
+    _auto_tolerate this may close an incident created on an EARLIER pass: the
+    allowlist is the operator's own standing verdict, not a machine one, so an
+    incident left open from before the entry was made is exactly what it
+    silences. Writes no dismissals row — an allowlist entry carries no typed
+    reason, so it must not feed tolerance or backtest precision."""
+    row = db.execute("SELECT status FROM incidents WHERE id=? AND kind='signal'",
+                     (incident_id,)).fetchone()
+    if not row or row["status"] not in _ACTIVE_INCIDENT_STATES:
+        return
+    db.execute(
+        "UPDATE incidents SET status='FALSE_POSITIVE',resolution='allowlisted',"
+        "updated_at=?,next_reminder_at=NULL WHERE id=?", (now, incident_id))
+    db.execute(
+        "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+        "incident_id,data_json) VALUES(?,?,?,?,?,?)",
+        (now, now, "incident", "incident.lifecycle", incident_id,
+         json.dumps({"from": row["status"], "to": "FALSE_POSITIVE",
+                     "reason_code": "allowlisted"})))
 
 
 # --------------------------------------------------------------------------- #
@@ -2877,7 +3826,7 @@ def _apply_path_lineage(db, new_events, now, initially_notified=False,
 
 
 def _apply_correlations(db, new_events, now, initially_notified=False,
-                        suppressed_categories=frozenset()):
+                        suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
     rows = db.execute(
         "SELECT id,observed_at,data_json FROM events "
@@ -2885,8 +3834,37 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         "AND observed_at>=?", (now - 1800,)).fetchall()
     observations = [(row["id"], row["observed_at"],
                      json.loads(row["data_json"])) for row in rows]
+    # A fact the operator has already blessed must not be able to MANUFACTURE
+    # a CRITICAL. Chains are built from events and so were blind to the
+    # routing gate: on the reference machine the six launchd jobs of one
+    # reviewed scheduler kit correlated with their own scheduled execution
+    # into a permanent CRITICAL "Persistence followed by execution", which is
+    # what every legitimate scheduled task looks like — and because chains are
+    # never tolerated and never aged out, that banner could not clear and
+    # would re-form for every job the kit ever adds.
+    #
+    # Deliberately narrow: quieted events are removed from the TRIGGER set
+    # only, not from `observations`. They still serve as the other leg, so a
+    # genuinely new process executing from a tolerated persistence item still
+    # chains at CRITICAL. Only the case where the sole new thing is one the
+    # operator already reviewed stops firing. `learning` is NOT quieted here —
+    # the learning period's documented promise is that CRITICAL chains alert
+    # throughout it.
+    memory = None
+    quieted = set()
+    for event_id, f in new_events:
+        verdict = (routing or {}).get(f.get("fingerprint"))
+        if verdict is None:
+            if memory is None:
+                memory = _suppression_memory(db, now)
+            decision = _signal_decision(f, memory)[0]
+        else:
+            decision = verdict["decision"]
+        if decision in ("tolerated", "allowlisted"):
+            quieted.add(event_id)
     new_ids = {event_id for event_id, f in new_events
-               if f.get("category") not in suppressed_categories}
+               if f.get("category") not in suppressed_categories
+               and event_id not in quieted}
     attached = set()
 
     def correlate(base_key, title, left_pred, right_pred, window=900):
@@ -2974,30 +3952,54 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
 
     # Every uncorrelated HIGH+ signal still becomes one actionable incident —
     # but an identity the operator has repeatedly reviewed as benign-positive
-    # opens pre-closed under acquired tolerance instead of re-alerting.
-    tolerance = _tolerance_memory(db, now)
-    disputed = _disputed_identities(db) if tolerance else frozenset()
+    # opens pre-closed under acquired tolerance, the learning period closes
+    # what tolerance has no verdict for, and an allowlisted fingerprint closes
+    # as allowlisted. The decision comes from the same gate that routed the
+    # notification (route_findings); a caller without a routing decides here
+    # with the same function over the same memory (already built above when
+    # any finding needed it).
     for event_id, f in new_events:
         if f.get("category") in suppressed_categories or event_id in attached \
                 or SEV_ORDER.get(f.get("severity"), -1) \
                 < SEV_ORDER["HIGH"]:
             continue
-        verdicts = 0
-        if tolerance and f.get("category") in _TOLERANCE_CATEGORIES \
-                and SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["CRITICAL"]:
-            ident = _tolerance_identity(f.get("fingerprint"))
-            if ident and ident not in disputed:
-                count, reviewed_sev = tolerance.get(ident, (0, -1))
-                if count and SEV_ORDER.get(f.get("severity"), -1) \
-                        <= reviewed_sev:
-                    verdicts = count
+        verdict = (routing or {}).get(f.get("fingerprint"))
+        if verdict is None:
+            if memory is None:
+                memory = _suppression_memory(db, now)
+            decision, verdicts = _signal_decision(f, memory)
+            notified = initially_notified
+        else:
+            decision, verdicts = verdict["decision"], verdict["verdicts"]
+            # Per FINDING, not per scan: one genuine new HIGH must not mark a
+            # digest-routed sibling as already told to a human.
+            notified = verdict["route"] == ROUTE_INTERRUPT
+        # The incident is keyed on the SUBJECT where a sensor names one, and
+        # on the raw fingerprint everywhere else. The two are different
+        # questions: the fingerprint identifies THIS observation (content-
+        # addressed, so a genuinely new change is still a new signal and still
+        # notifies once), while the case identifies the THING the operator has
+        # to make a decision about. Folding the content hash into the case key
+        # meant one launchd plist edited three times became three open HIGH
+        # incidents -- 17 open incidents over ~7 files on the reference machine,
+        # and the menu bar counts incidents, so that WAS the number being read.
+        #
+        # This is safe against the obvious objection -- "now dismissing the case
+        # mutes the file forever" -- because _upsert_incident already refuses to
+        # reattach a fingerprint a dismissed incident has never seen; an entity-
+        # keyed case that meets new evidence opens a fresh incident instead of
+        # swallowing it. Subject keying is precisely the shape that guard was
+        # written for.
         incident_id = _upsert_incident(
-            db, "signal:" + f["fingerprint"], f["title"],
-            f["severity"], "signal", now, [event_id],
-            initially_notified or bool(verdicts))
-        if verdicts:
+            db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
+            f["title"], f["severity"], "signal", now, [event_id],
+            notified or bool(decision), subject=f.get("subject"))
+        if decision == "allowlisted":
+            _close_allowlisted(db, incident_id, now)
+        elif decision == "tolerated":
             _auto_tolerate(db, incident_id, verdicts, now)
-
+        elif decision == "learning":
+            _auto_tolerate(db, incident_id, 0, now, reason="learning-period")
 
 def _record_health(db, health, now):
     for item in health:
@@ -3052,9 +4054,306 @@ def _record_health(db, health, now):
                        _ACTIVE_INCIDENT_STATES)
 
 
+_LAST_AGED_OUT = 0
+_AGE_OUT_DAYS = 7
+# Never aged out, whatever their age: the chain incidents that ARE the product
+# (a correlated kill chain is not ambient just because it is old), anything
+# CRITICAL, and attack-defined evidence — a tripped decoy or latch is a fact
+# about an attacker, and a quiet week is not an acquittal.
+_AGE_OUT_KINDS = ("signal", "risk")
+
+
+def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
+    """Close OPEN incidents that stopped producing evidence, and say so.
+
+    An incident queue that only ever grows stops being a queue. On this machine
+    it reached 129 open — one of them carrying 87 evidence events over weeks —
+    at which point the list communicates nothing: the operator cannot tell the
+    two items that arrived today from the hundred that have been sitting there,
+    so the whole surface gets ignored. That is a worse failure than a missed
+    alert, because it is silent and it applies to every future alert too.
+
+    An incident that has stopped SAYING anything new is a description of the
+    past. It is closed as ambient — retained in full under `incidents all`,
+    reopenable, and counted in the report's ambient line so the closure is
+    visible rather than a disappearance. NEW evidence re-opens it through the
+    ordinary reattach path, which is what makes this safe: age-out forgets a
+    thing that has run out of news, and it stops being old news the moment it
+    does something it has not done before.
+
+    Novelty, not mere evidence, is the clock — see _mark_novelty. Keying on
+    updated_at meant a permanently-true condition refreshed its own reprieve
+    on every scan, so this function could only reach incidents that had
+    already gone silent by themselves. It is additionally gated on the
+    operator having been TOLD: an incident ages out only once its reminder
+    ladder is exhausted, so nothing is ever quietly retired before it was
+    surfaced the full three times — OR once enough time has passed that the
+    ladder should have finished. That second clause is not belt-and-braces:
+    reminders are claimed only on a scan that raised no new HIGH
+    (`[] if new_high else claim_due_incident_reminders()`), so a machine noisy
+    enough to raise one every scan would never advance a reminder_count, and
+    an exhaustion-only gate would make its queue immortal — reinventing, under
+    load, the exact failure this tier exists to remove.
+
+    Writes NO dismissals row. A machine verdict must never feed backtest
+    precision or acquired tolerance — the same discipline _auto_tolerate holds.
+    """
+    cutoff = now - days * 86400
+    marks = ",".join("?" for _ in _AGE_OUT_KINDS)
+    rows = db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status='OPEN' "
+        "AND kind IN (%s) AND severity<>'CRITICAL' "
+        "AND COALESCE(last_novel_at,created_at)<? "
+        "AND (reminder_count>=? OR created_at<?)" % marks,
+        _AGE_OUT_KINDS + (cutoff, len(_REMINDER_DELAYS),
+                          now - _REMINDER_DELAYS[-1] - 86400)).fetchall()
+    aged = []
+    for row in rows:
+        key = row["correlation_key"] or ""
+        fp = key[len("signal:"):] if key.startswith("signal:") else key
+        if fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        aged.append(row["id"])
+    if not aged:
+        return 0
+    marks2 = ",".join("?" for _ in aged)
+    db.execute(
+        "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+        "updated_at=?,next_reminder_at=NULL WHERE id IN (%s) AND status='OPEN'"
+        % marks2,
+        ("aged out: nothing new in %dd after %d reminders (ambient; reopens "
+         "on new evidence)" % (days, len(_REMINDER_DELAYS)), now)
+        + tuple(aged))
+    return len(aged)
+
+
+# The exec identity produced by _exec_identity always ends in "|<12 hex>".
+_NEW_EXEC_ID_RE = re.compile(r"\|[0-9a-f]{12}$")
+
+
+def _is_legacy_exec_fingerprint(fp):
+    """True for an agent-surface fingerprint minted under the RETIRED positional
+    exec identity ("<json-pointer>|<cmd>"), which no live scan can ever produce
+    again."""
+    for prefix, trailing_sha in (("agent-surface:newexec:", False),
+                                 ("agent-surface:target:", True),
+                                 ("agent-surface:materialized:", True)):
+        if not fp.startswith(prefix):
+            continue
+        body = fp[len(prefix):]
+        if trailing_sha:
+            body = body.rsplit(":", 1)[0]    # drop the trailing target sha12
+        return "|" in body and not _NEW_EXEC_ID_RE.search(body)
+    return False
+
+
+def _retire_legacy_exec_incidents(db, now):
+    """One-time: close incidents keyed on the retired positional exec identity.
+
+    Changing what identifies an exec entry orphans every incident minted under
+    the old scheme — the sensor can no longer emit those fingerprints, so no
+    future evidence can ever reattach to them and no operator verdict on them
+    can ever be reused. Left alone they would sit OPEN forever (age-out would
+    take them eventually, but as 'ambient', which misdescribes why they closed).
+
+    They are closed as SUPERSEDED, with their evidence intact: whatever they
+    described, if it is still true, re-alerts under the new identity on the very
+    next scan. Run once per store by _run_store_migrations.
+    """
+    aged = [row["id"] for row in db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status IN "
+        "('OPEN','ACK') AND correlation_key LIKE 'signal:agent-surface:%'")
+        if _is_legacy_exec_fingerprint(
+            (row["correlation_key"] or "")[len("signal:"):])]
+    if aged:
+        marks = ",".join("?" for _ in aged)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: exec entries are now identified by the command they "
+             "run, not their position in the config — re-alerts under the new "
+             "identity if still present", now) + tuple(aged))
+    return len(aged)
+
+
+_LEGACY_PERSIST_CASE_RE = re.compile(
+    r"^(signal:persistence:changed:.*):[0-9a-f]{8,64}$")
+
+
+_LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:.*:[0-9a-f]{64}$")
+# FROZEN copies of _BEACON_FP_RE / _TOLERANCE_VERSION_RE as they stood when this
+# migration shipped (2026-08-23). A migration's meaning must not drift when the
+# live detection patterns evolve: a store restored from backup, or a second
+# machine upgrading late, must migrate exactly the way the first one did.
+_MIG_BEACON_FP_RE = re.compile(
+    r"^beacon:(?P<path>.+?):"
+    r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*):"
+    r"(?P<port>\d+)$")
+_MIG_VERSION_RE = re.compile(
+    r"(?<![0-9A-Za-z])\d+(?:\.\d+){1,3}(?![0-9A-Za-z])")
+
+
+def _is_orphaned_program_key(key):
+    """True for a signal key the program-subject sensors can no longer emit.
+
+    Two shapes were retired when process/outbound/beacon moved to a case keyed
+    on the PROGRAM rather than the versioned path it happens to live at:
+
+      * process keys carried a trailing `:<trust>:<sha256>`, so a rebuild of
+        the same program was a different entity;
+      * outbound/beacon keys embedded the version-bearing path, so every
+        editor-extension update minted a fresh incident forever.
+
+    A path with no version segment normalizes to itself, so those keys are NOT
+    orphaned and are deliberately left alone — this closes only what has
+    actually become unreachable.
+    """
+    key = key or ""
+    if _LEGACY_PROCESS_KEY_RE.match(key):
+        return True
+    if key.startswith(("signal:beacon:", "signal:outbound:")):
+        fp = key[len("signal:"):]
+        if fp.startswith("outbound:"):
+            fp = "beacon:" + fp[len("outbound:"):]
+        match = _MIG_BEACON_FP_RE.match(fp)
+        return bool(match and _MIG_VERSION_RE.search(match.group("path")))
+    return False
+
+
+def _retire_orphaned_program_incidents(db, now):
+    """One-time: close incidents whose correlation key the sensors retired.
+
+    Same reasoning as _retire_legacy_exec_incidents, and deliberately the same
+    remedy rather than a key rewrite: an outbound/beacon key ends in an
+    endpoint, and an IPv6 endpoint is itself full of colons, so any attempt to
+    parse the old key back into (path, address, port) would be guesswork on the
+    one table that must not be guessed at.
+
+    Closed as SUPERSEDED with evidence intact. Nothing is being judged benign:
+    whatever these described, if it is still true, re-alerts on the very next
+    scan under the new identity — collapsed by program instead of multiplied by
+    version. Run once per store by _run_store_migrations.
+    """
+    aged = [row["id"] for row in db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status IN "
+        "('OPEN','ACK')") if _is_orphaned_program_key(row["correlation_key"])]
+    if aged:
+        marks = ",".join("?" for _ in aged)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: process/outbound/beacon cases are now keyed on the "
+             "PROGRAM, not the versioned path it lives at — re-alerts under "
+             "the new identity if still present", now) + tuple(aged))
+    return len(aged)
+
+
+def _merge_legacy_persistence_cases(db, now):
+    """One-time: collapse per-content-hash persistence incidents onto the file.
+
+    The retired key was `signal:persistence:changed:<path>:<content-hash>`, so
+    one launchd plist edited three times sat as three separate OPEN HIGH
+    incidents. On the reference machine that was 17 open incidents over about 7
+    files, and the menu-bar plugin counts OPEN INCIDENTS — so those duplicates
+    were most of the number the operator actually read.
+
+    Unlike the exec-identity migration this does NOT close anything, because
+    nothing here is orphaned: the newest incident per file is RE-KEYED to the
+    subject and keeps its evidence, and its now-duplicate siblings are folded
+    into it (their events reattached, then marked superseded). The subject case
+    therefore inherits a real history instead of starting empty, and any file
+    that is still changing keeps alerting under the same case.
+
+    Run once per store by _run_store_migrations.
+    """
+    groups = {}
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE "
+            "'signal:persistence:changed:%' ORDER BY id"):
+        m = _LEGACY_PERSIST_CASE_RE.match(row["correlation_key"] or "")
+        if m:
+            groups.setdefault(m.group(1), []).append(row["id"])
+    merged = 0
+    for key, ids in groups.items():
+        keep, dupes = ids[-1], ids[:-1]
+        # Re-key the survivor to the subject. If some other incident already
+        # holds that exact key, keep THAT one and fold the survivor in too, so
+        # the migration can never violate the correlation_key uniqueness the
+        # rest of the store assumes.
+        existing = db.execute(
+            "SELECT id FROM incidents WHERE correlation_key=? AND id!=? "
+            "ORDER BY id LIMIT 1", (key, keep)).fetchone()
+        if existing:
+            dupes = dupes + [keep]
+            keep = existing["id"]
+        else:
+            db.execute("UPDATE incidents SET correlation_key=?,updated_at=? "
+                       "WHERE id=?", (key, now, keep))
+        for dupe in dupes:
+            db.execute("UPDATE incident_events SET incident_id=? WHERE "
+                       "incident_id=?", (keep, dupe))
+            db.execute("UPDATE events SET incident_id=? WHERE incident_id=?",
+                       (keep, dupe))
+            db.execute(
+                "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+                "updated_at=?,next_reminder_at=NULL WHERE id=?",
+                ("superseded: folded into the one case for this file — a "
+                 "persistence item is now one case per FILE, not one per "
+                 "content hash", now, dupe))
+            merged += 1
+    return merged
+
+
+# One-time event-store migrations, in ship order. Every incident-identity
+# redesign orphans the keys minted under the old scheme, and the first three
+# each shipped their own hand-rolled shim — recognizer regex, retire/merge
+# function, private meta key, call-site guard, ~70 lines apiece. This table is
+# the shared runner that scaffold should have been. Rules:
+#   * A migration runs ONCE per store, stamped under its meta key. Existing
+#     stores keep the stamps they already hold, so nothing re-runs on upgrade.
+#   * Its recognizer patterns are FROZEN copies (see _MIG_*), never the live
+#     detection regexes, so its meaning cannot drift after it ships.
+#   * A migration that raises is logged and NOT stamped, so it retries next
+#     scan; the others still run — each is independent.
+#   * A migration older than a reasonable deprecation window may simply be
+#     deleted with its row: a store that skipped it falls back to age-out,
+#     which already closes stale OPEN incidents (with a blander resolution).
+# Row shape: (meta_key, fn(db, now) -> count, log template taking that count).
+_STORE_MIGRATIONS = (
+    ("exec_identity_migrated", _retire_legacy_exec_incidents,
+     "retired %d incident(s) keyed on the old positional exec identity"),
+    ("persistence_case_merged", _merge_legacy_persistence_cases,
+     "folded %d duplicate persistence incident(s) into one case per file"),
+    ("program_case_migrated", _retire_orphaned_program_incidents,
+     "retired %d incident(s) keyed on the old versioned-path program identity"),
+)
+
+
+def _run_store_migrations(db, now):
+    """Run every _STORE_MIGRATIONS entry this store has not yet been stamped
+    for. Returns the number of migrations that ran (not rows touched)."""
+    ran = 0
+    for key, fn, log_tmpl in _STORE_MIGRATIONS:
+        try:
+            if db.execute("SELECT value FROM meta WHERE key=?",
+                          (key,)).fetchone():
+                continue
+            count = fn(db, now)
+            db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (key, str(now)))
+            ran += 1
+            if count:
+                log_run(log_tmpl % count)
+        except Exception as e:
+            log_run("store migration %s skipped: %s" % (key, e))
+    return ran
+
+
 def record_security_state(findings, sensor_health=(), now=None,
                           initially_notified=False,
-                          suppressed_categories=frozenset()):
+                          suppressed_categories=frozenset(), routing=None):
     now = _epoch(now)
     db = _event_connection()
     new_events = []
@@ -3087,7 +4386,20 @@ def record_security_state(findings, sensor_health=(), now=None,
                 new_events.append((cur.lastrowid, f))
             _record_health(db, sensor_health, now)
             _apply_correlations(db, new_events, now, initially_notified,
-                                frozenset(suppressed_categories))
+                                frozenset(suppressed_categories), routing)
+            # AFTER correlation: anything that produced evidence this scan has
+            # just had updated_at refreshed, so only genuinely quiet incidents
+            # are candidates. Ordering matters — the reverse would age out an
+            # incident in the same breath as its new evidence.
+            _run_store_migrations(db, now)
+            try:
+                global _LAST_AGED_OUT
+                aged = _age_out_incidents(db, now)
+                _LAST_AGED_OUT = aged
+                if aged:
+                    log_run("aged out %d ambient incident(s)" % aged)
+            except Exception as e:
+                log_run("age-out skipped: %s" % e)
             db.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON "
                        "CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
         # Bound raw observations while retaining materialized signals/incidents.
@@ -3331,7 +4643,8 @@ def _persist_record(label=None):
     the item is a launchd plist, a systemd unit, or a registry Run key."""
     return {"label": label, "program": None, "args": None, "args_sha256": None,
             "sha256": None, "trust": "unknown", "run_at_load": False,
-            "authority": None, "env": None}
+            "authority": None, "env": None,
+            "script_target": None, "target_sha": None}
 
 
 def _finish_persist_record(rec, prog, args):
@@ -3348,6 +4661,21 @@ def _finish_persist_record(rec, prog, args):
         rec["authority"] = sig["authority"]
     elif prog:
         rec["trust"] = "missing"
+    # Hash the PAYLOAD, not just the interpreter. The dominant persistence
+    # shape is `/bin/bash <script>` — recording only `program` hashes bash and
+    # says nothing about what actually runs, so rewriting the script under an
+    # otherwise-unchanged plist/unit was invisible to check_persistence
+    # (same program, same args, same env -> no finding). Carrying the target's
+    # own hash closes that blind spot, and is also the evidence that lets a
+    # pure path RELOCATION be distinguished from a payload swap (_custody_of).
+    tgt = _script_target(rec.get("args"), prog)
+    if tgt:
+        rec["script_target"] = tgt
+        try:
+            if os.path.isfile(tgt):
+                rec["target_sha"] = sha256(tgt)
+        except Exception:
+            pass
     return rec
 
 
@@ -3732,10 +5060,7 @@ def _snapshot_persistence_mac():
             if not name.endswith(".plist"):
                 continue
             path = os.path.join(d, name)
-            rec = {"label": name[:-6], "program": None, "args": None,
-                   "args_sha256": None,
-                   "sha256": None, "trust": "unknown", "run_at_load": False,
-                   "authority": None, "env": None}
+            rec = _persist_record(label=name[:-6])
             try:
                 with open(path, "rb") as f:
                     pl = plistlib.load(f)
@@ -3743,25 +5068,13 @@ def _snapshot_persistence_mac():
                 pl = {}
             prog, args = _plist_program(pl if isinstance(pl, dict) else {})
             rec["label"] = (pl.get("Label") if isinstance(pl, dict) else None) or rec["label"]
-            rec["program"] = prog
-            if args is not None:
-                raw_args = json.dumps(args, sort_keys=True, default=str)
-                rec["args_sha256"] = hashlib.sha256(raw_args.encode()).hexdigest()
-                rec["args"] = _redact_value(args)
             rec["run_at_load"] = bool(pl.get("RunAtLoad")) if isinstance(pl, dict) else False
             ev = pl.get("EnvironmentVariables") if isinstance(pl, dict) else None
             if isinstance(ev, dict):
                 # keep only injection-relevant keys — the rest is noise/PII
                 inj = {k: str(v) for k, v in ev.items() if k in _DYLD_INJECT_KEYS}
                 rec["env"] = inj or None
-            if prog and os.path.exists(prog):
-                rec["sha256"] = sha256(prog)
-                sig = classify_signature(prog)
-                rec["trust"] = sig["trust"]
-                rec["authority"] = sig["authority"]
-            elif prog:
-                rec["trust"] = "missing"
-            snap[path] = rec
+            snap[path] = _finish_persist_record(rec, prog, args)
     return snap
 
 
@@ -3770,10 +5083,28 @@ def _snapshot_persistence_mac():
 # (bash/python/osascript) driven by a hostile inline script, a piped network
 # fetch, or a script stashed in a dotdir — so the binary's own signature/location
 # says "safe" while the arguments are the payload.
+# Project runners front a payload behind a SUBCOMMAND: `uv run app.py`, not
+# `python3 app.py`. Recognizing them matters twice over. The payload is what
+# actually executes, so without this the script target of every uv/poetry/npx
+# job is None — its bytes are never hashed, and a swapped payload under an
+# unchanged plist is invisible to the CHANGED sensor (the exact substitution
+# _script_target exists to catch, on the launcher that modern Python tooling
+# has made ordinary). It is also what makes two jobs from one toolkit legible
+# as the same producer. Each name maps to the subcommands that precede the
+# payload; an empty tuple means the payload follows the binary directly.
+# POSIX-shaped, like the rest of _script_target: bare basenames (as
+# _INTERPRETERS matches) and absolute '/' payloads only, so it reaches the mac
+# and Linux bodies and is deliberately inert on Windows rather than carrying a
+# half-working .exe path that no test on this body could ever fail.
+_RUNNER_SUBCOMMANDS = {
+    "uv": ("run",), "uvx": (), "poetry": ("run",), "pipx": ("run",),
+    "pdm": ("run",), "rye": ("run",), "hatch": ("run",), "npx": (),
+    "bunx": (), "pnpm": ("exec", "dlx"), "yarn": ("dlx",),
+}
 _INTERPRETERS = frozenset((
     "bash", "sh", "zsh", "dash", "ksh", "env",
     "python", "python2", "python3", "perl", "ruby", "php", "osascript", "node",
-))
+)) | frozenset(_RUNNER_SUBCOMMANDS)
 _INLINE_EXEC_FLAGS = frozenset(("-c", "-e"))
 # Bounded interior run (not `.*?` over re.S): this runs in the check_behavior
 # pre-filter on every same-user process's full argv, so an unbounded lazy scan to
@@ -3860,7 +5191,22 @@ def _script_target(args, program=None):
         return None
     if not _interp_fronted(args, program):
         return None
-    for a in args[1:]:
+    rest = [str(a) for a in args[1:]]
+    # A runner's subcommand sits between the binary and the payload. Consume
+    # only a subcommand this particular runner actually declares, so an
+    # ordinary interpreter's first argument is never skipped: `python3 run
+    # ...` has no payload and must keep returning None.
+    for cand in (program, args[0]):
+        subs = _RUNNER_SUBCOMMANDS.get(os.path.basename(str(cand or "")))
+        if subs is None:
+            continue
+        i = 0
+        while i < len(rest) and rest[i].startswith("-"):
+            i += 1
+        if subs and i < len(rest) and rest[i] in subs:
+            rest = rest[i + 1:]
+        break
+    for a in rest:
         s = str(a)
         if s.startswith("-"):
             continue
@@ -4012,7 +5358,8 @@ def _persistence_severity(rec):
 
 
 def _persistence_change_detail(label, old, rec,
-                               prog_changed, env_changed, args_changed):
+                               prog_changed, env_changed, args_changed,
+                               target_changed=False):
     """Human-readable before->after for the fields that actually mutated. The
     old message always printed the PROGRAM path on both sides, so an args- or
     env-only change rendered as the nonsensical 'args changed (X -> X)' with an
@@ -4042,6 +5389,11 @@ def _persistence_change_detail(label, old, rec,
                 (old.get("sha256") or "?")[:12], (rec.get("sha256") or "?")[:12]))
     if args_changed:
         parts.append("args [%s] -> [%s]" % (_args_str(old), _args_str(rec)))
+    if target_changed:
+        parts.append("payload %s bytes %s -> %s" % (
+            rec.get("script_target") or old.get("script_target") or "?",
+            (old.get("target_sha") or "?")[:12],
+            (rec.get("target_sha") or "?")[:12]))
     if env_changed:
         parts.append("env %s -> %s" % (_env_str(old), _env_str(rec)))
     return "%s: %s" % (label, "; ".join(parts))
@@ -4058,6 +5410,11 @@ def check_persistence(baseline_snap, current_snap):
                 "%s -> %s [%s]" % (rec["label"], rec.get("program") or "?",
                                    rec.get("trust")),
                 "persistence:new:%s:%s" % (path, rec.get("sha256")),
+                subject=_subject(
+                    "persistence", path, op="new", content=rec.get("sha256"),
+                    program_sha=rec.get("sha256"), trust=rec.get("trust"),
+                    target=_script_target(rec.get("args"),
+                                          rec.get("program"))),
                 path=path, program=rec.get("program"), trust=rec.get("trust"),
                 script_target=_script_target(rec.get("args"),
                                              rec.get("program")),
@@ -4075,13 +5432,24 @@ def check_persistence(baseline_snap, current_snap):
             env_changed = (old.get("env") or None) != (rec.get("env") or None)
             args_changed = ((old.get("args_sha256") or old.get("args") or None) !=
                             (rec.get("args_sha256") or rec.get("args") or None))
-            if prog_changed or env_changed or args_changed:
+            # The payload the interpreter is told to run. Without this the
+            # dominant `/bin/bash <script>` job could have its SCRIPT rewritten
+            # with no finding at all — program, args and env are all unchanged
+            # by a content swap, so a program/args/env-only diff is blind to
+            # the one file that actually carries the behaviour. Requires the
+            # hash on BOTH sides: a baseline taken before payload hashing has
+            # no old value, and a field simply appearing is not a swap.
+            target_changed = bool(old.get("target_sha")) and \
+                bool(rec.get("target_sha")) and \
+                old.get("target_sha") != rec.get("target_sha")
+            if prog_changed or env_changed or args_changed or target_changed:
                 # Fold the current sha256/env/args into the fingerprint (sha256
                 # alone is unchanged on an env-only mutation) so a real change
                 # re-alerts but a steady mutated state does not storm.
                 fp = hashlib.sha256(repr(
                     (rec.get("sha256"), rec.get("env"),
-                     rec.get("args_sha256") or rec.get("args"))
+                     rec.get("args_sha256") or rec.get("args"),
+                     rec.get("target_sha"))
                 ).encode()).hexdigest()[:16]
                 # The mutated record's own risk drives severity (env-injection /
                 # adhoc-in-tmp escalate to CRITICAL), but a swapped program binary
@@ -4089,16 +5457,49 @@ def check_persistence(baseline_snap, current_snap):
                 # (supply-chain / stolen-cert swap), so a program/hash change never
                 # scores below HIGH — the change itself is the signal.
                 sev = _persistence_severity(rec)
-                if prog_changed and SEV_ORDER[sev] < SEV_ORDER["HIGH"]:
+                # A rewritten payload under an unchanged config is the same
+                # supply-chain shape as a swapped binary, and is rated with it.
+                if (prog_changed or target_changed) and \
+                        SEV_ORDER[sev] < SEV_ORDER["HIGH"]:
                     sev = "HIGH"
+                # Chain of custody, same ladder the delegate surface uses.
+                # Attack-defined mutations (dylib-injection env, hostile argv)
+                # are excluded at BOTH ends — _custody_persistence refuses to
+                # return a rung for them, and _demote is told explicitly — so a
+                # payload can never be quieted by proving who moved it.
+                attack_defined = bool(rec.get("env")) or _hostile_args(
+                    rec.get("args"), rec.get("program"))
+                prov = (None if attack_defined
+                        else _custody_persistence(old, rec)
+                        or (_custody(path, rec.get("sha256"))[0]
+                            if _intent_worthy(path) else None))
+                # A job of the dominant `<interpreter> <script>` shape mutates
+                # by having its SCRIPT rewritten — the config file is untouched,
+                # so grading only `path` can never see who did it and every
+                # payload update reads as a swap. Ask the ledger about the
+                # payload that actually changed. Same rung, same demote-only
+                # ladder, same attack-defined refusal above.
+                if prov is None and target_changed:
+                    tgt = rec.get("script_target") or _script_target(
+                        rec.get("args"), rec.get("program"))
+                    if tgt and rec.get("target_sha") and _intent_worthy(tgt):
+                        prov = _custody(tgt, rec.get("target_sha"))[0]
+                graded = _demote(sev, prov, attack_defined=attack_defined)
+                detail = _persistence_change_detail(
+                    rec["label"], old, rec,
+                    prog_changed, env_changed, args_changed, target_changed)
+                note = _PROVENANCE_NOTE.get(prov) if prov else None
+                if note:
+                    detail = "%s\n%s" % (detail, note)
                 findings.append(finding(
-                    sev, "persistence",
+                    graded, "persistence",
                     "Persistence item CHANGED",
-                    _persistence_change_detail(
-                        rec["label"], old, rec,
-                        prog_changed, env_changed, args_changed),
+                    detail,
                     "persistence:changed:%s:%s" % (path, fp),
+                    case_fingerprint="persistence:changed:%s" % path,
+                    subject=_subject("persistence", path, content=fp),
                     path=path, program=rec.get("program"), trust=rec.get("trust"),
+                    custody=prov,
                     script_target=_script_target(rec.get("args"),
                                                  rec.get("program"))))
     for path, old in base.items():
@@ -4293,6 +5694,9 @@ def _typosquats_apple_daemon(name):
 # which turns it into a DEGRADED sensor entry -- an unanswered process table must
 # never be reported as an empty one.
 _PROC_ENUM_FAILED = False
+# The executable table can succeed while macOS's separate full-argv query
+# fails. Keep the useful rows, but publish that behavioral coverage is partial.
+_PROC_ARGV_PARTIAL = False
 
 # Scan-scoped process-table cache. None => walk live (the default, and every
 # by-hand command). gather_all arms it with ONE walk before the sensor loop and
@@ -4345,7 +5749,7 @@ def _iter_processes_live():
       windows: one CIM query
     `owner` is the uid string (posix) or DOMAIN\\user (Windows); callers compare
     it against _own_owner() to enforce the same-user boundary."""
-    global _PROC_ENUM_FAILED
+    global _PROC_ENUM_FAILED, _PROC_ARGV_PARTIAL
     if IS_LINUX:
         try:
             pids = [d for d in os.listdir("/proc") if d.isdigit()]
@@ -4435,6 +5839,8 @@ def _iter_processes_live():
             parts = line.split(None, 1)
             if len(parts) == 2:
                 argvs[parts[0]] = parts[1].strip()
+    else:
+        _PROC_ARGV_PARTIAL = True
     # A failed argv call is NOT a reason to drop the process table: exec path,
     # owner and the same-user boundary all still hold without argv. The argv
     # sensors simply see nothing rather than seeing something wrong.
@@ -4546,11 +5952,16 @@ def check_processes():
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
+            graded, rung, note = _grade_binary(sev, comm)
             findings.append(finding(
-                sev, "process", "Suspicious running process",
-                "%s (%s) %s" % (comm, sig["trust"], reason),
+                graded, "process", "Suspicious running process",
+                "%s (%s) %s%s" % (comm, sig["trust"], reason,
+                                  ("\n" + note) if note else ""),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
-                path=comm, trust=sig["trust"], sha256=sha))
+                case_fingerprint="process:%s" % _program_subject(comm),
+                subject=_subject("process", comm, trust=sig["trust"],
+                                 content=sha),
+                path=comm, trust=sig["trust"], sha256=sha, custody=rung))
     return findings
 
 
@@ -6088,6 +7499,56 @@ def snapshot_extra_persistence():
     return snap
 
 
+# --- SSH identity fingerprints (per-key, not whole-file) ----------------------
+# authorized_keys is hashed WHOLE-FILE above (any edit is itself worth knowing
+# about — T1098.004). This is the finer-grained identity underneath that hash:
+# the same SHA256 fingerprint `ssh-keygen -lf` prints for a single key, so the
+# operator's own device key can be told apart from a stranger's without adding
+# a CA or any new infrastructure (see _apply_identity_trust below).
+_SSH_KEY_TYPES = ("ssh-rsa", "ssh-ed25519", "ssh-dss",
+                  "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+                  "ecdsa-sha2-nistp521", "sk-ecdsa-sha2-nistp256@openssh.com",
+                  "sk-ssh-ed25519@openssh.com")
+
+
+def _ssh_key_fingerprint(b64_blob):
+    """OpenSSH's own SHA256 fingerprint format: base64(sha256(key blob)),
+    unpadded — `ssh-keygen -lf` prints the identical string. None on anything
+    that does not decode as a key, so a malformed line degrades to 'unknown',
+    never to a false fingerprint."""
+    try:
+        raw = base64.b64decode(b64_blob, validate=True)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _parse_authorized_keys(text):
+    """[(keytype, fingerprint, comment), ...] for every key line in an
+    authorized_keys-shaped file. Blank/comment lines are skipped; an options
+    prefix (from="...",no-pty ssh-ed25519 AAAA... name@host) is handled by
+    scanning for the first recognized key-type token rather than assuming
+    column 0, since options are optional and freeform."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        idx = next((i for i, p in enumerate(parts) if p in _SSH_KEY_TYPES), None)
+        if idx is None or idx + 1 >= len(parts):
+            continue
+        fp = _ssh_key_fingerprint(parts[idx + 1])
+        if not fp:
+            continue
+        comment = " ".join(parts[idx + 2:]) if idx + 2 < len(parts) else ""
+        out.append((parts[idx], fp, comment))
+    return out
+
+
 def diff_extra_persistence(prior, cur):
     def _mk(title, verb):
         def f(p, h, *old):
@@ -6290,28 +7751,22 @@ def _ext_cap_finding(label, rec, gained, is_new):
 
 
 def diff_ext_caps(prior, cur):
-    findings = []
-    prior = prior or {}
-    for label, rec in cur.items():
-        try:
-            old = prior.get(label)
-            caps = set(rec.get("caps") or [])
-            if old is None:
-                f = _ext_cap_finding(label, rec, sorted(caps), True)
-            else:
-                gained = caps - set(old.get("caps") or [])
-                # A narrow->broad host widening is itself the escalation, even
-                # with no new API permission.
-                if not gained and rec.get("broad") and not old.get("broad"):
-                    gained = caps
-                if not gained:
-                    continue
-                f = _ext_cap_finding(label, rec, sorted(gained), False)
-            if f:
-                findings.append(f)
-        except Exception:
-            continue
-    return findings
+    def new_fn(label, rec):
+        return _ext_cap_finding(label, rec, sorted(set(rec.get("caps") or [])),
+                                True)
+
+    def changed_fn(label, rec, old):
+        caps = set(rec.get("caps") or [])
+        gained = caps - set(old.get("caps") or [])
+        # A narrow->broad host widening is itself the escalation, even
+        # with no new API permission.
+        if not gained and rec.get("broad") and not old.get("broad"):
+            gained = caps
+        if not gained:
+            return None
+        return _ext_cap_finding(label, rec, sorted(gained), False)
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
 
 
 def _firefox_exts(root):
@@ -6352,6 +7807,55 @@ def diff_browserext(prior, cur):
 
 
 # --- IDE / editor extensions --------------------------------------------------
+# An extension's identity is `publisher.name`. The DIRECTORY carries the version
+# (`anthropic.claude-code-2.1.238-darwin-arm64`), and VSCode leaves the old
+# directory behind on upgrade — so keying on the directory made every update a
+# brand-new extension. On the reference machine that meant four `claude-code`
+# directories and five `chatgpt` directories: nine entries, two extensions, and
+# a fresh MEDIUM "New editor extension" on each bump.
+#
+# The version is deliberately NOT part of the identity and deliberately NOT
+# diffed here. What this sensor answers is "did an extension I never installed
+# appear?", and a version bump is not that. The bytes an upgrade brings are
+# graded by the custody/receipt ladder that already covers extension payloads;
+# duplicating it as an inventory alert only buys noise.
+_EXT_VERSION_RE = re.compile(r"^(?P<id>.+?)-(?P<ver>\d+(?:\.\d+)+)(?:-.*)?$")
+
+
+def _ext_identity(name):
+    """('publisher.name', 'version') for an extension directory name.
+
+    A name with no parseable version keeps its WHOLE self as the identity —
+    never truncate something we could not parse, because a half-parsed identity
+    would silently merge two different extensions.
+    """
+    m = _EXT_VERSION_RE.match(name or "")
+    if not m:
+        return (name, None)
+    return (m.group("id"), m.group("ver"))
+
+
+def _ext_key(key):
+    """Normalize an '<editor>:<dir-name>' snapshot key to '<editor>:<identity>'.
+
+    Applied to BOTH sides of the diff so an existing baseline written under the
+    old version-bearing keys upgrades silently instead of re-alerting the whole
+    inventory once.
+    """
+    editor, _, name = (key or "").partition(":")
+    if not _:
+        return key
+    return "%s:%s" % (editor, _ext_identity(name)[0])
+
+
+def _ext_normalize(snap):
+    """{normalized key: display name}, newest directory per identity winning."""
+    out = {}
+    for k in sorted(snap or {}):
+        out[_ext_key(k)] = snap[k]
+    return out
+
+
 def snapshot_ide_ext():
     snap = {}
     for root in IDE_EXT_ROOTS:
@@ -6367,7 +7871,7 @@ def snapshot_ide_ext():
             if not os.path.isdir(p):
                 continue
             disp = _manifest_name(os.path.join(p, "package.json")) or name
-            snap["%s:%s" % (editor, name)] = disp
+            snap["%s:%s" % (editor, _ext_identity(name)[0])] = disp
     return snap
 
 
@@ -6377,7 +7881,7 @@ def diff_ide_ext(prior, cur):
                        "%s (%s) — a backdoored VSCode/Cursor extension is a live "
                        "supply-chain vector; confirm you installed it"
                        % (k, name), "ideext:%s" % k, ext=k, name=name)
-    return _diff_map(prior, cur, new_fn)
+    return _diff_map(_ext_normalize(prior), _ext_normalize(cur), new_fn)
 
 
 # --- crypto-wallet integrity --------------------------------------------------
@@ -6435,6 +7939,55 @@ BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
 # PRIVILEGED coverage gap in doctor/status (unknown is never green); it just
 # stops masquerading as a broken sensor.
 SURFACE_PRIVILEGED = object()
+
+# Remembering a proven wall.
+#
+# The refusal above is an OS POLICY, not a flake — the sensor's own contract is
+# that it "will fail identically on every scan this OS ever runs". But the
+# command raises an interactive authorization prompt, and the same condition
+# reaches us two different ways depending on whether that prompt was dismissed:
+# cancelled fast, stderr carries the marker and we classify correctly; left
+# sitting, the command blocks to the timeout and stderr is EMPTY, so the marker
+# never appears and a permanent wall reads as a DEGRADED sensor — which after
+# three consecutive misses opens a HIGH "coverage degraded" incident about a
+# gap that is already named, already reported, and cannot be fixed locally.
+#
+# One observation is therefore enough to classify later non-answers from the
+# same command. Fail-toward-suspicion is preserved at both ends: a machine that
+# has never proven a wall still degrades on a non-answer, and any SUCCESS
+# clears the memory, so a failure after the wall comes down is treated as new
+# rather than silently absorbed. The memory only ever downgrades a sensor-health
+# verdict — it can never suppress a finding, because a walled surface is not
+# diffed at all.
+SURFACE_WALLS = os.path.join(STATE_DIR, "surface_walls.json")
+
+
+def _wall_seen(name):
+    """Has this surface ever proven an OS privilege wall on this machine?"""
+    try:
+        return bool((load_json(SURFACE_WALLS, {}) or {}).get(name))
+    except Exception:
+        return False
+
+
+def _wall_record(name):
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        if name not in walls:
+            walls[name] = now_iso()
+            save_json(SURFACE_WALLS, walls)
+    except Exception:
+        pass
+
+
+def _wall_clear(name):
+    """The surface answered — the wall is down, so forget it."""
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        if walls.pop(name, None) is not None:
+            save_json(SURFACE_WALLS, walls)
+    except Exception:
+        pass
 
 # macOS 26 (Darwin 25) moved `sfltool dumpbtm` behind system.privilege.admin:
 # the unprivileged harvest this sensor was built on ("Ventura+, unprivileged")
@@ -6514,8 +8067,17 @@ def snapshot_btm():
     if rc != 0 or not out:
         blob = ((err or "") + "\n" + (out or "")).lower()
         if any(marker in blob for marker in _BTM_PRIVILEGED_MARKERS):
+            _wall_record("btm")
+            return SURFACE_PRIVILEGED
+        if _wall_seen("btm"):
+            # This machine has already PROVEN the wall. The authorization
+            # prompt blocking to the timeout produces an empty stderr and so
+            # carries no marker, but it is the same permanent refusal — not a
+            # newly broken sensor. Classifying it as DEGRADED opened HIGH
+            # incidents about an already-named gap.
             return SURFACE_PRIVILEGED
         return None  # timeout/failure — a non-answer, NOT "zero items"
+    _wall_clear("btm")   # it answered: any later failure is genuinely new
     return _parse_btm(out)
 
 
@@ -6816,15 +8378,19 @@ def diff_listeners(prior, cur):
                ("an unattributable process (uid %s — attributing it to a pid "
                 "needs root)" % uid if uid is not None
                 else "an unattributable process"))
+        graded, rung, note = _grade_binary(
+            "HIGH" if hostile else "MEDIUM", path if resolvable else None)
         return finding(
-            "HIGH" if hostile else "MEDIUM",
+            graded,
             "net-listener", "New network listener",
-            "%s is accepting connections on TCP port %s [%s]%s"
+            "%s is accepting connections on TCP port %s [%s]%s%s"
             % (who, port, trust,
                " — an untrusted binary in a user-writable path listening "
                "on the network is a bind-shell / rogue-server shape" if hostile
-               else " — reachable from the network; verify you started this"),
-            "listener:%s" % key, path=path, port=port, trust=trust, uid=uid)
+               else " — reachable from the network; verify you started this",
+               ("\n" + note) if note else ""),
+            "listener:%s" % key, path=path, port=port, trust=trust, uid=uid,
+            custody=rung)
     return _diff_map(prior, cur, new_fn)
 
 
@@ -6863,12 +8429,35 @@ def _parse_netstat_established(text):
     return rows
 
 
-def _outbound_finding(path, rip, rport):
-    """Score one outbound connection. A finding only for an unsigned/ad-hoc/broken
-    binary in a user-writable path (the rogue-payload-phoning-home shape); None
-    for a signed or system-path process (a browser/updater talking out is normal).
-    MEDIUM/medium-confidence: logged + fed to correlation, below the notify floor
-    (ad-hoc dev binaries talk to the network routinely — must not page alone)."""
+# The IDENTITY of "an untrusted binary is talking out" is the PROGRAM, not the
+# socket. The retired key was `outbound:<versioned path>:<ip>:<port>`, which
+# made every anycast frontend, every relay in a peer pool, every ephemeral peer
+# port, and every vendor update its own signal about one adjudicable fact. On
+# the reference machine that was one `claude` binary reported three times (three
+# Google frontends) inside a single scan, and 64 stored fingerprints over ~7
+# programs across time.
+#
+# It was not merely unreadable, it was WRONG: _accumulate_risk sums one weight
+# per DISTINCT fingerprint on an entity, so endpoint rotation MANUFACTURED risk
+# score out of a single fact — a program with a rotating relay pool could reach
+# the accumulation threshold on its own churn.
+#
+# Endpoints are not discarded, they are demoted from identity to EVIDENCE: the
+# finding carries the whole live endpoint set and grades on the WORST of them,
+# so a vouched workload reaching an endpoint its vouch does not cover still
+# raises that subject's finding and still lands in the deviation case. The
+# "a new endpoint is a new fact" invariant stays where it belongs — on
+# net-beacon, whose detection IS persistence at one fixed endpoint and which
+# therefore keeps the endpoint in its key. This sensor sits below the notify
+# floor and exists to be read and correlated, so nothing here can lose a page.
+_OUTBOUND_DETAIL_ENDPOINTS = 8
+
+
+def _outbound_candidate_trust(path):
+    """The trust verdict for `path` when it qualifies for the outbound rule,
+    else None — the rogue-payload-phoning-home shape: an unsigned/ad-hoc/broken
+    binary in a user-writable path. A signed or system-path process (a browser
+    or updater talking out) is normal and never qualifies."""
     if not path:
         return None
     if not (path.startswith("/") or (IS_WIN and ":" in path[:3])):
@@ -6881,15 +8470,71 @@ def _outbound_finding(path, rip, rport):
             return None
     elif not (suspicious_sig(trust) and is_risky_location(path)):
         return None
-    return finding(
-        "MEDIUM", "net-outbound", "Untrusted binary connected outbound",
-        "%s [%s] in a user-writable path is connected to %s:%s — an "
-        "unvouched-for binary holding an outbound socket is a payload-"
-        "phoning-home / exfil shape. Recorded for correlation."
-        % (path, trust, rip, rport),
-        "outbound:%s:%s:%s" % (path, rip, rport), path=path, program=path,
-        remote=rip, port=rport, trust=trust, confidence="medium",
-        markers=["outbound-exfil"])
+    return trust
+
+
+def _outbound_findings(rows):
+    """One MEDIUM/medium-confidence finding per PROGRAM holding live outbound
+    sockets, over `rows` of (path, remote_ip, remote_port).
+
+    Below the notify floor on purpose (ad-hoc dev binaries talk to the network
+    routinely — must not page alone): logged, rendered, and fed to correlation.
+
+    The subject's severity and custody rung are the WORST across its endpoints,
+    because custody is endpoint-scoped for network vouches: one uncovered
+    endpoint is enough to un-demote the whole subject, and it carries its
+    deviation case with it. Endpoints render sorted and capped, with the count
+    always stated so a truncated list can never read as a complete one."""
+    by_subject = {}
+    for path, rip, rport in rows:
+        trust = _outbound_candidate_trust(path)
+        if trust is None:
+            continue
+        by_subject.setdefault(_program_subject(path), set()).add(
+            (str(path), str(rip), str(rport), str(trust)))
+    findings = []
+    for subject in sorted(by_subject):
+        worst = None
+        endpoints = []
+        for path, rip, rport, trust in sorted(by_subject[subject]):
+            endpoint = "%s:%s" % (rip, rport)
+            endpoints.append(endpoint)
+            graded, rung, note = _grade_binary("MEDIUM", path,
+                                               endpoint=endpoint)
+            dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
+            # Rank: severity first, then a vouch deviation (the fact the
+            # operator must actually adjudicate), then an ungraded rung — all
+            # three tie-break toward the endpoint that says the most.
+            rank = (SEV_ORDER.get(graded, -1), 1 if dev_case else 0,
+                    0 if rung else 1)
+            if worst is None or rank > worst[0]:
+                worst = (rank, path, rip, rport, trust, graded, rung, note,
+                         dev_case, dev_note)
+        _r, path, rip, rport, trust, graded, rung, note, dev_case, dev_note \
+            = worst
+        if dev_note:
+            note = (note + "\n" + dev_note) if note else dev_note
+        shown = endpoints[:_OUTBOUND_DETAIL_ENDPOINTS]
+        rendered = ", ".join(shown)
+        if len(endpoints) > len(shown):
+            rendered += " (+%d more)" % (len(endpoints) - len(shown))
+        findings.append(finding(
+            graded, "net-outbound", "Untrusted binary connected outbound",
+            "%s [%s] in a user-writable path is connected to %d live "
+            "endpoint(s): %s — an unvouched-for binary holding an outbound "
+            "socket is a payload-phoning-home / exfil shape. Recorded for "
+            "correlation." % (path, trust, len(endpoints), rendered)
+            + (("\n" + note) if note else ""),
+            "outbound:%s" % subject,
+            case_fingerprint=dev_case or ("outbound:%s" % subject),
+            path=path, program=path,
+            # remote/port stay scalar (the worst endpoint) so every existing
+            # consumer of those attributes keeps working; the full set is its
+            # own attribute rather than a replacement.
+            remote=rip, port=rport, endpoints=endpoints,
+            endpoint_count=len(endpoints), trust=trust, confidence="medium",
+            custody=rung, markers=["outbound-exfil"]))
+    return findings
 
 
 def _parse_proc_net_tcp_established(text):
@@ -7008,6 +8653,7 @@ def check_outbound():
     findings = []
     seen = set()
     snap_rows = []
+    generic_rows = []
     for path, rip, rport in _outbound_rows():
         key = "%s:%s:%s" % (path, rip, rport)
         if key in seen:
@@ -7019,12 +8665,16 @@ def check_outbound():
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
         snap_rows.append((path, rip, rport, trust))
         # Community intel first (local set lookup): a known-C2 endpoint match
-        # is CRITICAL regardless of the binary's signature; only the rest
-        # falls through to the signature-gated generic scorer.
-        f = _intel_net_finding(path, rip, rport) or \
-            _outbound_finding(path, rip, rport)
-        if f:
-            findings.append(f)
+        # is CRITICAL regardless of the binary's signature, and stays keyed on
+        # the ENDPOINT because that is what the intel identifies — a catalogued
+        # C2 address is the fact, not the program that reached it. Only the
+        # rest falls through to the subject-keyed generic scorer below.
+        intel = _intel_net_finding(path, rip, rport)
+        if intel:
+            findings.append(intel)
+        else:
+            generic_rows.append((path, rip, rport))
+    findings += _outbound_findings(generic_rows)
     if snap_rows:
         record_observation(BEACON_SENSOR_ID, sorted(snap_rows))
         findings += _beacon_recurrence(
@@ -7088,17 +8738,34 @@ def _beacon_recurrence(history, current_rows):
             continue
         if not (suspicious_sig(trust) or is_risky_location(path)):
             continue
+        endpoint = "%s:%s" % (rip, rport)
+        graded, rung, note = _grade_binary("HIGH", path, endpoint=endpoint)
+        dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
+        if dev_note:
+            note = (note + "\n" + dev_note) if note else dev_note
         findings.append(finding(
-            "HIGH", "net-beacon",
+            graded, "net-beacon",
             "Persistent outbound connection (beacon shape)",
             "%s [%s] has held a connection to %s:%s in %d scans spanning "
             "%.1f hours. Ephemeral outbound churn does not survive between "
             "scans; the same non-browser binary re-observed at the same "
             "remote endpoint is the residue an interval C2 beacon leaves."
-            % (path, trust, rip, rport, len(stamps), span / 3600.0),
-            "beacon:%s:%s:%s" % (path, rip, rport), path=path, program=path,
+            % (path, trust, rip, rport, len(stamps), span / 3600.0)
+            + (("\n" + note) if note else ""),
+            # Version churn is not identity here either: the CASE already
+            # collapsed by program, but the signal key kept the versioned path,
+            # so one program beaconing to one endpoint across six extension
+            # updates was six stored signals — six weights on one entity in
+            # _accumulate_risk. The endpoint stays in the key: persistence at a
+            # FIXED endpoint is this sensor's whole detection.
+            "beacon:%s:%s:%s" % (_program_subject(path), rip, rport),
+            case_fingerprint=dev_case or ("beacon:%s:%s:%s" % (
+                _program_subject(path), rip, rport)),
+            subject=_subject("beacon", path, ip=rip, port=rport),
+            path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
-            span_secs=span, markers=["outbound-exfil", "beacon"]))
+            span_secs=span, custody=rung,
+            markers=["outbound-exfil", "beacon"]))
     return findings
 
 
@@ -7635,25 +9302,155 @@ def _parse_amfid_denials(ndjson_text):
     return hits
 
 
+# amfid names the rejected FILE in its message; the file is the identity.
+# Hashing the raw MESSAGE instead minted a fresh fingerprint every time the
+# same file was re-checked (26 findings for 19 distinct files on the reference
+# machine, seven of them counted twice), and left `path` unset — so nothing
+# reached the custody ladder, though 18 of those 19 sat under a Homebrew
+# receipt `_package_receipt` already understands.
+# The leading form is authoritative because it survives paths containing
+# spaces ("Chrome Apps.localized/Google Drive.app/..."); the NSURL tail is the
+# fallback for builds that word the prefix differently.
+_AMFID_PATH_RE = re.compile(r"^(/.+?)\s+(?:is\s+)?not valid\b")
+_AMFID_NSURL_RE = re.compile(r"NSURL=file://(/[^\s},]+)")
+
+
+def _amfid_path(msg):
+    """The rejected file's path from an amfid denial message, or None.
+
+    Never raises and never guesses: an unparsable message returns None and the
+    caller keeps reporting it under the old message-keyed identity. The live
+    message format varies by OS build, so a parser miss must degrade to the
+    noisier behaviour, never to silence.
+    """
+    if not msg or not isinstance(msg, str):
+        return None
+    m = _AMFID_PATH_RE.search(msg.strip())
+    if m:
+        return m.group(1)
+    m = _AMFID_NSURL_RE.search(msg)
+    return m.group(1) if m else None
+
+
+# Both separators, deliberately: this splits paths that arrive as TEXT from a
+# log message, not from the local filesystem, so os.sep is the wrong authority
+# — a posix-style path is perfectly normal on Windows (and CI proved it: the
+# os.sep version returned None for every forward-slash path there). Greedy so a
+# nested venv resolves to its innermost site-packages.
+_SITEPACKAGES_RE = re.compile(r"^(.*[\\/]site-packages)(?:[\\/]|$)")
+
+
+def _sitepackages_root(path):
+    """The `.../site-packages` directory owning `path`, or None.
+
+    A project venv is a package manager's output just as much as a Cellar tree
+    is, but it carries no receipt `_package_receipt` can read — pip and uv write
+    wheels straight into site-packages with no install record beside the file.
+    So this is used ONLY to group, never to grade: twenty-two ad-hoc signed
+    `.so` files in one venv are one fact about that venv, and saying it once is
+    a legibility win that claims nothing about where the venv came from.
+    """
+    m = _SITEPACKAGES_RE.match(path or "")
+    return m.group(1) if m else None
+
+
 def check_amfid_log(window_hours=None):
     """Harvest amfid code-signature-validation FAILURE events from the
     unified log. Kept at MEDIUM/low-confidence (log+correlation tier, below
     the notify floor) for the same reason as the syspolicy harvest: the live
     message format varies by OS build and can't be verified against a real
     denial in the field here, so it enriches without risking a noisy page.
-    On any log-read failure it degrades to empty (never a storm)."""
+    On any log-read failure it degrades to empty (never a storm).
+
+    One finding per rejected FILE, and one finding per package RECEIPT where a
+    receipt covers several files: a Homebrew formula whose twelve bundled
+    `.so`s are all ad-hoc signed is one fact about that formula, not twelve
+    findings. Files with no receipt stay one-per-file at full visibility —
+    grouping is a rendering decision about things custody can already vouch
+    for, never a reason to stop reporting an unvouched-for rejection.
+    """
     out, rc = _log_show(_PRED_AMFID, window_hours)
     if rc != 0 or not out:
         return []
-    findings = []
+    by_path, unparsed = {}, []
     for msg, ts in _parse_amfid_denials(out):
-        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]
+        path = _amfid_path(msg)
+        if not path:
+            unparsed.append((msg, ts))
+        elif path not in by_path:
+            by_path[path] = (msg, ts)
+
+    grouped, solo = {}, []
+    for path in by_path:
+        receipt = _package_receipt(path)
+        if receipt:
+            grouped.setdefault(receipt, []).append(path)
+        else:
+            solo.append(path)
+
+    findings = []
+    for receipt in sorted(grouped):
+        paths = sorted(grouped[receipt])
+        sev, rung, note = _grade_binary("MEDIUM", paths[0])
+        detail = ("amfid rejected %d file(s) belonging to %s (e.g. %s) — every "
+                  "one carries that package's install receipt, so this is the "
+                  "package's own ad-hoc signing, not a swap. Verify only if you "
+                  "did not install it." % (len(paths), receipt, paths[0]))
+        findings.append(finding(
+            sev, "amfid", "Code-signature validation failed (amfid)",
+            detail + (" [%s]" % note if note else ""),
+            "amfid:deny:receipt:%s" % _sha_key(receipt), confidence="low",
+            markers=["amfid-deny"], path=paths[0], receipt=receipt,
+            member_count=len(paths), members=paths[:20]))
+
+    # Second grouping pass, for package output that has no receipt to read: a
+    # project venv. Grouped but NEVER graded — the fingerprint carries a digest
+    # of the member set, so a NEW file appearing in an already-reported venv
+    # mints a new identity and alerts once, which is exactly the case a plain
+    # directory-keyed group would have swallowed.
+    venvs, ungrouped = {}, []
+    for path in solo:
+        root = _sitepackages_root(path)
+        if root:
+            venvs.setdefault(root, []).append(path)
+        else:
+            ungrouped.append(path)
+    for root in sorted(venvs):
+        paths = sorted(venvs[root])
+        if len(paths) < 2:
+            ungrouped.extend(paths)
+            continue
+        findings.append(finding(
+            "MEDIUM", "amfid", "Code-signature validation failed (amfid)",
+            "amfid rejected %d file(s) under %s — a project virtualenv's "
+            "wheels are ad-hoc signed by construction. No install receipt "
+            "vouches for this directory, so this is NOT graded down; it is "
+            "reported once instead of %d times. e.g. %s"
+            % (len(paths), root, len(paths), paths[0]),
+            "amfid:deny:venv:%s:%s" % (_sha_key(root),
+                                       _sha_key("\n".join(paths))),
+            confidence="low", markers=["amfid-deny"], path=paths[0],
+            venv=root, member_count=len(paths), members=paths[:20]))
+
+    for path in sorted(ungrouped):
+        msg, ts = by_path[path]
+        sev, rung, note = _grade_binary("MEDIUM", path)
+        findings.append(finding(
+            sev, "amfid", "Code-signature validation failed (amfid)",
+            "amfid rejected %s at %s — the OS refused to trust its code "
+            "signature; verify it was expected (a broken build, or a real "
+            "tamper attempt)." % (path, ts) + (" [%s]" % note if note else ""),
+            "amfid:deny:path:%s" % _sha_key(path), confidence="low",
+            markers=["amfid-deny"], path=path))
+
+    for msg, ts in unparsed:
         findings.append(finding(
             "MEDIUM", "amfid", "Code-signature validation failed (amfid)",
             "amfid rejected a binary/library's signature at %s: %s — the OS "
             "refused to trust something's code signature; verify it was "
             "expected (a broken build, or a real tamper attempt)."
-            % (ts, msg[:240]), "amfid:deny:%s" % digest, confidence="low",
+            % (ts, msg[:240]),
+            "amfid:deny:%s" % _sha_key(msg), confidence="low",
             markers=["amfid-deny"]))
     return findings
 
@@ -8038,10 +9835,51 @@ def _parse_who_remote(text):
     return out
 
 
+# Windows has no `who` — the closest analog to "a remote login session is
+# CURRENTLY active" is an ESTABLISHED inbound TCP connection to a remote-
+# control port: RDP (3389) or PowerShell Remoting/WinRM (5985/5986, HTTP and
+# HTTPS listeners). Get-NetTCPConnection needs no elevation and ships on every
+# Windows 8+/Server 2012+ box, so this costs no new privilege the way reading
+# the Security event log for logon type 10 would.
+_WIN_REMOTE_SESSION_PS = (
+    "$ports=3389,5985,5986;"
+    "Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |"
+    "Where-Object { $ports -contains $_.LocalPort } |"
+    "ForEach-Object { Write-Output ('remote=' + $_.RemoteAddress + '=' + "
+    "$_.LocalPort) }")
+
+
+def _snapshot_auth_sessions_win():
+    out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                      _WIN_REMOTE_SESSION_PS], timeout=30)
+    # Probe failure ⇒ non-answer, same rule every other Windows PS-backed
+    # surface here follows (snapshot_win_exclusions et al.) — never a false
+    # empty that would storm the moment the probe next succeeds.
+    if rc != 0:
+        return None
+    snap = {}
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("remote="):
+            continue
+        host, _, port = line[len("remote="):].partition("=")
+        host = host.strip()
+        # Same loopback exclusion as the POSIX side: a local RDP/WinRM test
+        # against 127.0.0.1 is routine tooling, not a remote actor.
+        if not host or host in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            continue
+        snap["rdp@%s:%s" % (host, port.strip())] = host
+    return snap
+
+
 def snapshot_auth_sessions():
     """{session_key: origin_host} of active REMOTE login sessions, or None if
-    `who` could not be read (a non-answer, not 'no sessions' — never adopt/diff a
-    false-empty)."""
+    the backing probe could not be read (a non-answer, not 'no sessions' —
+    never adopt/diff a false-empty). POSIX: `who`, filtered to sessions
+    carrying a remote origin. Windows: established TCP connections to
+    RDP/WinRM ports — see _snapshot_auth_sessions_win."""
+    if IS_WIN:
+        return _snapshot_auth_sessions_win()
     out, _, rc = run(WHO_CMD, timeout=8)
     if rc in (124, 127):
         return None
@@ -8050,13 +9888,14 @@ def snapshot_auth_sessions():
 
 def diff_auth_sessions(prior, cur):
     def new_fn(key, host):
+        channel = "RDP / PowerShell Remoting" if IS_WIN else "ssh / screen-sharing"
         return finding(
             "HIGH", "auth-session", "New remote login session",
-            "%s — a remote (ssh / screen-sharing) session appeared from %s. A "
-            "personal Mac rarely has an active remote login; verify this is you "
-            "(and that Remote Login / Screen Sharing being on is intended)."
-            % (key, host), "auth-session:%s" % key, session=key, origin=host,
-            confidence="medium", markers=["remote-access"])
+            "%s — a remote (%s) session appeared from %s. This machine rarely "
+            "has an active remote login; verify this is you (and that remote "
+            "access being enabled at all is intended)."
+            % (key, channel, host), "auth-session:%s" % key, session=key,
+            origin=host, confidence="medium", markers=["remote-access"])
     return _diff_map(prior, cur, new_fn)
 
 
@@ -8765,15 +10604,73 @@ def _git_bin():
         return None
 
 
+def _git_created_here(git, cwd, sha, author_email):
+    """True iff `sha` was CREATED in this working copy by its own configured
+    identity. Two independent records must agree: the commit's author email
+    equals the repo's `user.email`, and the HEAD reflog remembers the commit
+    being MADE here — a locally created commit enters the reflog as a
+    `commit`/`commit (amend)` entry, while a commit that arrived from
+    elsewhere enters as `pull:`/`merge:`/`fetch:`/`clone:` and never as
+    `commit`. Both records are same-uid-writable, so this is attribution
+    evidence for GRADING a finding, never proof of authorship — and both
+    checks fail toward suspicion (expired reflog, identity mismatch, any git
+    error all return False)."""
+    me, _e, rc = run([git, "-C", cwd, "config", "user.email"], timeout=10)
+    if rc != 0 or not (me or "").strip():
+        return False
+    if (author_email or "").strip() != me.strip():
+        return False
+    rl, _e, rc = run([git, "-C", cwd, "log", "-g", "--format=%H %gs",
+                      "-n", "400"], timeout=15)
+    if rc != 0:
+        return False
+    for line in (rl or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] == sha and parts[1].startswith("commit"):
+            return True
+    return False
+
+
+def _git_fleet_signed(git, cwd, sha):
+    """True iff `sha` carries a cryptographic signature that verifies against
+    the PINNED device roster (~/.aegis/allowed_signers, written only by the
+    explicit `signers pin` command).
+
+    This is the cross-device rung: a commit made on ANOTHER of the operator's
+    machines arrives here by fetch — no local reflog, no local authorship —
+    but it carries the originating device's SSH signature, and signatures are
+    the one custody evidence that survives transport. Verification runs
+    against Aegis's own pinned copy, never against a roster file synced
+    through the repo itself: a poisoned remote that adds an attacker's key to
+    the tracked roster changes nothing here until the operator explicitly
+    re-pins. Only an exact 'G' (good, signer in the roster) vouches; every
+    other verdict — unsigned, bad, unknown key, expired, error — is a
+    non-match, and asymmetric keys mean this machine holds nothing that can
+    MAKE a signature, only what checks one."""
+    if not os.path.isfile(FLEET_SIGNERS):
+        return False
+    out, _e, rc = run([git, "-c", "gpg.ssh.allowedSignersFile=%s" % FLEET_SIGNERS,
+                       "-C", cwd, "log", "-1", "--format=%G?", sha], timeout=15)
+    return rc == 0 and (out or "").strip() == "G"
+
+
 def _git_provenance(path):
     """How the current content of `path` arrived.
 
-      'untracked'    — exists only in the working tree, never committed
-      'worktree'     — tracked, with uncommitted local modifications
-      'remote'       — committed AND reachable from a remote-tracking branch:
-                       it came from (or is published to) someone else's history
-      'local-commit' — committed locally, not on any remote
-      None           — not in a repo, or git unavailable (reported, not guessed)
+      'untracked'      — exists only in the working tree, never committed
+      'worktree'       — tracked, with uncommitted local modifications
+      'self-committed' — the commit that last touched it was CREATED on this
+                         machine by the repo's own configured identity (HEAD
+                         reflog records it as a `commit`), pushed or not
+      'fleet-signed'   — the commit arrived from elsewhere but carries a
+                         signature verifying against the PINNED device
+                         roster: made on one of the operator's own machines
+      'remote-foreign' — committed AND reachable from a remote-tracking
+                         branch, with no local record of authorship: it
+                         arrived in (or belongs to) someone else's history
+      'local-commit'   — committed, not on any remote, authorship
+                         unconfirmed (expired reflog or identity mismatch)
+      None             — not in a repo, or git unavailable (reported, not guessed)
     """
     git = _git_bin()
     if not git:
@@ -8792,26 +10689,1177 @@ def _git_provenance(path):
         return "untracked"
     if st:
         return "worktree"
-    sha, _e, rc = run([git, "-C", d, "log", "-1", "--format=%H", "--", path],
+    out, _e, rc = run([git, "-C", d, "log", "-1", "--format=%H|%ae", "--", path],
                       timeout=10)
-    sha = (sha or "").strip()
-    if rc != 0 or not sha:
+    out = (out or "").strip()
+    if rc != 0 or "|" not in out:
         return None
+    sha, author = out.split("|", 1)
+    if _git_created_here(git, d, sha, author):
+        return "self-committed"
+    if _git_fleet_signed(git, d, sha):
+        return "fleet-signed"
     br, _e, rc = run([git, "-C", d, "branch", "-r", "--contains", sha], timeout=15)
-    return "remote" if (rc == 0 and (br or "").strip()) else "local-commit"
+    return "remote-foreign" if (rc == 0 and (br or "").strip()) else "local-commit"
 
 
 _PROVENANCE_NOTE = {
-    "remote": ("This arrived in your history from a REMOTE — it is a "
-               "third-party-authored instruction you may never have read. "
-               "This is the poisoned-repo case."),
-    "untracked": ("This file is not tracked by git, so nothing recorded who "
-                  "wrote it. An agent process writes exactly like this."),
+    "operator-vouched": ("The operator signed a vouch for exactly these bytes "
+                         "at exactly this path, with a passphrase-protected "
+                         "key verified against the pinned vouch roster. This "
+                         "is the strongest rung here because it is the only "
+                         "one code running as the operator cannot mint "
+                         "silently. It binds to the CONTENT: change the bytes, "
+                         "the uid, or (for network scope) the endpoint, and "
+                         "the vouch stops applying and this re-alerts."),
+    "self-attested": ("A supervised agent session recorded a signed intent "
+                      "entry for exactly this content at write time — this "
+                      "machine claims authorship. (Attribution, not proof: "
+                      "code already running as you could forge the record — "
+                      "but code already running as you no longer needs a "
+                      "config entry to gain execution.)"),
+    "self-committed": ("The commit that last touched this file was created on "
+                       "this machine by its own configured git identity — "
+                       "self-authored churn, not an arrival."),
+    "fleet-signed": ("The commit that last touched this file arrived from "
+                     "elsewhere but carries an SSH signature verifying "
+                     "against your PINNED device roster "
+                     "(~/.aegis/allowed_signers) — made on one of your own "
+                     "machines. (The signature proves WHICH device, not that "
+                     "the device was healthy; the roster changes only by an "
+                     "explicit `signers pin`.)"),
+    "remote-foreign": ("This arrived in your history from a REMOTE — it is a "
+                       "third-party-authored instruction you may never have "
+                       "read. This is the poisoned-repo case."),
+    "untracked": ("This file is not tracked by git and no supervised agent "
+                  "session attested it, so nothing on this machine claims "
+                  "authorship of this change."),
+    "relocated": ("The program bytes AND the payload script are byte-identical "
+                  "to the baseline — only the directory changed. Nothing new "
+                  "executes here; this is a move, not a substitution."),
+    "publisher-stable": ("The binary changed in place but is re-signed by the "
+                         "SAME authority as its baseline — the shape of a "
+                         "vendor auto-update. (Origin, not authorship: a "
+                         "publisher can ship a bad build, and a stolen cert "
+                         "signs too, so this quiets it rather than clearing "
+                         "it.)"),
+    "package-managed": ("This binary is owned by a package-manager transaction "
+                        "on this machine, proven by its receipt on disk — it "
+                        "arrived through an install you ran, not a drop. "
+                        "(Ad-hoc signing is normal for Homebrew/extension "
+                        "binaries and is why signature scoring alone cannot "
+                        "tell them from a payload.)"),
     "worktree": ("Uncommitted local edit — routine if you made it."),
     "local-commit": ("Committed locally and not pushed — routine if you made it."),
-    None: ("Not in a git repository, so no provenance is available — treat "
-           "authorship as unknown rather than as yours."),
+    None: ("Not in a git repository and no supervised agent session attested "
+           "it — treat authorship as unknown rather than as yours."),
 }
+
+# Custody grades that downgrade a structural (churn-shaped) delegate-surface
+# finding to a recorded-but-quiet severity. Deliberately NOT consulted for
+# attack-defined content — a conceal imperative stays HIGH no matter who
+# appears to have written it, the same guard acquired tolerance applies.
+_SELF_CUSTODY = ("operator-vouched", "self-attested", "self-committed",
+                 "fleet-signed")
+
+# --- vouching rungs: identity evidence the NON-agent sensors already hold ----
+#
+# Chain-of-custody was built for the delegate surface and, until now, only
+# diff_agent_surface() ever asked "did this machine make this change?". The
+# sensors that generate the bulk of the volume — persistence.diff, process,
+# outbound — never asked at all: they scored on code signature plus path
+# writability alone. That is why a directory migration, a vendor auto-update,
+# and a Homebrew daemon all arrive as HIGH next to a genuine intrusion.
+#
+# These three rungs answer the same question from evidence those sensors
+# ALREADY carry, with no new collection and no network:
+#
+#   relocated        the program bytes AND the payload hash are identical and
+#                    only the directory changed  -> nothing new executes
+#   publisher-stable the binary changed in place but is re-signed by the SAME
+#                    authority as its baseline   -> a vendor update
+#   package-managed  the binary is owned by a package-manager transaction on
+#                    this machine, proven by its RECEIPT on disk
+#
+# They are deliberately weaker than _SELF_CUSTODY: those three are claims of
+# AUTHORSHIP, these are claims of ORIGIN. So they demote one step (HIGH ->
+# MEDIUM), never straight to LOW, except `relocated`, which is a proof that
+# the executed content is byte-identical and therefore carries no new code.
+_VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
+
+# Recognised-but-weak: git knows the edit is local and unpushed. The note has
+# always read "routine if you made it" while the finding stayed HIGH anyway —
+# the ladder named the rung and then ignored it. One step down, not to LOW: an
+# uncommitted worktree edit is exactly what a local attacker's change also
+# looks like, so it earns quiet, not silence.
+_WEAK_CUSTODY = ("worktree", "local-commit")
+
+_CUSTODY_FLOOR = {"relocated": "LOW"}
+
+
+def _demote(severity, provenance, attack_defined=False):
+    """Lower `severity` by what custody can prove about `provenance`.
+
+    The three invariants this function exists to hold, all inherited from the
+    delegate-surface grader that came before it:
+
+      * grading DEMOTES, it never suppresses — every finding stays in the
+        report at its new level, no finding is dropped, no incident is
+        auto-closed, and nothing here ever writes a dismissal, so a demotion
+        can never feed acquired tolerance;
+      * attack-DEFINED evidence is never demoted, whoever authored it. A
+        hostile argv, an IOC hit, a dylib-injection env, a conceal imperative
+        keeps its severity even under perfect custody: knowing who wrote a
+        payload is not a reason to stop calling it a payload;
+      * a rung may only move severity DOWN. If a caller passes something the
+        ladder does not recognise, severity is returned untouched.
+    """
+    if attack_defined or not provenance:
+        return severity
+    if provenance in _SELF_CUSTODY:
+        target = "LOW"
+    elif provenance in _VOUCHED_CUSTODY:
+        target = _CUSTODY_FLOOR.get(provenance) or _step_down(severity)
+    elif provenance in _WEAK_CUSTODY:
+        target = _step_down(severity)
+    else:
+        return severity
+    return target if SEV_ORDER[target] < SEV_ORDER[severity] else severity
+
+
+_SEV_LADDER = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
+
+
+def _step_down(severity):
+    try:
+        i = _SEV_LADDER.index(severity)
+    except ValueError:
+        return severity
+    return _SEV_LADDER[max(0, i - 1)]
+
+
+# --- package-manager receipts -------------------------------------------------
+#
+# Nearly every "untrusted binary in a user-writable path" on a developer's
+# machine is a package manager's output. Homebrew ships Go/Rust binaries that
+# are ad-hoc (linker) signed by construction; VSCode extensions ship vendored
+# helpers; pipx builds venvs under Application Support. Signature-and-location
+# scoring cannot tell those from a dropped payload, because on those two axes
+# they are identical.
+#
+# The discriminator is the RECEIPT: a package manager records the transaction
+# that put the file there. This is checked by reading that receipt, never by
+# matching a path prefix — "/opt/homebrew/..." as a trust rule would vouch for
+# anything an attacker drops into a directory the user can write to, which is
+# precisely the file we are trying to grade. A receipt means the file arrived
+# through an install the operator initiated.
+#
+# Honest limits, because this rung is the most attackable one here: an attacker
+# who can overwrite a Cellar file (same access as any other user-writable path)
+# inherits its receipt, and a malicious package installed on purpose has a
+# perfectly good receipt too. That is why it demotes one step to MEDIUM and
+# never to LOW, and why it is refused entirely for behaviour-defined findings.
+
+
+def _homebrew_receipt(real):
+    """`<prefix>/Cellar/<formula>/<version>/...` with an install receipt."""
+    parts = real.split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("Cellar")
+    except ValueError:
+        return None
+    if i + 2 >= len(parts):
+        return None
+    formula, version = parts[i + 1], parts[i + 2]
+    root = os.sep.join(parts[:i + 3])
+    if os.path.isfile(os.path.join(root, "INSTALL_RECEIPT.json")):
+        return "homebrew:%s@%s" % (formula, version)
+    return None
+
+
+def _vscode_receipt(real):
+    """A file inside an extension directory the editor's own index lists."""
+    marker = os.sep + ".vscode"
+    idx = real.find(marker)
+    if idx < 0:
+        return None
+    parts = real[idx:].split(os.sep)
+    # ['', '.vscode(-insiders)', 'extensions', '<publisher.name-version>', ...]
+    if len(parts) < 4 or parts[2] != "extensions":
+        return None
+    ext_id = parts[3]
+    root = real[:idx] + os.sep.join(parts[:3])
+    for name in ("extensions.json", ".obsolete"):
+        if ext_id in (_read_text(os.path.join(root, name)) or ""):
+            return "vscode:%s" % ext_id
+    return None
+
+
+def _pipx_receipt(real):
+    """A pipx venv carries pipx_metadata.json at its root."""
+    parts = real.split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("venvs")
+    except ValueError:
+        return None
+    if i + 1 >= len(parts):
+        return None
+    root = os.sep.join(parts[:i + 2])
+    if os.path.isfile(os.path.join(root, "pipx_metadata.json")):
+        return "pipx:%s" % parts[i + 1]
+    return None
+
+
+def _uv_python_receipt(real):
+    """uv ships its own interpreters under <data>/uv/python/<dist>/, each
+    stamped with a BUILD receipt (the python-build-standalone build date) that
+    uv writes on install. On a Python developer's machine these are the busiest
+    unvouched binaries there are — every script a uv-managed interpreter runs
+    scores as ad-hoc-in-a-user-writable-path without this."""
+    parts = real.split(os.sep)
+    try:
+        i = len(parts) - 1 - parts[::-1].index("python")
+    except ValueError:
+        return None
+    # require the uv/python/<dist> shape, then prove it with the receipt
+    if i == 0 or parts[i - 1] != "uv" or i + 1 >= len(parts):
+        return None
+    root = os.sep.join(parts[:i + 2])
+    if os.path.isfile(os.path.join(root, "BUILD")):
+        return "uv-python:%s" % parts[i + 1]
+    return None
+
+
+def _winget_receipt(real):
+    """A file winget put on disk. Path-shaped, no subprocess — winget installs
+    into %LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\<Package.Id>_<hash>\\ and
+    shims into ...\\WinGet\\Links\\.
+
+    Separators are normalized rather than using os.sep, so this is exercisable
+    from any body — the same reason tests/test_cross_platform.py parses captured
+    Windows output on a Mac. The other portable probes predate that lesson.
+    """
+    p = (real or "").replace("\\", "/")
+    low = p.lower()
+    marker = "/microsoft/winget/packages/"
+    i = low.find(marker)
+    if i >= 0:
+        head = p[i + len(marker):].split("/")[0]
+        if head:
+            # Directory is "<Package.Id>_<install hash>"; the id is the fact.
+            return "winget:%s" % head.split("_")[0]
+    if "/microsoft/winget/links/" in low:
+        return "winget:link"
+    return None
+
+
+def _choco_receipt(real):
+    """A file Chocolatey put on disk: <ProgramData>\\chocolatey\\lib\\<pkg>\\."""
+    p = (real or "").replace("\\", "/")
+    marker = "/chocolatey/lib/"
+    i = p.lower().find(marker)
+    if i >= 0:
+        head = p[i + len(marker):].split("/")[0]
+        if head:
+            return "choco:%s" % head
+    return None
+
+
+def _os_package_receipt(real):
+    """The OS-NATIVE package manager's claim on `real`.
+
+    The gap this closes: `_grade_binary` offers non-mac bodies exactly two
+    custody rungs, and the second consulted only Homebrew, VS Code, pipx and uv
+    — so an apt/rpm/winget-installed binary, the ordinary shape of a
+    developer's toolchain, was scored at full severity with custody=None on
+    Linux and Windows while its Homebrew equivalent on macOS was demoted a
+    step. macOS needs no entry here: Homebrew IS its native manager and
+    _homebrew_receipt already covers it.
+    """
+    if IS_LINUX:
+        return _linux_pkg_owner(real)
+    return None
+
+
+# _os_package_receipt is LAST on purpose: the probes above it are pure path
+# arithmetic, while it can cost up to three subprocesses on Linux. Cheap
+# questions first, so the expensive one is only asked when no cheap answer won.
+_PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
+                     _uv_python_receipt, _winget_receipt, _choco_receipt,
+                     _os_package_receipt)
+
+
+def _package_receipt(path):
+    """The package-manager transaction that owns `path`, or None.
+
+    Symlinks are resolved first: Homebrew's `bin/` and `opt/` entries are
+    links into the versioned Cellar, and the receipt lives beside the target.
+    """
+    if not path:
+        return None
+    # Both the link and its target are probed, because the two managers point
+    # in OPPOSITE directions: Homebrew's bin/ entries are symlinks INTO the
+    # versioned Cellar (the receipt is at the target), while a pipx/venv
+    # `bin/python` is a symlink OUT to the system interpreter (the receipt is
+    # at the link). Resolving only one of them silently loses the other.
+    cands = []
+    for c in (path, os.path.realpath(path) if path else None):
+        try:
+            if c and c not in cands and os.path.exists(c):
+                cands.append(c)
+        except Exception:
+            continue
+    for cand in cands:
+        for probe in _PACKAGE_RECEIPTS:
+            try:
+                hit = probe(cand)
+            except Exception:
+                hit = None
+            if hit:
+                return hit
+    return None
+
+
+def _grade_binary(severity, path, attack_defined=False, endpoint=None):
+    """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
+
+    process / net-listener / net-outbound / net-beacon all raise on the same
+    two axes — the code signature is not trustworthy and the file sits in a
+    user-writable path. On a developer's machine that describes essentially
+    every package-manager artifact, which is why those sensors produce the
+    volume they do. A receipt is the evidence that separates "arrived through
+    an install you ran" from "was dropped here".
+
+    One step only, never to LOW: origin is not innocence. A package-managed
+    binary can still be the thing beaconing — the update itself can be the
+    compromise — so this quiets the identity half of the alarm and leaves the
+    behaviour half at a level that still reaches the report.
+    """
+    if attack_defined:
+        return severity, None, None
+    # The vouch tier is consulted FIRST because it is the only rung backed by
+    # something an attacker cannot produce with the operator's own uid. Where
+    # the caller names an endpoint, the vouch must cover that exact endpoint —
+    # an identity vouch never widens into "may talk to anywhere".
+    if _vouch_covers(path, endpoint):
+        rung = "operator-vouched"
+    elif _package_receipt(path):
+        rung = "package-managed"
+    else:
+        return severity, None, None
+    return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
+
+
+# --- the vouch tier: a workload the operator signed for, by hand -------------
+#
+# Every rung above answers "did this machine make this change?" from evidence
+# the machine already holds. None of them can vouch for a workload that arrived
+# by hand: no git history, no package receipt, no agent session. On the
+# reference machine that gap had a name — two self-hosted GitHub Actions
+# runners under ~/actions-runners, ad-hoc signed, in a user-writable path,
+# holding a permanent TLS connection to Microsoft. Every attribute the process,
+# net-outbound and net-beacon rules key on is DEFINITIONAL for a CI runner, so
+# they produced 11 of one scan's 52 findings and 24 of its 46 open incidents,
+# and no amount of tuning those rules could separate them from a real implant.
+#
+# The missing evidence is not technical, it is human: the operator knows. This
+# tier is the narrow, revocable, cryptographically-bound way to say so.
+#
+# Three properties make it a security control rather than an allowlist:
+#
+#   1. It is signed by a key with a PASSPHRASE, held outside ~/.aegis, and
+#      verified against a roster pinned by a separate explicit command. This is
+#      deliberately NOT the fleet roster: the fleet signing key is passphrase-
+#      less by design (it signs commits unattended), so code running as the
+#      operator could mint fleet signatures silently. A vouch must cost a human
+#      keystroke, or it vouches for whatever compromised the machine.
+#   2. It binds to EXACT BYTES plus the execution binding — path, sha256, uid,
+#      and, for network scope, the precise endpoint set. Every future change
+#      escapes the vouch and re-alerts at full severity. "The operator installed
+#      it" is a fact about one moment, not a permanent character reference.
+#   3. It FAILS CLOSED. A malformed line, a broken chain link, a rollback, an
+#      unverifiable signature or an unpinned roster does not degrade to "no
+#      vouches" — it discards the entire vouch set AND raises a CRITICAL
+#      tamper finding, because a trust store that has been edited is itself the
+#      most interesting event on the machine.
+#
+# The honest limit, stated because the design depends on the operator knowing
+# it: an attacker who can rewrite aegis.py, its verifier and the pinned roster
+# under the same uid defeats any local scheme. What this buys is tamper
+# EVIDENCE, not tamper-proofing. Resistance beyond that needs a hardware-backed
+# key or a root-owned anchor, which is a deliberate future rung, not this one.
+VOUCH_FILE = os.path.join(STATE_DIR, "vouches.jsonl")
+VOUCH_SIGNERS = os.path.join(STATE_DIR, "vouch_signers")
+_VOUCH_NAMESPACE = "aegis-vouch"
+_VOUCH_GENESIS = "0" * 64
+_VOUCH_DEFAULT_TTL = 180 * 86400
+
+
+def _vouch_canonical(rec):
+    """The exact bytes a vouch record is signed over and chained by.
+
+    Canonical JSON — sorted keys, no insignificant whitespace — computed over
+    every field EXCEPT the signature, so the signature can be added to the same
+    object without changing what it commits to.
+    """
+    body = {k: v for k, v in (rec or {}).items() if k != "sig"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def _vouch_link(rec):
+    return hashlib.sha256(
+        _vouch_canonical(rec).encode("utf-8", "replace")).hexdigest()
+
+
+def _vouch_verify_sig(payload, sig, principal):
+    """True iff `sig` is a good ssh signature over `payload` by a principal in
+    the PINNED vouch roster. Any failure — missing roster, missing ssh-keygen,
+    bad signature, unknown signer, timeout — is False, never an exception."""
+    if not sig or not os.path.isfile(VOUCH_SIGNERS):
+        return False
+    sig_path = None
+    try:
+        fd, sig_path = tempfile.mkstemp(prefix="aegis_vsig_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(sig if sig.endswith("\n") else sig + "\n")
+        _out, _err, rc = run(
+            ["ssh-keygen", "-Y", "verify", "-f", VOUCH_SIGNERS,
+             "-I", principal, "-n", _VOUCH_NAMESPACE, "-s", sig_path],
+            timeout=15, stdin_data=payload)
+        return rc == 0
+    except Exception:
+        return False
+    finally:
+        if sig_path:
+            try:
+                os.unlink(sig_path)
+            except OSError:
+                pass
+
+
+def load_vouches(now=None):
+    """({subject: record}, tamper_reason_or_None) from the signed vouch log.
+
+    Returns ({}, None) when no vouch file exists — an operator who has never
+    vouched for anything is the normal case, not a tamper event.
+
+    On ANY integrity failure returns ({}, reason): the whole set is discarded,
+    never the offending line alone. Partial trust in a store somebody edited is
+    worse than none, because it lets an attacker delete the one record that
+    would have made their change loud.
+    """
+    now = _epoch(now)
+    if not os.path.isfile(VOUCH_FILE):
+        return {}, None
+    if not os.path.isfile(VOUCH_SIGNERS):
+        return {}, ("a vouch log exists but no signer roster is pinned — "
+                    "nothing can verify it (pin one: aegis.py vouch pin ...)")
+    try:
+        with open(VOUCH_FILE, "r", encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    except Exception as e:
+        return {}, "vouch log unreadable: %s" % e
+
+    active, prev, seq = {}, _VOUCH_GENESIS, 0
+    for n, line in enumerate(lines, 1):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            return {}, "vouch log line %d is not valid JSON" % n
+        if not isinstance(rec, dict):
+            return {}, "vouch log line %d is not an object" % n
+        if rec.get("prev") != prev:
+            return {}, ("vouch log line %d breaks the hash chain (rollback or "
+                        "removed record)" % n)
+        if not isinstance(rec.get("seq"), int) or rec["seq"] != seq + 1:
+            return {}, "vouch log line %d has a non-sequential seq" % n
+        principal = str(rec.get("principal") or "")
+        if not principal or not _vouch_verify_sig(
+                _vouch_canonical(rec), rec.get("sig"), principal):
+            return {}, ("vouch log line %d is not signed by a pinned signer"
+                        % n)
+        subject = str(rec.get("subject") or "")
+        if not subject:
+            return {}, "vouch log line %d names no subject" % n
+        if rec.get("action") == "revoke":
+            active.pop(subject, None)
+        elif rec.get("action") == "vouch":
+            active[subject] = rec
+        else:
+            return {}, "vouch log line %d has an unknown action" % n
+        prev, seq = _vouch_link(rec), rec["seq"]
+
+    live = {s: r for s, r in active.items()
+            if not r.get("expires_at") or int(r["expires_at"]) > now}
+    return live, None
+
+
+def _vouch_subject(path):
+    return "workload:%s" % _sha_key(os.path.realpath(path or ""))
+
+
+def _vouch_covers(path, endpoint=None, now=None):
+    """True iff a verified, unexpired vouch covers exactly these bytes at this
+    path, for this endpoint.
+
+    Every clause is an AND, and every mismatch is a silent False that leaves
+    the finding at full severity — a deviated contract must never read as a
+    weaker vouch. Where the caller names an endpoint (the network sensors), the
+    vouch must list that exact endpoint: a vouch with no endpoint set vouches
+    for the IDENTITY of a binary and deliberately says nothing about where it
+    may connect, so it can never wildcard an exfil destination.
+    """
+    if not path:
+        return False
+    try:
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            return False
+        st = os.stat(real)
+    except OSError:
+        return False
+    vouches, tamper = load_vouches(now)
+    if tamper:
+        return False
+    rec = vouches.get(_vouch_subject(real))
+    if not rec:
+        return False
+    if str(rec.get("path") or "") != real:
+        return False
+    if rec.get("uid") is not None and int(rec["uid"]) != st.st_uid:
+        return False
+    if sha256(real) != str(rec.get("sha256") or ""):
+        return False
+    if endpoint is not None:
+        return endpoint in (rec.get("endpoints") or [])
+    return True
+
+
+def _vouch_chain_head():
+    """(prev_link, last_seq) for appending. Refuses to extend a log that does
+    not currently verify — appending to a broken chain would launder it."""
+    if not os.path.isfile(VOUCH_FILE):
+        return _VOUCH_GENESIS, 0
+    _v, tamper = load_vouches()
+    if tamper:
+        raise ValueError(tamper)
+    with open(VOUCH_FILE, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    if not lines:
+        return _VOUCH_GENESIS, 0
+    last = json.loads(lines[-1])
+    return _vouch_link(last), int(last["seq"])
+
+
+def _vouch_sign(payload, key_path):
+    """Armored ssh signature over `payload`, or None.
+
+    ssh-keygen prompts for the key's passphrase on the terminal; that prompt is
+    the entire human gate this tier is built around, so it is never suppressed
+    and never cached by Aegis.
+    """
+    data_path = None
+    try:
+        fd, data_path = tempfile.mkstemp(prefix="aegis_vsign_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        # Not run() — this one must inherit the real tty to prompt for the
+        # passphrase, which capture_output would swallow.
+        rc = subprocess.call(
+            ["/usr/bin/ssh-keygen", "-Y", "sign", "-f", key_path,
+             "-n", _VOUCH_NAMESPACE, "-q", data_path])
+        if rc != 0:
+            return None
+        with open(data_path + ".sig", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        for p in (data_path, (data_path + ".sig") if data_path else None):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _vouch_record(action, path, principal, endpoints=(), ttl=None, now=None):
+    """The unsigned record for `path`, bound to its bytes and execution uid."""
+    now = _epoch(now)
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    return {
+        "action": action,
+        "subject": _vouch_subject(real),
+        "path": real,
+        "sha256": sha256(real),
+        "uid": st.st_uid,
+        "endpoints": sorted(endpoints or []),
+        "principal": principal,
+        "created_at": now,
+        "expires_at": now + int(ttl or _VOUCH_DEFAULT_TTL),
+    }
+
+
+def _vouch_append(rec, key_path):
+    """Chain, sign and append one record. Returns the signed record."""
+    prev, seq = _vouch_chain_head()
+    rec = dict(rec)
+    rec["prev"], rec["seq"] = prev, seq + 1
+    sig = _vouch_sign(_vouch_canonical(rec), key_path)
+    if not sig:
+        raise ValueError("signing failed (wrong passphrase, or no such key)")
+    rec["sig"] = sig
+    line = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    fd = os.open(VOUCH_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return rec
+
+
+_VOUCH_DEVIATION_NOTE = (
+    "These bytes ARE vouched — the digest still matches the contract you "
+    "signed — but this endpoint is not in that contract's reviewed set. That "
+    "is either an endpoint rotation (GitHub, a CDN, a relay pool) or vouched "
+    "software reaching somewhere new, and the two are indistinguishable from "
+    "here. Severity is NOT reduced. Confirm and re-vouch with the new "
+    "endpoint, or revoke: `aegis.py vouch list`.")
+
+
+def _vouch_endpoint_deviation(path, endpoint):
+    """(case_key, note) when `path` is a vouched workload reaching an endpoint
+    its vouch does not cover; (None, None) otherwise.
+
+    This exists because the alternative is worse in both directions. Binding a
+    vouch to an exact endpoint set is right — an identity vouch that widened
+    into "may contact anything on 443" would hide the one connection worth
+    seeing. But a workload whose provider rotates addresses then re-alerts as a
+    COLD, brand-new HIGH beacon every rotation, which is the same alert-fatigue
+    the whole precision tier exists to end, and it trains the operator to
+    silence beacons by hand-editing a trust store.
+
+    So the rotation batches into the workload's own case: one case per vouched
+    workload, each unreviewed endpoint attached to it as its own evidence
+    fingerprint. Severity is deliberately UNCHANGED — this never demotes.
+    Nothing here decides the endpoint is benign; it decides only which case the
+    operator reads it in.
+    """
+    if not path or endpoint is None:
+        return None, None
+    # Fully covered, or not a vouched workload at all: not a deviation.
+    if _vouch_covers(path, endpoint) or not _vouch_covers(path):
+        return None, None
+    try:
+        subject = _vouch_subject(os.path.realpath(path))
+    except OSError:
+        return None, None
+    return "vouched-endpoint:%s" % subject, _VOUCH_DEVIATION_NOTE
+
+
+def check_vouch_store():
+    """CRITICAL when the vouch log exists but does not verify.
+
+    This is the fail-closed half of the tier and the reason it can be a
+    security control at all. It is deliberately CRITICAL and deliberately
+    attack-defined — a store whose chain broke or whose signature stopped
+    verifying is either corruption or somebody editing what the monitor
+    trusts, and neither is something to grade down.
+    """
+    if not os.path.isfile(VOUCH_FILE):
+        return []
+    _v, tamper = load_vouches()
+    if not tamper:
+        return []
+    return [finding(
+        "CRITICAL", "vouch-store", "Vouch store failed verification",
+        "%s did not verify: %s. Every vouch has been DISCARDED for this scan "
+        "and all vouched workloads are being graded as if unvouched. Either "
+        "the log was corrupted or something edited what Aegis trusts."
+        % (VOUCH_FILE, tamper),
+        "vouch:tamper:%s" % _sha_key(tamper), confidence="high",
+        markers=["trust-store-tamper"], attack_defined=True,
+        path=VOUCH_FILE)]
+
+
+def _custody_persistence(old, rec):
+    """Custody rung for a CHANGED persistence item, or None.
+
+    Answers one question: does the diff between `old` and `rec` describe the
+    same software in a new place / a newer build, or something else running?
+
+    `relocated` requires proof on BOTH halves of what a job executes — the
+    program bytes and the payload script's own hash. Requiring only the
+    program hash would be worthless for the dominant `/bin/bash <script>`
+    shape, where the program is bash and identical by definition while the
+    script is the part that could have been swapped. When the baseline
+    predates payload hashing (`target_sha` absent) no relocation claim is
+    made at all: an unproven half is not a passing half.
+    """
+    if not isinstance(old, dict) or not isinstance(rec, dict):
+        return None
+    # Environment injection and hostile argv are attack-DEFINED. They are
+    # refused here as well as at the demotion gate, so no future caller can
+    # reach a vouching rung by a path that skips the gate.
+    if rec.get("env") or _hostile_args(rec.get("args"), rec.get("program")):
+        return None
+
+    op, np_ = old.get("program"), rec.get("program")
+    osha, nsha = old.get("sha256"), rec.get("sha256")
+    otgt, ntgt = old.get("script_target"), rec.get("script_target")
+    otsha, ntsha = old.get("target_sha"), rec.get("target_sha")
+
+    # --- relocated: identical content, different directory --------------------
+    same_program = bool(osha) and osha == nsha
+    moved = bool(op and np_ and op != np_
+                 and os.path.basename(op) == os.path.basename(np_))
+    if same_program and (moved or op == np_):
+        if ntgt or otgt:
+            # a payload exists: it must be present on both sides, byte-equal,
+            # and keep its own basename
+            proven = bool(otsha) and otsha == ntsha
+            same_name = bool(otgt and ntgt) and \
+                os.path.basename(otgt) == os.path.basename(ntgt)
+            if proven and same_name and otgt != ntgt:
+                return "relocated"
+            if proven and same_name and otgt == ntgt and moved:
+                return "relocated"
+        elif moved:
+            # no payload script at all — the program IS the whole job
+            return "relocated"
+
+    # --- publisher-stable: same place, same signer, newer build ---------------
+    auth_o, auth_n = old.get("authority"), rec.get("authority")
+    if (op == np_ and osha and nsha and osha != nsha
+            and auth_o and auth_n and auth_o == auth_n
+            and publisher_sig(rec.get("trust"))):
+        return "publisher-stable"
+    return None
+
+
+
+
+def cmd_vouch(argv):
+    """`vouch` — the operator's own signature on a workload.
+
+    Deliberately manual in every respect: the operator names the path, the
+    endpoints, and types a passphrase. Nothing here can be driven by a
+    dismissal, a heuristic, or a prior verdict — an automatic path into this
+    store would hand an attacker the one rung the rest of the ladder cannot
+    forge.
+    """
+    sub = argv[2] if len(argv) > 2 else ""
+
+    if sub == "pin":
+        if len(argv) < 4:
+            print("usage: aegis.py vouch pin <allowed_signers file>")
+            return 2
+        src = argv[3]
+        try:
+            with open(src, encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            print("cannot read %s: %s" % (src, e))
+            return 1
+        keys = [ln for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+        if not keys:
+            print("%s contains no signer lines; nothing pinned" % src)
+            return 1
+        fd = os.open(VOUCH_SIGNERS + ".tmp",
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(VOUCH_SIGNERS + ".tmp", VOUCH_SIGNERS)
+        print("pinned %d vouch signer(s) -> %s" % (len(keys), VOUCH_SIGNERS))
+        return 0
+
+    if sub in ("list", "status", ""):
+        vouches, tamper = load_vouches()
+        if tamper:
+            print("VOUCH STORE FAILED VERIFICATION: %s" % tamper)
+            print("every vouch is being ignored; workloads grade as unvouched.")
+            return 1
+        if not os.path.isfile(VOUCH_SIGNERS):
+            print("no vouch roster pinned (vouching inactive).")
+            print("  aegis.py vouch pin <allowed_signers file>")
+        if not vouches:
+            print("no active vouches.")
+            return 0
+        print("%d active vouch(es):" % len(vouches))
+        for subj in sorted(vouches, key=lambda k: vouches[k]["path"]):
+            r = vouches[subj]
+            print("  %s" % r["path"])
+            print("    sha256=%s uid=%s expires=%s"
+                  % (r["sha256"][:16], r.get("uid"),
+                     datetime.fromtimestamp(int(r["expires_at"])).isoformat()))
+            if r.get("endpoints"):
+                print("    endpoints: %s" % ", ".join(r["endpoints"]))
+        return 0
+
+    if sub in ("add", "revoke"):
+        if len(argv) < 5:
+            print("usage: aegis.py vouch %s <path> <signing-key> "
+                  "[endpoint ...]" % sub)
+            print("  the signing key must be passphrase-protected and live "
+                  "OUTSIDE ~/.aegis")
+            return 2
+        path, key = argv[3], argv[4]
+        endpoints = list(argv[5:])
+        if not os.path.isfile(path):
+            print("no such file: %s" % path)
+            return 1
+        if not os.path.isfile(VOUCH_SIGNERS):
+            print("no vouch roster pinned — pin one first:")
+            print("  aegis.py vouch pin <allowed_signers file>")
+            return 1
+        principal = os.environ.get("AEGIS_VOUCH_PRINCIPAL") or ""
+        if not principal:
+            print("set AEGIS_VOUCH_PRINCIPAL to the principal named in %s"
+                  % VOUCH_SIGNERS)
+            return 2
+        try:
+            rec = _vouch_record(
+                "vouch" if sub == "add" else "revoke", path, principal,
+                endpoints=endpoints)
+            _vouch_append(rec, key)
+        except Exception as e:
+            print("%s failed: %s" % (sub, e))
+            return 1
+        print("%s recorded for %s" % (sub, os.path.realpath(path)))
+        if sub == "add" and not endpoints:
+            print("  NOTE: identity-only vouch — this does NOT quiet network "
+                  "findings.\n  Re-run with the exact endpoints to cover those.")
+        return 0
+
+    print("usage: aegis.py vouch [list | pin <file> | add <path> <key> "
+          "[endpoint ...] | revoke <path> <key>]")
+    return 2
+
+
+def cmd_signers(argv):
+    """CLI: `signers pin <file>` | `signers status`. Pinning copies a roster
+    of `principal ssh-key` lines into ~/.aegis/allowed_signers — the ONLY way
+    that file changes. Verification always reads the pinned copy, so a synced
+    or repo-tracked roster an attacker can edit never grants itself trust."""
+    sub = argv[2] if len(argv) > 2 else "status"
+    if sub == "pin" and len(argv) > 3:
+        src = os.path.realpath(os.path.expanduser(argv[3]))
+        try:
+            with open(src, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            print("cannot read %s: %s" % (src, e))
+            return 1
+        keys = [ln for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+        if not keys:
+            print("%s contains no signer lines; nothing pinned" % src)
+            return 1
+        fd = os.open(FLEET_SIGNERS + ".tmp",
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(FLEET_SIGNERS + ".tmp", FLEET_SIGNERS)
+        print("pinned %d signer(s) from %s -> %s" % (len(keys), src,
+                                                     FLEET_SIGNERS))
+        for ln in keys:
+            print("  " + " ".join(ln.split()[:2]) + " ...")
+        return 0
+    if sub == "status":
+        if not os.path.isfile(FLEET_SIGNERS):
+            print("no device roster pinned (fleet-signed grading inactive).\n"
+                  "Pin one: aegis.py signers pin <allowed_signers file>")
+            return 0
+        with open(FLEET_SIGNERS, encoding="utf-8", errors="replace") as f:
+            keys = [ln for ln in f.read().splitlines()
+                    if ln.strip() and not ln.lstrip().startswith("#")]
+        print("pinned roster: %s (%d signer(s))" % (FLEET_SIGNERS, len(keys)))
+        for ln in keys:
+            print("  " + " ".join(ln.split()[:2]) + " ...")
+        return 0
+    print("usage: signers pin <allowed_signers file> | signers status")
+    return 2
+
+
+def cmd_identity(argv):
+    """`identity` — the operator's own confirm-once roster of SSH
+    keys/origins (see _apply_identity_trust). `trust`/`block` are the only
+    ways a fingerprint enters this table, aside from a `benign-positive`
+    verdict on the incident it raised — nothing here is inferred."""
+    sub = argv[2] if len(argv) > 2 else "list"
+    if sub == "list":
+        rows = list_identities()
+        if not rows:
+            print("no trusted/blocked identities recorded.")
+            print("  aegis.py identity trust <ssh-key|ssh-origin> "
+                  "<fingerprint> [label]")
+            return 0
+        for r in rows:
+            print("  [%s] %-11s %-55s %s%s" % (
+                r["disposition"], r["kind"], r["fingerprint"],
+                r.get("label") or "",
+                " (last seen %s)" %
+                datetime.fromtimestamp(r["last_seen"]).isoformat()))
+        return 0
+    if sub in ("trust", "block"):
+        if len(argv) < 5:
+            print("usage: aegis.py identity %s <ssh-key|ssh-origin> "
+                  "<fingerprint> [label]" % sub)
+            return 2
+        kind, fingerprint = argv[3], argv[4]
+        if kind not in ("ssh-key", "ssh-origin"):
+            print("unknown identity kind: %s (expected ssh-key or "
+                  "ssh-origin)" % kind)
+            return 2
+        label = " ".join(argv[5:])
+        disposition = "trusted" if sub == "trust" else "blocked"
+        trust_identity(kind, fingerprint, disposition, label=label)
+        print("%s: %s %s%s" % (disposition, kind, fingerprint,
+                               " (%s)" % label if label else ""))
+        return 0
+    if sub == "forget":
+        if len(argv) < 5:
+            print("usage: aegis.py identity forget <ssh-key|ssh-origin> "
+                  "<fingerprint>")
+            return 2
+        removed = forget_identity(argv[3], argv[4])
+        print("removed" if removed else "no such identity recorded")
+        return 0 if removed else 1
+    print("usage: aegis.py identity [list | trust <kind> <fp> [label] | "
+          "block <kind> <fp> [label] | forget <kind> <fp>]")
+    return 2
+
+
+def _custody(path, content_sha):
+    """(provenance, note) for a changed delegate-surface object.
+
+    The intent ledger is consulted first because it covers what git cannot
+    (untracked files, binaries outside any repo) and is bound to the exact
+    content hash; git provenance is the fallback for everything committed."""
+    if content_sha and _intent_attested(path, content_sha):
+        return "self-attested", _PROVENANCE_NOTE["self-attested"]
+    prov = _git_provenance(path)
+    return prov, _PROVENANCE_NOTE.get(prov, "")
+
+
+# --- the intent ledger: supervised writes attest themselves -------------------
+#
+# Git answers "how did this arrive" only for tracked files. The intent ledger
+# answers it for everything else the delegate surface watches: the agent
+# harness calls `aegis.py intent hook <tool>` after each file-writing tool
+# call, and Aegis appends one MAC'd {ts, path, sha256, tool} line. At diff
+# time a change whose content hash matches a valid record grades as
+# 'self-attested'.
+#
+# Threat honesty (the same split the witness layer states): the MAC key is
+# same-uid-readable, so an attacker ALREADY EXECUTING as you can forge
+# records. That does not defeat the surface's purpose, because it exists to
+# catch hostile instructions at ARRIVAL — a poisoned repo, a trojaned config,
+# a malicious skill — i.e. before the attacker has local execution, which is
+# the only moment forging is impossible. Post-compromise silence is the
+# witness layer's problem. And attestation only GRADES a finding (HIGH -> LOW,
+# still recorded in the report); it never suppresses one, never auto-closes an
+# incident, and never writes a dismissal, so it cannot feed tolerance.
+
+_INTENT_MAX_AGE_DAYS = 90
+_INTENT_MAX_BYTES = 2 * 1024 * 1024     # rewrite-prune past this
+
+
+def _intent_mac(ts, path, sha, tool):
+    msg = "intent:v1|%s|%s|%s|%s" % (ts, path, sha, tool)
+    return hmac.new(_hmac_key(), msg.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _intent_prune(lines):
+    """Keep only records younger than the retention window; validity is
+    checked at LOOKUP, not here, so a tampered line ages out instead of being
+    silently deleted the moment it would become evidence."""
+    cutoff = _epoch() - _INTENT_MAX_AGE_DAYS * 86400
+    kept = []
+    for ln in lines:
+        try:
+            if _epoch(json.loads(ln).get("ts")) >= cutoff:
+                kept.append(ln)
+        except Exception:
+            continue
+    return kept
+
+
+def intent_record(path, tool="manual"):
+    """Append one signed intent record for `path`'s CURRENT content.
+
+    Never raises and never prints: the caller is a harness hook whose failure
+    must not break or slow a tool call."""
+    try:
+        path = os.path.realpath(os.path.expanduser(path))
+        sha = sha256(path)
+        if not sha:
+            return False
+        tool = str(tool)[:64]
+        ts = now_iso()
+        rec = {"ts": ts, "path": path, "sha256": sha, "tool": tool,
+               "mac": _intent_mac(ts, path, sha, tool)}
+        line = json.dumps(rec, separators=(",", ":"))
+        try:
+            oversized = os.path.getsize(INTENT_FILE) > _INTENT_MAX_BYTES
+        except OSError:
+            oversized = False
+        if oversized:
+            with open(INTENT_FILE, encoding="utf-8", errors="replace") as f:
+                kept = _intent_prune(f.read().splitlines())
+            tmp = INTENT_FILE + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(kept) + ("\n" if kept else ""))
+            os.replace(tmp, INTENT_FILE)
+        fd = os.open(INTENT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _intent_attested(path, sha):
+    """True iff a valid signed intent record binds `path` to content `sha`
+    inside the retention window. Newest records win; a bad MAC or stale
+    timestamp is simply a non-match (fail toward suspicion)."""
+    if not sha:
+        return False
+    try:
+        real = os.path.realpath(os.path.expanduser(path))
+        with open(INTENT_FILE, "rb") as f:
+            blob = f.read(_INTENT_MAX_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return False
+    cutoff = _epoch() - _INTENT_MAX_AGE_DAYS * 86400
+    for ln in reversed(blob.splitlines()):
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if rec.get("sha256") != sha or rec.get("path") not in (path, real):
+            continue
+        if _epoch(rec.get("ts")) < cutoff:
+            continue
+        expect = _intent_mac(rec.get("ts"), rec.get("path"),
+                             rec.get("sha256"), rec.get("tool"))
+        if hmac.compare_digest(expect, str(rec.get("mac") or "")):
+            return True
+    return False
+
+
+def _intent_worthy(path):
+    """Is `path` something the delegate surface could ever grade? Cheap
+    prefilter for hook mode so the ledger holds agent-surface writes, not a
+    transcript of every file the operator's tools touch."""
+    base = os.path.basename(path)
+    if base in AGENT_INSTRUCTION_NAMES or base in AGENT_REPO_CONFIG_NAMES:
+        return True
+    if base.endswith((".json", ".toml", ".md", ".sh", ".py", ".js", ".ps1")):
+        return True
+    real = os.path.realpath(os.path.expanduser(path))
+    return any(real.startswith(os.path.realpath(r) + os.sep)
+               for r in AGENT_CONFIG_ROOTS if os.path.isdir(r))
+
+
+def cmd_learn(argv):
+    """CLI: `learn [status|start [days]|extend <days>|done]`.
+
+    Exists because the learning period is only automatic for a FRESH install,
+    and the machine that most needs one is usually an existing install whose
+    operator has stopped reading the report. `learn start` gives them a way to
+    draw a line and rebuild the envelope from evidence."""
+    sub = argv[2] if len(argv) > 2 else "status"
+    now = int(_epoch())
+    if sub == "status":
+        until = _learning_until()
+        if not until:
+            print("learning period: not active")
+            print("  start one with: %s learn start [days]  (default %d)"
+                  % (_SELF_PATH, _LEARNING_DEFAULT_DAYS))
+            return 0
+        if now >= until:
+            print("learning period: ENDED %s"
+                  % time.strftime("%Y-%m-%d", time.localtime(until)))
+            return 0
+        print("learning period: ACTIVE — %d day(s) remaining (ends %s)"
+              % (max(0, (until - now + 86399) // 86400),
+                 time.strftime("%Y-%m-%d", time.localtime(until))))
+        print("  Non-CRITICAL findings are recorded and correlated but open "
+              "pre-closed as 'learning'\n  instead of alerting. CRITICAL chains "
+              "and tripped decoys/latches still alert.")
+        return 0
+    if sub in ("start", "extend"):
+        try:
+            days = int(argv[3]) if len(argv) > 3 else _LEARNING_DEFAULT_DAYS
+        except ValueError:
+            print("usage: aegis.py learn %s [days]" % sub)
+            return 1
+        if days <= 0:
+            print("usage: aegis.py learn %s [days]  (days must be > 0)" % sub)
+            return 1
+        until = _set_learning_period(days)
+        print("learning period active for %d day(s) — ends %s"
+              % (days, time.strftime("%Y-%m-%d", time.localtime(until))))
+        return 0
+    if sub == "done":
+        _set_learning_period(0)
+        print("learning period ended — full alerting restored")
+        return 0
+    print("usage: aegis.py learn [status|start [days]|extend <days>|done]")
+    return 1
+
+
+def cmd_intent(argv):
+    """CLI: `intent record <path> [tool]` | `intent hook <tool>` |
+    `intent list [n]`. Hook mode reads the harness's tool-call JSON on stdin,
+    extracts the written file's path, and attests it — always exits 0, prints
+    nothing, so a broken ledger can never break the operator's editor."""
+    sub = argv[2] if len(argv) > 2 else "list"
+    if sub == "record" and len(argv) > 3:
+        ok = intent_record(argv[3], argv[4] if len(argv) > 4 else "manual")
+        print("recorded" if ok else "not recorded (unreadable path?)")
+        return 0 if ok else 1
+    if sub == "hook":
+        tool = argv[3] if len(argv) > 3 else "agent"
+        try:
+            payload = json.loads(sys.stdin.read(1 << 20) or "{}")
+            ti = payload.get("tool_input") or {}
+            p = ti.get("file_path") or ti.get("path") or ""
+            if p and _intent_worthy(p):
+                intent_record(p, tool)
+        except Exception:
+            pass
+        return 0
+    if sub == "list":
+        try:
+            n = int(argv[3]) if len(argv) > 3 else 20
+        except ValueError:
+            n = 20
+        try:
+            with open(INTENT_FILE, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        for ln in lines[-n:]:
+            try:
+                rec = json.loads(ln)
+                expect = _intent_mac(rec.get("ts"), rec.get("path"),
+                                     rec.get("sha256"), rec.get("tool"))
+                ok = hmac.compare_digest(expect, str(rec.get("mac") or ""))
+                print("%s  %s  %s  [%s]" % (rec.get("ts"), "valid " if ok
+                      else "BADMAC", rec.get("path"), rec.get("tool")))
+            except Exception:
+                print("(unparseable line)")
+        if not lines:
+            print("no intent records")
+        return 0
+    print("usage: intent record <path> [tool] | intent hook <tool> | "
+          "intent list [n]")
+    return 2
 
 
 # --- discovery + snapshot ----------------------------------------------------
@@ -9021,8 +12069,24 @@ def snapshot_agent_surface():
             execs = {}
             for label, cmd, args in entries[:32]:
                 tgt, h = _resolve_exec_target(cmd, args)
-                execs["%s|%s" % (label, cmd)] = {
-                    "cmd": cmd, "args": args, "target": tgt, "target_sha": h}
+                ent = {"cmd": cmd, "args": args, "target": tgt, "target_sha": h}
+                if tgt and h:
+                    # Record who VOUCHES for the target alongside what it
+                    # hashes to, so a later rewrite can be graded "same
+                    # publisher updated its own binary" vs "something else
+                    # now answers to this config line". Stat-cached, so a
+                    # stable target costs the probe once, not once per scan;
+                    # recorded only when a signer exists, so Linux (no
+                    # ambient signing) adds nothing rather than noise.
+                    sig = classify_signature(tgt)
+                    if sig.get("team"):
+                        ent["target_team"] = sig["team"]
+                        ent["target_trust"] = sig["trust"]
+                # `label` is the positional JSON pointer. It stays in the
+                # record for the report ("where is this hook?") but must not
+                # be part of the identity — see _exec_identity.
+                ent["label"] = label
+                execs[_exec_identity(cmd, args)] = ent
             rec["execs"] = execs
         if os.path.basename(p) in AGENT_INSTRUCTION_NAMES or p.endswith(".md"):
             marks = _imperative_signals(text)
@@ -9033,53 +12097,141 @@ def snapshot_agent_surface():
     return snap
 
 
+def _exec_identity(cmd, args):
+    """The stable identity of an exec-capable config entry: WHAT RUNS, never
+    WHERE IT SITS.
+
+    The identity used to be "<json-pointer>|<cmd>" — and the pointer is
+    positional (`hooks.SessionStart[4].hooks[0]`). Inserting one hook renumbers
+    every later sibling, so each one presented as a *deleted* old entry plus a
+    *brand-new* exec registration and re-opened a fresh HIGH incident. One hook
+    added at the top of a list could re-alert the whole list; 55 of the 67
+    un-generalizable open incidents on this machine were that cascade, all of
+    them the same handful of unchanged commands.
+
+    Position is not a security fact — the command and its arguments are what
+    execute with the operator's authority. Keying identity on those makes a
+    renumbering silent and a genuinely new command loud, which is the
+    distinction the sensor exists to draw. Two entries in one file that run the
+    identical command collapse to one identity deliberately: that is one
+    execution capability, and it should alert once."""
+    blob = "\x00".join([str(cmd or "")] + [str(a) for a in (args or [])])
+    return "%s|%s" % (
+        str(cmd or "")[:120],
+        hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:12])
+
+
+def _migrate_exec_keys(execs):
+    """Re-key a possibly-legacy exec snapshot onto _exec_identity.
+
+    Baselines written before the identity fix carry positional keys. Re-keying
+    the PRIOR side at diff time makes the upgrade silent (the entries match and
+    nothing alerts) instead of presenting every baselined entry as new — the
+    exact storm this fix exists to end. Lossless: the ent already carries the
+    cmd/args the identity is derived from."""
+    if not execs:
+        return {}
+    out = {}
+    for key, ent in execs.items():
+        if not isinstance(ent, dict) or not ent.get("cmd"):
+            out[key] = ent          # unparseable: keep as-is, never drop
+            continue
+        out[_exec_identity(ent.get("cmd"), ent.get("args"))] = ent
+    return out
+
+
 def diff_agent_surface(prior, cur):
     """Alert only on what an attacker must change to gain execution.
 
     Three classes, deliberately unequal:
-      * a NEW exec-capable entry, or a changed RESOLVED TARGET   -> HIGH
+      * a NEW exec-capable entry, or a changed RESOLVED TARGET   -> HIGH,
+        graded down by chain of custody (see below)
       * a new semantic imperative in an instruction file          -> by marker
       * a plain content edit with no exec and no marker           -> silent
     The third case is the overwhelming majority of real churn, and keeping it
-    silent is what makes the other two readable."""
+    silent is what makes the other two readable.
+
+    Custody grading: a structural change whose authorship this machine can
+    claim — a signed intent record from a supervised agent session, or a
+    commit created here by the repo's own identity — is recorded at LOW
+    instead of HIGH (visible in the report, no incident, no alert), and a
+    changed target re-signed by the SAME publisher as its baseline is
+    MEDIUM. Everything the machine cannot claim stays HIGH, now against a
+    quiet background. Attack-defined content (a conceal imperative) is never
+    downgraded, whoever wrote it — grading churn is not licensing content."""
     findings = []
     prior = prior or {}
     for path, rec in cur.items():
         old = prior.get(path)
         try:
+            # Exec keys are settled in the STORE (baseline schema v3 re-keys a
+            # legacy positional snapshot once, at load), so the steady state
+            # is a plain compare — no per-scan re-hashing of every entry on
+            # both sides. The in-memory fallback survives for the one path
+            # that deliberately skips the store rewrite: a watermark mismatch
+            # keeps a tampered baseline byte-identical for evidence, and a
+            # legacy-shaped prior reaching here must be re-keyed rather than
+            # mis-diffed as "everything is new". Both sides are re-keyed
+            # together so a hand-built legacy pair still compares equal.
             execs = rec.get("execs") or {}
             old_execs = (old or {}).get("execs") or {}
+            if any(not _NEW_EXEC_ID_RE.search(str(k)) for k in old_execs) \
+                    or any(not _NEW_EXEC_ID_RE.search(str(k)) for k in execs):
+                execs = _migrate_exec_keys(execs)
+                old_execs = _migrate_exec_keys(old_execs)
             for key, e in execs.items():
                 oe = old_execs.get(key)
                 if old is not None and oe is None:
-                    prov = _git_provenance(path)
+                    prov, note = _custody(path, rec.get("sha256"))
                     findings.append(finding(
-                        "HIGH", "agent-surface",
+                        _demote("HIGH", prov), "agent-surface",
                         "New agent exec entry registered",
-                        "%s registered a new executable entry: %s %s\nResolved "
-                        "target: %s\n%s\nAn MCP server or tool hook runs with "
-                        "your full authority every time the agent starts."
+                        "%s registered a new executable entry: %s %s\nAt: %s"
+                        "\nResolved target: %s\n%s\nAn MCP server or tool hook "
+                        "runs with your full authority every time the agent "
+                        "starts."
                         % (path, e.get("cmd"),
                            (" ".join(e.get("args") or []))[:400],
-                           e.get("target") or "(unresolved)",
-                           _PROVENANCE_NOTE.get(prov, "")),
+                           e.get("label") or "(position unrecorded)",
+                           e.get("target") or "(unresolved)", note),
                         "agent-surface:newexec:%s:%s" % (path, key),
                         path=path, program=e.get("target") or e.get("cmd"),
-                        provenance=prov, markers=["agent-surface", "exec"]))
+                        provenance=prov,
+                        markers=["agent-surface", "exec"] +
+                                (["self-custody"] if prov in _SELF_CUSTODY else [])))
                 elif oe is not None and oe.get("target_sha") and \
                         e.get("target_sha") and \
                         oe["target_sha"] != e["target_sha"]:
+                    prov, note = _custody(e.get("target"), e.get("target_sha"))
+                    same_signer = bool(oe.get("target_team")) and \
+                        oe.get("target_team") == e.get("target_team")
+                    if _demote("HIGH", prov) != "HIGH":
+                        sev, grade = _demote("HIGH", prov), note
+                    elif same_signer:
+                        # The rewrite carries a valid signature from the same
+                        # team that signed the baselined content — vendor
+                        # updater churn's exact shape. MEDIUM: recorded and
+                        # able to corroborate, no incident by itself.
+                        sev = "MEDIUM"
+                        grade = ("Both the old and new content are validly "
+                                 "signed by the same publisher (team %s) — "
+                                 "the shape of a vendor updating its own "
+                                 "binary." % e.get("target_team"))
+                    else:
+                        sev, grade = "HIGH", note
                     findings.append(finding(
-                        "HIGH", "agent-surface",
+                        sev, "agent-surface",
                         "Agent exec target changed underneath a static config",
                         "%s: the config line for %s is unchanged, but the file "
                         "it resolves to (%s) has different contents. This is "
                         "the supply-chain shape a config-only hash cannot see."
-                        % (path, e.get("cmd"), e.get("target")),
+                        "\n%s" % (path, e.get("cmd"), e.get("target"), grade),
                         "agent-surface:target:%s:%s:%s"
                         % (path, key, (e.get("target_sha") or "")[:12]),
-                        path=path, program=e.get("target"),
-                        markers=["agent-surface", "exec", "supply-chain"]))
+                        path=path, program=e.get("target"), provenance=prov,
+                        markers=["agent-surface", "exec", "supply-chain"] +
+                                (["self-custody"] if prov in _SELF_CUSTODY
+                                 else [])))
                 elif oe is not None and not oe.get("target_sha") and \
                         e.get("target_sha") and oe.get("target"):
                     # The target MATERIALIZED: baselined as an absolute path
@@ -9093,26 +12245,34 @@ def diff_agent_surface(prior, cur):
                     # dormant config entry acquiring an executable payload,
                     # which is the cheapest way to arm an agent config without
                     # ever editing a watched file.
+                    prov, note = _custody(e.get("target"), e.get("target_sha"))
                     findings.append(finding(
-                        "HIGH", "agent-surface",
+                        _demote("HIGH", prov), "agent-surface",
                         "Agent exec target appeared under a static config",
                         "%s: the config line for %s never changed, but its "
                         "target (%s) did not exist when this surface was "
                         "baselined and now does. A config entry that pointed "
-                        "at nothing is now executable at agent start."
-                        % (path, e.get("cmd"), e.get("target")),
+                        "at nothing is now executable at agent start.\n%s"
+                        % (path, e.get("cmd"), e.get("target"), note),
                         "agent-surface:materialized:%s:%s:%s"
                         % (path, key, (e.get("target_sha") or "")[:12]),
-                        path=path, program=e.get("target"),
-                        markers=["agent-surface", "exec", "supply-chain"]))
+                        path=path, program=e.get("target"), provenance=prov,
+                        markers=["agent-surface", "exec", "supply-chain"] +
+                                (["self-custody"] if prov in _SELF_CUSTODY else [])))
             new_marks = set(rec.get("imperatives") or [])
             old_marks = set((old or {}).get("imperatives") or [])
             gained = sorted(new_marks - old_marks)
             if gained and old is not None:
                 sev = _imperative_severity(gained)
                 if sev:
+                    # Deliberately _git_provenance, not _custody: custody
+                    # grades structure and this branch judges CONTENT. A
+                    # hostile directive an agent was prompt-injected into
+                    # writing is self-attested and still hostile, so
+                    # attestation must not soften it; provenance here only
+                    # ever escalates.
                     prov = _git_provenance(path)
-                    if prov == "remote" and sev == "MEDIUM":
+                    if prov == "remote-foreign" and sev == "MEDIUM":
                         sev = "HIGH"
                     findings.append(finding(
                         sev, "agent-surface",
@@ -9642,53 +12802,102 @@ def cmd_glean(mode="new"):
 # Baseline-diffed surfaces. Portable ones run everywhere; a surface with no
 # meaning on a platform is simply ABSENT from its registry rather than reported
 # as a failed sensor (a launchd LoginHook check on Linux is not a coverage gap).
-SURFACES = [
-    ("shellrc", snapshot_shellrc, diff_shellrc),
-    ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
-    ("browserext", snapshot_browserext, diff_browserext),
-    ("ide_ext", snapshot_ide_ext, diff_ide_ext),
-    ("wallet", snapshot_wallet, diff_wallet),
-    ("listeners", snapshot_listeners, diff_listeners),
-    ("agent_skills", snapshot_agent_skills, diff_agent_skills),
-    # The AI-agent trust surface. Registered here rather than as a standalone
-    # sensor so it inherits the whole managed pipeline for free: silent
-    # first-sight adoption, sensor health, dedup, dismissals, and a baseline
-    # already covered by the notary state digest (so an attacker who edits an
-    # MCP registration AND Aegis's baseline breaks the hash chain).
-    ("agent_surface", snapshot_agent_surface, diff_agent_surface),
-    ("session_binding", snapshot_session_binding, diff_session_binding),
-    ("ext_caps", snapshot_ext_caps, diff_ext_caps),
-]
-if IS_MAC:
-    SURFACES += [
-        ("xprotect_corpus", snapshot_xprotect_corpus, diff_xprotect_corpus),
-        ("loginhooks", snapshot_loginhooks, diff_loginhooks),
-        ("profiles", snapshot_profiles, diff_profiles),
-        ("btm", snapshot_btm, diff_btm),
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
-    ]
-elif IS_LINUX:
-    SURFACES += [
-        ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions),
-        ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
-        ("suid_binaries", snapshot_suid, diff_suid),
-    ]
-else:
-    SURFACES += [
-        ("win_defender_exclusions", snapshot_win_exclusions,
-         diff_win_exclusions),
-        ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
-         diff_wmi_subscriptions),
-        ("win_com_hijack", snapshot_com_hijack, diff_com_hijack),
-        ("win_ifeo", snapshot_ifeo, diff_ifeo),
-        ("win_appinit", snapshot_appinit, diff_appinit),
-    ]
+# One registry row per baseline-diffed surface. Row shape:
+#   (key, snapshot_fn, diff_fn[, writ_scope[, never_adopt_live]])
+# The trailing fields default to ("persistence", False) via _surface_row, so a
+# plain 3-tuple — including the ones tests patch in — is a fully governed row.
+# The scope and the adopt policy live ON the row deliberately: they used to be
+# two hand-maintained side-maps keyed on a THIRD spelling of the surface name,
+# and a key/category/scope spelling drift has already shipped one bug (benign
+# notes that silently never rendered). One row, one vocabulary.
+def _build_surfaces(is_mac, is_linux):
+    """Pure builder for the SURFACES registry, parameterized on platform
+    rather than reading the IS_MAC/IS_LINUX globals directly. This is what
+    makes the platform-specific branches unit-testable without a real machine
+    of that OS or faking sys.platform before import: `_build_surfaces(False,
+    False)` gets you exactly what a Windows box would register, on any body.
 
-# Surfaces whose first-sight items are LIVE risks, not installed-residue: they
-# must NOT be silently adopted on the very first scan (see _scan_surfaces). An
-# active remote login present at install/upgrade time is a current-access threat
-# the README's live-vs-residue rule says the user must hear about immediately.
-_NEVER_ADOPT_LIVE = {"auth_sessions"}
+    That gap was real, not theoretical: `SURFACES = [...]` used to be built
+    directly from the module-level IS_MAC/IS_LINUX at import time, so it was
+    fixed the instant `aegis` was first imported. Neither simbody (flips the
+    flags AFTER import — its own docstring's "verdict, a flag, a branch, and
+    nothing else" caveat) nor any Windows-specific test exercised this
+    branch's CONTENT on non-Windows CI, so a real gap — Windows had no
+    `never_adopt_live` surface at all, unlike mac/linux's auth_sessions — went
+    undetected until a real windows-latest run caught it (2026-08-30)."""
+    surfaces = [
+        ("shellrc", snapshot_shellrc, diff_shellrc, "shellrc"),
+        ("extra_persist", snapshot_extra_persistence, diff_extra_persistence),
+        ("browserext", snapshot_browserext, diff_browserext, "browserext"),
+        ("ide_ext", snapshot_ide_ext, diff_ide_ext, "browserext"),
+        ("wallet", snapshot_wallet, diff_wallet),
+        ("listeners", snapshot_listeners, diff_listeners, "listeners"),
+        ("agent_skills", snapshot_agent_skills, diff_agent_skills,
+         "agent_surface"),
+        # The AI-agent trust surface. Registered here rather than as a
+        # standalone sensor so it inherits the whole managed pipeline for
+        # free: silent first-sight adoption, sensor health, dedup,
+        # dismissals, and a baseline already covered by the notary state
+        # digest (so an attacker who edits an MCP registration AND Aegis's
+        # baseline breaks the hash chain).
+        ("agent_surface", snapshot_agent_surface, diff_agent_surface,
+         "agent_surface"),
+        ("session_binding", snapshot_session_binding, diff_session_binding),
+        ("ext_caps", snapshot_ext_caps, diff_ext_caps),
+    ]
+    if is_mac:
+        surfaces += [
+            ("xprotect_corpus", snapshot_xprotect_corpus, diff_xprotect_corpus),
+            ("loginhooks", snapshot_loginhooks, diff_loginhooks),
+            ("profiles", snapshot_profiles, diff_profiles),
+            ("btm", snapshot_btm, diff_btm),
+            # never_adopt_live: an active remote login present at
+            # install/upgrade time is a CURRENT-ACCESS threat, not
+            # installed-residue — the README's live-vs-residue rule says the
+            # user must hear about it immediately, so this surface is never
+            # silently adopted (see _scan_surfaces).
+            ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+             "persistence", True),
+        ]
+    elif is_linux:
+        surfaces += [
+            ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+             "persistence", True),
+            ("kernel_modules", snapshot_kernel_modules, diff_kernel_modules),
+            ("suid_binaries", snapshot_suid, diff_suid),
+        ]
+    else:
+        surfaces += [
+            ("win_defender_exclusions", snapshot_win_exclusions,
+             diff_win_exclusions),
+            ("win_wmi_subscriptions", snapshot_wmi_subscriptions,
+             diff_wmi_subscriptions),
+            ("win_com_hijack", snapshot_com_hijack, diff_com_hijack),
+            ("win_ifeo", snapshot_ifeo, diff_ifeo),
+            ("win_appinit", snapshot_appinit, diff_appinit),
+            # never_adopt_live: see the identical mac/linux comment above —
+            # an active RDP/WinRM connection present at install/upgrade time
+            # is CURRENT ACCESS, not residue, so it must alert on the very
+            # first scan.
+            ("auth_sessions", snapshot_auth_sessions, diff_auth_sessions,
+             "persistence", True),
+        ]
+    return surfaces
+
+
+SURFACES = _build_surfaces(IS_MAC, IS_LINUX)
+
+
+def _surface_row(row):
+    """Normalize a SURFACES row to (key, snap_fn, diff_fn, writ_scope,
+    never_adopt_live). A surface with no explicit scope falls back to
+    "persistence", so a newly added surface is governed by default rather than
+    silently ungoverned — the failure that would otherwise grow a hole every
+    time someone adds a sensor."""
+    key, snap_fn, diff_fn = row[0], row[1], row[2]
+    scope = row[3] if len(row) > 3 else "persistence"
+    live = bool(row[4]) if len(row) > 4 else False
+    return key, snap_fn, diff_fn, scope, live
 
 
 # --------------------------------------------------------------------------- #
@@ -9935,6 +13144,19 @@ def record_selfstate():
     save_json(SELFSTATE, st)
 
 
+def _record_baseline_watermark():
+    """Re-watermark the baseline right after WE rewrite it out-of-band, so a
+    deliberate `aegis.py learn` is not read as tampering on the next scan.
+    Only the baseline keys are touched — refreshing the whole selfstate here
+    would also silently re-bless a tampered allowlist or canary record. Same
+    discipline (and same reason) as _record_canary_watermark."""
+    st = load_json(SELFSTATE, {})
+    present = os.path.exists(BASELINE)
+    st["baseline_sha"] = sha256(BASELINE) if present else None
+    st["baseline_mac"] = _hmac_file(BASELINE) if present else None
+    save_json(SELFSTATE, st)
+
+
 def _record_canary_watermark():
     """Re-watermark the canary arming record right after WE rewrite it, so a
     deliberate `aegis.py canary` plant/remove is not read as out-of-band
@@ -9982,22 +13204,10 @@ def check_canaries():
     return findings
 
 
-# Which writ scope governs each baseline-diffed surface. A surface with no
-# entry falls back to "persistence", so a newly added surface is governed by
-# default rather than silently ungoverned — the failure that would otherwise
-# grow a hole every time someone adds a sensor.
-_SURFACE_WRIT_SCOPE = {
-    "shellrc": "shellrc",
-    "browserext": "browserext",
-    "ide_ext": "browserext",
-    "listeners": "listeners",
-    "agent_surface": "agent_surface",
-    "agent_skills": "agent_surface",
-}
-
-
-def _apply_writ(findings, surface_key):
-    """Mark changes that happened with NO open writ.
+def _apply_writ(findings, scope):
+    """Mark changes that happened with NO open writ. `scope` is the writ scope
+    governing the batch — each SURFACES row carries its own (defaulting to
+    "persistence" via _surface_row).
 
     This is the call site that makes `writ enforce on` mean something. Without
     it the command existed, the state file was written, and the documentation
@@ -10010,11 +13220,11 @@ def _apply_writ(findings, surface_key):
     data = load_json(WRIT_FILE, {})
     if not isinstance(data, dict) or not data.get("enforcing"):
         return findings
-    scope = _SURFACE_WRIT_SCOPE.get(surface_key, "persistence")
+    covered = _writ_data_covers(data, scope)
     out = []
     for f in findings:
         try:
-            if writ_covers(scope):
+            if covered:
                 # Authorized: keep the record, drop it below the notify floor.
                 f["severity"] = "INFO"
                 f["writ"] = "covered"
@@ -10053,7 +13263,8 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
     if baseline is None:
         baseline = {}
     dirty = False
-    for key, snap_fn, diff_fn in SURFACES:
+    for row in SURFACES:
+        key, snap_fn, diff_fn, writ_scope, never_adopt = _surface_row(row)
         started = time.monotonic()
         try:
             cur = snap_fn()
@@ -10094,12 +13305,12 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             # first scan (an intruder logged in at install/upgrade time must not
             # be blessed as known-good). Diff against empty to surface it, then
             # record so it does not re-alert next scan.
-            if key in _NEVER_ADOPT_LIVE:
-                findings += _apply_writ(diff_fn({}, cur), key)
+            if never_adopt:
+                findings += _apply_writ(diff_fn({}, cur), writ_scope)
             baseline[key] = cur
             dirty = True
         else:
-            findings += _apply_writ(diff_fn(prior, cur), key)
+            findings += _apply_writ(diff_fn(prior, cur), writ_scope)
     if dirty and not first_run:
         save_json(BASELINE, baseline)
     return findings, baseline
@@ -10117,7 +13328,14 @@ def gather_all(baseline_snap, current_snap, health=None):
     # sensors only it can answer. A sensor that cannot exist here is absent
     # rather than permanently DEGRADED.
     sensors = [
-        ("persistence.diff", check_persistence, (baseline_snap, current_snap)),
+        # Writ-wrapped like every registry surface: launchd/systemd/Run-key
+        # persistence is the flagship change-shaped sensor, yet only the
+        # _scan_surfaces registry flowed through _apply_writ — so
+        # `writ enforce on` governed shellrc and browser extensions while the
+        # primary persistence diff bypassed enforcement entirely.
+        ("persistence.diff",
+         lambda b, c: _apply_writ(check_persistence(b, c), "persistence"),
+         (baseline_snap, current_snap)),
         ("process", check_processes, ()),
         ("behavior", check_behavior, ()),
         ("shell-history", check_shell_history, ()),
@@ -10146,6 +13364,10 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
         ("self-protection", check_self_protection, ()),
+        # Fail-closed half of the vouch tier: a trust store that stopped
+        # verifying is the most interesting event on the machine, so it is a
+        # first-class sensor rather than a check buried in the grader.
+        ("vouch-store", check_vouch_store, ()),
     ]
     if IS_MAC:
         sensors += [
@@ -10225,39 +13447,308 @@ def gather_all(baseline_snap, current_snap, health=None):
     return findings
 
 
-def write_report(findings, first_run, incidents=None, sensor_health=None):
+VERDICT_ICON = {"alert": "🔴", "minor": "🟡", "clear": "🟢", "learning": "🔵",
+                "review": "🟡"}
+
+
+def _report_self_check(verdict, new_findings, findings, incidents):
+    """Assert the headline against the findings it claims to summarize.
+
+    A report is a summariser: it reduces N findings and M incidents to one line
+    that most readers will never read past. That makes exactly one failure mode
+    catastrophic and invisible — a headline that contradicts its own input. Tests
+    cover the cases we thought of; this covers the case the machine is actually
+    in, on real data, every run.
+
+    Returns a list of contradictions (empty = consistent). The caller PUBLISHES
+    the result: a silent check reassures the author, a printed one tells the
+    reader how much was verified.
+    """
+    problems = []
+    worst_new = max([SEV_ORDER.get(f.get("severity"), -1) for f in new_findings]
+                    or [-1])
+    if verdict == "clear" and new_findings:
+        problems.append("headline says nothing new, but %d finding(s) are new"
+                        % len(new_findings))
+    if verdict == "clear" and incidents:
+        problems.append("headline says nothing is waiting, but %d incident(s) "
+                        "are open" % len(incidents))
+    if verdict == "review" and not incidents:
+        problems.append("headline claims items are waiting with none open")
+    if verdict in ("clear", "minor") and worst_new >= SEV_ORDER["HIGH"]:
+        problems.append("headline is not an alert, but a new finding is %s"
+                        % SEV_NAMES[worst_new])
+    if verdict == "alert" and worst_new < SEV_ORDER["HIGH"]:
+        problems.append("headline claims an alert with no new HIGH+ finding")
+    open_crit = [i for i in (incidents or [])
+                 if i.get("severity") == "CRITICAL"]
+    if open_crit and verdict in ("clear", "minor", "learning"):
+        problems.append("headline says %s with %d open CRITICAL incident(s)"
+                        % (verdict, len(open_crit)))
+    if verdict == "standing" and not open_crit:
+        problems.append("headline claims a standing CRITICAL with none open")
+    return problems
+
+
+# A monitor that silently stopped running is the worst failure it has, and it
+# is the one the report could not show: every line described the scan you were
+# reading, so a scan that never happened produced no line at all. The previous
+# scan's heartbeat is already on disk when the report is written, which makes
+# "the schedule is alive" a fact this file can state rather than imply.
+_SCAN_GAP_ALARM = 3 * 3600
+
+
+def _duration(seconds):
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            n = seconds // size
+            return "%d %s%s" % (n, unit, "" if n == 1 else "s")
+    return "%d seconds" % seconds
+
+
+def _liveness_line(prev_scan_at):
+    if not isinstance(prev_scan_at, int) or prev_scan_at <= 0:
+        return ""
+    gap = _epoch() - prev_scan_at
+    if gap > _SCAN_GAP_ALARM:
+        return ("> \u26a0\ufe0f **Watch gap: %s since the previous scan.** "
+                "Anything that happened in between was not observed."
+                % _duration(gap))
+    return "_Watched \u00b7 previous scan %s._" % _ago(prev_scan_at)
+
+
+def _ago(epoch):
+    """'4 minutes ago' for a report a human reads, not an ISO stamp."""
+    try:
+        delta = max(0, _epoch() - int(epoch))
+    except (TypeError, ValueError):
+        return "at an unknown time"
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if delta >= size:
+            n = delta // size
+            return "%d %s%s ago" % (n, unit, "" if n == 1 else "s")
+    return "just now"
+
+
+# A privilege wall the OS imposes is a PERMANENT fact about this machine; a
+# sensor that failed is a transient one; a sensor that did not run at all is
+# neither, and is the dangerous case — its last verdict is not evidence about
+# this scan. Splitting them is what lets the report repeat itself less without
+# saying less.
+_PERMANENT_COVERAGE = ("PRIVILEGED",)
+
+
+def _coverage_split(sensor_health):
+    """(live_ok, stale, permanent, degraded) over the stored sensor rows.
+
+    `stale` is the one that changes an answer rather than a wording. Health is
+    stored per sensor and read back whole, so a sensor that stops running
+    keeps its last row forever — and a sensor that stopped while OK therefore
+    kept counting toward "38/40 sensors OK" indefinitely. That is silent
+    coverage loss presented as green, which is the failure `doctor`'s "unknown
+    is never green" rule exists to prevent and which the report — the thing
+    the operator actually reads — did not apply. A row older than the newest
+    one in the same batch did not run this scan and is counted as unknown.
+    """
+    rows = list(sensor_health or [])
+    if not rows:
+        return [], [], [], []
+    runs = [r.get("last_run_at") for r in rows
+            if isinstance(r.get("last_run_at"), int)]
+    newest = max(runs) if runs else None
+    live, stale, permanent, degraded = [], [], [], []
+    for row in rows:
+        at = row.get("last_run_at")
+        if newest is not None and isinstance(at, int) and at < newest:
+            stale.append(row)
+        elif row.get("status") in _PERMANENT_COVERAGE:
+            permanent.append(row)
+        elif row.get("status") != "OK":
+            degraded.append(row)
+        else:
+            live.append(row)
+    return live, stale, permanent, degraded
+
+
+def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
+                  learning_days, aged, quiet=0, prev_scan_at=None):
+    """The one-line-verdict report. Detail lives behind `report --full`."""
     counts = {}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
-    lines = []
-    lines.append("# Aegis report - %s" % now_iso())
-    lines.append("")
+    worst_new = max([SEV_ORDER.get(f.get("severity"), -1) for f in new_findings]
+                    or [-1])
+    incidents = incidents or []
+    crit = [i for i in incidents if i.get("severity") == "CRITICAL"]
+    # Order matters, and an open CRITICAL outranks everything below it. A
+    # standing unresolved kill chain is not a quiet machine, and it is not
+    # something a learning period gets to sit on either — the first draft of
+    # this function printed "Nothing new" over two open CRITICAL chains, and
+    # the self-check below is what caught it on real data.
+    n_new_high = len([f for f in new_findings
+                      if SEV_ORDER.get(f["severity"], -1) >= SEV_ORDER["HIGH"]])
+    if worst_new >= SEV_ORDER["HIGH"]:
+        verdict = "alert"
+    elif crit:
+        verdict = "standing"
+    elif learning_days:
+        verdict = "learning"
+    elif new_findings:
+        verdict = "minor"
+    elif incidents:
+        # Green with a queue is the worst state this report can show. "Nothing
+        # new" was TRUE with fourteen incidents waiting — and a reader who
+        # sees green stops looking, so a true sentence became the thing that
+        # hid the backlog. Clear now means clear: nothing arrived AND nothing
+        # is waiting on you.
+        verdict = "review"
+    else:
+        verdict = "clear"
+    live, stale, permanent, degraded = _coverage_split(sensor_health)
+    total_sensors = len(sensor_health or [])
+
+    lines = ["# Aegis — %s" % now_iso(), ""]
+    if verdict == "alert":
+        head = "%s **%d NEW alert%s need you.**" % (
+            VERDICT_ICON["alert"], n_new_high, "" if n_new_high == 1 else "s")
+    elif verdict == "standing":
+        head = ("%s **%d CRITICAL incident%s still open** — nothing new this "
+                "scan." % (VERDICT_ICON["alert"], len(crit),
+                           "" if len(crit) == 1 else "s"))
+    elif verdict == "minor":
+        head = "%s **%d new finding%s, none above MEDIUM.**" % (
+            VERDICT_ICON["minor"], len(new_findings),
+            "" if len(new_findings) == 1 else "s")
+    elif verdict == "learning":
+        head = ("%s **Learning this machine — %d day%s left.** Recording "
+                "everything; alerting only on CRITICAL chains and tripped "
+                "decoys." % (VERDICT_ICON["learning"], learning_days,
+                             "" if learning_days == 1 else "s"))
+    elif verdict == "review":
+        head = "%s **%d item%s waiting on you.** Nothing new this scan." % (
+            VERDICT_ICON["review"], len(incidents),
+            "" if len(incidents) == 1 else "s")
+    else:
+        head = ("%s **Protected.** Nothing new, nothing waiting."
+                % VERDICT_ICON["clear"])
+    lines += [head, ""]
+
+    # Actionable first. "N findings this scan" is an observation count that
+    # never reaches zero on a live machine — leading with it made every report
+    # read like a problem list, and it is still published verbatim by the
+    # self-check line at the foot, so nothing is lost by moving it out of the
+    # headline's supporting facts.
+    ctx = []
+    if incidents:
+        ctx.append("%d waiting" % len(incidents))
+    if crit:
+        ctx.append("**%d CRITICAL**" % len(crit))
+    if total_sensors:
+        ctx.append("%d/%d sensors OK" % (len(live), total_sensors))
+    if permanent:
+        # Named here rather than re-explained below: an OS privilege wall is a
+        # permanent fact about this machine, so the operator needs to know it
+        # is still there and WHICH surface it costs, not to re-read the same
+        # paragraph every hour for months.
+        ctx.append("%d permanent gap%s (%s)" % (
+            len(permanent), "" if len(permanent) == 1 else "s",
+            ", ".join(sorted(h.get("sensor_id") or "?" for h in permanent))))
+    if stale:
+        ctx.append("**%d sensor%s did not run**" % (
+            len(stale), "" if len(stale) == 1 else "s"))
+    if aged:
+        ctx.append("%d aged out as ambient" % aged)
+    if quiet:
+        ctx.append("%d new but auto-closed (tolerated/learning/allowlisted)"
+                   % quiet)
+    lines += ["- " + " · ".join(ctx), ""]
+    beat = _liveness_line(prev_scan_at)
+    if beat:
+        lines += [beat, ""]
+
     if first_run:
-        lines.append("> First run: baseline established. Persistence items above "
-                     "are recorded as known-good; you will only be alerted about "
-                     "NEW/changed persistence from now on.")
+        lines += ["> First run: baseline established. Persistence items are "
+                  "recorded as known-good; only NEW/changed persistence alerts "
+                  "from here.", ""]
+
+    top = [f for f in new_findings
+           if SEV_ORDER.get(f["severity"], -1) >= SEV_ORDER["HIGH"]][:5]
+    if top:
+        lines.append("## New since last scan")
+        for f in top:
+            lines.append("- %s **%s** — %s" % (
+                SEV_ICON[f["severity"]], f["title"],
+                (f["detail"] or "").splitlines()[0][:160]))
         lines.append("")
+    if crit:
+        lines.append("## Open CRITICAL incidents")
+        for i in crit[:5]:
+            lines.append("- %s **#%s %s** — %s (%s evidence event%s)" % (
+                SEV_ICON.get(i.get("severity"), "?"), i.get("id"),
+                i.get("title"), i.get("status"), i.get("evidence_count", 0),
+                "" if i.get("evidence_count") == 1 else "s"))
+        lines.append("")
+    if degraded or stale:
+        # Only what CHANGED or is unknown. A permanent privilege wall is real
+        # and stays counted in the line above, but re-explaining it every hour
+        # for months is what teaches the reader to skip this section — and
+        # then the transient failure that matters gets skipped with it.
+        lines.append("## Coverage health")
+        for h in degraded:
+            lines.append("- **%s: %s** — %s" % (
+                h.get("sensor_id"), h.get("status"),
+                h.get("detail") or "coverage unavailable"))
+        for h in stale:
+            lines.append("- **%s: DID NOT RUN** — last reported %s; its "
+                         "coverage this scan is unknown, not clean"
+                         % (h.get("sensor_id"),
+                            _ago(h.get("last_run_at"))))
+        lines.append("")
+
+    problems = _report_self_check(verdict, new_findings, findings, incidents)
+    if problems:
+        # At the TOP of what the reader sees next, not the bottom: someone who
+        # trusts the first paragraph must not have to reach the last line to
+        # learn it was wrong.
+        lines.insert(2, "> ⚠️ **REPORT SELF-CHECK FAILED — do not trust the "
+                        "headline above.** " + "; ".join(problems))
+        lines.insert(3, "")
+    else:
+        lines.append("_Self-check: headline verified against %d finding(s) and "
+                     "%d incident(s)._" % (len(findings), len(incidents)))
+    lines.append("_Full detail: `aegis.py report --full` · incidents: "
+                 "`aegis.py incidents`_")
+    return "\n".join(lines) + "\n"
+
+
+def _full_report(payload):
+    """The complete, grouped report, rendered from the durable latest.json."""
+    findings = payload.get("findings") or []
+    incidents = payload.get("incidents") or []
+    health = payload.get("sensor_health") or []
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    lines = ["# Aegis report (full) - %s" % payload.get("ts", ""), ""]
     summary = "  ".join("%s %s %d" % (SEV_ICON[s], s, counts[s])
                         for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
                         if counts.get(s))
-    lines.append("**Summary:** %s" % (summary or "no findings"))
-    lines.append("")
-    degraded = [h for h in (sensor_health or []) if h.get("status") != "OK"]
+    lines += ["**Summary:** %s" % (summary or "no findings"), ""]
+    degraded = [h for h in health if h.get("status") != "OK"]
     if degraded:
         lines.append("## Coverage health")
         for h in degraded:
-            lines.append("- ? **%s: %s** — %s" %
-                         (h.get("sensor_id"), h.get("status"),
-                          h.get("detail") or "coverage unavailable"))
+            lines.append("- **%s: %s** — %s" % (
+                h.get("sensor_id"), h.get("status"),
+                h.get("detail") or "coverage unavailable"))
         lines.append("")
     if incidents:
         lines.append("## Active incidents")
-        for incident in incidents:
+        for i in incidents:
             lines.append("- %s **#%s %s** — %s (%s evidence event%s)" % (
-                SEV_ICON.get(incident.get("severity"), "?"), incident.get("id"),
-                incident.get("title"), incident.get("status"),
-                incident.get("evidence_count", 0),
-                "" if incident.get("evidence_count") == 1 else "s"))
+                SEV_ICON.get(i.get("severity"), "?"), i.get("id"),
+                i.get("title"), i.get("status"), i.get("evidence_count", 0),
+                "" if i.get("evidence_count") == 1 else "s"))
         lines.append("")
     if not findings:
         lines.append("_No findings._")
@@ -10269,12 +13760,51 @@ def write_report(findings, first_run, incidents=None, sensor_health=None):
                 lines.append("## %s" % cur)
             lines.append("- %s **%s** — %s" % (
                 SEV_ICON[f["severity"]], f["title"], f["detail"]))
-    md = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def write_report(findings, first_run, incidents=None, sensor_health=None,
+                 prior_seen=None, aged=0, routing=None, prev_scan_at=None):
+    """Write the brief report to latest.md and the full payload to latest.json.
+
+    The report this replaced opened with ninety red bullets and ran 208 lines,
+    which is a way of saying nothing at all: an operator cannot find the two
+    things that arrived today in a wall of things that have been there for
+    weeks, so they stop opening it. What a monitor owes its reader first is a
+    verdict — and then, only if the verdict is interesting, the evidence.
+    """
+    incidents = incidents or []
+    if prior_seen is None:
+        new_findings = list(findings)   # unknown history: treat all as new,
+    else:                               # which can only over-report, never under
+        new_findings = [f for f in findings
+                        if f.get("fingerprint") not in prior_seen]
+    # A finding the gate closed (tolerated, learning, allowlisted) is not
+    # "new and needs you": the headline must agree with the notification and
+    # the incident it summarizes. Still in `findings`, still counted below.
+    closed = {fp for fp, v in (routing or {}).items() if v.get("decision")}
+    quiet = len([f for f in new_findings if f.get("fingerprint") in closed])
+    new_findings = [f for f in new_findings
+                    if f.get("fingerprint") not in closed]
+    now = int(_epoch())
+    until = _learning_until()
+    learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
+    md = _brief_report(findings, new_findings, incidents, sensor_health,
+                       first_run, learning_days, aged, quiet=quiet,
+                       prev_scan_at=prev_scan_at)
     with open(LATEST_MD, "w", encoding="utf-8") as f:
         f.write(md)
-    save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings})
+    save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings,
+                            "incidents": incidents,
+                            "sensor_health": list(sensor_health or []),
+                            "new_fingerprints": [f.get("fingerprint")
+                                                 for f in new_findings],
+                            # Everything else the brief report is built from, so
+                            # `report` can re-render faithfully instead of
+                            # serving a snapshot that stopped being true.
+                            "scan_at": _epoch(), "first_run": bool(first_run),
+                            "aged": aged, "quiet": quiet})
     return md
-
 
 SEEN_MAX = 10000  # bound the dedup ledger; findings.jsonl is the durable record
 
@@ -10289,49 +13819,26 @@ def _cap_seen(seen):
     return dict(newest)
 
 
-def emit(findings, first_run, adopt=frozenset()):
-    """Append new findings to the durable log; notify on new >= HIGH.
-
-    `adopt` is the set of categories being SILENTLY ADOPTED on this scan (an
-    upgrade seeing a live, non-baseline surface for the first time — e.g. an
-    install predating shell-history support). Their findings are still logged but
-    never notified, so the residue they hold is not re-alerted as if it were new.
-    """
+def emit(findings, first_run, adopt=frozenset(), routing=None):
+    """Append new findings to the durable log; notify on what the gate routes
+    to the interrupt tier. `routing` is route_findings(...) — computed with
+    the incident tier's memory on the scan path, or here without it for a
+    direct caller (see route_findings for the rules)."""
+    if routing is None:
+        routing = route_findings(findings, first_run, adopt)
     seen = load_json(SEEN, {})
-    allow = set(load_json(ALLOWLIST, []))
     new_high = []
     _rotate_log(FINDINGS_LOG)
     with open(FINDINGS_LOG, "a", encoding="utf-8") as log:
         for f in findings:
             fp = f["fingerprint"]
-            if fp in allow:
-                continue
-            if fp in seen:
+            verdict = routing.get(fp) or {"route": ROUTE_SEEN}
+            # `fp in seen` also folds a fingerprint repeated within one batch.
+            if verdict["route"] in (ROUTE_SILENT, ROUTE_SEEN) or fp in seen:
                 continue
             seen[fp] = f["ts"]
             log.write(json.dumps(f) + "\n")
-            # First-run silence is the KnockKnock "trust what's already installed"
-            # rule — it applies to PERSISTENCE and SHELL-HISTORY only, the two
-            # surfaces made of accreted-over-time RESIDUE (a launchd item, or a
-            # months-old `curl|sh` install line). Suppressing them on the first
-            # scan adopts the existing state silently (still LOGGED) so upgrading
-            # Aegis on a busy machine is not an alert storm; NEW ones thereafter
-            # alert. A payload already sitting in a hot dir, a suspicious RUNNING
-            # process (behavior), an XProtect detection, /tmp staging, a modified
-            # canary, or a weak hardening setting is a LIVE risk the user must
-            # hear about even on the very first scan — those are never suppressed.
-            suppressed = (
-                (first_run and f["category"] in ("persistence", "shell-history"))
-                or f["category"] in adopt)
-            # Two-axis routing gate: notify only when severity clears the floor
-            # AND confidence is not 'low'. A high-impact-but-noisy hit (explicit
-            # confidence='low') is still logged/correlated but routed to the
-            # digest tier instead of interrupting — the anti-fatigue rule that
-            # keeps the tool trusted. Default 'medium' keeps every existing
-            # finding's notify behavior byte-identical.
-            low_conf = CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0
-            if not suppressed and not low_conf \
-                    and SEV_ORDER[f["severity"]] >= SEV_ORDER[NOTIFY_MIN_SEV]:
+            if verdict["route"] == ROUTE_INTERRUPT:
                 new_high.append(f)
     save_json(SEEN, _cap_seen(seen))
 
@@ -10341,7 +13848,6 @@ def emit(findings, first_run, adopt=frozenset()):
         notify("Aegis: %s" % top["severity"],
                "%s%s" % (top["title"], extra))
     return new_high
-
 
 def load_baseline():
     """Return (baseline_or_None, corrupt). Distinguishes 'no baseline yet' (a
@@ -10359,13 +13865,23 @@ def load_baseline():
 
 
 def _migrate_baseline(data):
-    """Upgrade legacy raw-argv baselines without laundering tamper evidence."""
+    """Upgrade a legacy baseline IN THE STORE, once, without laundering tamper
+    evidence. `schema_version` is the gate: a file already at the current
+    version is returned without a single record inspected.
+
+      v2  raw argv -> args_sha256, record redacted (a secret in
+          ProgramArguments must not persist in plaintext)
+      v3  agent_surface exec entries re-keyed from the retired positional
+          identity onto _exec_identity — settled in the store once, so
+          diff_agent_surface no longer re-hashes both sides on every scan
+    """
     if not isinstance(data, dict):
         return data
-    records = data.get("persistence")
-    if not isinstance(records, dict) or not any(
-            isinstance(rec, dict) and "args_sha256" not in rec
-            for rec in records.values()):
+    try:
+        version = int(data.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= BASELINE_SCHEMA_VERSION:
         return data
 
     # Rewrite only when the existing self-protection watermark agrees. If an
@@ -10377,24 +13893,30 @@ def _migrate_baseline(data):
     if recorded and recorded != current:
         return data
 
-    for key, rec in list(records.items()):
-        if not isinstance(rec, dict):
-            continue
-        raw_args = rec.get("args")
-        if "args_sha256" not in rec:
+    records = data.get("persistence")
+    if isinstance(records, dict):
+        for key, rec in list(records.items()):
+            if not isinstance(rec, dict) or "args_sha256" in rec:
+                continue
+            raw_args = rec.get("args")
             if raw_args is None:
                 rec["args_sha256"] = None
             else:
                 encoded = json.dumps(raw_args, sort_keys=True, default=str)
                 rec["args_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
-        records[key] = _redact_value(rec)
+            records[key] = _redact_value(rec)
+    surface = data.get("agent_surface")
+    if isinstance(surface, dict):
+        for rec in surface.values():
+            if isinstance(rec, dict) and isinstance(rec.get("execs"), dict):
+                rec["execs"] = _migrate_exec_keys(rec["execs"])
     data["schema_version"] = BASELINE_SCHEMA_VERSION
     data["trust"] = data.get("trust") or "unverified"
     save_json(BASELINE, data)
     state["baseline_sha"] = sha256(BASELINE)
     save_json(SELFSTATE, state)
-    log_run("migrated baseline schema to v%d (legacy argv redacted)" %
-            BASELINE_SCHEMA_VERSION)
+    log_run("migrated baseline schema v%d -> v%d"
+            % (version, BASELINE_SCHEMA_VERSION))
     return data
 
 
@@ -10419,11 +13941,12 @@ def cmd_scan(quiet=False):
 
 
 def _cmd_scan_locked(quiet=False):
-    global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED
+    global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED, _PROC_ARGV_PARTIAL
     ensure_state()
     # per-scan; a stale count or flag would mislead every later run
     _SIG_PROBE_FAILURES = 0
     _PROC_ENUM_FAILED = False
+    _PROC_ARGV_PARTIAL = False
     health = []
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
@@ -10480,33 +14003,67 @@ def _cmd_scan_locked(quiet=False):
         baseline["trust"] = "unverified"
         baseline["persistence"] = current
         baseline["shell_history_adopted"] = True
+        # A fresh install knows nothing about this machine yet; give it a window
+        # to learn before it starts interrupting. See _in_learning_period.
+        baseline["learning_until"] = int(_epoch()) + \
+            _LEARNING_DEFAULT_DAYS * 86400
         save_json(BASELINE, baseline)
     elif baseline is not None and not baseline.get("shell_history_adopted"):
         adopt.add("shell-history")
         baseline["shell_history_adopted"] = True
         save_json(BASELINE, baseline)
 
+    # Downgrade any finding whose actor is an operator-confirmed identity
+    # (a trusted SSH key/origin) BEFORE routing/sort, so a known "this was me"
+    # recurrence routes to the digest instead of interrupting — see
+    # _apply_identity_trust.
+    _apply_identity_trust(findings)
+
     # Re-sort: surface findings (and any corrupt-baseline finding) were appended
     # after gather_all's sort.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
 
+    # Reported on EVERY scan, not only on the bad ones. Emitting health only
+    # on failure leaves the stored row pinned to that failure forever: on the
+    # reference machine process.enumerate failed once, on 2026-08-26, and the
+    # report then told the operator "the process table could not be read this
+    # scan" every hour for three days while it was reading fine. A coverage
+    # section that is wrong on most scans is one the reader learns to skip,
+    # which costs the coverage warnings that are real.
     if _PROC_ENUM_FAILED:
         health.append({
             "sensor_id": "process.enumerate", "status": "DEGRADED",
             "detail": "the process table could not be read this scan; no "
                       "process or behavioural finding below is complete",
             "duration_ms": 0, "item_count": 0})
-
-    if _SIG_PROBE_FAILURES:
-        # Never silent: an operator reading a clean report must be able to tell
-        # "nothing suspicious" from "I could not check N of them".
+        # argv is deliberately left unreported here rather than called OK: if
+        # the table could not be read at all, its completeness is unknown, and
+        # the staleness rule below is what stops last scan's verdict standing
+        # in for one nobody took.
+    else:
+        health.append({"sensor_id": "process.enumerate", "status": "OK",
+                       "detail": "", "duration_ms": 0, "item_count": 0})
         health.append({
-            "sensor_id": "signature.classify", "status": "DEGRADED",
-            "detail": "%d signature probe(s) returned no verdict; those "
-                      "binaries were NOT vouched for" % _SIG_PROBE_FAILURES,
-            "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
+            "sensor_id": "process.argv",
+            "status": "DEGRADED" if _PROC_ARGV_PARTIAL else "OK",
+            "detail": ("the executable table was read, but macOS full argv "
+                       "enumeration failed; behavioral findings are "
+                       "incomplete") if _PROC_ARGV_PARTIAL else "",
+            "duration_ms": 0, "item_count": 0})
+    health.append({
+        "sensor_id": "signature.classify",
+        "status": "DEGRADED" if _SIG_PROBE_FAILURES else "OK",
+        "detail": ("%d signature probe(s) returned no verdict; those binaries "
+                   "were NOT vouched for" % _SIG_PROBE_FAILURES)
+        if _SIG_PROBE_FAILURES else "",
+        "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
 
-    new_high = emit(findings, first_run, adopt=adopt)
+    # Captured BEFORE emit, which is what updates the ledger: this is the set
+    # the previous scan had already reported, and the difference against it is
+    # the report's "new since last scan".
+    prior_seen = set(load_json(SEEN, {}))
+    routing = _route_for_scan(findings, first_run, adopt)
+    new_high = emit(findings, first_run, adopt=adopt, routing=routing)
     # Pre-authorized reversible response, if the operator armed any. Runs
     # AFTER emit so the report is written before anything acts on it, and is
     # wrapped because a standing order that could fail a scan — and so blind
@@ -10523,7 +14080,7 @@ def _cmd_scan_locked(quiet=False):
     try:
         record_security_state(
             findings, sensor_health=health, initially_notified=bool(new_high),
-            suppressed_categories=suppressed_categories)
+            suppressed_categories=suppressed_categories, routing=routing)
         reminders = [] if new_high else claim_due_incident_reminders()
         if reminders:
             top = reminders[0]
@@ -10538,8 +14095,13 @@ def _cmd_scan_locked(quiet=False):
         # but the failure is durable and visible rather than silently "clean".
         log_run("event-store failure: %s" % e)
         incidents, persisted_health = [], health
+    # The heartbeat is written AFTER the report, so what is on disk now is the
+    # PREVIOUS scan's — which is exactly the liveness fact the report needs and
+    # costs no new state to obtain.
     md = write_report(findings, first_run, incidents=incidents,
-                      sensor_health=persisted_health)
+                      sensor_health=persisted_health, prior_seen=prior_seen,
+                      aged=_LAST_AGED_OUT, routing=routing,
+                      prev_scan_at=read_heartbeat().get("epoch"))
     flush_sigcache()
     record_selfstate()
     # Extend the tamper-evidence chain AFTER state is settled, so the link
@@ -10584,15 +14146,24 @@ def _cmd_baseline_locked(trust="verified"):
     current = snapshot_persistence()
     b = {"created": now_iso(), "schema_version": BASELINE_SCHEMA_VERSION,
          "persistence": current, "trust": trust}
-    for key, snap_fn, _diff in SURFACES:
+    for key, snap_fn, _diff, _scope, _live in map(_surface_row, SURFACES):
         try:
             snap = snap_fn()
         except Exception:
             snap = None
-        # A None snapshot means the backing command couldn't be read now; omit
-        # the surface so the next scan adopts it once it can, rather than
-        # baselining a false-empty (see snapshot_btm).
-        if snap is not None:
+        # A None snapshot means the backing command couldn't be read now, and
+        # SURFACE_PRIVILEGED means this OS puts the surface behind an
+        # interactive admin wall. Both are non-answers and both are omitted, so
+        # the next scan adopts the surface once it can rather than baselining a
+        # false-empty (see snapshot_btm).
+        #
+        # The sentinel must be tested for explicitly: it is a bare object(), so
+        # it is truthy and `is not None`, and letting it through put a
+        # non-serializable value into the baseline dict — `baseline` then died
+        # in json.dump on any machine where the wall is up (macOS 26 moved
+        # `sfltool dumpbtm` behind system.privilege.admin), taking the whole
+        # command out. The scan path already treats the two identically.
+        if snap is not None and snap is not SURFACE_PRIVILEGED:
             b[key] = snap
     save_json(BASELINE, b)
     flush_sigcache()
@@ -10704,13 +14275,425 @@ def cmd_canary(action="plant"):
     return 0
 
 
-def cmd_report():
-    if os.path.exists(LATEST_MD):
-        with open(LATEST_MD, encoding="utf-8") as f:
-            sys.stdout.write(f.read())
-    else:
-        print("No report yet. Run: aegis.py scan")
+def cmd_report(full=False):
+    """Render the report NOW, from the last scan's observations and the LIVE
+    incident state.
+
+    It used to `cat` latest.md, a file frozen at scan time — so the moment the
+    operator resolved anything, the report went on describing a world that no
+    longer existed until the next hourly scan. On the reference machine that
+    meant closing the one open CRITICAL and still being told, in red, "1
+    CRITICAL incident still open". Telling someone their machine is on fire
+    after they put it out is the fastest way to teach them not to read the
+    report at all — the same lesson the stale coverage rows taught, one layer
+    up.
+
+    Only the incident state is re-read: findings, sensor health and the
+    new-since-last-scan set are properties OF that scan and would be
+    falsified, not refreshed, by recomputing them here. latest.md is still
+    written at scan time for anything that tails the file."""
+    payload = load_json(LATEST_JSON, None)
+    if not payload:
+        if os.path.exists(LATEST_MD):
+            with open(LATEST_MD, encoding="utf-8") as f:
+                sys.stdout.write(f.read())
+        else:
+            print("No report yet. Run: aegis.py scan")
+        return 0
+    if full:
+        sys.stdout.write(_full_report(payload))
+        return 0
+    findings = payload.get("findings") or []
+    fresh = set(payload.get("new_fingerprints") or [])
+    new_findings = [f for f in findings if f.get("fingerprint") in fresh]
+    try:
+        incidents = list_incidents()
+    except Exception:
+        incidents = payload.get("incidents") or []
+    until = _learning_until()
+    now = _epoch()
+    learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
+    sys.stdout.write(_brief_report(
+        findings, new_findings, incidents,
+        payload.get("sensor_health") or [], bool(payload.get("first_run")),
+        learning_days, payload.get("aged") or 0,
+        quiet=payload.get("quiet") or 0,
+        prev_scan_at=payload.get("scan_at")))
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# FAMILIES — the adjudication surface, because a verdict nobody gives teaches
+# nothing.
+#
+# Every suppression mechanism in this file learns from the operator's own
+# `benign-positive` verdicts, and on the reference machine those arrived in
+# three bursts (33, then 70, then 15) and stopped — nine days of silence while
+# the queue rebuilt to 27. That is not neglect, it is arithmetic: adjudicating
+# meant issuing one command per incident, after working out by eye which of
+# them were the same fact. Six launchd jobs from one kit read as six problems.
+# So the learning starved between bursts, which is exactly when it was needed,
+# and every tier built on it shipped inert.
+#
+# A family is a set of active incidents that share an identity THIS FILE
+# ALREADY TRUSTS for tolerance — a producer class, an endpoint class, or a
+# tolerance identity. Nothing new is asserted to be "the same thing": the
+# grouping is the same judgement the tolerance layer makes, surfaced before the
+# verdict instead of after it. An incident sharing none of those stays a
+# singleton, so the view can never lump unrelated things together to look tidy.
+#
+# The verdict is still one human judgement per FACT, and it still writes one
+# dismissals row per incident — byte-identical to issuing the commands by hand,
+# so precision math and tolerance counts are unchanged. What collapses is the
+# clerical work, which is the part that was actually stopping.
+# --------------------------------------------------------------------------- #
+
+def _accept_into_baseline(incident_ids):
+    """Promote persistence items the operator just called benign into the
+    baseline, and return the paths accepted.
+
+    This is the fix the mute layers were standing in for. `cmd_scan` writes
+    baseline["persistence"] only on `first_run`, so an item installed later is
+    absent from it permanently and `check_persistence` re-emits
+    `persistence:new` for it on EVERY scan, forever — one such item on the
+    reference machine had accumulated 68 evidence events for something that
+    was new exactly once, and re-fed the correlation engine each time. Every
+    mechanism downstream (the seen ledger, acquired tolerance, age-out,
+    families) was compensating for a sensor whose "new" could never become
+    "known". A verdict that does not reach the baseline does not end anything;
+    it only buys silence, and it has to keep buying it.
+
+    Why this is not the hole the first-run rule exists to prevent. Silently
+    absorbing an unreviewed persistence item would launder a planted job into
+    known-good — that is why the baseline is written once. This promotes ONLY
+    on the operator's explicit `benign-positive`, which is the difference
+    between a machine deciding something is normal and a human saying so.
+
+    Two guards make it safe to write:
+
+    · The fact must still be EXACTLY true. Rather than trusting a parsed path,
+      the whole persistence diff is recomputed and the incident's own
+      fingerprint must still appear in it. If the item changed between the
+      alert and the verdict, the fingerprint is gone, nothing is promoted, and
+      the change stands as its own unreviewed fact.
+    · The accepted BYTES are what lands. The baseline record carries the
+      program hash, args, env and payload hash, so `check_persistence` still
+      diffs against exactly what was reviewed — accepting a job does not
+      accept its next mutation, which is the whole point of a baseline.
+
+    The baseline is re-watermarked, or the deliberate write would read as
+    tampering on the very next scan (`_record_baseline_watermark`, the same
+    discipline `learn` already uses).
+    """
+    if not incident_ids:
+        return []
+    baseline, corrupt = load_baseline()
+    if corrupt or not baseline:
+        return []
+    db = _event_connection()
+    try:
+        marks = ",".join("?" for _ in incident_ids)
+        wanted = {row[0][len("signal:"):] for row in db.execute(
+            "SELECT correlation_key FROM incidents WHERE id IN (%s)" % marks,
+            tuple(incident_ids)).fetchall()
+            if (row[0] or "").startswith("signal:")}
+    finally:
+        db.close()
+    if not wanted or any(w.startswith(_NEVER_TOLERATE_PREFIXES) for w in wanted):
+        return []
+    wanted = set(wanted)
+    accepted, dirty = [], False
+    # Every baseline-diffed surface has the same defect, so acceptance walks
+    # the same registry the scan does rather than knowing about persistence
+    # alone. Measured on the live store: 38 of 93 findings per scan were
+    # `AI-agent skill changed` and 12 more were agent-surface — a fix wired
+    # only to persistence would have left 50 permanently-re-asserted facts in
+    # place and the headline count still pinned far above zero.
+    #
+    # Surfaces are snapshotted LAZILY and the walk stops as soon as every
+    # accepted fingerprint is accounted for: a verdict is interactive, and a
+    # family is almost always one surface, so the usual cost is one snapshot
+    # rather than a whole scan's worth of I/O.
+    for key, snap_fn, diff_fn in _acceptable_surfaces():
+        if not wanted:
+            break
+        prior = baseline.get(key)
+        if not isinstance(prior, dict):
+            continue
+        try:
+            live = snap_fn()
+        except Exception as e:
+            log_run("baseline acceptance skipped %s: %s" % (key, e))
+            continue
+        if not isinstance(live, dict):
+            # A non-answer is not an empty world — never accept over a surface
+            # whose backing command could not be read this run.
+            continue
+        for f in diff_fn(prior, live):
+            if f["fingerprint"] not in wanted:
+                continue
+            entry = _accepted_entry_key(f, prior, live)
+            if entry is None:
+                continue
+            if entry in live:
+                # Stored verbatim from the snapshot, which is ALREADY in
+                # baseline shape (persistence emits args_sha256 alongside args,
+                # exactly as the store holds it). Re-deriving the shape here
+                # would make the accepted record differ from every other one,
+                # and the diffs compare those fields like-for-like — so the
+                # item would report CHANGED on every scan from then on, which
+                # is the noise this whole path exists to end.
+                prior[entry] = live[entry]
+            else:
+                prior.pop(entry, None)
+            baseline[key] = prior
+            wanted.discard(f["fingerprint"])
+            accepted.append(entry)
+            dirty = True
+    if not dirty:
+        return []
+    save_json(BASELINE, baseline)
+    _record_baseline_watermark()
+    log_run("accepted %d item(s) into the baseline" % len(accepted))
+    return accepted
+
+
+def _acceptable_surfaces():
+    """(key, snapshot_fn, diff_fn) for every baseline-diffed surface, core
+    persistence first because it is the one that is not in SURFACES."""
+    rows = [("persistence", snapshot_persistence, check_persistence)]
+    for row in SURFACES:
+        key, snap_fn, diff_fn, _scope, never_adopt = _surface_row(row)
+        # A surface that is never silently adopted is one the README's
+        # live-vs-residue rule says the operator must keep hearing about (an
+        # active remote login is CURRENT ACCESS, not installed residue). An
+        # explicit verdict is a stronger signal than adoption, but this is the
+        # one place where "stop telling me" is the wrong thing to honour.
+        if not never_adopt:
+            rows.append((key, snap_fn, diff_fn))
+    return rows
+
+
+def _accepted_entry_key(f, prior, live):
+    """Which snapshot entry a finding is about.
+
+    Most diffs name it as `path`, but the snapshots are keyed differently per
+    surface (agent_skills by `skills/<name>`, shellrc by absolute path), so a
+    path-only rule would silently accept nothing on half of them. The
+    fingerprint always embeds the key, so the fallback is the longest snapshot
+    key it contains — longest so `skills/archive` cannot shadow
+    `skills/archive-tool`.
+
+    Fails CLOSED, and that matters: not every baseline surface is a set of
+    entities the operator owns. `xprotect_corpus` is one RECORD describing
+    Apple's malware definitions ({rules, count}), and its fingerprint names a
+    rule digest rather than a snapshot key — so nothing resolves, nothing is
+    accepted, and a verdict cannot quietly bless a change to the corpus. A
+    surface whose keys this cannot find keeps reporting, which is the right
+    failure direction for an accept path."""
+    path = f.get("path")
+    if path and (path in live or path in prior):
+        return path
+    fp = f.get("fingerprint") or ""
+    best = None
+    for candidate in list(live) + list(prior):
+        if candidate and candidate in fp and (
+                best is None or len(candidate) > len(best)):
+            best = candidate
+    return best
+
+
+def _family_label(key, rows):
+    """A one-line human name for what the operator is being asked about."""
+    paths = []
+    for row in rows:
+        raw = row.get("subject_json")
+        if raw:
+            try:
+                sub = json.loads(raw)
+                paths.append(sub.get("raw_path") or sub.get("path") or "")
+            except Exception:
+                pass
+    paths = [p for p in paths if p]
+    if key.startswith("persistence:#producer:"):
+        bits = key.split(":")
+        return "%d job(s) from one installed toolkit -> %s [%s]" % (
+            len(rows), bits[-2], bits[-1] or "?")
+    if key.startswith("beacon:") and ":#ip:" in key:
+        return "%d endpoint(s) of one program -> %s" % (
+            len(rows), key.split(":#ip:")[0][len("beacon:"):])
+    if paths:
+        common = os.path.dirname(os.path.commonprefix(paths)) or paths[0]
+        return "%d incident(s) on %s" % (len(rows), common)
+    if key.startswith(_FAMILY_UNGROUPED_PREFIX):
+        # The synthetic key `_incident_families` mints for an incident that
+        # generalizes to nothing. It is unique to that row BY CONSTRUCTION, so
+        # rendering it through the "sharing <key>" branch told the operator
+        # these rows shared an identity — the exact opposite of why they are
+        # listed apart, and on this machine that was 9 of 14 lines.
+        return "1 incident, no shared identity — judge it on its own terms"
+    return "%d incident(s) sharing %s" % (len(rows), key)
+
+
+# Marks a family of one that generalizes to nothing. Distinct from any real
+# identity, and never rendered as a shared one.
+_FAMILY_UNGROUPED_PREFIX = "incident:"
+
+
+def _incident_families(db):
+    """[(key, label, [rows])] over ACTIVE incidents, widest family first.
+
+    An incident joins the FIRST identity it has, narrowest generalization
+    last: a producer class, then an endpoint class, then its plain tolerance
+    identity. Anything with none of those is its own family keyed on its
+    correlation_key, because a fact that cannot generalize is a fact the
+    operator has to look at on its own terms."""
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    rows = _dict_rows(db.execute(
+        "SELECT * FROM incidents WHERE status IN (%s) "
+        "ORDER BY id" % marks, _ACTIVE_INCIDENT_STATES).fetchall())
+    groups = {}
+    for row in rows:
+        key = None
+        raw = row.get("subject_json")
+        if raw:
+            try:
+                sub = json.loads(raw)
+                producer = _subject_producer_classes(sub)
+                key = producer[0][0] if producer else None
+            except Exception:
+                key = None
+        if key is None:
+            ident, classes = _incident_identity(row)
+            key = classes[0][0] if classes else ident
+        groups.setdefault(
+            key or ("%s%s" % (_FAMILY_UNGROUPED_PREFIX, row["id"])),
+            []).append(row)
+    out = [(k, _family_label(k, v), v) for k, v in groups.items()]
+    out.sort(key=lambda t: (-len(t[2]), t[0]))
+    return out
+
+
+def cmd_families():
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        families = _incident_families(db)
+    finally:
+        db.close()
+    if not families:
+        print("No active incidents.")
+        return 0
+    total = sum(len(rows) for _k, _l, rows in families)
+    print("# Aegis incident families — %d active incident(s), %d decision(s)\n"
+          % (total, len(families)))
+    for n, (_key, label, rows) in enumerate(families, 1):
+        worst = max(rows, key=lambda r: SEV_ORDER.get(r["severity"], -1))
+        ids = " ".join("#%s" % r["id"] for r in rows)
+        print("  [%d] %-8s %s\n      %s" % (n, worst["severity"], label, ids))
+    print("\nOne verdict per family: aegis.py family <n> "
+          "[benign-positive|false-positive]")
+    print("A family is grouped ONLY on an identity acquired tolerance already "
+          "keys on;\nanything that cannot generalize is listed on its own.")
+    return 0
+
+
+def cmd_family(numbers, action=None, reason=None):
+    """Apply ONE verdict to every incident in one or more families.
+
+    Takes a LIST resolved against a SINGLE snapshot, and that is the whole
+    reason the signature is not `family <n>`. Family numbers are positions in
+    a list recomputed on every invocation, so chaining verdicts —
+    `family 1 ... && family 2 ...`, the obvious thing to type and the exact
+    line this tool handed the operator — renumbers between the two commands
+    and the second verdict lands on whatever slid into that position. It
+    happened on the reference machine the first time anyone used it: family 1
+    was the toolkit, family 2 was meant to be Zotero, and by the time the
+    second command ran, family 2 was an unrelated agent-config incident. A
+    verdict is a permanent, teaching record; silently applying it to the wrong
+    subject is the worst thing this command can do.
+
+    `family 1,2 benign-positive` resolves both against one list, so nothing
+    can shift underneath. Writes the same rows the per-incident commands write
+    — one dismissal each, through the same transition — so precision,
+    tolerance counts and the audit trail are unchanged. The saving is
+    clerical, and the clerical work is what was stopping.
+    """
+    raw = str(numbers if numbers is not None else "").replace(",", " ").split()
+    try:
+        wanted = [int(x) for x in raw]
+    except ValueError:
+        wanted = []
+    if not wanted:
+        print("usage: aegis.py family <n[,n...]> "
+              "[benign-positive|false-positive]")
+        return 2
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        families = _incident_families(db)
+    finally:
+        db.close()
+    bad = [n for n in wanted if not 1 <= n <= len(families)]
+    if bad:
+        print("No family %s (there %s %d). Current families: aegis.py families"
+              % (", ".join(str(n) for n in bad),
+                 "is" if len(families) == 1 else "are", len(families)))
+        return 2
+    seen, chosen = set(), []
+    for n in wanted:
+        if n not in seen:
+            seen.add(n)
+            chosen.append((n, families[n - 1]))
+
+    if action is None:
+        for n, (key, label, rows) in chosen:
+            print("Family %d — %s\n" % (n, label))
+            for row in rows:
+                print("  #%-4s %-8s %-14s %s" % (row["id"], row["severity"],
+                                                 row["status"], row["title"]))
+            print("\nIdentity: %s" % key)
+            print("Verdict:  aegis.py family %d benign-positive\n" % n)
+        return 0
+
+    verb = str(action).lower()
+    if verb not in ("benign-positive", "false-positive"):
+        print("usage: aegis.py family <n[,n...]> "
+              "[benign-positive|false-positive]")
+        return 2
+
+    results, all_done = [], []
+    for n, (_key, label, rows) in chosen:
+        done, refused = [], []
+        for row in rows:
+            if transition_incident(row["id"], "FALSE_POSITIVE",
+                                   reason_code=verb):
+                done.append(row["id"])
+            else:
+                refused.append(row["id"])
+        all_done.extend(done)
+        results.append((n, label, done, refused))
+    # One acceptance pass over everything just verdicted: it snapshots live
+    # surfaces, so doing it per family would repeat that work per family.
+    accepted = _accept_into_baseline(all_done) if verb == "benign-positive" \
+        else []
+    for n, label, done, refused in results:
+        print("Family %d — %s" % (n, label))
+        print("  %s recorded on %d incident(s): %s"
+              % (verb, len(done), " ".join("#%s" % i for i in done) or "none"))
+        if refused:
+            print("  refused (not in a dismissable state): %s"
+                  % " ".join("#%s" % i for i in refused))
+        if verb == "benign-positive" and len(done) >= _TOLERANCE_MIN_VERDICTS:
+            print("  this identity now carries %d verdicts — future members "
+                  "open pre-closed" % len(done))
+    if accepted:
+        print("%d item(s) accepted into the baseline — the sensor stops "
+              "reporting them (a CHANGE to any of them still alerts)"
+              % len(accepted))
+    return 0 if all_done else 1
 
 
 def cmd_incidents(show_all=False):
@@ -10734,6 +14717,8 @@ def cmd_incidents(show_all=False):
         print("\n" + _tolerated_footer(tolerated))
     print("\nDetails/actions: aegis.py incident <id> [ack|investigate|contain|"
           "recover|monitor|resolve|false-positive|benign-positive|reopen]")
+    if not show_all:
+        print("One verdict per FACT instead of per row: aegis.py families")
     return 0
 
 
@@ -10771,7 +14756,13 @@ _INCIDENT_ACTIONS = {
 # one-person SOC. Shown on the incident card next to the evidence.
 SENSOR_BENIGN_NOTES = {
     "persistence": "Homebrew services, Docker/VSCode helpers, backup agents, "
-                   "and printer/VPN vendors all install launchd jobs.",
+                   "and printer/VPN vendors all install launchd jobs. An "
+                   "authorized_keys change from adding your OWN device's key: "
+                   "benign-positive here also trusts that key's fingerprint "
+                   "(aegis.py identity list to review).",
+    "auth-session": "Your own SSH / screen-sharing login from a machine you "
+                    "use. benign-positive trusts that origin host, or set it "
+                    "directly: aegis.py identity trust ssh-origin HOST.",
     "process": "Dev toolchains run unsigned binaries from ~/ (cargo/go build "
                "output, node_modules/.bin, pyenv shims).",
     "behavior": "Installer one-liners (Homebrew/rustup) legitimately pipe curl "
@@ -10938,6 +14929,43 @@ def _finding_techniques(f):
     return tuple(sorted(out))
 
 
+def _trust_identities_from_incident(incident_id):
+    """Confirm-once: a benign-positive verdict on an SSH-identity incident
+    also trusts the exact fingerprint(s) it was about — the origin host of an
+    auth-session, or the specific authorized_keys fingerprint(s) that were not
+    already recognized (_apply_authorized_keys_trust always records these on
+    a finding it does not fully trust, including on first sight, since an
+    empty trust table makes every key 'unrecognized'). Future recurrences of
+    the SAME actor then report at digest tier instead of interrupting — see
+    _apply_identity_trust. Returns the (kind, fingerprint) pairs trusted."""
+    item = incident_detail(incident_id)
+    if not item:
+        return []
+    trusted, seen = [], set()
+    for ev in item.get("evidence", []):
+        try:
+            data = json.loads(ev["data_json"])
+        except Exception:
+            continue
+        if data.get("category") == "auth-session" and data.get("origin"):
+            key = ("ssh-origin", data["origin"])
+            if key not in seen:
+                seen.add(key)
+                trust_identity("ssh-origin", data["origin"], "trusted",
+                               label=data["origin"],
+                               source_incident_id=incident_id)
+                trusted.append(key)
+        elif data.get("category") == "persistence":
+            for fp in data.get("unrecognized_key_fingerprints") or ():
+                key = ("ssh-key", fp)
+                if key not in seen:
+                    seen.add(key)
+                    trust_identity("ssh-key", fp, "trusted",
+                                   source_incident_id=incident_id)
+                    trusted.append(key)
+    return trusted
+
+
 def cmd_incident(incident_id, action=None, reason=None):
     try:
         incident_id = int(incident_id)
@@ -10962,6 +14990,14 @@ def cmd_incident(incident_id, action=None, reason=None):
             print("refuse: invalid transition from %s to %s" %
                   ((current or {}).get("status", "missing"), new_status))
             return 1
+        if reason_code == "benign-positive":
+            for path in _accept_into_baseline([incident_id]):
+                print("accepted into the baseline: %s\n  the sensor stops "
+                      "reporting it; a CHANGE to it still alerts" % path)
+            for kind, fp in _trust_identities_from_incident(incident_id):
+                print("trusted identity: %s %s\n  future recurrences report "
+                      "at low severity instead of interrupting; reverse with "
+                      "aegis.py identity block %s %s" % (kind, fp, kind, fp))
     item = incident_detail(incident_id)
     if not item:
         print("no such incident: %s" % incident_id)
@@ -11236,9 +15272,26 @@ def cmd_mark_uninstalled():
 
 
 def cmd_status():
+    """Posture, led by a verdict.
+
+    This printed forty-odd lines in source order, so its one real problem —
+    XProtect definitions 93 days stale, on the reference machine — sat eighth
+    in a column of green ticks. An operator checking "am I OK?" has to audit
+    every row to answer it, which is the same failure the report had: the
+    surface knew, and made the reader do the finding. Lines are buffered, the
+    ✗ and ? rows are collected, and the answer is printed BEFORE the evidence.
+    Nothing is removed — the full column still follows."""
     ensure_state()
     findings = check_hardening()
-    print("# Aegis hardening posture - %s\n" % now_iso())
+    out, problems = [], []
+
+    def emit(line):
+        out.append(line)
+        mark = line.strip()[:1]
+        if mark in ("✗", "?"):
+            problems.append(line)
+
+    emit("# Aegis hardening posture - %s\n" % now_iso())
     checks = [
         ("System Integrity Protection", "hardening:sip:off", "hardening:sip:unknown"),
         ("Gatekeeper", "hardening:gatekeeper:off", "hardening:gatekeeper:unknown"),
@@ -11250,11 +15303,11 @@ def cmd_status():
     bad = {f["fingerprint"]: f for f in findings}
     for label, fp, unknown_fp in checks:
         if fp in bad:
-            print("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
+            emit("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
         elif unknown_fp in bad:
-            print("  ? %-32s %s" % (label, bad[unknown_fp]["detail"]))
+            emit("  ? %-32s %s" % (label, bad[unknown_fp]["detail"]))
         else:
-            print("  ✓ %-32s ok" % label)
+            emit("  ✓ %-32s ok" % label)
 
     # Apple's own engine: report XProtect definition version/age (piggybacks the
     # professionally-maintained signature pipeline; a stale value is a red flag).
@@ -11273,46 +15326,74 @@ def cmd_status():
     if newest is not None:
         age = (time.time() - newest) / 86400.0
         mark = "✓" if age <= XPROTECT_STALE_DAYS else "✗"
-        print("  %s %-32s v%s, updated %.0f days ago"
+        emit("  %s %-32s v%s, updated %.0f days ago"
               % (mark, "XProtect definitions", version or "?", age))
     health = get_sensor_health()
     if health:
-        print("\n# Sensor coverage")
+        emit("\n# Sensor coverage")
+        # Same staleness rule the report applies: a sensor that did not run
+        # this scan has NOT reported OK, whatever its stored row still says.
+        # Reading get_sensor_health() raw here showed a dead sensor as a green
+        # tick, which is the failure `doctor`'s "unknown is never green" rule
+        # exists to prevent — and status is where an operator goes to check
+        # exactly that.
+        live, stale, permanent, degraded = _coverage_split(health)
+        stale_ids = {h.get("sensor_id") for h in stale}
         for item in health:
+            if item["sensor_id"] in stale_ids:
+                emit("  ✗ %-32s DID NOT RUN — last reported %s"
+                      % (item["sensor_id"], _ago(item.get("last_run_at"))))
+                continue
             mark = {"OK": "✓", "PRIVILEGED": "i"}.get(item["status"], "?")
-            print("  %s %-32s %s%s" % (
+            emit("  %s %-32s %s%s" % (
                 mark, item["sensor_id"], item["status"],
                 (" — " + item["detail"]) if item["detail"] else ""))
-    print("\n# Incidents\n  %d active" % len(list_incidents()))
+    active = list_incidents()
+    emit("\n# Incidents\n  %d active" % len(active))
 
     # Survivability (dead-man's switch) + capability posture.
-    print("\n# Survivability")
+    emit("\n# Survivability")
     beat = read_heartbeat()
     if beat.get("epoch"):
         age = int(time.time()) - int(beat["epoch"])
         mark = "✓" if age <= HEARTBEAT_STALE_SECS else "✗"
-        print("  %s %-32s last beat %d min ago (pid %s)"
+        emit("  %s %-32s last beat %d min ago (pid %s)"
               % (mark, "Heartbeat", age // 60, beat.get("pid", "?")))
     else:
-        print("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
-    print("  %s %-32s %s" % (
+        emit("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
+    emit("  %s %-32s %s" % (
         "✓" if _heartbeat_url() else "·", "Off-host heartbeat",
         "configured (out-of-band alerting on)" if _heartbeat_url()
         else "off (local-only; set AEGIS_HEARTBEAT_URL to enable)"))
     intel_mark, intel_text = _intel_summary()
-    print("  %s %-32s %s" % (intel_mark, "Intel feeds", intel_text))
+    emit("  %s %-32s %s" % (intel_mark, "Intel feeds", intel_text))
     if os.path.exists(WATCHDOG_ALERT):
         try:
             with open(WATCHDOG_ALERT, encoding="utf-8") as f:
                 last = f.read().strip().splitlines()[-1]
         except Exception:
             last = "(unreadable)"
-        print("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
+        emit("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
     fda = _has_full_disk_access()
-    print("  %s %-32s %s" % (
+    emit("  %s %-32s %s" % (
         "✓" if fda else "·", "Full Disk Access",
         "granted (Downloads/Desktop/Bastion in scope)" if fda
         else "not granted (Downloads/Desktop scan degraded; grant to python3)"))
+    checked = len([l for l in out if l.strip()[:1] in ("✓", "✗", "?", "i")])
+    if problems:
+        print("%s **%d of %d checks need attention.**\n"
+              % (VERDICT_ICON["alert"], len(problems), checked))
+        for line in problems:
+            print(line)
+        print()
+    elif active:
+        print("%s **Posture clean — %d checks pass.** %d incident(s) waiting.\n"
+              % (VERDICT_ICON["review"], checked, len(active)))
+    else:
+        print("%s **Protected — %d checks pass, nothing waiting.**\n"
+              % (VERDICT_ICON["clear"], checked))
+    for line in out:
+        print(line)
     return 0
 
 
@@ -11537,10 +15618,12 @@ def _intel_sets():
     return hashes, net
 
 
-def _intel_hash_finding(sha, path, where):
+def _intel_hash_finding(sha, path, where, hashes=None):
     if not sha:
         return None
-    meta = _intel_sets()[0].get(str(sha).lower())
+    if hashes is None:
+        hashes = _intel_sets()[0]
+    meta = hashes.get(str(sha).lower())
     if meta is None:
         return None
     return finding(
@@ -11586,9 +15669,10 @@ def check_intel(current_snap, prior_findings=None):
     the scan already did, scheduled by gather_all only when local intel
     exists."""
     findings, seen = [], set()
+    hashes, _net = _intel_sets()
 
     def grade(sha, path, where):
-        f = _intel_hash_finding(sha, path, where)
+        f = _intel_hash_finding(sha, path, where, hashes=hashes)
         if f and f["fingerprint"] not in seen:
             seen.add(f["fingerprint"])
             findings.append(f)
@@ -13019,6 +17103,45 @@ def _process_identity(pid):
     return None, None
 
 
+def _process_start_token(pid):
+    """Stable creation token for a live process, or None when unavailable.
+
+    A numeric PID is a reusable slot.  Response actions bind to this token so
+    an exited target cannot be replaced by an unrelated process between the
+    ownership check and a signal.
+    """
+    pid = int(pid)
+    if IS_LINUX:
+        try:
+            with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
+                stat = fh.read().strip()
+            # comm (field 2) is parenthesized and may itself contain spaces or
+            # ')'; fields after its final ')' begin with state (field 3).
+            tail = stat[stat.rfind(")") + 1:].split()
+            return tail[19] if len(tail) > 19 else None  # field 22: starttime
+        except (OSError, ValueError, IndexError):
+            return None
+    if IS_WIN:
+        script = ("$p=Get-CimInstance Win32_Process -Filter 'ProcessId = %d' "
+                  "-ErrorAction SilentlyContinue;if($p){$p.CreationDate}" % pid)
+        out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", script], timeout=15)
+    else:
+        out, _, rc = run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
+    token = (out or "").strip()
+    return token if rc == 0 and token else None
+
+
+def _process_matches(pid, expected_owner, expected_comm, expected_start):
+    """True for the authorized process, False for PID reuse, None if gone."""
+    owner, comm = _process_identity(pid)
+    if owner is None:
+        return None
+    current_start = _process_start_token(pid)
+    return (owner == expected_owner and comm == expected_comm and
+            current_start is not None and current_start == expected_start)
+
+
 def _process_alive(pid):
     if IS_WIN:
         out, _, rc = run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
@@ -13061,10 +17184,25 @@ def cmd_kill(pid):
         print("refuse: pid %d is a session-critical process (%s)" % (pid, comm))
         log_action("kill", str(pid), "refused-protected-comm", comm=comm)
         return 1
+    start_token = _process_start_token(pid)
+    if start_token is None:
+        print("refuse: could not bind pid %d to a stable process identity" % pid)
+        log_action("kill", str(pid), "refused-no-start-token", comm=comm)
+        return 1
+
+    def revalidate():
+        same = _process_matches(pid, owner, comm, start_token)
+        if same is False:
+            print("refuse: pid %d was reused after authorization" % pid)
+            log_action("kill", str(pid), "refused-pid-reused", comm=comm)
+        return same
 
     if IS_WIN:
         # No POSIX signals: taskkill without /F requests a clean WM_CLOSE, then
         # /F is the SIGKILL equivalent — the same graceful-then-forced ladder.
+        same = revalidate()
+        if same is not True:
+            return 0 if same is None else 1
         run(["taskkill", "/PID", str(pid)], timeout=20)
         for _ in range(10):
             time.sleep(0.1)
@@ -13072,6 +17210,9 @@ def cmd_kill(pid):
                 log_action("kill", str(pid), "ok-graceful", comm=comm)
                 print("Killed pid %d (%s) gracefully." % (pid, comm))
                 return 0
+        same = revalidate()
+        if same is not True:
+            return 0 if same is None else 1
         run(["taskkill", "/PID", str(pid), "/F"], timeout=20)
         gone = not _process_alive(pid)
         log_action("kill", str(pid), "ok-forced" if gone else "failed", comm=comm)
@@ -13081,6 +17222,9 @@ def cmd_kill(pid):
         return 0 if gone else 1
 
     import signal as _signal
+    same = revalidate()
+    if same is not True:
+        return 0 if same is None else 1
     try:
         os.kill(pid, _signal.SIGTERM)
     except ProcessLookupError:
@@ -13095,6 +17239,9 @@ def cmd_kill(pid):
             log_action("kill", str(pid), "ok-sigterm", comm=comm)
             print("Killed pid %d (%s) with SIGTERM." % (pid, comm))
             return 0
+    same = revalidate()
+    if same is not True:
+        return 0 if same is None else 1
     try:
         os.kill(pid, _signal.SIGKILL)
     except Exception:
@@ -13500,12 +17647,20 @@ _FREEZE_NEVER_COMMS = _PROTECTED_COMMS - frozenset((
 def _process_owner_and_names(pid):
     """(owner, names) for `pid` from ONE process-table walk.
 
-    Deliberately not `_process_identity()` + `_process_names()`: those are two
-    full enumerations, and _freeze_refusal is called once per descendant during
-    a tree sweep. On Windows a single enumeration is a CIM query this codebase
-    measured at 41s for 135 processes, so the doubled version turns freezing a
-    small tree into minutes of latency — for a verb whose entire value is that
-    it lands before the payload finishes."""
+    Deliberately one combined walk, not an owner lookup plus a name lookup:
+    those would be two full enumerations, and _freeze_refusal is called once
+    per descendant during a tree sweep. On Windows a single enumeration is a
+    CIM query this codebase measured at 41s for 135 processes, so the doubled
+    version turns freezing a small tree into minutes of latency — for a verb
+    whose entire value is that it lands before the payload finishes.
+
+    Names come from BOTH the exe column and argv tokens because macOS `ps`
+    truncates the `comm` column to 16 characters WHEN `args` is requested in
+    the same call (exactly how _iter_processes queries it) — so
+    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames
+    to `Applicat`, matching nothing in _PROTECTED_COMMS. The full argv[0] is
+    NOT truncated, so it is the reliable source; either one matching is enough
+    to refuse — a guard should over-refuse, never under-refuse."""
     owner, names = None, set()
     for p, o, exe, argv in _iter_processes():
         if p != str(pid):
@@ -13522,20 +17677,6 @@ def _process_owner_and_names(pid):
                 names.add(os.path.basename(tok))
         break
     return owner, {n for n in names if n}
-
-
-def _process_names(pid):
-    """Every plausible name for `pid`, for matching against _PROTECTED_COMMS.
-
-    Why this exists rather than just using _process_identity's `comm`: macOS
-    `ps` truncates the `comm` column to 16 characters WHEN `args` is requested
-    in the same call, which is exactly how _iter_processes queries it. So
-    `/System/.../MacOS/Terminal` arrives as `/System/Applicat` and basenames to
-    `Applicat`, which matches nothing in _PROTECTED_COMMS. The full argv[0] is
-    NOT truncated, so it is the reliable source. Both are returned because
-    either one matching is enough to refuse — a guard should over-refuse, never
-    under-refuse."""
-    return _process_owner_and_names(pid)[1]
 
 
 def _freeze_refusal(pid, parents=None):
@@ -15491,6 +19632,21 @@ def _install_runtime_copy():
     shutil.copyfile(src, tmp)
     os.chmod(tmp, 0o700)
     os.replace(tmp, dst)
+    # Attest the copy we just made. Aegis's own upgrade rewrites the payload
+    # its launchd job runs, which is — structurally — indistinguishable from
+    # an attacker swapping that payload, and so alerted HIGH every time the
+    # operator updated Aegis. The tool's loudest recurring alert being its own
+    # install is how a monitor teaches its operator to ignore it.
+    #
+    # This does NOT self-exempt: it writes one ordinary intent record, so the
+    # SAME custody ladder every other surface uses grades the change, and the
+    # finding is still reported (LOW) rather than suppressed. A payload swapped
+    # by anything that did not come through `install` records nothing and stays
+    # HIGH, which is the case that actually matters.
+    try:
+        intent_record(dst, "aegis-install")
+    except Exception:
+        pass    # an unattested install is noisier, never broken
     return dst
 
 
@@ -17077,10 +21233,8 @@ def _writs_open(now=None):
             if isinstance(w, dict) and w.get("expires", 0) > now]
 
 
-def writ_covers(scope, when=None):
-    """Was `scope` under an open writ at `when`? False when enforcement is off,
-    so every existing call site keeps its current behaviour byte-for-byte."""
-    data = load_json(WRIT_FILE, {})
+def _writ_data_covers(data, scope, when=None):
+    """Pure coverage check over one already-loaded writ snapshot."""
     if not isinstance(data, dict) or not data.get("enforcing"):
         return False
     when = _epoch(when)
@@ -17092,6 +21246,12 @@ def writ_covers(scope, when=None):
             if scope in scopes or "all" in scopes:
                 return True
     return False
+
+
+def writ_covers(scope, when=None):
+    """Was `scope` under an open writ at `when`? False when enforcement is off,
+    so every existing call site keeps its current behaviour byte-for-byte."""
+    return _writ_data_covers(load_json(WRIT_FILE, {}), scope, when)
 
 
 def cmd_writ(action="list", reason=None, minutes=20, scopes=None):
@@ -17362,10 +21522,38 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
 
  DETECT (default; runs on the scheduled interval, never destructive)
   scan             run all checks once; update report; alert on new HIGH+
-  report           print the latest report
+  report [--full]  print the latest report. The default is the BRIEF report:
+                   one verdict line, what is new since the last scan, open
+                   CRITICALs, and degraded coverage. `--full` renders every
+                   finding grouped by category, from the same latest.json
+  learn [status|start [days]|extend <days>|done]
+                   the learning period. A fresh install starts one
+                   automatically (14d): everything is still recorded and
+                   correlated, but a non-CRITICAL signal opens PRE-CLOSED as
+                   'learning' instead of alerting, so the picture of normal is
+                   built from evidence rather than from your patience.
+                   CRITICAL chains and tripped decoys/latches always alert.
+                   `learn start` begins one on an EXISTING install — the case
+                   that usually needs it most
   status           print hardening, XProtect, sensor coverage, and incidents
   doctor           verify actual coverage/liveness (unknown is never green)
   incidents [all]  list active incidents (or complete history)
+  families         group active incidents into DECISIONS: members of one
+                   family share an identity acquired tolerance already keys
+                   on (a producer, an endpoint class, a tolerance identity),
+                   so six launchd jobs from one kit read as one fact instead
+                   of six problems. Anything that cannot generalize is listed
+                   on its own — the view never invents a resemblance
+  family <n[,n...]> [benign-positive|false-positive]
+                   one verdict for a whole family. Takes a LIST, resolved
+                   against a single snapshot: family numbers are positions
+                   that shift as families close, so `family 1 ... && family 2
+                   ...` would apply the second verdict to whatever slid into
+                   slot 2. Say `family 1,2 benign-positive` instead. Writes
+                   exactly the rows the per-incident commands write (one
+                   dismissal each), so precision and tolerance counts are
+                   unchanged; what collapses is the clerical work. Bare
+                   `family <n>` prints members and identity, deciding nothing
   incident <id> [ack|investigate|contain|recover|monitor|resolve|reopen|
                  false-positive|benign-positive]
                    ...the two dismissals are recorded separately and feed
@@ -17381,9 +21569,33 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   replay [days]    backtest the CURRENT correlation logic against recorded
                    history (default 30d). Read-only: opens no incident, sends
                    no notification — run it after changing detection logic
+  intent record <path> [tool]
+                   attest the current content of an agent config/script you
+                   just authored: appends a MAC'd {ts,path,sha256,tool} line
+                   to ~/.aegis/intent.jsonl. A delegate-surface change whose
+                   hash matches a valid record grades LOW (self-attested,
+                   still in the report) instead of opening a HIGH incident
+  intent hook <tool>
+                   harness hook mode (wire as a post-write hook in Claude
+                   Code/Codex): reads the tool-call JSON on stdin, attests the
+                   written file. Prints nothing, always exits 0
+  intent list [n]  show recent attestations and whether their MACs verify
+  signers pin <file>
+                   pin a device roster (`principal ssh-key` lines) into
+                   ~/.aegis/allowed_signers — the only way it changes. A
+                   commit arriving from another machine whose SSH signature
+                   verifies against the PINNED roster grades LOW
+                   (fleet-signed) instead of the poisoned-repo HIGH
+  signers status   show the pinned roster
   attck [days]     ATT&CK technique coverage: what's wired, what's actually
                    fired on this machine (default 180d). Read-only.
-  baseline         reset the known-good persistence baseline to current state
+  baseline         accept the CURRENT state of every baseline-diffed surface
+                   as known-good: persistence plus shell rc, login items,
+                   browser/IDE extensions, agent skills and the agent config
+                   surface. The bulk answer when a review left many findings
+                   re-asserting that are below the incident threshold and so
+                   have no per-incident verdict to give. Accepts whatever is
+                   there right now, so run it only on a state you trust
   allow <path>     suppress future alerts for findings matching <path>
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
@@ -17536,12 +21748,31 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
 """
 
 
+def _authorize_response_cli(verb, argument=None):
+    """Human gate for direct CLI entry to mutating response commands.
+
+    Internal cmd_* calls remain composable (notably neutralize's ordered
+    quarantine steps); the dispatcher is the trust boundary where an external
+    script would otherwise gain response authority.
+    """
+    target = "%s %s" % (verb, argument if argument is not None else "all")
+    ok, channel = authorize_interactive("Authorize response command", target)
+    # Audit-before-mutation: both approval and refusal are durable, including
+    # which authorization channel made the decision. If the append fails, an
+    # approval cannot safely proceed because it would become unauditable.
+    recorded = log_action(
+        "response-auth", target, "authorized" if ok else "refused",
+        channel=channel, verb=verb,
+        argument=argument if argument is not None else "all")
+    return bool(ok and recorded)
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "scan"
     if cmd == "scan":
         return cmd_scan()
     if cmd == "report":
-        return cmd_report()
+        return cmd_report(full=(len(argv) > 2 and argv[2] in ("--full", "full")))
     if cmd == "status":
         return cmd_status()
     if cmd == "doctor":
@@ -17551,10 +21782,27 @@ def main(argv):
     if cmd == "mark-uninstalled":  # uninstaller-only
         return cmd_mark_uninstalled()
     if cmd == "incidents":
+        if len(argv) > 2 and argv[2] == "families":
+            return cmd_families()
         return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
+    if cmd == "families":
+        return cmd_families()
+    if cmd == "family" and len(argv) > 2:
+        return cmd_family(argv[2], argv[3] if len(argv) > 3 else None,
+                          argv[4] if len(argv) > 4 else None)
     if cmd == "incident" and len(argv) > 2:
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
+    if cmd == "learn":
+        return cmd_learn(argv)
+    if cmd == "intent":
+        return cmd_intent(argv)
+    if cmd == "signers":
+        return cmd_signers(argv)
+    if cmd == "vouch":
+        return cmd_vouch(argv)
+    if cmd == "identity":
+        return cmd_identity(argv)
     if cmd == "replay":
         try:
             days = int(argv[2]) if len(argv) > 2 else 30
@@ -17608,23 +21856,37 @@ def main(argv):
         return cmd_rootwatch(argv[2] if len(argv) > 2 else "status")
     # --- response tier (opt-in) ---
     if cmd == "quarantine" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_quarantine(argv[2])
     if cmd in ("quarantine-list", "ql"):
         return cmd_quarantine_list()
     if cmd == "restore" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_restore(argv[2])
     if cmd == "destroy" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_destroy(argv[2], confirmed=("--yes" in argv[3:]))
     if cmd == "kill" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_kill(argv[2])
     if cmd == "sandbox" and len(argv) > 2:
         return cmd_sandbox(argv[2], argv[3:])
     if cmd == "neutralize" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_neutralize(argv[2])
     # --- protective tier (opt-in, by-hand) ---
     if cmd == "freeze" and len(argv) > 2:
+        if not _authorize_response_cli(cmd, argv[2]):
+            return 1
         return cmd_freeze(argv[2])
     if cmd == "thaw":
+        if not _authorize_response_cli(cmd, argv[2] if len(argv) > 2 else None):
+            return 1
         return cmd_thaw(argv[2] if len(argv) > 2 else None)
     if cmd == "frozen":
         return cmd_frozen()
