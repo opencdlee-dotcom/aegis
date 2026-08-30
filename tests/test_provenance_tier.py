@@ -506,6 +506,44 @@ class FamiliesAreTheAdjudicationSurface(unittest.TestCase):
         self._open(self._kit("alpha"))
         self.assertEqual(aegis.cmd_family("7", "benign-positive"), 2)
         self.assertEqual(aegis.cmd_family("1", "not-a-verdict"), 2)
+        self.assertEqual(aegis.cmd_family("", "benign-positive"), 2)
+        self.assertEqual(aegis.cmd_family("x", "benign-positive"), 2)
+
+    def test_several_families_resolve_against_one_snapshot(self):
+        """The bug this signature exists for. Family numbers are positions in
+        a list recomputed per invocation, so `family 1 ... && family 2 ...` —
+        the obvious thing to type, and the line this tool handed the operator
+        — renumbers between the two commands and the second verdict lands on
+        whatever slid into slot 2. It happened the first time anyone used it.
+        A verdict is a permanent, teaching record, so applying one to the
+        wrong subject is the worst thing this command can do."""
+        for n in ("alpha", "bravo", "charlie"):          # family of three
+            self._open(self._kit(n))
+        lone = self._open(aegis.finding(
+            "HIGH", "behavior", "b", "d", "behavior:bash:solo:" + "a" * 16))
+        bystander = self._open(aegis.finding(
+            "HIGH", "behavior", "b", "d", "behavior:zsh:other:" + "b" * 16))
+        fams = self._families()
+        self.assertEqual([len(rows) for _k, _l, rows in fams], [3, 1, 1])
+        self.assertEqual(aegis.cmd_family("1,2", "benign-positive"), 0)
+        db = aegis._event_connection()
+        closed = {r[0] for r in db.execute(
+            "SELECT incident_id FROM dismissals")}
+        surviving = {r[0] for r in db.execute(
+            "SELECT id FROM incidents WHERE status='OPEN'")}
+        db.close()
+        self.assertIn(lone, closed, "family 2 must be the family 2 that was "
+                                    "listed, not the one that slid into it")
+        self.assertEqual(surviving, {bystander})
+
+    def test_a_repeated_family_number_is_applied_once(self):
+        ids = [self._open(self._kit(n)) for n in ("alpha", "bravo", "charlie")]
+        self.assertEqual(aegis.cmd_family("1,1", "benign-positive"), 0)
+        db = aegis._event_connection()
+        rows = [r[0] for r in db.execute("SELECT incident_id FROM dismissals")]
+        db.close()
+        self.assertEqual(sorted(rows), sorted(ids),
+                         "one dismissal per incident, not two")
 
 
 class AcceptedStateIsDurable(unittest.TestCase):

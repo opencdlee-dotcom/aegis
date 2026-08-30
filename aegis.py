@@ -14076,17 +14076,35 @@ def cmd_families():
     return 0
 
 
-def cmd_family(number, action=None, reason=None):
-    """Apply ONE verdict to every incident in a family.
+def cmd_family(numbers, action=None, reason=None):
+    """Apply ONE verdict to every incident in one or more families.
 
-    Deliberately writes the same rows the per-incident commands write — one
-    dismissal each, through the same transition — so nothing about precision,
-    tolerance counts, or the audit trail differs from having typed them out.
-    The saving is clerical, and the clerical work is what was stopping."""
+    Takes a LIST resolved against a SINGLE snapshot, and that is the whole
+    reason the signature is not `family <n>`. Family numbers are positions in
+    a list recomputed on every invocation, so chaining verdicts —
+    `family 1 ... && family 2 ...`, the obvious thing to type and the exact
+    line this tool handed the operator — renumbers between the two commands
+    and the second verdict lands on whatever slid into that position. It
+    happened on the reference machine the first time anyone used it: family 1
+    was the toolkit, family 2 was meant to be Zotero, and by the time the
+    second command ran, family 2 was an unrelated agent-config incident. A
+    verdict is a permanent, teaching record; silently applying it to the wrong
+    subject is the worst thing this command can do.
+
+    `family 1,2 benign-positive` resolves both against one list, so nothing
+    can shift underneath. Writes the same rows the per-incident commands write
+    — one dismissal each, through the same transition — so precision,
+    tolerance counts and the audit trail are unchanged. The saving is
+    clerical, and the clerical work is what was stopping.
+    """
+    raw = str(numbers if numbers is not None else "").replace(",", " ").split()
     try:
-        n = int(number)
-    except (TypeError, ValueError):
-        print("usage: aegis.py family <n> [benign-positive|false-positive]")
+        wanted = [int(x) for x in raw]
+    except ValueError:
+        wanted = []
+    if not wanted:
+        print("usage: aegis.py family <n[,n...]> "
+              "[benign-positive|false-positive]")
         return 2
     ensure_state()
     init_event_store()
@@ -14095,43 +14113,64 @@ def cmd_family(number, action=None, reason=None):
         families = _incident_families(db)
     finally:
         db.close()
-    if not 1 <= n <= len(families):
-        print("No family %d. Current families: aegis.py families" % n)
+    bad = [n for n in wanted if not 1 <= n <= len(families)]
+    if bad:
+        print("No family %s (there %s %d). Current families: aegis.py families"
+              % (", ".join(str(n) for n in bad),
+                 "is" if len(families) == 1 else "are", len(families)))
         return 2
-    key, label, rows = families[n - 1]
+    seen, chosen = set(), []
+    for n in wanted:
+        if n not in seen:
+            seen.add(n)
+            chosen.append((n, families[n - 1]))
+
     if action is None:
-        print("Family %d — %s\n" % (n, label))
-        for row in rows:
-            print("  #%-4s %-8s %-14s %s" % (row["id"], row["severity"],
-                                             row["status"], row["title"]))
-        print("\nIdentity: %s" % key)
-        print("Verdict:  aegis.py family %d benign-positive" % n)
+        for n, (key, label, rows) in chosen:
+            print("Family %d — %s\n" % (n, label))
+            for row in rows:
+                print("  #%-4s %-8s %-14s %s" % (row["id"], row["severity"],
+                                                 row["status"], row["title"]))
+            print("\nIdentity: %s" % key)
+            print("Verdict:  aegis.py family %d benign-positive\n" % n)
         return 0
+
     verb = str(action).lower()
     if verb not in ("benign-positive", "false-positive"):
-        print("usage: aegis.py family <n> [benign-positive|false-positive]")
+        print("usage: aegis.py family <n[,n...]> "
+              "[benign-positive|false-positive]")
         return 2
-    done, refused = [], []
-    for row in rows:
-        if transition_incident(row["id"], "FALSE_POSITIVE", reason_code=verb):
-            done.append(row["id"])
-        else:
-            refused.append(row["id"])
-    accepted = _accept_into_baseline(done) if verb == "benign-positive" else []
-    print("Family %d — %s" % (n, label))
-    print("  %s recorded on %d incident(s): %s"
-          % (verb, len(done), " ".join("#%s" % i for i in done) or "none"))
+
+    results, all_done = [], []
+    for n, (_key, label, rows) in chosen:
+        done, refused = [], []
+        for row in rows:
+            if transition_incident(row["id"], "FALSE_POSITIVE",
+                                   reason_code=verb):
+                done.append(row["id"])
+            else:
+                refused.append(row["id"])
+        all_done.extend(done)
+        results.append((n, label, done, refused))
+    # One acceptance pass over everything just verdicted: it snapshots live
+    # surfaces, so doing it per family would repeat that work per family.
+    accepted = _accept_into_baseline(all_done) if verb == "benign-positive" \
+        else []
+    for n, label, done, refused in results:
+        print("Family %d — %s" % (n, label))
+        print("  %s recorded on %d incident(s): %s"
+              % (verb, len(done), " ".join("#%s" % i for i in done) or "none"))
+        if refused:
+            print("  refused (not in a dismissable state): %s"
+                  % " ".join("#%s" % i for i in refused))
+        if verb == "benign-positive" and len(done) >= _TOLERANCE_MIN_VERDICTS:
+            print("  this identity now carries %d verdicts — future members "
+                  "open pre-closed" % len(done))
     if accepted:
-        print("  %d item(s) accepted into the baseline — the sensor stops "
+        print("%d item(s) accepted into the baseline — the sensor stops "
               "reporting them (a CHANGE to any of them still alerts)"
               % len(accepted))
-    if refused:
-        print("  refused (not in a dismissable state): %s"
-              % " ".join("#%s" % i for i in refused))
-    if verb == "benign-positive" and len(done) >= _TOLERANCE_MIN_VERDICTS:
-        print("  this identity now carries %d verdicts — future members open "
-              "pre-closed" % len(done))
-    return 0 if done else 1
+    return 0 if all_done else 1
 
 
 def cmd_incidents(show_all=False):
@@ -20890,12 +20929,16 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    so six launchd jobs from one kit read as one fact instead
                    of six problems. Anything that cannot generalize is listed
                    on its own — the view never invents a resemblance
-  family <n> [benign-positive|false-positive]
-                   one verdict for the whole family. Writes exactly the rows
-                   the per-incident commands write (one dismissal each), so
-                   precision and tolerance counts are unchanged; what
-                   collapses is the clerical work. Bare `family <n>` prints
-                   its members and identity without deciding anything
+  family <n[,n...]> [benign-positive|false-positive]
+                   one verdict for a whole family. Takes a LIST, resolved
+                   against a single snapshot: family numbers are positions
+                   that shift as families close, so `family 1 ... && family 2
+                   ...` would apply the second verdict to whatever slid into
+                   slot 2. Say `family 1,2 benign-positive` instead. Writes
+                   exactly the rows the per-incident commands write (one
+                   dismissal each), so precision and tolerance counts are
+                   unchanged; what collapses is the clerical work. Bare
+                   `family <n>` prints members and identity, deciding nothing
   incident <id> [ack|investigate|contain|recover|monitor|resolve|reopen|
                  false-positive|benign-positive]
                    ...the two dismissals are recorded separately and feed
@@ -20931,7 +20974,13 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   signers status   show the pinned roster
   attck [days]     ATT&CK technique coverage: what's wired, what's actually
                    fired on this machine (default 180d). Read-only.
-  baseline         reset the known-good persistence baseline to current state
+  baseline         accept the CURRENT state of every baseline-diffed surface
+                   as known-good: persistence plus shell rc, login items,
+                   browser/IDE extensions, agent skills and the agent config
+                   surface. The bulk answer when a review left many findings
+                   re-asserting that are below the incident threshold and so
+                   have no per-incident verdict to give. Accepts whatever is
+                   there right now, so run it only on a state you trust
   allow <path>     suppress future alerts for findings matching <path>
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
