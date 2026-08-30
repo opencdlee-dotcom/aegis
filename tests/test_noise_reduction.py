@@ -105,7 +105,7 @@ class _DBCase(unittest.TestCase):
               title TEXT, severity TEXT, kind TEXT, status TEXT,
               resolution TEXT, created_at INT, updated_at INT,
               next_reminder_at INT, reminder_count INT DEFAULT 0,
-              last_notified_at INT, subject_json TEXT);
+              last_notified_at INT, subject_json TEXT, last_novel_at INT);
             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE events(id INTEGER PRIMARY KEY, occurred_at INT,
               observed_at INT, source TEXT, event_type TEXT, signal_id INT,
@@ -118,12 +118,20 @@ class _DBCase(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _inc(self, ident, sev="HIGH", kind="signal", status="OPEN", age_days=0,
-             key=None):
+             key=None, novel_days=None, reminders=None):
+        """`novel_days` is how long ago this incident last said something NEW
+        (default: its whole age), and `reminders` how many times it has been
+        surfaced (default: the full ladder, i.e. the operator has been told)."""
+        at = self.now - age_days * 86400
+        novel = self.now - (age_days if novel_days is None
+                            else novel_days) * 86400
         self.db.execute(
             "INSERT INTO incidents(correlation_key,title,severity,kind,status,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (key or ("signal:" + ident), ident, sev, kind, status,
-             self.now - age_days * 86400, self.now - age_days * 86400))
+            "created_at,updated_at,last_novel_at,reminder_count) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (key or ("signal:" + ident), ident, sev, kind, status, at, at,
+             novel, len(aegis._REMINDER_DELAYS) if reminders is None
+             else reminders))
         return self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def _status(self, i):
@@ -163,6 +171,50 @@ class IncidentsAgeOut(_DBCase):
             i = self._inc(p + "tripped", age_days=999)
             aegis._age_out_incidents(self.db, self.now)
             self.assertEqual(self._status(i), "OPEN", p)
+
+    def test_evidence_that_only_repeats_itself_does_not_buy_a_reprieve(self):
+        """The fix. A condition that is CONTINUOUSLY true re-emits the same
+        evidence on every scan, so keying age-out on updated_at made it
+        unreachable: on the reference machine all 27 open incidents had
+        refreshed updated_at on the final scan, one of them across 2,122
+        events over 17 days, and none could ever be retired. Recurrence is
+        not news."""
+        i = self._inc("persistence:new:/L/x.plist", age_days=30)
+        self.db.execute("UPDATE incidents SET updated_at=? WHERE id=?",
+                        (self.now, i))          # re-seen this very scan
+        self.assertEqual(aegis._age_out_incidents(self.db, self.now), 1)
+        self.assertEqual(self._status(i), "FALSE_POSITIVE")
+
+    def test_a_new_fingerprint_resets_the_clock(self):
+        """The safety half: an old incident that says something it has never
+        said before is live, however long it has been open."""
+        i = self._inc("persistence:new:/L/x.plist", age_days=30, novel_days=1)
+        self.assertEqual(aegis._age_out_incidents(self.db, self.now), 0)
+        self.assertEqual(self._status(i), "OPEN")
+
+    def test_nothing_is_retired_before_the_operator_was_told(self):
+        """Age-out closes what the operator has ignored, which requires that
+        they were asked. Exercised at a window SHORTER than the reminder
+        ladder, which is the only place the clause can bind — at the shipped
+        7d it never does, because a 7d-quiet incident is necessarily old
+        enough for the ladder to have finished. Pinned so that shortening
+        _AGE_OUT_DAYS cannot silently start retiring un-surfaced incidents."""
+        i = self._inc("process:/bin/x", age_days=2, reminders=1)
+        self.assertEqual(aegis._age_out_incidents(self.db, self.now, days=1), 0)
+        self.assertEqual(self._status(i), "OPEN")
+        self.db.execute("UPDATE incidents SET reminder_count=? WHERE id=?",
+                        (len(aegis._REMINDER_DELAYS), i))
+        self.assertEqual(aegis._age_out_incidents(self.db, self.now, days=1), 1)
+
+    def test_a_stalled_reminder_pump_cannot_make_the_queue_immortal(self):
+        """Reminders are claimed only on a scan that raised no new HIGH, so a
+        machine noisy enough to raise one every scan never advances a
+        reminder_count. Time the ladder should have taken stands in, or the
+        gate would restore the unbounded queue under exactly the load that
+        makes one unbearable."""
+        i = self._inc("process:/bin/x", age_days=30, reminders=0)
+        self.assertEqual(aegis._age_out_incidents(self.db, self.now), 1)
+        self.assertEqual(self._status(i), "FALSE_POSITIVE")
 
     def test_age_out_writes_no_dismissal_row(self):
         """A machine verdict must never feed tolerance or backtest precision."""
@@ -455,10 +507,21 @@ class SubjectIdentityIsStructured(_DBCase):
             self._stored("signal:beacon:garbage-%d" % n,
                          aegis._subject("beacon", "/bin/app", ip=ip, port="443"))
         for n in range(3):
-            self._stored("signal:process:garbage-%d" % n,
-                         aegis._subject("process", "/bin/tool",
-                                        trust=SUSPICIOUS_TRUST,
-                                        content="%064x" % n))
+            i = self._stored("signal:process:garbage-%d" % n,
+                             aegis._subject("process", "/bin/tool",
+                                            trust=SUSPICIOUS_TRUST,
+                                            content="%064x" % n))
+            if n == 0:
+                # Dispute is an ACT, so one of these is explicitly reopened —
+                # otherwise an untriaged row would not be disputed and this
+                # test could not tell a subject-built dispute set from an
+                # empty one.
+                self.db.execute(
+                    "INSERT INTO events(occurred_at,observed_at,source,"
+                    "event_type,incident_id,data_json) VALUES(?,?,?,?,?,?)",
+                    (self.now, self.now, "incident", "incident.lifecycle", i,
+                     aegis.json.dumps({"from": "FALSE_POSITIVE",
+                                       "to": "OPEN"})))
         saved = (aegis._beacon_endpoint_classes, aegis._tolerance_identity)
 
         def boom(_fp):

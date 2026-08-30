@@ -2305,7 +2305,8 @@ _EVENT_SCHEMA_SQL = """
             next_reminder_at INTEGER,
             last_notified_at INTEGER,
             resolution TEXT,
-            subject_json TEXT
+            subject_json TEXT,
+            last_novel_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_incidents_active
             ON incidents(status, next_reminder_at);
@@ -2364,6 +2365,15 @@ def _event_connection():
     cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
     if "subject_json" not in cols:
         db.execute("ALTER TABLE incidents ADD COLUMN subject_json TEXT")
+    if "last_novel_at" not in cols:
+        db.execute("ALTER TABLE incidents ADD COLUMN last_novel_at INTEGER")
+        # Backfill from creation, not from updated_at: an existing row's
+        # updated_at is the last time it REPEATED itself, which is exactly the
+        # clock this column exists to stop trusting. Seeding it with
+        # created_at means a long-running incident that has said nothing new
+        # is eligible immediately, which is the correct verdict on it.
+        db.execute("UPDATE incidents SET last_novel_at=created_at "
+                   "WHERE last_novel_at IS NULL")
     db.commit()
     try:
         os.chmod(EVENT_DB, 0o600)
@@ -2469,6 +2479,30 @@ def _incident_fingerprints(db, incident_id):
     return fps
 
 
+def _mark_novelty(db, incident_id, event_ids, now):
+    """Advance an incident's novelty clock when the incoming evidence carries
+    a fingerprint it has never held before.
+
+    The distinction this draws is the whole of the age-out fix. `updated_at`
+    answers "when did this incident last receive evidence", and for anything
+    whose condition is CONTINUOUSLY true — a launchd job that still exists, a
+    config file still being written — that is every scan, forever. Age-out
+    keyed on it could therefore only ever retire incidents that had already
+    gone quiet, which are the ones not bothering anybody. On the reference
+    machine the entire open queue re-touched updated_at on the final scan, one
+    of them carrying 2,122 evidence events over 17 days, so nothing in it was
+    reachable. `last_novel_at` answers "when did this incident last tell me
+    something I did not already know", which is what the age-out resolution
+    string has always claimed to measure."""
+    if not event_ids:
+        return
+    incoming = _event_fingerprints(db, event_ids)
+    if incoming and not incoming.issubset(
+            _incident_fingerprints(db, incident_id)):
+        db.execute("UPDATE incidents SET last_novel_at=? WHERE id=?",
+                   (now, incident_id))
+
+
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                      initially_notified=False, subject=None):
     subject_json = json.dumps(subject, sort_keys=True) if subject else None
@@ -2489,6 +2523,7 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                    "updated_at=?, subject_json=COALESCE(subject_json,?) "
                    "WHERE id=?",
                    (new_sev, new_status, now, now, subject_json, incident_id))
+        _mark_novelty(db, incident_id, event_ids, now)
     else:
         # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
         # a permanent mute on the whole entity. Keep genuinely-recurring evidence
@@ -2517,15 +2552,17 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
             incident_id = reviewed["id"]
             db.execute("UPDATE incidents SET last_seen=?,updated_at=? WHERE id=?",
                        (now, now, incident_id))
+            _mark_novelty(db, incident_id, event_ids, now)
         else:
             last_notified = now if initially_notified else None
             cur = db.execute(
                 "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
                 "created_at,first_seen,last_seen,updated_at,reminder_count,"
-                "next_reminder_at,last_notified_at,subject_json) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "next_reminder_at,last_notified_at,subject_json,"
+                "last_novel_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-                 now + _REMINDER_DELAYS[0], last_notified, subject_json))
+                 now + _REMINDER_DELAYS[0], last_notified, subject_json, now))
             incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
@@ -2892,7 +2929,9 @@ def _subject_identity(sub):
         return None
     generalizes = bool(sub.get("content")) or path != sub.get("raw_path")
     if kind == "persistence" and generalizes:
-        return "persistence:changed:%s" % path
+        # A subject written before persistence:new declared one describes a
+        # CHANGED item, so an absent `op` must keep rendering exactly that.
+        return "persistence:%s:%s" % (sub.get("op") or "changed", path)
     if kind == "process" and generalizes:
         return "process:%s:%s" % (path, sub.get("trust") or "")
     return None
@@ -2917,6 +2956,57 @@ def _subject_endpoint_classes(sub):
         return []
     return [("beacon:%s:#ip:%s" % (path, port), ip),
             ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
+
+
+_PRODUCER_MIN_SIBLINGS = 3
+
+
+def _producer_class(sub):
+    """The producer class a NEW persistence item could be tolerated under, or
+    None. A producer is (launcher bytes, payload path, trust class): the same
+    binary running the same script is one installed toolkit registering
+    another job, which is what a scheduler kit, a language runtime's service
+    manager, or a backup vendor does every time it grows a task.
+
+    Why this is narrow enough to be safe. The class names the launcher by its
+    SHA, not its path, so a swapped binary is a different producer. It names
+    the payload the launcher actually runs — which only exists because
+    _script_target now sees through a runner subcommand — so `uv` alone
+    generalizes nothing; a second aikit-shaped kit under a different script is
+    unrelated. And it carries the trust class, so an adhoc sibling never
+    inherits a signed one's verdicts. To abuse it an attacker must already be
+    able to write the reviewed payload, at which point they own the jobs the
+    operator approved and the tolerance grants them nothing new.
+
+    Only `new` generalizes. An EXISTING job mutating is a different fact and
+    keeps its own identity, which is the fact a payload swap presents as.
+    """
+    if not isinstance(sub, dict) or sub.get("kind") != "persistence":
+        return None
+    if (sub.get("op") or "changed") != "new":
+        return None
+    prog_sha, target = sub.get("program_sha"), sub.get("target")
+    if not prog_sha or not target:
+        return None
+    return "persistence:#producer:%s:%s:%s" % (
+        prog_sha, _program_subject(target), sub.get("trust") or "")
+
+
+def _subject_producer_classes(sub):
+    """[(class, observation)] for a subject, breadth evidenced by DISTINCT
+    persistence paths — the same shape the endpoint classes use. There is
+    deliberately no fingerprint fallback: the old string carries the launcher
+    hash but never the payload, so a producer cannot be recovered from a row
+    that predates subjects. Those rows acquire one from their next evidence
+    (_upsert_incident COALESCEs it in) and join the memory then."""
+    klass = _producer_class(sub)
+    path = sub.get("path") if isinstance(sub, dict) else None
+    return [(klass, path)] if klass and path else []
+
+
+def _finding_producer_classes(f):
+    sub = f.get("subject")
+    return _subject_producer_classes(sub) if sub else []
 
 
 def _finding_identity(f):
@@ -2989,6 +3079,45 @@ def _rotating_endpoint_memory(db, now):
     return memory
 
 
+def _producer_memory(db, now):
+    """{producer_class: (verdicts, max_reviewed_sev)} for producers the
+    operator has dismissed benign-positive across enough DISTINCT persistence
+    paths. Breadth over distinct paths is the evidence, exactly as distinct
+    endpoints are for rotation: three dismissals of the SAME job teach nothing
+    here, because the exact-key reattach already covers that."""
+    memory = {}
+    try:
+        rows = db.execute(
+            "SELECT d.incident_id, d.correlation_key, i.severity, "
+            "i.subject_json "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+            "AND d.correlation_key LIKE 'signal:persistence:%'",
+            (now - _TOLERANCE_WINDOW,)).fetchall()
+    except Exception:
+        return memory
+    seen = {}
+    for row in rows:
+        raw = row["subject_json"] if "subject_json" in row.keys() else None
+        if not raw:
+            continue
+        try:
+            sub = json.loads(raw)
+        except Exception:
+            continue
+        for klass, observed in _subject_producer_classes(sub):
+            bucket = seen.setdefault(klass, {"obs": set(), "inc": set(),
+                                             "sev": -1})
+            bucket["obs"].add(observed)
+            bucket["inc"].add(row["incident_id"])
+            bucket["sev"] = max(bucket["sev"],
+                                SEV_ORDER.get(row["severity"], -1))
+    for klass, bucket in seen.items():
+        if len(bucket["obs"]) >= _PRODUCER_MIN_SIBLINGS:
+            memory[klass] = (len(bucket["inc"]), bucket["sev"])
+    return memory
+
+
 def _tolerance_memory(db, now):
     """{identity: (distinct_verdicts, max_reviewed_sev_order)} from the
     operator's own benign-positive dismissals of signal incidents inside the
@@ -3020,20 +3149,46 @@ def _tolerance_memory(db, now):
 
 
 def _disputed_identities(db):
-    """Identities with ANY incident currently in an active state. An operator
-    who reopened (or has not yet triaged) an incident on an identity is in
-    dispute with tolerance for it, so tolerance stands down there."""
+    """Identities the operator is actually in dispute with, so tolerance
+    stands down there.
+
+    This used to mean "any active incident", with the docstring reading
+    "reopened (or has not yet triaged)" — and that parenthesis was the bug.
+    It reads an operator's silence as an objection. On this machine every
+    identity that was noisy enough to matter therefore sat permanently
+    disputed by its own untriaged backlog: Zotero's open beacons kept the
+    endpoint class suppressed, so verdicts on that class could never take
+    effect and the queue kept growing the evidence of its own deadlock.
+    Tolerance could only ever engage where it was not needed.
+
+    A dispute is an ACT: a status the operator moved the incident to, or an
+    explicit `reopen` (to=OPEN from a closed state — the documented way to
+    revoke tolerance, and still fully honoured). An OPEN incident nobody has
+    touched is a backlog item, not an objection."""
     idents = set()
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    reopened = {r["incident_id"] for r in db.execute(
+        "SELECT DISTINCT incident_id FROM events WHERE "
+        "event_type='incident.lifecycle' AND incident_id IS NOT NULL AND "
+        "data_json LIKE '%\"to\": \"OPEN\"%'")}
     for row in db.execute(
-            "SELECT correlation_key, subject_json FROM incidents "
+            "SELECT id, status, correlation_key, subject_json FROM incidents "
             "WHERE status IN (%s) AND correlation_key LIKE 'signal:%%'" % marks,
             _ACTIVE_INCIDENT_STATES):
+        if row["status"] == "OPEN" and row["id"] not in reopened:
+            continue
         ident, classes = _incident_identity(row)
         if ident:
             idents.add(ident)
         for klass, _observed in classes:
             idents.add(klass)
+        raw = row["subject_json"] if "subject_json" in row.keys() else None
+        if raw:
+            try:
+                for klass, _obs in _subject_producer_classes(json.loads(raw)):
+                    idents.add(klass)
+            except Exception:
+                pass
     return idents
 
 
@@ -3155,9 +3310,10 @@ def _suppression_memory(db, now):
     per scan: (tolerance, rotating, disputed, learning)."""
     tolerance = _tolerance_memory(db, now)
     rotating = _rotating_endpoint_memory(db, now)
-    disputed = _disputed_identities(db) if (tolerance or rotating) \
+    producer = _producer_memory(db, now)
+    disputed = _disputed_identities(db) if (tolerance or rotating or producer) \
         else frozenset()
-    return tolerance, rotating, disputed, _in_learning_period(now)
+    return tolerance, rotating, disputed, _in_learning_period(now), producer
 
 
 def _signal_decision(f, memory):
@@ -3168,7 +3324,8 @@ def _signal_decision(f, memory):
     never above the severity the operator actually reviewed."""
     if not memory:
         return None, 0
-    tolerance, rotating, disputed, learning = memory
+    tolerance, rotating, disputed, learning = memory[:4]
+    producer = memory[4] if len(memory) > 4 else {}
     sev = SEV_ORDER.get(f.get("severity"), -1)
     if sev >= SEV_ORDER["CRITICAL"]:
         return None, 0
@@ -3184,6 +3341,9 @@ def _signal_decision(f, memory):
         if rotating:
             for klass, _observed in _finding_endpoint_classes(f):
                 candidates.append((klass, rotating))
+        if producer:
+            for klass, _observed in _finding_producer_classes(f):
+                candidates.append((klass, producer))
         for ident, mem in candidates:
             if ident in disputed:
                 continue
@@ -3397,8 +3557,37 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         "AND observed_at>=?", (now - 1800,)).fetchall()
     observations = [(row["id"], row["observed_at"],
                      json.loads(row["data_json"])) for row in rows]
+    # A fact the operator has already blessed must not be able to MANUFACTURE
+    # a CRITICAL. Chains are built from events and so were blind to the
+    # routing gate: on the reference machine the six launchd jobs of one
+    # reviewed scheduler kit correlated with their own scheduled execution
+    # into a permanent CRITICAL "Persistence followed by execution", which is
+    # what every legitimate scheduled task looks like — and because chains are
+    # never tolerated and never aged out, that banner could not clear and
+    # would re-form for every job the kit ever adds.
+    #
+    # Deliberately narrow: quieted events are removed from the TRIGGER set
+    # only, not from `observations`. They still serve as the other leg, so a
+    # genuinely new process executing from a tolerated persistence item still
+    # chains at CRITICAL. Only the case where the sole new thing is one the
+    # operator already reviewed stops firing. `learning` is NOT quieted here —
+    # the learning period's documented promise is that CRITICAL chains alert
+    # throughout it.
+    memory = None
+    quieted = set()
+    for event_id, f in new_events:
+        verdict = (routing or {}).get(f.get("fingerprint"))
+        if verdict is None:
+            if memory is None:
+                memory = _suppression_memory(db, now)
+            decision = _signal_decision(f, memory)[0]
+        else:
+            decision = verdict["decision"]
+        if decision in ("tolerated", "allowlisted"):
+            quieted.add(event_id)
     new_ids = {event_id for event_id, f in new_events
-               if f.get("category") not in suppressed_categories}
+               if f.get("category") not in suppressed_categories
+               and event_id not in quieted}
     attached = set()
 
     def correlate(base_key, title, left_pred, right_pred, window=900):
@@ -3490,8 +3679,8 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # what tolerance has no verdict for, and an allowlisted fingerprint closes
     # as allowlisted. The decision comes from the same gate that routed the
     # notification (route_findings); a caller without a routing decides here
-    # with the same function over the same memory.
-    memory = None
+    # with the same function over the same memory (already built above when
+    # any finding needed it).
     for event_id, f in new_events:
         if f.get("category") in suppressed_categories or event_id in attached \
                 or SEV_ORDER.get(f.get("severity"), -1) \
@@ -3607,12 +3796,27 @@ def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
     so the whole surface gets ignored. That is a worse failure than a missed
     alert, because it is silent and it applies to every future alert too.
 
-    An incident whose evidence stopped is a description of the past. It is
-    closed as ambient — retained in full under `incidents all`, reopenable, and
-    counted in the report's ambient line so the closure is visible rather than a
-    disappearance. Evidence RESUMING re-opens it through the ordinary reattach
-    path, which is what makes this safe: age-out forgets a quiet thing, and the
-    thing stops being quiet the moment it acts again.
+    An incident that has stopped SAYING anything new is a description of the
+    past. It is closed as ambient — retained in full under `incidents all`,
+    reopenable, and counted in the report's ambient line so the closure is
+    visible rather than a disappearance. NEW evidence re-opens it through the
+    ordinary reattach path, which is what makes this safe: age-out forgets a
+    thing that has run out of news, and it stops being old news the moment it
+    does something it has not done before.
+
+    Novelty, not mere evidence, is the clock — see _mark_novelty. Keying on
+    updated_at meant a permanently-true condition refreshed its own reprieve
+    on every scan, so this function could only reach incidents that had
+    already gone silent by themselves. It is additionally gated on the
+    operator having been TOLD: an incident ages out only once its reminder
+    ladder is exhausted, so nothing is ever quietly retired before it was
+    surfaced the full three times — OR once enough time has passed that the
+    ladder should have finished. That second clause is not belt-and-braces:
+    reminders are claimed only on a scan that raised no new HIGH
+    (`[] if new_high else claim_due_incident_reminders()`), so a machine noisy
+    enough to raise one every scan would never advance a reminder_count, and
+    an exhaustion-only gate would make its queue immortal — reinventing, under
+    load, the exact failure this tier exists to remove.
 
     Writes NO dismissals row. A machine verdict must never feed backtest
     precision or acquired tolerance — the same discipline _auto_tolerate holds.
@@ -3621,8 +3825,11 @@ def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
     marks = ",".join("?" for _ in _AGE_OUT_KINDS)
     rows = db.execute(
         "SELECT id,correlation_key FROM incidents WHERE status='OPEN' "
-        "AND kind IN (%s) AND severity<>'CRITICAL' AND updated_at<?" % marks,
-        _AGE_OUT_KINDS + (cutoff,)).fetchall()
+        "AND kind IN (%s) AND severity<>'CRITICAL' "
+        "AND COALESCE(last_novel_at,created_at)<? "
+        "AND (reminder_count>=? OR created_at<?)" % marks,
+        _AGE_OUT_KINDS + (cutoff, len(_REMINDER_DELAYS),
+                          now - _REMINDER_DELAYS[-1] - 86400)).fetchall()
     aged = []
     for row in rows:
         key = row["correlation_key"] or ""
@@ -3637,8 +3844,9 @@ def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
         "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
         "updated_at=?,next_reminder_at=NULL WHERE id IN (%s) AND status='OPEN'"
         % marks2,
-        ("aged out: no new evidence in %dd (ambient; reopens if it recurs)"
-         % days, now) + tuple(aged))
+        ("aged out: nothing new in %dd after %d reminders (ambient; reopens "
+         "on new evidence)" % (days, len(_REMINDER_DELAYS)), now)
+        + tuple(aged))
     return len(aged)
 
 
@@ -4598,10 +4806,28 @@ def _snapshot_persistence_mac():
 # (bash/python/osascript) driven by a hostile inline script, a piped network
 # fetch, or a script stashed in a dotdir — so the binary's own signature/location
 # says "safe" while the arguments are the payload.
+# Project runners front a payload behind a SUBCOMMAND: `uv run app.py`, not
+# `python3 app.py`. Recognizing them matters twice over. The payload is what
+# actually executes, so without this the script target of every uv/poetry/npx
+# job is None — its bytes are never hashed, and a swapped payload under an
+# unchanged plist is invisible to the CHANGED sensor (the exact substitution
+# _script_target exists to catch, on the launcher that modern Python tooling
+# has made ordinary). It is also what makes two jobs from one toolkit legible
+# as the same producer. Each name maps to the subcommands that precede the
+# payload; an empty tuple means the payload follows the binary directly.
+# POSIX-shaped, like the rest of _script_target: bare basenames (as
+# _INTERPRETERS matches) and absolute '/' payloads only, so it reaches the mac
+# and Linux bodies and is deliberately inert on Windows rather than carrying a
+# half-working .exe path that no test on this body could ever fail.
+_RUNNER_SUBCOMMANDS = {
+    "uv": ("run",), "uvx": (), "poetry": ("run",), "pipx": ("run",),
+    "pdm": ("run",), "rye": ("run",), "hatch": ("run",), "npx": (),
+    "bunx": (), "pnpm": ("exec", "dlx"), "yarn": ("dlx",),
+}
 _INTERPRETERS = frozenset((
     "bash", "sh", "zsh", "dash", "ksh", "env",
     "python", "python2", "python3", "perl", "ruby", "php", "osascript", "node",
-))
+)) | frozenset(_RUNNER_SUBCOMMANDS)
 _INLINE_EXEC_FLAGS = frozenset(("-c", "-e"))
 # Bounded interior run (not `.*?` over re.S): this runs in the check_behavior
 # pre-filter on every same-user process's full argv, so an unbounded lazy scan to
@@ -4688,7 +4914,22 @@ def _script_target(args, program=None):
         return None
     if not _interp_fronted(args, program):
         return None
-    for a in args[1:]:
+    rest = [str(a) for a in args[1:]]
+    # A runner's subcommand sits between the binary and the payload. Consume
+    # only a subcommand this particular runner actually declares, so an
+    # ordinary interpreter's first argument is never skipped: `python3 run
+    # ...` has no payload and must keep returning None.
+    for cand in (program, args[0]):
+        subs = _RUNNER_SUBCOMMANDS.get(os.path.basename(str(cand or "")))
+        if subs is None:
+            continue
+        i = 0
+        while i < len(rest) and rest[i].startswith("-"):
+            i += 1
+        if subs and i < len(rest) and rest[i] in subs:
+            rest = rest[i + 1:]
+        break
+    for a in rest:
         s = str(a)
         if s.startswith("-"):
             continue
@@ -4892,6 +5133,11 @@ def check_persistence(baseline_snap, current_snap):
                 "%s -> %s [%s]" % (rec["label"], rec.get("program") or "?",
                                    rec.get("trust")),
                 "persistence:new:%s:%s" % (path, rec.get("sha256")),
+                subject=_subject(
+                    "persistence", path, op="new", content=rec.get("sha256"),
+                    program_sha=rec.get("sha256"), trust=rec.get("trust"),
+                    target=_script_target(rec.get("args"),
+                                          rec.get("program"))),
                 path=path, program=rec.get("program"), trust=rec.get("trust"),
                 script_target=_script_target(rec.get("args"),
                                              rec.get("program")),
@@ -13447,6 +13693,167 @@ def cmd_report(full=False):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# FAMILIES — the adjudication surface, because a verdict nobody gives teaches
+# nothing.
+#
+# Every suppression mechanism in this file learns from the operator's own
+# `benign-positive` verdicts, and on the reference machine those arrived in
+# three bursts (33, then 70, then 15) and stopped — nine days of silence while
+# the queue rebuilt to 27. That is not neglect, it is arithmetic: adjudicating
+# meant issuing one command per incident, after working out by eye which of
+# them were the same fact. Six launchd jobs from one kit read as six problems.
+# So the learning starved between bursts, which is exactly when it was needed,
+# and every tier built on it shipped inert.
+#
+# A family is a set of active incidents that share an identity THIS FILE
+# ALREADY TRUSTS for tolerance — a producer class, an endpoint class, or a
+# tolerance identity. Nothing new is asserted to be "the same thing": the
+# grouping is the same judgement the tolerance layer makes, surfaced before the
+# verdict instead of after it. An incident sharing none of those stays a
+# singleton, so the view can never lump unrelated things together to look tidy.
+#
+# The verdict is still one human judgement per FACT, and it still writes one
+# dismissals row per incident — byte-identical to issuing the commands by hand,
+# so precision math and tolerance counts are unchanged. What collapses is the
+# clerical work, which is the part that was actually stopping.
+# --------------------------------------------------------------------------- #
+
+def _family_label(key, rows):
+    """A one-line human name for what the operator is being asked about."""
+    paths = []
+    for row in rows:
+        raw = row.get("subject_json")
+        if raw:
+            try:
+                sub = json.loads(raw)
+                paths.append(sub.get("raw_path") or sub.get("path") or "")
+            except Exception:
+                pass
+    paths = [p for p in paths if p]
+    if key.startswith("persistence:#producer:"):
+        bits = key.split(":")
+        return "%d job(s) from one installed toolkit -> %s [%s]" % (
+            len(rows), bits[-2], bits[-1] or "?")
+    if key.startswith("beacon:") and ":#ip:" in key:
+        return "%d endpoint(s) of one program -> %s" % (
+            len(rows), key.split(":#ip:")[0][len("beacon:"):])
+    if paths:
+        common = os.path.dirname(os.path.commonprefix(paths)) or paths[0]
+        return "%d incident(s) on %s" % (len(rows), common)
+    return "%d incident(s) sharing %s" % (len(rows), key)
+
+
+def _incident_families(db):
+    """[(key, label, [rows])] over ACTIVE incidents, widest family first.
+
+    An incident joins the FIRST identity it has, narrowest generalization
+    last: a producer class, then an endpoint class, then its plain tolerance
+    identity. Anything with none of those is its own family keyed on its
+    correlation_key, because a fact that cannot generalize is a fact the
+    operator has to look at on its own terms."""
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    rows = _dict_rows(db.execute(
+        "SELECT * FROM incidents WHERE status IN (%s) "
+        "ORDER BY id" % marks, _ACTIVE_INCIDENT_STATES).fetchall())
+    groups = {}
+    for row in rows:
+        key = None
+        raw = row.get("subject_json")
+        if raw:
+            try:
+                sub = json.loads(raw)
+                producer = _subject_producer_classes(sub)
+                key = producer[0][0] if producer else None
+            except Exception:
+                key = None
+        if key is None:
+            ident, classes = _incident_identity(row)
+            key = classes[0][0] if classes else ident
+        groups.setdefault(key or ("incident:%s" % row["id"]), []).append(row)
+    out = [(k, _family_label(k, v), v) for k, v in groups.items()]
+    out.sort(key=lambda t: (-len(t[2]), t[0]))
+    return out
+
+
+def cmd_families():
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        families = _incident_families(db)
+    finally:
+        db.close()
+    if not families:
+        print("No active incidents.")
+        return 0
+    total = sum(len(rows) for _k, _l, rows in families)
+    print("# Aegis incident families — %d active incident(s), %d decision(s)\n"
+          % (total, len(families)))
+    for n, (_key, label, rows) in enumerate(families, 1):
+        worst = max(rows, key=lambda r: SEV_ORDER.get(r["severity"], -1))
+        ids = " ".join("#%s" % r["id"] for r in rows)
+        print("  [%d] %-8s %s\n      %s" % (n, worst["severity"], label, ids))
+    print("\nOne verdict per family: aegis.py family <n> "
+          "[benign-positive|false-positive]")
+    print("A family is grouped ONLY on an identity acquired tolerance already "
+          "keys on;\nanything that cannot generalize is listed on its own.")
+    return 0
+
+
+def cmd_family(number, action=None, reason=None):
+    """Apply ONE verdict to every incident in a family.
+
+    Deliberately writes the same rows the per-incident commands write — one
+    dismissal each, through the same transition — so nothing about precision,
+    tolerance counts, or the audit trail differs from having typed them out.
+    The saving is clerical, and the clerical work is what was stopping."""
+    try:
+        n = int(number)
+    except (TypeError, ValueError):
+        print("usage: aegis.py family <n> [benign-positive|false-positive]")
+        return 2
+    ensure_state()
+    init_event_store()
+    db = _event_connection()
+    try:
+        families = _incident_families(db)
+    finally:
+        db.close()
+    if not 1 <= n <= len(families):
+        print("No family %d. Current families: aegis.py families" % n)
+        return 2
+    key, label, rows = families[n - 1]
+    if action is None:
+        print("Family %d — %s\n" % (n, label))
+        for row in rows:
+            print("  #%-4s %-8s %-14s %s" % (row["id"], row["severity"],
+                                             row["status"], row["title"]))
+        print("\nIdentity: %s" % key)
+        print("Verdict:  aegis.py family %d benign-positive" % n)
+        return 0
+    verb = str(action).lower()
+    if verb not in ("benign-positive", "false-positive"):
+        print("usage: aegis.py family <n> [benign-positive|false-positive]")
+        return 2
+    done, refused = [], []
+    for row in rows:
+        if transition_incident(row["id"], "FALSE_POSITIVE", reason_code=verb):
+            done.append(row["id"])
+        else:
+            refused.append(row["id"])
+    print("Family %d — %s" % (n, label))
+    print("  %s recorded on %d incident(s): %s"
+          % (verb, len(done), " ".join("#%s" % i for i in done) or "none"))
+    if refused:
+        print("  refused (not in a dismissable state): %s"
+              % " ".join("#%s" % i for i in refused))
+    if verb == "benign-positive" and len(done) >= _TOLERANCE_MIN_VERDICTS:
+        print("  this identity now carries %d verdicts — future members open "
+              "pre-closed" % len(done))
+    return 0 if done else 1
+
+
 def cmd_incidents(show_all=False):
     incidents = list_incidents(active_only=not show_all)
     tolerated = _recent_tolerated_count()
@@ -13468,6 +13875,8 @@ def cmd_incidents(show_all=False):
         print("\n" + _tolerated_footer(tolerated))
     print("\nDetails/actions: aegis.py incident <id> [ack|investigate|contain|"
           "recover|monitor|resolve|false-positive|benign-positive|reopen]")
+    if not show_all:
+        print("One verdict per FACT instead of per row: aegis.py families")
     return 0
 
 
@@ -20191,6 +20600,18 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   status           print hardening, XProtect, sensor coverage, and incidents
   doctor           verify actual coverage/liveness (unknown is never green)
   incidents [all]  list active incidents (or complete history)
+  families         group active incidents into DECISIONS: members of one
+                   family share an identity acquired tolerance already keys
+                   on (a producer, an endpoint class, a tolerance identity),
+                   so six launchd jobs from one kit read as one fact instead
+                   of six problems. Anything that cannot generalize is listed
+                   on its own — the view never invents a resemblance
+  family <n> [benign-positive|false-positive]
+                   one verdict for the whole family. Writes exactly the rows
+                   the per-incident commands write (one dismissal each), so
+                   precision and tolerance counts are unchanged; what
+                   collapses is the clerical work. Bare `family <n>` prints
+                   its members and identity without deciding anything
   incident <id> [ack|investigate|contain|recover|monitor|resolve|reopen|
                  false-positive|benign-positive]
                    ...the two dismissals are recorded separately and feed
@@ -20413,7 +20834,14 @@ def main(argv):
     if cmd == "mark-uninstalled":  # uninstaller-only
         return cmd_mark_uninstalled()
     if cmd == "incidents":
+        if len(argv) > 2 and argv[2] == "families":
+            return cmd_families()
         return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
+    if cmd == "families":
+        return cmd_families()
+    if cmd == "family" and len(argv) > 2:
+        return cmd_family(argv[2], argv[3] if len(argv) > 3 else None,
+                          argv[4] if len(argv) > 4 else None)
     if cmd == "incident" and len(argv) > 2:
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
