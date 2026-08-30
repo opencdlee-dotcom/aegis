@@ -13039,8 +13039,88 @@ def _report_self_check(verdict, new_findings, findings, incidents):
     return problems
 
 
+# A monitor that silently stopped running is the worst failure it has, and it
+# is the one the report could not show: every line described the scan you were
+# reading, so a scan that never happened produced no line at all. The previous
+# scan's heartbeat is already on disk when the report is written, which makes
+# "the schedule is alive" a fact this file can state rather than imply.
+_SCAN_GAP_ALARM = 3 * 3600
+
+
+def _duration(seconds):
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            n = seconds // size
+            return "%d %s%s" % (n, unit, "" if n == 1 else "s")
+    return "%d seconds" % seconds
+
+
+def _liveness_line(prev_scan_at):
+    if not isinstance(prev_scan_at, int) or prev_scan_at <= 0:
+        return ""
+    gap = _epoch() - prev_scan_at
+    if gap > _SCAN_GAP_ALARM:
+        return ("> \u26a0\ufe0f **Watch gap: %s since the previous scan.** "
+                "Anything that happened in between was not observed."
+                % _duration(gap))
+    return "_Watched \u00b7 previous scan %s._" % _ago(prev_scan_at)
+
+
+def _ago(epoch):
+    """'4 minutes ago' for a report a human reads, not an ISO stamp."""
+    try:
+        delta = max(0, _epoch() - int(epoch))
+    except (TypeError, ValueError):
+        return "at an unknown time"
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if delta >= size:
+            n = delta // size
+            return "%d %s%s ago" % (n, unit, "" if n == 1 else "s")
+    return "just now"
+
+
+# A privilege wall the OS imposes is a PERMANENT fact about this machine; a
+# sensor that failed is a transient one; a sensor that did not run at all is
+# neither, and is the dangerous case — its last verdict is not evidence about
+# this scan. Splitting them is what lets the report repeat itself less without
+# saying less.
+_PERMANENT_COVERAGE = ("PRIVILEGED",)
+
+
+def _coverage_split(sensor_health):
+    """(live_ok, stale, permanent, degraded) over the stored sensor rows.
+
+    `stale` is the one that changes an answer rather than a wording. Health is
+    stored per sensor and read back whole, so a sensor that stops running
+    keeps its last row forever — and a sensor that stopped while OK therefore
+    kept counting toward "38/40 sensors OK" indefinitely. That is silent
+    coverage loss presented as green, which is the failure `doctor`'s "unknown
+    is never green" rule exists to prevent and which the report — the thing
+    the operator actually reads — did not apply. A row older than the newest
+    one in the same batch did not run this scan and is counted as unknown.
+    """
+    rows = list(sensor_health or [])
+    if not rows:
+        return [], [], [], []
+    runs = [r.get("last_run_at") for r in rows
+            if isinstance(r.get("last_run_at"), int)]
+    newest = max(runs) if runs else None
+    live, stale, permanent, degraded = [], [], [], []
+    for row in rows:
+        at = row.get("last_run_at")
+        if newest is not None and isinstance(at, int) and at < newest:
+            stale.append(row)
+        elif row.get("status") in _PERMANENT_COVERAGE:
+            permanent.append(row)
+        elif row.get("status") != "OK":
+            degraded.append(row)
+        else:
+            live.append(row)
+    return live, stale, permanent, degraded
+
+
 def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
-                  learning_days, aged, quiet=0):
+                  learning_days, aged, quiet=0, prev_scan_at=None):
     """The one-line-verdict report. Detail lives behind `report --full`."""
     counts = {}
     for f in findings:
@@ -13066,7 +13146,7 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
         verdict = "minor"
     else:
         verdict = "clear"
-    degraded = [h for h in (sensor_health or []) if h.get("status") != "OK"]
+    live, stale, permanent, degraded = _coverage_split(sensor_health)
     total_sensors = len(sensor_health or [])
 
     lines = ["# Aegis — %s" % now_iso(), ""]
@@ -13097,14 +13177,27 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
     if crit:
         ctx.append("**%d CRITICAL**" % len(crit))
     if total_sensors:
-        ctx.append("%d/%d sensors OK" % (total_sensors - len(degraded),
-                                         total_sensors))
+        ctx.append("%d/%d sensors OK" % (len(live), total_sensors))
+    if permanent:
+        # Named here rather than re-explained below: an OS privilege wall is a
+        # permanent fact about this machine, so the operator needs to know it
+        # is still there and WHICH surface it costs, not to re-read the same
+        # paragraph every hour for months.
+        ctx.append("%d permanent gap%s (%s)" % (
+            len(permanent), "" if len(permanent) == 1 else "s",
+            ", ".join(sorted(h.get("sensor_id") or "?" for h in permanent))))
+    if stale:
+        ctx.append("**%d sensor%s did not run**" % (
+            len(stale), "" if len(stale) == 1 else "s"))
     if aged:
         ctx.append("%d aged out as ambient" % aged)
     if quiet:
         ctx.append("%d new but auto-closed (tolerated/learning/allowlisted)"
                    % quiet)
     lines += ["- " + " · ".join(ctx), ""]
+    beat = _liveness_line(prev_scan_at)
+    if beat:
+        lines += [beat, ""]
 
     if first_run:
         lines += ["> First run: baseline established. Persistence items are "
@@ -13128,12 +13221,21 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
                 i.get("title"), i.get("status"), i.get("evidence_count", 0),
                 "" if i.get("evidence_count") == 1 else "s"))
         lines.append("")
-    if degraded:
+    if degraded or stale:
+        # Only what CHANGED or is unknown. A permanent privilege wall is real
+        # and stays counted in the line above, but re-explaining it every hour
+        # for months is what teaches the reader to skip this section — and
+        # then the transient failure that matters gets skipped with it.
         lines.append("## Coverage health")
         for h in degraded:
             lines.append("- **%s: %s** — %s" % (
                 h.get("sensor_id"), h.get("status"),
                 h.get("detail") or "coverage unavailable"))
+        for h in stale:
+            lines.append("- **%s: DID NOT RUN** — last reported %s; its "
+                         "coverage this scan is unknown, not clean"
+                         % (h.get("sensor_id"),
+                            _ago(h.get("last_run_at"))))
         lines.append("")
 
     problems = _report_self_check(verdict, new_findings, findings, incidents)
@@ -13195,7 +13297,7 @@ def _full_report(payload):
 
 
 def write_report(findings, first_run, incidents=None, sensor_health=None,
-                 prior_seen=None, aged=0, routing=None):
+                 prior_seen=None, aged=0, routing=None, prev_scan_at=None):
     """Write the brief report to latest.md and the full payload to latest.json.
 
     The report this replaced opened with ninety red bullets and ran 208 lines,
@@ -13221,7 +13323,8 @@ def write_report(findings, first_run, incidents=None, sensor_health=None,
     until = _learning_until()
     learning_days = max(0, (until - now + 86399) // 86400) if until > now else 0
     md = _brief_report(findings, new_findings, incidents, sensor_health,
-                       first_run, learning_days, aged, quiet=quiet)
+                       first_run, learning_days, aged, quiet=quiet,
+                       prev_scan_at=prev_scan_at)
     with open(LATEST_MD, "w", encoding="utf-8") as f:
         f.write(md)
     save_json(LATEST_JSON, {"ts": now_iso(), "findings": findings,
@@ -13442,27 +13545,40 @@ def _cmd_scan_locked(quiet=False):
     # after gather_all's sort.
     findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["category"]))
 
+    # Reported on EVERY scan, not only on the bad ones. Emitting health only
+    # on failure leaves the stored row pinned to that failure forever: on the
+    # reference machine process.enumerate failed once, on 2026-08-26, and the
+    # report then told the operator "the process table could not be read this
+    # scan" every hour for three days while it was reading fine. A coverage
+    # section that is wrong on most scans is one the reader learns to skip,
+    # which costs the coverage warnings that are real.
     if _PROC_ENUM_FAILED:
         health.append({
             "sensor_id": "process.enumerate", "status": "DEGRADED",
             "detail": "the process table could not be read this scan; no "
                       "process or behavioural finding below is complete",
             "duration_ms": 0, "item_count": 0})
-    elif _PROC_ARGV_PARTIAL:
+        # argv is deliberately left unreported here rather than called OK: if
+        # the table could not be read at all, its completeness is unknown, and
+        # the staleness rule below is what stops last scan's verdict standing
+        # in for one nobody took.
+    else:
+        health.append({"sensor_id": "process.enumerate", "status": "OK",
+                       "detail": "", "duration_ms": 0, "item_count": 0})
         health.append({
-            "sensor_id": "process.argv", "status": "DEGRADED",
-            "detail": "the executable table was read, but macOS full argv "
-                      "enumeration failed; behavioral findings are incomplete",
+            "sensor_id": "process.argv",
+            "status": "DEGRADED" if _PROC_ARGV_PARTIAL else "OK",
+            "detail": ("the executable table was read, but macOS full argv "
+                       "enumeration failed; behavioral findings are "
+                       "incomplete") if _PROC_ARGV_PARTIAL else "",
             "duration_ms": 0, "item_count": 0})
-
-    if _SIG_PROBE_FAILURES:
-        # Never silent: an operator reading a clean report must be able to tell
-        # "nothing suspicious" from "I could not check N of them".
-        health.append({
-            "sensor_id": "signature.classify", "status": "DEGRADED",
-            "detail": "%d signature probe(s) returned no verdict; those "
-                      "binaries were NOT vouched for" % _SIG_PROBE_FAILURES,
-            "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
+    health.append({
+        "sensor_id": "signature.classify",
+        "status": "DEGRADED" if _SIG_PROBE_FAILURES else "OK",
+        "detail": ("%d signature probe(s) returned no verdict; those binaries "
+                   "were NOT vouched for" % _SIG_PROBE_FAILURES)
+        if _SIG_PROBE_FAILURES else "",
+        "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
 
     # Captured BEFORE emit, which is what updates the ledger: this is the set
     # the previous scan had already reported, and the difference against it is
@@ -13501,9 +13617,13 @@ def _cmd_scan_locked(quiet=False):
         # but the failure is durable and visible rather than silently "clean".
         log_run("event-store failure: %s" % e)
         incidents, persisted_health = [], health
+    # The heartbeat is written AFTER the report, so what is on disk now is the
+    # PREVIOUS scan's — which is exactly the liveness fact the report needs and
+    # costs no new state to obtain.
     md = write_report(findings, first_run, incidents=incidents,
                       sensor_health=persisted_health, prior_seen=prior_seen,
-                      aged=_LAST_AGED_OUT, routing=routing)
+                      aged=_LAST_AGED_OUT, routing=routing,
+                      prev_scan_at=read_heartbeat().get("epoch"))
     flush_sigcache()
     record_selfstate()
     # Extend the tamper-evidence chain AFTER state is settled, so the link
