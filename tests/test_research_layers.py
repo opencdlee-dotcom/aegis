@@ -198,18 +198,36 @@ class TestProvenance(Sandbox):
         self._quarantine_db("UUID-1", "https://x.example/a")
         self.assertIsNone(aegis._origin_from_quarantine_db("NOPE"))
 
-    def test_chrome_downloads_table_is_a_second_origin_source(self):
-        hist = os.path.join(self.tmp, "chrome-history")
+    def _chrome_profile(self, profile, target, url):
+        """A History DB at the real on-disk shape: <root>/<profile>/History."""
+        root = os.path.join(self.tmp, "Chrome")
+        d = os.path.join(root, profile)
+        os.makedirs(d, exist_ok=True)
+        hist = os.path.join(d, "History")
         con = sqlite3.connect(hist)
         con.execute("CREATE TABLE downloads(target_path TEXT, tab_url TEXT, "
                     "start_time INTEGER)")
-        con.execute("INSERT INTO downloads VALUES(?,?,?)",
-                    ("/tmp/dropped.bin", "https://lure.example/fake-update", 1))
+        con.execute("INSERT INTO downloads VALUES(?,?,?)", (target, url, 1))
         con.commit()
         con.close()
-        aegis._CHROME_HISTORY_DBS = [hist]
+        aegis._CHROME_ROOTS = [root]
+        return hist
+
+    def test_chrome_downloads_table_is_a_second_origin_source(self):
+        self._chrome_profile("Default", "/tmp/dropped.bin",
+                             "https://lure.example/fake-update")
         self.assertEqual(aegis._origin_from_chrome_history("/tmp/dropped.bin"),
                          "https://lure.example/fake-update")
+
+    def test_a_non_default_profile_is_reached_too(self):
+        # The regression: hardcoding Default/History reached 1 of this Mac's
+        # 15 profiles, so 1,479 download rows were invisible and provenance
+        # returned None -- which reads as "no known origin" and keeps a
+        # hot-dir finding loud.
+        self._chrome_profile("Profile 7", "/tmp/dropped.bin",
+                             "https://lure.example/from-profile-7")
+        self.assertEqual(aegis._origin_from_chrome_history("/tmp/dropped.bin"),
+                         "https://lure.example/from-profile-7")
 
     def test_trusted_origin_hosts_recognized(self):
         self.assertEqual(aegis._origin_host("https://objects.githubusercontent.com/x"),

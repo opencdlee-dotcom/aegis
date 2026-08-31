@@ -1580,13 +1580,42 @@ _QUARANTINE_EVENTS_DB = os.path.join(
 # Safari): their `downloads` table (target_path, tab_url) is a second FDA-free
 # origin source, useful when the QuarantineEventsV2 row was pruned or the file
 # carries no quarantine xattr (curl/AirDrop side-load).
-_CHROME_HISTORY_DBS = [os.path.join(HOME, p) for p in (
-    "Library/Application Support/Google/Chrome/Default/History",
-    "Library/Application Support/BraveSoftware/Brave-Browser/Default/History",
-    "Library/Application Support/Microsoft Edge/Default/History",
-    "Library/Application Support/Chromium/Default/History",
-    "Library/Application Support/Vivaldi/Default/History",
+_CHROME_ROOTS = [os.path.join(HOME, p) for p in (
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/BraveSoftware/Brave-Browser",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/Vivaldi",
 )]
+
+
+def _chrome_history_dbs():
+    """Every readable Chrome-family History DB — one per PROFILE, not just
+    `Default`.
+
+    Hardcoding `Default/History` reached exactly one profile. Measured on the
+    reference machine 2026-08-30: Chrome held 15 numbered profiles with 1,479
+    download rows between them and NONE were reachable. For the ~45% of
+    ~/Downloads items carrying no quarantine xattr this was the only remaining
+    provenance path, so it silently returned None for the life of the install
+    — a miss that looks exactly like "this file has no known origin", which is
+    the input that keeps a hot-dir finding loud.
+
+    `_chromium_exts` already walks these same roots per profile; this is an
+    internal-consistency fix, not a new capability. Resolved per call rather
+    than at import: a profile created after the module loaded is precisely the
+    case a long-lived `watch` process still has to see."""
+    dbs = []
+    for root in _CHROME_ROOTS:
+        try:
+            profiles = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for prof in profiles:
+            db = os.path.join(root, prof, "History")
+            if os.path.isfile(db):
+                dbs.append(db)
+    return dbs
 
 # Origin hosts we trust enough to DOWN-grade (never to suppress) a fresh-unsigned
 # hot-dir drop: a binary a developer knowingly pulled from these is far likelier
@@ -1657,7 +1686,7 @@ def _origin_from_quarantine_db(uuid):
 def _origin_from_chrome_history(path):
     """Look up a downloaded file's source tab_url in any Chrome-family History
     DB by exact target_path. Read-only/immutable; bounded to the newest match."""
-    for hist in _CHROME_HISTORY_DBS:
+    for hist in _chrome_history_dbs():
         db = _sqlite_readonly(hist)
         if db is None:
             continue
@@ -6305,23 +6334,10 @@ def check_xprotect(window_hours=None):
                         hashlib.sha256((msg + ts).encode()).hexdigest()[:16]),
                     module=fam, status=status))
 
-    # (b) Definition freshness — newest bundle mtime across the known locations.
-    newest = None
-    version = None
-    for b in XPROTECT_BUNDLES:
-        try:
-            m = os.path.getmtime(b)
-        except Exception:
-            continue
-        if newest is None or m > newest:
-            newest = m
-            info = os.path.join(b, "Contents", "Info.plist")
-            v, _, vrc = run(["/usr/libexec/PlistBuddy", "-c",
-                             "Print :CFBundleShortVersionString", info], timeout=6)
-            if vrc == 0:
-                version = v.strip()
-    if newest is not None:
-        age_days = (time.time() - newest) / 86400.0
+    # (b) Definition freshness — newest file INSIDE the bundle. The bundle
+    # DIRECTORY's mtime lags the corpus by months; see _xprotect_corpus_age.
+    age_days, version = _xprotect_corpus_age()
+    if age_days is not None:
         if age_days > XPROTECT_STALE_DAYS:
             # Corpus age alone cannot distinguish the two opposite diagnoses:
             # a broken update path (fix Software Update / MDM) vs Apple simply
@@ -6354,6 +6370,56 @@ def check_xprotect(window_hours=None):
 
 
 _XPROTECT_UPDATER_FRESH_DAYS = 14
+
+
+def _xprotect_corpus_age():
+    """(age_days, version) for the freshest XProtect corpus across the known
+    bundle locations, or (None, None) if no bundle is readable.
+
+    Age is the newest mtime of any file INSIDE the bundle, never the bundle
+    DIRECTORY's own mtime. Apple rewrites files under Contents/ in place, so
+    the directory's mtime only moves when an entry is added or removed and can
+    sit months behind the corpus it contains. Measured on the reference
+    machine 2026-08-30: the bundle directory read 93.9 days old while
+    XProtect.yara inside it read 9.3 and `xprotect version` reported the
+    corpus installed 4 days earlier -- so the directory mtime alone produced a
+    hard "definitions are stale" verdict about a corpus that was current.
+
+    One implementation for both callers on purpose. `check_xprotect` and
+    `cmd_status` each carried their own copy of this arithmetic; PR #7 fixed
+    only the first, so `status` printed a failing mark on XProtect on the same
+    screen that reported the xprotect sensor OK.
+
+    Cost: 14 files, ~2ms to walk -- cheaper than the PlistBuddy call beside
+    it, which this now makes ONCE for the winning bundle instead of once per
+    bundle that advanced the maximum."""
+    newest, best = None, None
+    for b in XPROTECT_BUNDLES:
+        local = None
+        for root, _dirs, files in os.walk(b):
+            for name in files:
+                try:
+                    m = os.stat(os.path.join(root, name)).st_mtime
+                except OSError:
+                    continue    # one unreadable entry never voids the bundle
+                if local is None or m > local:
+                    local = m
+        if local is None:
+            try:
+                local = os.path.getmtime(b)   # unreadable/empty: dir is all we have
+            except OSError:
+                continue
+        if newest is None or local > newest:
+            newest, best = local, b
+    if newest is None:
+        return None, None
+    version = None
+    v, _, vrc = run(["/usr/libexec/PlistBuddy", "-c",
+                     "Print :CFBundleShortVersionString",
+                     os.path.join(best, "Contents", "Info.plist")], timeout=6)
+    if vrc == 0:
+        version = v.strip() or None
+    return (time.time() - newest) / 86400.0, version
 
 
 def _xprotect_updater_age_days():
@@ -7285,6 +7351,103 @@ def _check_hardening_windows():
     return findings
 
 
+_SU_PREFS = "/Library/Preferences/com.apple.SoftwareUpdate.plist"
+_SYSTEM_VERSION_PLIST = "/System/Library/CoreServices/SystemVersion.plist"
+_MACOS_PATCH_GAP_DAYS = 30       # offered-but-unapplied this long is a finding
+_MACOS_PATCH_GAP_HIGH_DAYS = 90  # ...this long is worth interrupting for
+
+
+def _version_tuple(text):
+    """'26.6.2' -> (26, 6, 2). A non-numeric segment ENDS the parse rather than
+    raising, so a build string that is not a version compares as whatever came
+    before it and can never be mistaken for something newer."""
+    parts = []
+    for seg in str(text).split("."):
+        if not seg.isdigit():
+            break
+        parts.append(int(seg))
+    return tuple(parts)
+
+
+def _check_macos_patch_gap():
+    """Offered-but-unapplied macOS updates — the patch-gap control.
+
+    `hardening:autoupdate:off` existed only in _check_hardening_linux, so a Mac
+    could sit indefinitely unpatched behind a full screen of green ticks.
+    Written after finding a Mac many months behind on point releases with
+    AutomaticallyInstallMacOSUpdates = 1 set the whole time and silently
+    failing (SUMacControllerErrorCommitStashInvalidState=7749) behind a full
+    screen of green hardening ticks. The setting being ON is not evidence it
+    WORKS, which is the entire reason this reads OUTCOMES — what was offered
+    and never applied — rather than intent. An unpatched OS is the largest
+    exposure on a personal machine and the one no antivirus product closes.
+
+    (Deliberately no measured version/day figures here: this repo is public,
+    and a comment naming a live machine's exact patch lag publishes an
+    exposure window. The mechanism is the reusable part.)
+
+    Reads softwareupdated's OWN durable record of what it offered and when.
+    Deliberately NOT `softwareupdate --list`: that reaches the network on a
+    scan path documented as local-only and blocks for tens of seconds. This is
+    unprivileged, offline, and two plist reads."""
+    try:
+        with open(_SYSTEM_VERSION_PLIST, "rb") as f:
+            running = plistlib.load(f).get("ProductVersion") or ""
+        with open(_SU_PREFS, "rb") as f:
+            offers = plistlib.load(f).get("FirstOfferDateDictionary") or {}
+    except Exception:
+        return []   # no readable record is not evidence of a gap — claim nothing
+    if not running or not isinstance(offers, dict):
+        return []
+    cur = _version_tuple(running)
+    pending, newest, oldest_at = 0, None, None
+    for key, offered_at in offers.items():
+        # `_minor` only, deliberately. A MAJOR upgrade (macOS 27 offered to a
+        # fully-patched 26.6.2) is a choice the operator is entitled to decline
+        # indefinitely; a patch release is not. Counting one would produce a
+        # permanent HIGH on a machine with nothing wrong with it, which is the
+        # exact alert-fatigue failure this tool exists to avoid. If Apple ever
+        # changes the key shape this matches nothing and the check goes silent
+        # — the safe direction to fail, since the loud direction trains the
+        # operator to ignore it.
+        m = re.search(r"_patch_([0-9][0-9.]*)_minor$", str(key))
+        if not m:
+            continue
+        ver = _version_tuple(m.group(1))
+        if not ver or ver <= cur:
+            continue    # already applied, or the build we are running
+        when = getattr(offered_at, "tzinfo", "missing")
+        if when == "missing":
+            continue    # not a plist <date>; unusable as an age
+        offered_at = (offered_at if offered_at.tzinfo
+                      else offered_at.replace(tzinfo=timezone.utc))
+        pending += 1
+        if newest is None or ver > newest[0]:
+            newest = (ver, m.group(1))
+        if oldest_at is None or offered_at < oldest_at:
+            oldest_at = offered_at
+    if not pending or oldest_at is None:
+        return []
+    days = (datetime.now(timezone.utc) - oldest_at).total_seconds() / 86400.0
+    if days < _MACOS_PATCH_GAP_DAYS:
+        return []   # a normal update cadence is not a finding
+    return [finding(
+        "HIGH" if days >= _MACOS_PATCH_GAP_HIGH_DAYS else "MEDIUM",
+        "hardening", "macOS security updates are offered but not installed",
+        "This Mac runs macOS %s. %d later update(s) have been offered and not "
+        "installed; the oldest was offered %.0f days ago%s. Automatic updates "
+        "being switched on is not evidence they are working — open System "
+        "Settings > General > Software Update."
+        % (running, pending, days,
+           (", newest available %s" % newest[1]) if newest else ""),
+        # Keyed on the RUNNING version: one standing fact that ends the moment
+        # the machine is patched, rather than a fresh alert every time Apple
+        # ships another update the operator has also not taken.
+        "hardening:macos:patchgap:%s" % running,
+        running_version=running, pending_updates=pending,
+        oldest_offer_days=round(days))]
+
+
 def _check_hardening_mac():
     findings = []
 
@@ -7345,6 +7508,9 @@ def _check_hardening_mac():
             "com.openssh.sshd present in launchctl list",
             "hardening:ssh:on"))
 
+    # The patch-gap control. Its Linux twin (hardening:autoupdate:off) has
+    # shipped since the first release; the Mac had no equivalent.
+    findings.extend(_check_macos_patch_gap())
     return findings
 
 
@@ -13101,14 +13267,30 @@ def check_self_protection():
     # it is rot, not an intrusion, and a permanent HIGH for "you edited the repo"
     # is how a tool teaches its operator to stop reading HIGHs.
     rt_status = _runtime_copy_status()
+    if rt_status == "self":
+        # The scheduled run IS the runtime copy, so there is nothing for
+        # _runtime_copy_status to compare and it answers 'self'. Fall back to
+        # the source stamped at install time: that is the only way the process
+        # which actually runs on a schedule can report its own staleness.
+        rt_status = _runtime_source_drift() or rt_status
     if rt_status == "drift":
         findings.append(finding(
             "MEDIUM", "self-protection",
             "Background monitor is running OLD code",
-            "%s does not match this file, so every SCHEDULED scan runs an "
-            "older Aegis than the one you are reading. Refresh it: %s"
-            % (RUNTIME_SCRIPT, _refresh_line()),
+            "%s does not match the source it was installed from, so every "
+            "SCHEDULED scan runs an older Aegis than the repo holds. "
+            "Refresh it: %s" % (RUNTIME_SCRIPT, _refresh_line()),
             "self:runtime:drift", confidence="high"))
+    elif rt_status == "source-unknown":
+        # Unknown is never clean — the same rule doctor applies to a sensor.
+        findings.append(finding(
+            "LOW", "self-protection",
+            "Cannot verify the background monitor is current",
+            "The source %s was installed from is no longer readable, so "
+            "whether it is running current code cannot be established. "
+            "Re-run install from the repo to restore the check."
+            % RUNTIME_SCRIPT,
+            "self:runtime:source-unknown", confidence="high"))
     return findings
 
 
@@ -15187,7 +15369,25 @@ def cmd_doctor():
     elif rt == "in-sync":
         print("  ✓ runtime copy               in sync with this file")
     elif rt == "self":
-        print("  ✓ runtime copy               running the installed copy")
+        # 'self' is not a clean bill of health, it is the absence of a
+        # comparison. Answer it from the source stamped at install instead.
+        srcdrift = _runtime_source_drift()
+        if srcdrift == "drift":
+            print("  ✗ runtime copy               STALE — the source it was "
+                  "installed from has moved ahead: %s" % _refresh_line())
+            problems.append("runtime copy stale")
+        elif srcdrift == "source-unknown":
+            print("  ? runtime copy               install source unreadable "
+                  "(unknown, not clean)")
+            problems.append("runtime copy unknown")
+        elif srcdrift == "in-sync":
+            print("  ✓ runtime copy               matches the source it was "
+                  "installed from")
+        else:
+            print("  ? runtime copy               this IS the installed copy "
+                  "and no install source was recorded — re-run install to "
+                  "make its currency checkable")
+            problems.append("runtime copy uncheckable")
     else:
         print("  · runtime copy               not installed (manual runs only)")
     for path in (os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")):
@@ -15225,6 +15425,12 @@ def cmd_doctor():
             ("i", "rootwatch (root witness)",
              "absent — OPT-IN; the kill gap is open: run "
              "`aegis.py rootwatch install`")))
+    # Proven-vs-asserted coverage. doctor's whole contract is that unknown is
+    # never green, and "we have not checked lately" is exactly unknown.
+    a_mark, a_text = _assay_coverage_line()
+    print("  %s %-27s %s" % (a_mark, "positive controls", a_text))
+    if a_mark != "✓":
+        problems.append("assay coverage")
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
@@ -15300,34 +15506,48 @@ def cmd_status():
         ("Firewall stealth mode", "hardening:stealth:off", "hardening:stealth:unknown"),
         ("Remote Login (SSH) off", "hardening:ssh:on", "hardening:ssh:unknown"),
     ]
+    # The patch-gap fingerprint carries the running version, so it cannot be a
+    # literal in the table above like every other row.
+    patch_fp = next((f["fingerprint"] for f in findings
+                     if str(f.get("fingerprint", "")).startswith(
+                         "hardening:macos:patchgap:")), None)
+    if patch_fp:
+        checks.append(("macOS security updates", patch_fp, None))
     bad = {f["fingerprint"]: f for f in findings}
     for label, fp, unknown_fp in checks:
         if fp in bad:
             emit("  ✗ %-32s %s" % (label, bad[fp]["detail"]))
-        elif unknown_fp in bad:
+        elif unknown_fp is not None and unknown_fp in bad:
             emit("  ? %-32s %s" % (label, bad[unknown_fp]["detail"]))
         else:
             emit("  ✓ %-32s ok" % label)
 
     # Apple's own engine: report XProtect definition version/age (piggybacks the
     # professionally-maintained signature pipeline; a stale value is a red flag).
-    newest, version = None, None
-    for b in XPROTECT_BUNDLES:
-        try:
-            m = os.path.getmtime(b)
-        except Exception:
-            continue
-        if newest is None or m > newest:
-            newest = m
-            info = os.path.join(b, "Contents", "Info.plist")
-            v, _, vrc = run(["/usr/libexec/PlistBuddy", "-c",
-                             "Print :CFBundleShortVersionString", info], timeout=6)
-            version = v.strip() if vrc == 0 else None
-    if newest is not None:
-        age = (time.time() - newest) / 86400.0
-        mark = "✓" if age <= XPROTECT_STALE_DAYS else "✗"
-        emit("  %s %-32s v%s, updated %.0f days ago"
-              % (mark, "XProtect definitions", version or "?", age))
+    # Same helper AND the same nuance as check_xprotect: a fresh (re)install of
+    # an old corpus proves the update PATH works, which is information, not a
+    # failing check. This screen ran its own copy of the math with neither.
+    age, version = _xprotect_corpus_age()
+    if age is not None:
+        note = ""
+        if age <= XPROTECT_STALE_DAYS:
+            mark = "✓"
+        else:
+            updater_age = _xprotect_updater_age_days()
+            if updater_age is not None and \
+                    updater_age <= _XPROTECT_UPDATER_FRESH_DAYS:
+                mark = "i"
+                note = (" — updater ran %.0fd ago; Apple has shipped no newer "
+                        "corpus, nothing to fix locally" % updater_age)
+            else:
+                mark = "✗"
+        emit("  %s %-32s v%s, updated %.0f days ago%s"
+              % (mark, "XProtect definitions", version or "?", age, note))
+    # Same one-line verdict doctor prints, from the same helper: a detector
+    # whose control has decayed is unproven coverage, and this screen is where
+    # an operator asks whether the coverage is real.
+    a_mark, a_text = _assay_coverage_line()
+    emit("  %s %-32s %s" % (a_mark, "Detector positive controls", a_text))
     health = get_sensor_health()
     if health:
         emit("\n# Sensor coverage")
@@ -19216,6 +19436,59 @@ def cmd_assay():
     return 1 if failed else 0
 
 
+def _assay_coverage_state():
+    """How much of the detector coverage is currently PROVEN, not asserted.
+
+    Returns {total, proven, stale, broken, oldest_days} or None if `assay` has
+    never been run.
+
+    `check_assay` below computes the same facts, but only as FINDINGS — and it
+    grades the stale case INFO/low-confidence, which routes to the digest and
+    never interrupts. So coverage could decay past its half-life in silence
+    while `doctor` and `status` — the two screens an operator opens to ask
+    "is my coverage real?" — did not mention assay at all. That silence is not
+    cosmetic: `_deadfall_coverage_fresh` requires a PROVEN control, so every
+    standing response order disarms itself when the assay goes stale, and
+    nothing anywhere said so."""
+    state = load_json(ASSAY_FILE, {})
+    if not isinstance(state, dict) or not state:
+        return None
+    now = _epoch()
+    stale, broken, oldest = [], [], 0.0
+    for lane_id, rec in sorted(state.items()):
+        if not rec.get("ok"):
+            broken.append(lane_id)
+            continue
+        age = (now - rec.get("last_ok", 0)) / 86400.0
+        oldest = max(oldest, age)
+        if age * 86400.0 > ASSAY_HALF_LIFE_SECS:
+            stale.append(lane_id)
+    return {"total": len(state), "proven": len(state) - len(stale) - len(broken),
+            "stale": stale, "broken": broken, "oldest_days": oldest}
+
+
+def _assay_coverage_line():
+    """(mark, text) for the one-line coverage verdict shared by doctor and
+    status, so the two screens can never disagree about it."""
+    half = ASSAY_HALF_LIFE_SECS // 86400
+    cov = _assay_coverage_state()
+    if cov is None:
+        return "?", ("never run — coverage is asserted, not demonstrated: "
+                     "`aegis.py assay`")
+    if cov["broken"]:
+        return "✗", ("%d of %d lane(s) FAILING (%s) — treat as LOST "
+                           "coverage, not a clean scan"
+                           % (len(cov["broken"]), cov["total"],
+                              ", ".join(cov["broken"][:3])))
+    if cov["stale"]:
+        return "?", ("%d of %d lane(s) unproven past the %dd half-life "
+                     "(oldest %.0fd): `aegis.py assay`"
+                     % (len(cov["stale"]), cov["total"], half,
+                        cov["oldest_days"]))
+    return "✓", ("%d/%d proven, oldest %.0fd of a %dd half-life"
+                       % (cov["total"], cov["total"], cov["oldest_days"], half))
+
+
 def check_assay():
     """Sensor: a control whose last proof is older than its half-life. Silent
     until `aegis.py assay` has been run at least once."""
@@ -19561,8 +19834,30 @@ def cmd_backtest(category=None):
         totals = db.execute(
             "SELECT COUNT(*) AS n FROM events "
             "WHERE event_type='observation.finding'").fetchone()
+        # One row per interrupt this store has ever raised, categorised and
+        # tagged with whether the operator later dismissed it.
+        #
+        # The category comes from signals.category via the incident's FIRST
+        # signal event — the same vocabulary dismissals.category records, so
+        # the two line up exactly. Deriving it from correlation_key instead
+        # looks equivalent and is not: that key reads 'signal:beacon:...'
+        # where the finding's category is 'net-beacon', which silently split
+        # one detector across two rows, each of them missing the other's half.
+        alerts = db.execute(
+            "SELECT cat, COUNT(*) AS n, SUM(dismissed) AS dismissed FROM ("
+            "  SELECT (SELECT s.category FROM events e "
+            "          JOIN signals s ON s.id = e.signal_id "
+            "          WHERE e.incident_id = i.id AND e.signal_id IS NOT NULL "
+            "          ORDER BY e.id LIMIT 1) AS cat, "
+            "         (SELECT COUNT(*) FROM dismissals d "
+            "          WHERE d.incident_id = i.id) > 0 AS dismissed "
+            "  FROM incidents i WHERE i.last_notified_at IS NOT NULL"
+            ") WHERE cat IS NOT NULL GROUP BY cat"
+        ).fetchall()
     finally:
         db.close()
+    alerted = dict((r["cat"], {"n": r["n"], "dismissed": r["dismissed"] or 0})
+                   for r in alerts)
     labelled = {}
     for r in rows:
         cat = r["category"] or "(uncategorised)"
@@ -19576,28 +19871,48 @@ def cmd_backtest(category=None):
     print("# Aegis backtest — %d recorded finding events, %d labelled "
           "categor%s\n" % ((totals["n"] if totals else 0), len(labelled),
                            "y" if len(labelled) == 1 else "ies"))
-    if not labelled:
+    if not labelled and not alerted:
         print("No typed dismissals recorded yet, so there are no labels to "
               "score against. Label findings with `aegis.py incident <id> "
               "false-positive|benign-positive` and re-run.")
         return 0
-    targets = [category] if category else sorted(labelled)
+    # ALERT precision is printed FIRST because it is the number being asked
+    # about. RULE precision answers "was the detection correct", and a
+    # benign-positive counts as correct there BY DESIGN (the event was real,
+    # the rule worked — ARCHITECTURE.md, typed dismissals). So a detector with
+    # 66 of its 67 incidents dismissed still scores 1.00: a true answer to a
+    # question nobody is asking. ALERT precision answers the one that matters
+    # — of the times this category interrupted you, how often was that worth
+    # it. Both are shown; where they diverge, the gap IS the tuning signal.
+    targets = ([category] if category
+               else sorted(set(labelled) | set(alerted)))
     for cat in targets:
+        a = alerted.get(cat)
+        if a is None:
+            print("  %-16s ALERT precision — never interrupted" % cat)
+        elif a["n"] < BACKTEST_MIN_SAMPLES:
+            print("  %-16s ALERT precision REFUSED — %d interrupt(s), need %d"
+                  % (cat, a["n"], BACKTEST_MIN_SAMPLES))
+        else:
+            print("  %-16s ALERT precision %.2f over %d interrupt(s) "
+                  "(%d dismissed)"
+                  % (cat, 1.0 - a["dismissed"] / float(a["n"]),
+                     a["n"], a["dismissed"]))
         bucket = labelled.get(cat)
         if not bucket:
-            print("  %s: no labels recorded" % cat)
+            print("  %-16s  rule precision — no typed verdicts recorded" % "")
             continue
         n = bucket["false-positive"] + bucket["benign-positive"]
         if n < BACKTEST_MIN_SAMPLES:
-            print("  %-16s REFUSED — %d label(s), need %d. A precision figure "
-                  "from this few is noise, and a rule promoted on noise is "
-                  "worse than one never measured." % (cat, n,
-                                                      BACKTEST_MIN_SAMPLES))
+            print("  %-16s  rule precision REFUSED — %d label(s), need %d. A "
+                  "precision figure from this few is noise, and a rule "
+                  "promoted on noise is worse than one never measured."
+                  % ("", n, BACKTEST_MIN_SAMPLES))
             continue
         precision = 1.0 - (bucket["false-positive"] / float(n))
-        print("  %-16s precision %.2f over %d label(s) "
+        print("  %-16s  rule precision %.2f over %d label(s) "
               "(%d false-positive, %d benign-positive)"
-              % (cat, precision, n, bucket["false-positive"],
+              % ("", precision, n, bucket["false-positive"],
                  bucket["benign-positive"]))
     return 0
 
@@ -19853,6 +20168,11 @@ def cmd_install(mode="scan", interval=None):
     state["installed"] = True
     state["installed_at"] = now_iso()
     state["install_mode"] = mode
+    # Stamp WHERE this install was cut from. The scheduled agent IS the runtime
+    # copy, so _runtime_copy_status() can only ever answer 'self' there and the
+    # one process whose staleness actually costs detections was structurally
+    # unable to notice its own rot. With the source recorded it can re-hash it.
+    state["source_path"] = os.path.realpath(_SELF_PATH)
     save_json(SELFSTATE, state)
     log_run("installed: %s mode=%s interval=%d" % (PLATFORM, mode, interval))
     print("Aegis installed on %s: %s" % (PLATFORM, message))
@@ -19925,6 +20245,35 @@ def _runtime_copy_status():
     a, b = sha256(src), sha256(RUNTIME_SCRIPT)
     if not a or not b:
         return "unknown"
+    return "in-sync" if a == b else "drift"
+
+
+def _runtime_source_drift():
+    """For the process that IS the runtime copy: has the SOURCE it was
+    installed from moved ahead of it?
+
+    Returns 'in-sync', 'drift', 'source-unknown' (a source was recorded but is
+    no longer readable — never reported as clean), or None (nothing recorded,
+    i.e. installed by a build older than this one, or the source and the
+    runtime copy are the same file).
+
+    Distinct from _runtime_copy_status()'s 'unknown', which means the runtime
+    copy itself could not be hashed. Keeping the two tokens apart lets the
+    scheduled agent report the case it can actually diagnose without changing
+    what any existing caller does with the case it cannot."""
+    src = load_json(SELFSTATE, {}).get("source_path")
+    if not src:
+        return None
+    try:
+        if os.path.realpath(src) == os.path.realpath(_SELF_PATH):
+            return None     # source and runtime are one file; nothing to compare
+    except OSError:
+        return "source-unknown"
+    if not os.path.exists(src):
+        return "source-unknown"
+    a, b = sha256(os.path.realpath(_SELF_PATH)), sha256(src)
+    if not a or not b:
+        return "source-unknown"
     return "in-sync" if a == b else "drift"
 
 
@@ -20933,8 +21282,13 @@ def cmd_cauterize(arg=None, step=None):
 #      control within its half-life. You may not automate a detector that
 #      cannot currently demonstrate it fires.
 #
-# Deliberately shipped with NO trigger wiring: the interlocks land first and get
-# tested before anything can fire. That ordering is the point, not an omission.
+# Dispatch IS wired — _deadfall_dispatch() runs on every scan from
+# _cmd_scan_locked. What stops a standing order acting is the three interlocks
+# above, each of which refuses at dispatch time and says which one refused
+# (run.log: "deadfall decoy-read -> skipped-coverage-unproven"). This comment
+# used to say dispatch was deliberately unwired, which was true when the
+# interlocks landed and stopped being true when dispatch did — leaving the two
+# places an operator actually reads describing a tier that no longer existed.
 # --------------------------------------------------------------------------- #
 
 DEADFALL_FILE = os.path.join(STATE_DIR, "deadfall.json")
@@ -21726,8 +22080,9 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    warnings: only attack-defined triggers with no benign cause,
                    only reversible fail-open verbs (never kill/quarantine/
                    destroy), and only when `assay` has PROVEN that trigger's
-                   control within its half-life. Dispatch is deliberately not
-                   wired yet — the interlocks ship and get tested first.
+                   control within its half-life. Dispatch runs on every scan;
+                   an order that does not fire says which interlock refused it
+                   (see run.log). Nothing is armed until you `arm` it.
   writ [list|open|enforce] "why" [minutes] [scopes]
                    authorization bookkeeping instead of anomaly scoring:
                    declare a change window BEFORE you change the machine.
