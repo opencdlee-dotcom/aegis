@@ -4738,6 +4738,24 @@ def _finish_persist_record(rec, prog, args):
 _LD_INJECT_KEYS = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
 
 
+def _env_attack_defined(env):
+    """Does this EnvironmentVariables dict itself constitute the attack?
+
+    Only the loader-injection families qualify — any DYLD_* key (the whole
+    namespace: new keys appear across OS releases and an allowlist would rot)
+    and the LD_PRELOAD/LD_LIBRARY_PATH/LD_AUDIT trio. A dict of PATH/LANG/HOME
+    is an ordinary launchd/systemd idiom; treating ANY env as attack-defined
+    permanently disqualified such jobs from custody grading, pinning a benign
+    one-time change at HIGH with no exit but age-out (live incident #319)."""
+    if not isinstance(env, dict):
+        return False
+    for key in env:
+        k = str(key)
+        if k.startswith("DYLD_") or k in _LD_INJECT_KEYS:
+            return True
+    return False
+
+
 def _parse_systemd_unit(text):
     """Pure parser: unit-file text → (exec_cmds, inject_env, run_at_boot).
     exec_cmds is a list of shell-split argv lists from Exec* directives (systemd
@@ -5521,8 +5539,8 @@ def check_persistence(baseline_snap, current_snap):
                 # are excluded at BOTH ends — _custody_persistence refuses to
                 # return a rung for them, and _demote is told explicitly — so a
                 # payload can never be quieted by proving who moved it.
-                attack_defined = bool(rec.get("env")) or _hostile_args(
-                    rec.get("args"), rec.get("program"))
+                attack_defined = _env_attack_defined(rec.get("env")) \
+                    or _hostile_args(rec.get("args"), rec.get("program"))
                 prov = (None if attack_defined
                         else _custody_persistence(old, rec)
                         or (_custody(path, rec.get("sha256"))[0]
@@ -11684,7 +11702,8 @@ def _custody_persistence(old, rec):
     # Environment injection and hostile argv are attack-DEFINED. They are
     # refused here as well as at the demotion gate, so no future caller can
     # reach a vouching rung by a path that skips the gate.
-    if rec.get("env") or _hostile_args(rec.get("args"), rec.get("program")):
+    if _env_attack_defined(rec.get("env")) or _hostile_args(
+            rec.get("args"), rec.get("program")):
         return None
 
     op, np_ = old.get("program"), rec.get("program")
@@ -14542,7 +14561,7 @@ def _cmd_baseline_locked(trust="verified"):
     current = snapshot_persistence()
     b = {"created": now_iso(), "schema_version": BASELINE_SCHEMA_VERSION,
          "persistence": current, "trust": trust}
-    for key, snap_fn, _diff, _scope, _live in map(_surface_row, SURFACES):
+    for key, snap_fn, _diff, _scope, _live, _adopt in map(_surface_row, SURFACES):
         try:
             snap = snap_fn()
         except Exception:

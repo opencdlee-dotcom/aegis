@@ -713,13 +713,15 @@ class BaselineSurvivesAPrivilegedSurface(unittest.TestCase):
 
         saved = {k: getattr(aegis, k) for k in
                  ("BASELINE", "SURFACES", "snapshot_persistence",
-                  "flush_sigcache", "record_selfstate", "ensure_state")}
+                  "flush_sigcache", "record_selfstate", "ensure_state",
+                  "_record_baseline_watermark")}
         self.addCleanup(lambda: [setattr(aegis, k, v) for k, v in saved.items()])
 
         aegis.BASELINE = baseline_path
         aegis.ensure_state = lambda: None
         aegis.flush_sigcache = lambda: None
         aegis.record_selfstate = lambda: None
+        aegis._record_baseline_watermark = lambda: None
         aegis.snapshot_persistence = lambda: {}
         aegis.SURFACES = [
             ("walled", lambda: aegis.SURFACE_PRIVILEGED, None),
