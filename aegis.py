@@ -13150,7 +13150,7 @@ def _build_surfaces(is_mac, is_linux):
         # digest (so an attacker who edits an MCP registration AND Aegis's
         # baseline breaks the hash chain).
         ("agent_surface", snapshot_agent_surface, diff_agent_surface,
-         "agent_surface"),
+         "agent_surface", False, True),   # adopt_new_entries: see _scan_surfaces
         ("session_binding", snapshot_session_binding, diff_session_binding),
         ("ext_caps", snapshot_ext_caps, diff_ext_caps),
     ]
@@ -13199,14 +13199,15 @@ SURFACES = _build_surfaces(IS_MAC, IS_LINUX)
 
 def _surface_row(row):
     """Normalize a SURFACES row to (key, snap_fn, diff_fn, writ_scope,
-    never_adopt_live). A surface with no explicit scope falls back to
+    never_adopt_live, adopt_new_entries). A surface with no explicit scope falls back to
     "persistence", so a newly added surface is governed by default rather than
     silently ungoverned — the failure that would otherwise grow a hole every
     time someone adds a sensor."""
     key, snap_fn, diff_fn = row[0], row[1], row[2]
     scope = row[3] if len(row) > 3 else "persistence"
     live = bool(row[4]) if len(row) > 4 else False
-    return key, snap_fn, diff_fn, scope, live
+    adopt_new = bool(row[5]) if len(row) > 5 else False
+    return key, snap_fn, diff_fn, scope, live, adopt_new
 
 
 # --------------------------------------------------------------------------- #
@@ -13626,7 +13627,8 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
         baseline = {}
     dirty = False
     for row in SURFACES:
-        key, snap_fn, diff_fn, writ_scope, never_adopt = _surface_row(row)
+        key, snap_fn, diff_fn, writ_scope, never_adopt, adopt_new = \
+            _surface_row(row)
         started = time.monotonic()
         try:
             cur = snap_fn()
@@ -13679,8 +13681,32 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             dirty = True
         else:
             findings += _apply_writ(diff_fn(prior, cur), writ_scope)
+            # Per-file first-sight adoption, for surfaces that opt in. Before
+            # this, baseline[key] was written ONLY on the surface's own first
+            # sighting, so a file appearing later had `old is None` forever —
+            # and diff_agent_surface deliberately silences a file's first
+            # sight, so both its exec branch and its imperative branch stayed
+            # silent on every later scan too: 271 of 558 walked files on the
+            # reference machine were present-but-never-recorded, invisible to
+            # the sensor behind a full-coverage report. Recording the NEW
+            # paths is the same KnockKnock rule the first-sighting branch
+            # documents, at file granularity; the file's next change then
+            # diffs normally. Two boundaries keep it safe: an EXISTING record
+            # is never overwritten (a changed entry keeps alerting against
+            # the reviewed bytes until the operator's verdict promotes it via
+            # _accept_into_baseline — the anti-laundering rule), and adoption
+            # is opt-in per surface, because on a live surface (listeners) a
+            # new key is an alert, not an adoptable fact.
+            if adopt_new and isinstance(prior, dict) and isinstance(cur, dict):
+                appeared = {k: v for k, v in cur.items() if k not in prior}
+                if appeared:
+                    prior.update(appeared)      # prior IS baseline[key]
+                    dirty = True
     if dirty and not first_run:
         save_json(BASELINE, baseline)
+        # The deliberate write must be re-witnessed, or the next scan reads
+        # Aegis's own adoption as out-of-band tampering.
+        _record_baseline_watermark()
     return findings, baseline
 
 
@@ -14834,7 +14860,7 @@ def _acceptable_surfaces():
     persistence first because it is the one that is not in SURFACES."""
     rows = [("persistence", snapshot_persistence, check_persistence)]
     for row in SURFACES:
-        key, snap_fn, diff_fn, _scope, never_adopt = _surface_row(row)
+        key, snap_fn, diff_fn, _scope, never_adopt, _adopt = _surface_row(row)
         # A surface that is never silently adopted is one the README's
         # live-vs-residue rule says the operator must keep hearing about (an
         # active remote login is CURRENT ACCESS, not installed residue). An
@@ -20068,7 +20094,7 @@ def _rehunt_lanes():
     lanes = [("persistence.snapshot", _replay_pairwise(check_persistence)),
              (BEACON_SENSOR_ID, _replay_beacon)]
     for row in SURFACES:
-        key, _snap, diff_fn, _scope, _live = _surface_row(row)
+        key, _snap, diff_fn, _scope, _live, _adopt = _surface_row(row)
         lanes.append(("surface." + key, _replay_pairwise(diff_fn)))
     return lanes
 
