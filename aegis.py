@@ -13342,6 +13342,7 @@ def check_self_protection():
     # non-attacker-writable anchor (a configured heartbeat URL is one). Falls back
     # to the legacy sha watermark for installs upgraded before a MAC was recorded
     # (the next record_selfstate writes the MAC).
+    tampered_names = set()
     for name, path in _self_watermarked():
         recorded_mac = st.get("%s_mac" % name)
         recorded = recorded_mac or st.get("%s_sha" % name)
@@ -13355,6 +13356,7 @@ def check_self_protection():
         # onto the first_run path, silently re-baselining current persistence as
         # known-good). A differing watermark => modification. Both are tampering.
         if recorded and cur_watermark != recorded:
+            tampered_names.add(name)
             deleted_why, modified_why = _SELF_TAMPER_CONSEQUENCE[name]
             if cur_watermark is None:
                 detail = ("%s was DELETED out-of-band — Aegis recorded its "
@@ -13370,6 +13372,20 @@ def check_self_protection():
                                  if cur_sha is None else "modified out-of-band"),
                 detail,
                 "self:%s:tampered:%s" % (name, (cur_sha or "deleted")[:16])))
+    # Persist WHICH stores stand accused, so record_selfstate at the end of
+    # this same scan does not re-derive their watermark from the tampered
+    # bytes. Without this flag, tampering alarms exactly once and the
+    # detecting scan itself blesses the edit as the new ground truth (found
+    # live as a 1-event self:baseline:tampered incident that ~150 later scans
+    # all read as clean). The flag is cleared only by an AUTHORIZED write —
+    # the per-store watermark helpers — never by the passage of a scan.
+    flags_changed = False
+    for name in tampered_names:
+        if not st.get("%s_tamper_since" % name):
+            st["%s_tamper_since" % name] = int(_epoch())
+            flags_changed = True
+    if flags_changed:
+        save_json(SELFSTATE, st)
     # Runtime-copy rot. The scheduled agent executes ~/.aegis/aegis.py, so a
     # stale copy means every scheduled scan runs OLD code — the detections you
     # believe you have, you do not have. Measured on the author's own machine:
@@ -13438,6 +13454,12 @@ def record_selfstate():
     # forge it without the key), and the plain sha is retained because
     # _migrate_baseline uses `baseline_sha` as its own out-of-band-edit guard.
     for name, path in _self_watermarked():
+        if st.get("%s_tamper_since" % name):
+            # This store stands accused of an out-of-band edit. Re-recording
+            # its watermark here would bless the tampered bytes and silence
+            # the alarm after one scan — the stale witness stays until an
+            # authorized write (a per-store watermark helper) clears the flag.
+            continue
         present = os.path.exists(path)
         st["%s_sha" % name] = sha256(path) if present else None
         st["%s_mac" % name] = _hmac_file(path) if present else None
@@ -13454,6 +13476,20 @@ def _record_baseline_watermark():
     present = os.path.exists(BASELINE)
     st["baseline_sha"] = sha256(BASELINE) if present else None
     st["baseline_mac"] = _hmac_file(BASELINE) if present else None
+    st.pop("baseline_tamper_since", None)   # an authorized write ends the accusation
+    save_json(SELFSTATE, st)
+
+
+def _record_allowlist_watermark():
+    """Re-watermark the allowlist right after WE rewrite it (`aegis.py allow`),
+    so the operator's own deliberate write is not read as tampering — and so it
+    CLEARS a standing accusation, which record_selfstate no longer does. Same
+    per-store discipline (and same reason) as _record_baseline_watermark."""
+    st = load_json(SELFSTATE, {})
+    present = os.path.exists(ALLOWLIST)
+    st["allowlist_sha"] = sha256(ALLOWLIST) if present else None
+    st["allowlist_mac"] = _hmac_file(ALLOWLIST) if present else None
+    st.pop("allowlist_tamper_since", None)
     save_json(SELFSTATE, st)
 
 
@@ -13466,6 +13502,7 @@ def _record_canary_watermark():
     present = os.path.exists(CANARY_STATE)
     st["canaries_sha"] = sha256(CANARY_STATE) if present else None
     st["canaries_mac"] = _hmac_file(CANARY_STATE) if present else None
+    st.pop("canaries_tamper_since", None)   # an authorized write ends the accusation
     save_json(SELFSTATE, st)
 
 
@@ -14219,8 +14256,10 @@ def _migrate_baseline(data):
     data["schema_version"] = BASELINE_SCHEMA_VERSION
     data["trust"] = data.get("trust") or "unverified"
     save_json(BASELINE, data)
-    state["baseline_sha"] = sha256(BASELINE)
-    save_json(SELFSTATE, state)
+    # Both sha AND mac: check_self_protection PREFERS the mac, so hand-writing
+    # only baseline_sha here made every MAC-bearing install read its own schema
+    # migration as HIGH out-of-band tampering at the next scan.
+    _record_baseline_watermark()
     log_run("migrated baseline schema v%d -> v%d"
             % (version, BASELINE_SCHEMA_VERSION))
     return data
@@ -14472,6 +14511,7 @@ def _cmd_baseline_locked(trust="verified"):
         if snap is not None and snap is not SURFACE_PRIVILEGED:
             b[key] = snap
     save_json(BASELINE, b)
+    _record_baseline_watermark()   # the operator's own reset ends any accusation
     flush_sigcache()
     record_selfstate()
     label = "reviewed/verified" if trust == "verified" else "adopted/unverified"
@@ -16170,6 +16210,7 @@ def cmd_allow(path):
                 allow.append(f["fingerprint"])
                 added += 1
     save_json(ALLOWLIST, allow)
+    _record_allowlist_watermark()
     print("Allowlisted %d finding(s) matching %r." % (added, path))
     return 0
 
