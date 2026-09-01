@@ -8883,15 +8883,35 @@ def _beacon_recurrence(history, current_rows):
         return []
     sightings = {}
     for ts, rows in history:
-        if not isinstance(rows, (list, tuple)):
+        _beacon_add_sighting(sightings, ts, rows)
+    return _beacon_from_sightings(sightings, current_rows)
+
+
+def _beacon_add_sighting(sightings, ts, rows):
+    """Fold one stored snapshot into a pair -> {timestamps} map. Split out so
+    `rehunt` can maintain the map INCREMENTALLY across a replay instead of
+    rebuilding the whole window at every step — that rebuild is O(window) per
+    snapshot, i.e. O(n^2) over the series, and measured 66s against 0.5s on a
+    30-day store. The decision below stays in exactly one place."""
+    if not isinstance(rows, (list, tuple)):
+        return
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
             continue
-        for row in rows:
-            if not isinstance(row, (list, tuple)) or len(row) < 3:
-                continue
-            pair = (str(row[0]), str(row[1]), str(row[2]))
-            sightings.setdefault(pair, set()).add(int(ts))
+        pair = (str(row[0]), str(row[1]), str(row[2]))
+        sightings.setdefault(pair, set()).add(int(ts))
+
+
+def _beacon_from_sightings(sightings, current_rows):
+    """The recurrence DECISION, over an already-built sightings map."""
     findings = []
     for row in sorted(set(tuple(r) for r in current_rows)):
+        # Length-guarded like the history fold above. Live, current_rows always
+        # comes from _outbound_rows() and is well-formed — but `rehunt` feeds
+        # this the same shape read back from a gzipped file on disk, where a
+        # truncated record would otherwise crash the whole retro-hunt.
+        if len(row) < 3:
+            continue
         path, rip, rport = str(row[0]), str(row[1]), str(row[2])
         trust = str(row[3]) if len(row) > 3 else "unknown"
         stamps = sightings.get((path, rip, rport), ())
@@ -11319,8 +11339,46 @@ def _vouch_verify_sig(payload, sig, principal):
                 pass
 
 
+_VOUCH_CACHE = {"key": None, "active": None, "reason": None}
+
+
+def _vouch_cache_key():
+    """(path, mtime_ns, size) for both vouch files — the cheap question "could
+    the verified answer have changed", answered without re-verifying."""
+    out = []
+    for p in (VOUCH_FILE, VOUCH_SIGNERS):
+        try:
+            st = os.stat(p)
+            out.append((p, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((p, None, None))
+    return tuple(out)
+
+
 def load_vouches(now=None):
     """({subject: record}, tamper_reason_or_None) from the signed vouch log.
+
+    Thin wrapper: everything except EXPIRY is time-independent and memoized in
+    _vouch_verified_store, so repeated callers pay for verification once.
+    """
+    now = _epoch(now)
+    active, reason = _vouch_verified_store()
+    if reason is not None:
+        return {}, reason
+    return ({s: r for s, r in active.items()
+             if not r.get("expires_at") or int(r["expires_at"]) > now}, None)
+
+
+def _vouch_verified_store():
+    """({subject: record}, tamper_reason_or_None) — the expensive half: read,
+    chain-check and signature-verify the whole log. NOTHING here depends on the
+    clock, so it is memoized on both files' (mtime_ns, size).
+
+    Verification shells out to ssh-keygen once per record and callers ask
+    repeatedly: profiled 2026-09-01, `rehunt` over a 30-day store called this
+    4,520 times, spawned 9,043 ssh-keygen processes, and spent 63 of the
+    command's 70 seconds inside them. A `vouch add` mid-run changes the file
+    and invalidates the entry, so the cache cannot serve a stale roster.
 
     Returns ({}, None) when no vouch file exists — an operator who has never
     vouched for anything is the normal case, not a tamper event.
@@ -11330,7 +11388,15 @@ def load_vouches(now=None):
     worse than none, because it lets an attacker delete the one record that
     would have made their change loud.
     """
-    now = _epoch(now)
+    key = _vouch_cache_key()
+    if _VOUCH_CACHE["key"] == key:
+        return _VOUCH_CACHE["active"], _VOUCH_CACHE["reason"]
+    active, reason = _vouch_read_and_verify()
+    _VOUCH_CACHE.update({"key": key, "active": active, "reason": reason})
+    return active, reason
+
+
+def _vouch_read_and_verify():
     if not os.path.isfile(VOUCH_FILE):
         return {}, None
     if not os.path.isfile(VOUCH_SIGNERS):
@@ -11371,9 +11437,7 @@ def load_vouches(now=None):
             return {}, "vouch log line %d has an unknown action" % n
         prev, seq = _vouch_link(rec), rec["seq"]
 
-    live = {s: r for s, r in active.items()
-            if not r.get("expires_at") or int(r["expires_at"]) > now}
-    return live, None
+    return active, None
 
 
 def _vouch_subject(path):
@@ -13519,6 +13583,12 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
         # Skip the surface for this scan; the prior baseline is left intact.
         if cur is None:
             continue
+        # Raw history for retro-hunt. Recorded HERE, in the generic runner,
+        # rather than inside each snapshot fn: every surface then gets replay
+        # coverage from one call site, and a surface added later inherits it
+        # without anyone remembering to. Change-gated, so a static surface
+        # costs one snapshot and then nothing.
+        record_observation_if_changed("surface." + key, cur)
         prior = baseline.get(key)
         if prior is None:
             # First sighting → adopt silently (the KnockKnock "trust what's
@@ -19774,6 +19844,53 @@ def record_observation(sensor_id, payload):
         return None
 
 
+def _newest_observation_digest(sensor_id):
+    """sha256 of the most recent stored snapshot for sensor_id, or None.
+
+    Reads only the newest file, not the series: the caller is asking "did this
+    change since last time", which is a question about one predecessor."""
+    try:
+        names = sorted(n for n in os.listdir(OBSERVATIONS_DIR)
+                       if n.startswith(sensor_id + "."))
+    except Exception:
+        return None
+    for name in reversed(names):            # filenames sort by embedded epoch
+        parts = name.split(".")
+        if len(parts) < 3 or not parts[-3].isdigit():
+            continue
+        try:
+            import gzip
+            with gzip.open(os.path.join(OBSERVATIONS_DIR, name), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except Exception:
+            return None                     # unreadable predecessor -> re-store
+    return None
+
+
+def record_observation_if_changed(sensor_id, payload):
+    """record_observation, but skip the write when nothing changed.
+
+    Retro-hunt diffs CONSECUTIVE snapshots, so a run of byte-identical ones
+    contributes exactly nothing to it — storing them buys no evidence and costs
+    real disk. Measured 2026-09-01: snapshotting every surface every scan is
+    39.9 KB gzipped, i.e. ~42 MB over the 45-day retention at one scan an hour
+    — but `watch` mode permits up to 60 scans an hour, where the same policy
+    reaches gigabytes. Gating on change makes the cost track how often the
+    machine actually changes instead of how often Aegis looks at it, which is
+    also the honest shape of the evidence.
+
+    NOT for outbound.snapshot: `_beacon_recurrence` counts the number of
+    DISTINCT SCANS a (binary, endpoint) pair was seen in, so collapsing
+    identical scans would deflate its threshold and hide a beacon. That caller
+    records unconditionally, on purpose."""
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    if digest == _newest_observation_digest(sensor_id):
+        return None
+    return record_observation(sensor_id, payload)
+
+
 def _prune_observations():
     cutoff = _epoch() - OBSERVATION_KEEP_DAYS * 86400
     try:
@@ -19812,6 +19929,71 @@ def _load_observations(sensor_id, days):
     return out
 
 
+REHUNT_SHOW_LIMIT = 25      # distinct items printed; the rest are counted
+
+
+def _replay_pairwise(diff_fn):
+    """Replay a (prior, cur) surface differ over consecutive snapshots."""
+    def run(snaps):
+        for idx in range(1, len(snaps)):
+            prev, cur = snaps[idx - 1][1], snaps[idx][1]
+            if not isinstance(prev, dict) or not isinstance(cur, dict):
+                continue
+            for f in diff_fn(prev, cur):
+                yield snaps[idx][0], f
+    return run
+
+
+def _replay_beacon(snaps):
+    """Replay recurrence: each snapshot in turn is 'now', everything inside the
+    window before it is history.
+
+    The window SLIDES rather than being rebuilt. Rebuilding it per step is the
+    obvious version and is O(n^2) over the series — measured 66s against 0.5s
+    on a 30-day store, which is a 120x regression on a command that already
+    existed. Here each snapshot is folded in once and evicted once, so the
+    replay is linear and uses the same decision function as the live path."""
+    span = BEACON_WINDOW_DAYS * 86400
+    sightings, start = {}, 0        # `snaps` IS the window; start is its head
+    for idx in range(1, len(snaps)):
+        prev_ts, prev_rows = snaps[idx - 1]
+        _beacon_add_sighting(sightings, prev_ts, prev_rows)
+        cur_ts, cur_rows = snaps[idx]
+        while start < idx and cur_ts - snaps[start][0] > span:
+            old_ts, old_rows = snaps[start]
+            start += 1
+            if not isinstance(old_rows, (list, tuple)):
+                continue
+            for row in old_rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 3:
+                    continue
+                stamps = sightings.get(
+                    (str(row[0]), str(row[1]), str(row[2])))
+                if stamps is not None:
+                    stamps.discard(int(old_ts))
+        if not isinstance(cur_rows, (list, tuple)):
+            continue
+        for f in _beacon_from_sightings(sightings, cur_rows):
+            yield cur_ts, f
+
+
+def _rehunt_lanes():
+    """(sensor_id, replay) for everything with a detector that can be re-run
+    over stored history.
+
+    Was persistence ONLY, while the store already held outbound snapshots and
+    nothing recorded the surfaces at all — so the retro-hunt was blind to the
+    agent surface, which is the most precise detector in the tool (measured
+    alert precision 0.91). Derived from SURFACES rather than listed, so a
+    surface added later is replayable the day it lands."""
+    lanes = [("persistence.snapshot", _replay_pairwise(check_persistence)),
+             (BEACON_SENSOR_ID, _replay_beacon)]
+    for row in SURFACES:
+        key, _snap, diff_fn, _scope, _live = _surface_row(row)
+        lanes.append(("surface." + key, _replay_pairwise(diff_fn)))
+    return lanes
+
+
 def cmd_rehunt(days=30):
     """Re-run TODAY's detectors over stored raw snapshots.
 
@@ -19819,36 +20001,64 @@ def cmd_rehunt(days=30):
     number it exists to produce is silent-miss latency — how long a thing sat
     there before the detectors could see it."""
     ensure_state()
-    snaps = _load_observations("persistence.snapshot", days)
-    print("# Aegis rehunt — %d stored snapshot(s) over %s days\n"
-          % (len(snaps), days))
-    if len(snaps) < 2:
+    now, retro, lanes = _epoch(), [], []
+    for lane, replay in _rehunt_lanes():
+        snaps = _load_observations(lane, days)
+        if len(snaps) < 2:
+            lanes.append((lane, len(snaps), 0))
+            continue
+        snaps.sort()
+        found = 0
+        for ts, f in replay(snaps):
+            if SEV_ORDER[f["severity"]] >= SEV_ORDER["HIGH"]:
+                retro.append((ts, f))
+                found += 1
+        lanes.append((lane, len(snaps), found))
+    total = sum(n for _l, n, _f in lanes)
+    print("# Aegis rehunt — %d stored snapshot(s) over %s days, %d lane(s)\n"
+          % (total, days, len([l for l in lanes if l[1] >= 2])))
+    for lane, n, found in sorted(lanes):
+        if n >= 2:
+            print("  %-26s %4d snapshot(s), %d HIGH+ replayed" % (lane, n, found))
+        elif n:
+            print("  %-26s %4d snapshot(s) — need 2 to diff" % (lane, n))
+    print("")
+    if total < 2:
         print("Not enough stored history to re-hunt. Raw snapshots accumulate "
               "once this build has been scanning for a while "
               "(kept %d days)." % OBSERVATION_KEEP_DAYS)
         return 0
-    snaps.sort()
-    now, retro = _epoch(), []
-    for idx in range(1, len(snaps)):
-        prev_ts, prev = snaps[idx - 1]
-        cur_ts, cur = snaps[idx]
-        if not isinstance(prev, dict) or not isinstance(cur, dict):
-            continue
-        for f in check_persistence(prev, cur):
-            if SEV_ORDER[f["severity"]] >= SEV_ORDER["HIGH"]:
-                retro.append((cur_ts, f))
     if not retro:
         print("No HIGH+ finding surfaces when today's detectors are replayed "
               "over that window. On a clean machine this is the expected "
               "result, and it bounds the silent-miss rate rather than proving "
               "there was nothing to find.")
         return 0
-    print("Today's detectors find %d HIGH+ item(s) in stored history:\n"
-          % len(retro))
-    for ts, f in sorted(retro, key=lambda r: r[0]):
-        print("  %s  %-8s %s\n      %s\n      silent-miss latency: %.1f days"
-              % (_iso_short(ts), f["severity"], f["title"], f["detail"],
+    # Grouped by fingerprint, not listed flat. Replaying a recurrence detector
+    # over N snapshots re-emits the same standing fact once per snapshot: the
+    # outbound lane alone produced 499 hits from a far smaller number of
+    # distinct (binary, endpoint) pairs. The distinct fact and its EARLIEST
+    # sighting are the answer here — that is what silent-miss latency measures.
+    groups = {}
+    for ts, f in retro:
+        g = groups.setdefault(f["fingerprint"], {"f": f, "n": 0, "first": ts})
+        g["n"] += 1
+        g["first"] = min(g["first"], ts)
+    ordered = sorted(groups.values(), key=lambda g: g["first"])
+    print("Today's detectors find %d HIGH+ item(s) in stored history, "
+          "%d distinct:\n" % (len(retro), len(ordered)))
+    for g in ordered[:REHUNT_SHOW_LIMIT]:
+        f, ts = g["f"], g["first"]
+        seen = "" if g["n"] == 1 else "  (x%d)" % g["n"]
+        print("  %s  %-8s %s%s\n      %s\n      silent-miss latency: %.1f days"
+              % (_iso_short(ts), f["severity"], f["title"], seen, f["detail"],
                  (now - ts) / 86400.0))
+    if len(ordered) > REHUNT_SHOW_LIMIT:
+        # Never a silent truncation: a bounded list that does not say what it
+        # dropped reads as "that was everything".
+        print("  ... %d more distinct item(s) not shown (oldest first; raise "
+              "REHUNT_SHOW_LIMIT or narrow with `rehunt <days>`)."
+              % (len(ordered) - REHUNT_SHOW_LIMIT))
     return 0
 
 

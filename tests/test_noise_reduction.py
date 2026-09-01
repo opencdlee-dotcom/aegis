@@ -607,8 +607,18 @@ class SubjectIdentityIsStructured(_DBCase):
         self.assertEqual(aegis._finding_identity(fs[0]),
                          aegis._tolerance_identity(fs[0]["fingerprint"]))
         import inspect
-        for fn in (aegis.check_processes, aegis._beacon_recurrence):
+        # _beacon_from_sightings, not _beacon_recurrence: the recurrence
+        # DECISION (and therefore the finding, and therefore the declared
+        # subject) was split out so `rehunt` could maintain the sightings map
+        # incrementally instead of rebuilding it per step. _beacon_recurrence
+        # is now the thin build-then-decide wrapper the live path calls, so
+        # grepping it would only prove the wrapper is thin.
+        for fn in (aegis.check_processes, aegis._beacon_from_sightings):
             self.assertIn("subject=_subject(", inspect.getsource(fn), fn.__name__)
+        # The wrapper must still reach that decision, or the check above is
+        # asserting about code nothing calls.
+        self.assertIn("_beacon_from_sightings",
+                      inspect.getsource(aegis._beacon_recurrence))
 
 
 class ReportLeadsWithAVerdict(unittest.TestCase):
