@@ -10650,7 +10650,22 @@ AGENT_REPO_CONFIG_NAMES = (
     ".mcp.json", ".cursorrules", "CLAUDE.md", "AGENTS.md", "GEMINI.md",
 )
 
-_AGENT_SCAN_FILE_CAP = 400          # hard ceiling; a home-wide walk is a DoS
+# Two ceilings, because one global ceiling is order-dependent starvation.
+# The walk used to take a single 400-file budget and RETURN the moment it ran
+# out, in root order — so the roots reached last were not "partially covered",
+# they were silently uncovered, and which ones depended on how big the earlier
+# roots happened to be that day. Measured 2026-08-31 on the reference machine:
+# 558 candidate files against the 400 budget, with the entire 158-file shortfall
+# landing on the LAST root reached. `~/.claude` grows with every session, so the
+# starvation front advances on its own.
+#
+# The per-root cap is the structural fix: a root can exhaust its own budget and
+# nothing downstream of it is affected. The global cap stays as the DoS backstop
+# it was written to be, raised because 400 was never the real cost — reading a
+# candidate measures 0.2 ms, so 400 -> 3000 is ~0.5 s of headroom on a sensor
+# that already runs ~1.8 s, and the honest surface here is under 600.
+_AGENT_SCAN_ROOT_CAP = 500          # per ROOT: no root may starve a later one
+_AGENT_SCAN_FILE_CAP = 3000         # global backstop; a home-wide walk is a DoS
 _AGENT_SCAN_DEPTH = 3
 _AGENT_TEXT_CAP = 256 * 1024
 
@@ -12148,20 +12163,33 @@ def _agent_config_files():
     # scan top for exactly this reason, and this producer-owned flag needs the
     # same reset, here at the source so the assay/test paths get it too.
     _AGENT_SCAN_TRUNCATED[0] = False
+    del _AGENT_SCAN_TRUNCATED_ROOTS[:]
     seen = []
     roots = list(AGENT_CONFIG_ROOTS)
     cfg = load_json(os.path.join(STATE_DIR, "config.json"), {})
     extra = cfg.get("agent_repo_roots") if isinstance(cfg, dict) else None
     if isinstance(extra, list):
         roots += [os.path.expanduser(str(r)) for r in extra[:16]]
+    def _starved(root):
+        _AGENT_SCAN_TRUNCATED[0] = True
+        if root not in _AGENT_SCAN_TRUNCATED_ROOTS:
+            _AGENT_SCAN_TRUNCATED_ROOTS.append(root)
+
     for root in roots:
         if not os.path.isdir(root):
             continue
+        if len(seen) >= _AGENT_SCAN_FILE_CAP:
+            # The global backstop is spent. Record every root this starves
+            # rather than returning on the first one — "which roots did I not
+            # look at" is the whole question this finding has to answer.
+            _starved(root)
+            continue
+        root_start = len(seen)
         base_depth = root.rstrip(os.sep).count(os.sep)
+        stop = False
         for dirpath, dirnames, filenames in os.walk(root):
-            if len(seen) >= _AGENT_SCAN_FILE_CAP:
-                _AGENT_SCAN_TRUNCATED[0] = True
-                return seen
+            if stop:
+                break
             if dirpath.count(os.sep) - base_depth >= _AGENT_SCAN_DEPTH:
                 dirnames[:] = []
             dirnames[:] = [d for d in dirnames
@@ -12174,9 +12202,13 @@ def _agent_config_files():
                 if (fn.endswith((".json", ".toml")) or
                         fn in AGENT_INSTRUCTION_NAMES):
                     seen.append(p)
-                    if len(seen) >= _AGENT_SCAN_FILE_CAP:
-                        _AGENT_SCAN_TRUNCATED[0] = True
-                        return seen
+                    # Checked AFTER the append, as the single-budget version
+                    # was: a cap of 1 must truncate on the first candidate.
+                    if (len(seen) - root_start >= _AGENT_SCAN_ROOT_CAP or
+                            len(seen) >= _AGENT_SCAN_FILE_CAP):
+                        _starved(root)
+                        stop = True
+                        break
     return seen
 
 
@@ -12190,18 +12222,27 @@ def check_agent_surface_coverage():
     absorbed."""
     if not _AGENT_SCAN_TRUNCATED[0]:
         return []
+    # finding() redacts detail and extras itself; this is only the
+    # HOME -> ~ shortening the rest of the tool renders paths with.
+    cut = [r.replace(HOME, "~") for r in _AGENT_SCAN_TRUNCATED_ROOTS] \
+        or ["(unknown)"]
     return [finding(
         "LOW", "agent-surface", "Agent-surface walk hit its file cap",
-        "More than %d candidate agent config/instruction files exist under the "
-        "watched roots, so this scan examined only the first %d. Coverage here "
-        "is PARTIAL, not clean. Narrow the roots (or raise the cap) with "
-        "\"agent_repo_roots\" in ~/.aegis/config.json."
-        % (_AGENT_SCAN_FILE_CAP, _AGENT_SCAN_FILE_CAP),
-        "agent-surface:truncated", confidence="high",
-        markers=["agent-surface", "coverage"])]
+        "These roots hit a scan budget, so the files past it were NOT examined "
+        "and coverage there is PARTIAL, not clean: %s. Per-root cap %d, global "
+        "cap %d. Narrow the roots (or raise the caps) with \"agent_repo_roots\" "
+        "in ~/.aegis/config.json."
+        % (", ".join(cut), _AGENT_SCAN_ROOT_CAP, _AGENT_SCAN_FILE_CAP),
+        # Fingerprint carries WHICH roots: a newly-starved root is a new fact
+        # and must re-alert, rather than hiding under a standing "truncated".
+        "agent-surface:truncated:%s"
+        % hashlib.sha256(",".join(sorted(cut)).encode()).hexdigest()[:12],
+        confidence="high", markers=["agent-surface", "coverage"],
+        truncated_roots=cut)]
 
 
 _AGENT_SCAN_TRUNCATED = [False]     # set by _agent_config_files, read by health
+_AGENT_SCAN_TRUNCATED_ROOTS = []    # WHICH roots were cut short, same writer
 
 
 def snapshot_agent_surface():
