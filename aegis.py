@@ -3166,6 +3166,13 @@ def _carries_new_evidence(incoming, held):
     binary — is unseen exactly as before."""
     if not incoming:
         return False
+    if not held:
+        # An incident with NO remembered identities is not a blank slate — it
+        # is an incident whose evidence was lost (retention prune, hand-edited
+        # store). Reading amnesia as "everything is novel" permanently locked
+        # judged cases out of reattachment and refreshed last_novel_at forever;
+        # declining to claim novelty fails toward the operator's last verdict.
+        return False
     unseen = incoming - held
     if not unseen:
         return False
@@ -4432,9 +4439,18 @@ def record_security_state(findings, sensor_health=(), now=None,
             db.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON "
                        "CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
         # Bound raw observations while retaining materialized signals/incidents.
+        # Evidence attached to an incident IS materialized state: the FK is
+        # ON DELETE CASCADE with foreign_keys=ON, so pruning a referenced row
+        # deletes the incident's evidence with it, _incident_identities goes
+        # empty, and the FALSE_POSITIVE reattach guard can never pass again —
+        # the operator's verdict is silently revoked (59 judged incidents on
+        # the reference store had been stripped this way). Exempting the
+        # referenced rows keeps the cap on the only thing it was bounding:
+        # observations nothing points at.
         with db:
             db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
-                       "ORDER BY id DESC LIMIT -1 OFFSET 50000)")
+                       "ORDER BY id DESC LIMIT -1 OFFSET 50000) "
+                       "AND id NOT IN (SELECT event_id FROM incident_events)")
     finally:
         db.close()
     return {"events": len(new_events), "health": len(sensor_health)}
