@@ -2716,10 +2716,19 @@ def _category_dismissal_weights(db, now, window=90 * 86400):
         dismissed = int(row["n"])
         if dismissed < _PRECISION_MIN_SAMPLE:
             continue
+        # COUNT(DISTINCT i.id), never COUNT(*): the join fans out to one row
+        # per EVIDENCE EVENT, so a sensor that re-emits one fact every scan
+        # (the exact noise this loop exists to damp) inflated the denominator
+        # until 23 operator dismissals bought a 2% discount. The numerator is
+        # per-incident; the denominator must be too. And the window predicate
+        # matches the DISMISSAL side (updated_at, which every dismissal
+        # touches), so an old incident triaged today counts on both sides of
+        # the ratio instead of only against the sensor.
         opened = db.execute(
-            "SELECT COUNT(*) FROM incidents i JOIN incident_events ie "
-            "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
-            "WHERE i.created_at>=? AND json_extract(e.data_json,'$.category')=?",
+            "SELECT COUNT(DISTINCT i.id) FROM incidents i "
+            "JOIN incident_events ie ON ie.incident_id=i.id "
+            "JOIN events e ON e.id=ie.event_id "
+            "WHERE i.updated_at>=? AND json_extract(e.data_json,'$.category')=?",
             (now - window, row["category"])).fetchone()[0]
         total = max(opened, dismissed)
         precision = max(0.0, (total - dismissed) / float(total)) if total else 1.0
