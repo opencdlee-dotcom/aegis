@@ -11343,15 +11343,28 @@ _VOUCH_CACHE = {"key": None, "active": None, "reason": None}
 
 
 def _vouch_cache_key():
-    """(path, mtime_ns, size) for both vouch files — the cheap question "could
-    the verified answer have changed", answered without re-verifying."""
+    """(path, sha256-of-bytes) for both vouch files.
+
+    CONTENT, not (mtime, size). The stat-keyed version was wrong on Windows and
+    the test caught it: the system clock ticks about every 15.6 ms, so two
+    writes inside one tick get identical st_mtime_ns, and a same-SIZE edit in
+    that window is then invisible. Rewriting a signed trust store to the same
+    length is a small target, but "the attacker would have to be quick" is not
+    an integrity argument — and this project's own rule is that unknown is
+    never clean.
+
+    Cheap by construction: these are an operator-authored roster and an
+    append-only vouch log (107 B and 1.5 KB on the reference machine), and the
+    uncached path reads the same bytes anyway before shelling out to
+    ssh-keygen once per record. Hashing can never cost more than the work it
+    skips."""
     out = []
-    for p in (VOUCH_FILE, VOUCH_SIGNERS):
+    for path in (VOUCH_FILE, VOUCH_SIGNERS):
         try:
-            st = os.stat(p)
-            out.append((p, st.st_mtime_ns, st.st_size))
+            with open(path, "rb") as f:
+                out.append((path, hashlib.sha256(f.read()).hexdigest()))
         except OSError:
-            out.append((p, None, None))
+            out.append((path, None))       # absent/unreadable is its own key
     return tuple(out)
 
 

@@ -68,17 +68,97 @@ class TestCacheHitsAndMisses(VouchCacheBase):
                          "a re-pinned signer roster served a cached answer")
 
     def test_same_size_different_content_still_invalidates(self):
-        """The nastiest case for a stat-keyed cache: identical length."""
+        """The case that killed the stat-keyed version.
+
+        Caught by windows-latest/py3.9: the Windows system clock ticks about
+        every 15.6 ms, so a rewrite inside one tick keeps st_mtime_ns, and with
+        the size unchanged the key was identical — a modified TRUST store
+        served from cache. Deliberately writes back-to-back with no utime
+        nudge, because "fast enough to share a clock tick" is exactly the
+        window an attacker would use."""
         with open(aegis.VOUCH_FILE, "w") as f:
             f.write("AAAA\n")
         aegis.load_vouches()
         before = len(self.calls)
-        os.utime(aegis.VOUCH_FILE, (1, 1))          # force a distinct mtime
         with open(aegis.VOUCH_FILE, "w") as f:
             f.write("BBBB\n")                       # same size, new bytes
         aegis.load_vouches()
         self.assertGreater(len(self.calls), before,
                            "same-size edit went undetected")
+
+    def test_a_rewrite_with_identical_bytes_is_not_a_change(self):
+        """The other half: rewriting the same content must NOT bust the cache,
+        or a touch-happy sync client would re-verify the chain every scan."""
+        with open(aegis.VOUCH_FILE, "w") as f:
+            f.write("AAAA\n")
+        aegis.load_vouches()
+        before = len(self.calls)
+        with open(aegis.VOUCH_FILE, "w") as f:
+            f.write("AAAA\n")
+        aegis.load_vouches()
+        self.assertEqual(len(self.calls), before,
+                         "identical bytes forced a needless re-verification")
+
+
+class TestCoarseClockCannotHideAnEdit(VouchCacheBase):
+    """Pin the Windows failure mode so ANY body can fail on it.
+
+    The stat-keyed cache broke only on windows-latest/py3.9, because macOS and
+    Linux hand out nanosecond mtimes and a back-to-back rewrite therefore looks
+    different there. That is the exact shape tests/simbody.py exists for: a
+    macOS run cannot fail on a platform-shaped defect BY CONSTRUCTION. So this
+    simulates the coarse clock instead of relying on one — quantising mtime to
+    Windows' ~15.6 ms tick — and then the same-size edit must STILL invalidate.
+    """
+
+    WINDOWS_TICK_NS = 15_600_000
+
+    def _coarsen(self):
+        real_stat = os.stat
+
+        def coarse(path, *a, **k):
+            st = real_stat(path, *a, **k)
+
+            class _S:
+                def __getattr__(self, name):
+                    return getattr(st, name)
+                st_mtime_ns = (st.st_mtime_ns //
+                               TestCoarseClockCannotHideAnEdit.WINDOWS_TICK_NS
+                               ) * TestCoarseClockCannotHideAnEdit.WINDOWS_TICK_NS
+            return _S()
+        return coarse
+
+    def test_same_size_edit_survives_a_coarse_mtime(self):
+        real_stat = os.stat
+        os.stat = self._coarsen()
+        try:
+            with open(aegis.VOUCH_FILE, "w") as f:
+                f.write("AAAA\n")
+            aegis.load_vouches()
+            before = len(self.calls)
+            with open(aegis.VOUCH_FILE, "w") as f:
+                f.write("BBBB\n")          # same size, same 15.6ms tick
+            aegis.load_vouches()
+        finally:
+            os.stat = real_stat
+        self.assertGreater(
+            len(self.calls), before,
+            "a same-size edit inside one clock tick served a cached TRUST "
+            "store — this is the windows-latest/py3.9 failure")
+
+    def test_the_key_does_not_consult_mtime_at_all(self):
+        """Stronger and refactor-proof: coarsening the clock must not change
+        the key, because the key is content-addressed."""
+        with open(aegis.VOUCH_FILE, "w") as f:
+            f.write("AAAA\n")
+        fine = aegis._vouch_cache_key()
+        real_stat = os.stat
+        os.stat = self._coarsen()
+        try:
+            coarse = aegis._vouch_cache_key()
+        finally:
+            os.stat = real_stat
+        self.assertEqual(fine, coarse, "the cache key still depends on mtime")
 
 
 class TestExpiryIsNotCached(VouchCacheBase):
