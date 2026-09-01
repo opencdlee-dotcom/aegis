@@ -424,9 +424,21 @@ class TestAgentSurfaceTruncationReportedOnOneShotScan(Sandbox):
         with open(aegis.LATEST_JSON) as fh:
             data = json.load(fh)
         fps = [x["fingerprint"] for x in data["findings"]]
-        self.assertIn("agent-surface:truncated", fps,
-                      "a truncated one-shot scan reported clean coverage; the "
-                      "reader ran before the writer")
+        # PREFIX, not equality: the fingerprint now carries a digest of WHICH
+        # roots were cut short, so a root that only just started being starved
+        # re-alerts instead of hiding under a standing "truncated". This test
+        # is about ORDERING (the reader running after the writer, per the class
+        # docstring), so the prefix is the part it owns.
+        hits = [f for f in fps if f.startswith("agent-surface:truncated")]
+        self.assertTrue(hits,
+                        "a truncated one-shot scan reported clean coverage; the "
+                        "reader ran before the writer")
+        # And while we are here: the finding must name what it stopped looking
+        # at. "Coverage is PARTIAL" without a root is an unanswerable warning.
+        cut = [x for x in data["findings"]
+               if x["fingerprint"].startswith("agent-surface:truncated")][0]
+        self.assertIn(os.path.basename(root), cut["detail"],
+                      "the truncation finding did not say WHICH root was cut")
 
 
 class TestHostileArgsSeverity(Sandbox):
