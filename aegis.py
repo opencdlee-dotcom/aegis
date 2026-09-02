@@ -3395,6 +3395,19 @@ def _auto_tolerate(db, incident_id, verdicts, now, reason="auto-tolerated"):
                          "prior_verdicts": verdicts})))
 
 
+# Corroboration groups: findings carry no sensor name, and two registry
+# sensors emit multiple categories each — check_outbound emits net-outbound
+# AND net-beacon (one code path, one socket table), check_hardening emits
+# hardening AND coverage. Counting raw category strings let one sensor
+# corroborate itself, buying the min_signals 3->2 drop and the x1.5 bonus that
+# exist (Splunk RBA, above) for evidence from INDEPENDENT sources. Categories
+# absent from this map are their own group, so a new sensor fails safe.
+_RISK_SENSOR_GROUP = {
+    "net-outbound": "outbound", "net-beacon": "outbound",
+    "hardening": "hardening-posture", "coverage": "hardening-posture",
+}
+
+
 def _accumulate_risk(db, now, new_ids):
     """Open one 'risk' incident per entity whose recent findings sum past
     RISK_THRESHOLD from ≥ RISK_MIN_SIGNALS DISTINCT signals spanning at least
@@ -3444,7 +3457,7 @@ def _accumulate_risk(db, now, new_ids):
         b["fps"].add(fp)
         b["weight"] += w
         b["ids"].add(row["id"])
-        b["cats"].add(category)
+        b["cats"].add(_RISK_SENSOR_GROUP.get(category, category))
         if row["id"] in new_ids:
             b["new"] = True
     for ek, b in by_entity.items():
