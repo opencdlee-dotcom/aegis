@@ -1415,7 +1415,7 @@ class ListenerAttribution(unittest.TestCase):
 class RegistryIntegrity(unittest.TestCase):
     def test_all_surface_callables_are_defined(self):
         for row in aegis.SURFACES:
-            key, snap_fn, diff_fn, scope, live = aegis._surface_row(row)
+            key, snap_fn, diff_fn, scope, live, _adopt = aegis._surface_row(row)
             self.assertTrue(callable(snap_fn), "%s snapshot" % key)
             self.assertTrue(callable(diff_fn), "%s diff" % key)
             self.assertTrue(scope, "%s writ scope" % key)

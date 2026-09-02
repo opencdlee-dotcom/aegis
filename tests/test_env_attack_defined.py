@@ -23,7 +23,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from conftest import aegis                                    # noqa: E402
+from conftest import SUSPICIOUS_TRUST, aegis                  # noqa: E402
 from test_regression import Sandbox                           # noqa: E402
 
 
@@ -51,10 +51,11 @@ class BenignEnvDoesNotBlockCustody(Sandbox):
     def _relocated(self, env):
         """The `relocated` shape: same bytes, same basename, new directory."""
         old = {"label": "j", "program": "/old/dir/tool", "args": None,
-               "trust": "adhoc", "sha256": "samebytes", "run_at_load": True}
+               "trust": SUSPICIOUS_TRUST, "sha256": "samebytes",
+               "run_at_load": True}
         new = {"label": "j", "program": "/new/dir/tool", "args": None,
-               "trust": "adhoc", "sha256": "samebytes", "run_at_load": True,
-               "env": env}
+               "trust": SUSPICIOUS_TRUST, "sha256": "samebytes",
+               "run_at_load": True, "env": env}
         fs = aegis.check_persistence({"/fake/j.plist": old},
                                      {"/fake/j.plist": new})
         self.assertEqual(1, len(fs), fs)

@@ -782,7 +782,7 @@ class TestWritEnforcementIsActuallyWired(AgentSandbox):
         the shape a hurried new surface will be added as) must normalize to
         the default writ scope, never to no scope."""
         row = ("brand_new_surface", lambda: {}, lambda p, c: [])
-        key, _snap, _diff, scope, live = aegis._surface_row(row)
+        key, _snap, _diff, scope, live, _adopt = aegis._surface_row(row)
         self.assertEqual("brand_new_surface", key)
         self.assertEqual("persistence", scope)
         self.assertFalse(live)
