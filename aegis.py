@@ -4038,11 +4038,24 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # notification (route_findings); a caller without a routing decides here
     # with the same function over the same memory (already built above when
     # any finding needed it).
+    active_signal_keys = None
     for event_id, f in new_events:
-        if f.get("category") in suppressed_categories or event_id in attached \
-                or SEV_ORDER.get(f.get("severity"), -1) \
-                < SEV_ORDER["HIGH"]:
+        if f.get("category") in suppressed_categories or event_id in attached:
             continue
+        if SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["HIGH"]:
+            # Below the incident floor — EXCEPT when this signal's case is
+            # already an active incident: a demoted re-observation is exactly
+            # the news that incident needs (before this, a custody re-grade
+            # was skipped here and the incident froze at its opening severity
+            # with no exit but age-out — five of the fifteen live incidents).
+            if active_signal_keys is None:
+                marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+                active_signal_keys = {r["correlation_key"] for r in db.execute(
+                    "SELECT correlation_key FROM incidents WHERE kind='signal' "
+                    "AND status IN (%s)" % marks, _ACTIVE_INCIDENT_STATES)}
+            key = "signal:" + (f.get("case_fingerprint") or f["fingerprint"])
+            if key not in active_signal_keys:
+                continue
         verdict = (routing or {}).get(f.get("fingerprint"))
         if verdict is None:
             if memory is None:
@@ -4439,10 +4452,14 @@ def record_security_state(findings, sensor_health=(), now=None,
     new_events = []
     try:
         with db:
+            marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
             for original in findings:
                 f = _redact_value(dict(original))
                 occurred = _epoch(f.get("occurred_at") or f.get("ts") or now)
                 attrs = _event_attributes(f)
+                prev = db.execute(
+                    "SELECT severity FROM signals WHERE fingerprint=?",
+                    (f["fingerprint"],)).fetchone()
                 db.execute(
                     "INSERT INTO signals(fingerprint,rule_id,rule_version,category,"
                     "severity,title,detail,first_seen,last_seen,occurrence_count,"
@@ -4457,6 +4474,28 @@ def record_security_state(findings, sensor_health=(), now=None,
                      json.dumps(attrs, sort_keys=True)))
                 signal_id = db.execute("SELECT id FROM signals WHERE fingerprint=?",
                                        (f["fingerprint"],)).fetchone()[0]
+                # A persisting condition is one fact with a count, not an
+                # event per scan. When this signal's OWN case is already an
+                # ACTIVE incident holding its evidence, at the same severity,
+                # the re-observation adds nothing an event row can say —
+                # occurrence_count (incremented above) and last_seen carry it.
+                # Live cost of the old behaviour: 41-64 byte-identical rows
+                # per open signal incident, feeding the 50k retention budget.
+                # Three deliberate bounds: a SEVERITY change still records (a
+                # custody re-grade is exactly the news the incident needs); a
+                # finding with a routing verdict still records (an allowlist
+                # or tolerance decision must reach the loop that closes the
+                # case); and only kind='signal' incidents fold — a risk
+                # incident's corroborating facts must stay visible in the
+                # accumulator's event window.
+                rv = (routing or {}).get(f["fingerprint"])
+                if prev and prev["severity"] == f["severity"]                         and not (rv and rv.get("decision")) and db.execute(
+                        "SELECT 1 FROM incidents i JOIN incident_events ie "
+                        "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
+                        "WHERE i.status IN (%s) AND i.kind='signal' "
+                        "AND e.signal_id=? LIMIT 1" % marks,
+                        _ACTIVE_INCIDENT_STATES + (signal_id,)).fetchone():
+                    continue
                 cur = db.execute(
                     "INSERT INTO events(occurred_at,observed_at,source,event_type,"
                     "signal_id,data_json) VALUES(?,?,?,?,?,?)",
@@ -4567,6 +4606,18 @@ def incident_detail(incident_id):
         # Which sensors contributed — drives the known-benign-cause lookup that
         # makes triage a match-against-known-list instead of an investigation.
         result["categories"] = sorted(_incident_categories(db, incident_id))
+        # The recurrence counter finally gets a reader: with still-true facts
+        # folded into occurrence_count instead of minting evidence rows, the
+        # honest statement of a standing incident is "seen N times since
+        # <date>", and this is where the renderer finds it.
+        key = result.get("correlation_key") or ""
+        if key.startswith("signal:"):
+            sig = db.execute(
+                "SELECT occurrence_count, first_seen FROM signals "
+                "WHERE fingerprint=?", (key[len("signal:"):],)).fetchone()
+            if sig:
+                result["occurrences"] = sig["occurrence_count"]
+                result["first_occurrence"] = sig["first_seen"]
         return result
     finally:
         db.close()
@@ -15481,6 +15532,12 @@ def cmd_incident(incident_id, action=None, reason=None):
               item["correlation_key"],
               datetime.fromtimestamp(item["created_at"]).isoformat(),
               datetime.fromtimestamp(item["updated_at"]).isoformat()))
+    # The honest statement of a standing fact: one line with a count, not one
+    # evidence row per scan (still-true re-observations fold into the count).
+    if (item.get("occurrences") or 0) > 1:
+        print("  seen:     %d observations since %s" % (
+            item["occurrences"],
+            datetime.fromtimestamp(item["first_occurrence"]).isoformat()))
     for evidence in item.get("evidence", []):
         try:
             data = json.loads(evidence["data_json"])
