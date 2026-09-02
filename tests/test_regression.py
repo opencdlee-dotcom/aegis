@@ -213,7 +213,12 @@ class Sandbox(unittest.TestCase):
                                               "malwarebazaar.json"),
             "INTEL_THREATFOX_FILE": os.path.join(self.state, "intel",
                                                  "threatfox.json"),
+            "INTEL_LOCAL_FILE": os.path.join(self.state, "intel",
+                                             "local.json"),
             "_INTEL_CACHE": None,
+            # Auto-Protect shadow state: sandboxed so a scan-level test can
+            # never rehearse against (or tally into) the real ledger.
+            "AUTOPROTECT_FILE": os.path.join(self.state, "autoprotect.json"),
             # The listener surface shells to lsof (live host state). Point it
             # at /usr/bin/true (rc 0, no output ⇒ empty snapshot) so scan-level
             # tests are deterministic; listener tests call the parse/diff

@@ -43,6 +43,7 @@ DB_FILE = os.path.join(STATE_DIR, "aegis.db")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 LATEST_MD = os.path.join(STATE_DIR, "latest.md")
 BASELINE = os.path.join(STATE_DIR, "baseline.json")
+AUTOPROTECT_FILE = os.path.join(STATE_DIR, "autoprotect.json")
 RUNTIME = os.path.join(STATE_DIR, "aegis.py")   # install.sh's runtime copy
 
 HEARTBEAT_STALE_SECS = 3 * 3600   # mirrors aegis.py cmd_watchdog tolerance
@@ -67,6 +68,19 @@ def read_heartbeat():
         with open(HEARTBEAT_FILE, "r", encoding="utf-8", errors="replace") as f:
             beat = json.loads(f.read(MAX_JSON_BYTES))
         return beat if isinstance(beat, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_autoprotect():
+    """autoprotect.json as written by aegis.py's Auto-Protect tier; {} on any
+    problem or when the tier has never been armed. Same bounded-read doctrine
+    as read_heartbeat."""
+    try:
+        with open(AUTOPROTECT_FILE, "r", encoding="utf-8",
+                  errors="replace") as f:
+            state = json.loads(f.read(MAX_JSON_BYTES))
+        return state if isinstance(state, dict) else {}
     except Exception:
         return {}
 
@@ -218,6 +232,16 @@ def render():
         lines.append("Last scan: %s" % _rel(now - store["last_scan"]))
     else:
         lines.append("Last scan: unavailable | color=gray")
+    ap = read_autoprotect()
+    if ap.get("mode") == "shadow":
+        tally = ap.get("tally") if isinstance(ap.get("tally"), dict) else {}
+        try:
+            wq = int(tally.get("would-quarantine") or 0)
+            wf = int(tally.get("would-freeze") or 0)
+        except Exception:
+            wq = wf = 0
+        lines.append("Auto-Protect: shadow — %d would-quarantine · %d "
+                     "would-freeze" % (wq, wf))
 
     # ---- incidents ------------------------------------------------------------
     if open_count:

@@ -36,7 +36,8 @@ You are a background security monitor for macOS, Linux, and Windows. Your job is
   REAL `scan` against live `~/.aegis` state**, because `cmd` defaults to
   `"scan"`. So `aegis.py --help` is safe and bare `aegis.py` is not; verified
   2026-08-30. Read-only subcommands for poking at a live install: `status`,
-  `doctor`, `report`, `incidents`, `backtest`, `attck`, `replay`, `rehunt`.
+  `doctor`, `report`, `incidents`, `backtest`, `attck`, `replay`, `rehunt`,
+  `autoprotect` (bare = status; `shadow`/`off` write state but act on nothing).
 - **Before pushing anything platform-shaped, diff a simulated body against your
   merge base**: `PYTHONPATH=tests SIM_BODY=win python3 -m pytest tests/ -q -p simbody`.
   See `tests/simbody.py` — a macOS run cannot fail on a fixture that hard-codes

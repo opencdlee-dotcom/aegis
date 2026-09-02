@@ -1132,7 +1132,10 @@ things it *can* do, none of which require privilege:
 
 The invariant that does **not** move: **nothing here fires automatically from a
 heuristic.** What changed is that the operator now has reversible verbs
-available, not that Aegis acquired judgement.
+available, not that Aegis acquired judgement. (The operator has since decided —
+2026-09-01, ROADMAP.md — to amend this invariant into a *tiered* form; the
+Auto-Protect tier below is that amendment's staged arrival, and until its live
+stage ships, the sentence above remains literally true of the runtime.)
 
 That invariant survives `deadfall`, which is the one path where a verb runs
 without being typed at the moment it runs, so it is worth stating exactly what
@@ -1164,6 +1167,54 @@ currently *proven*. A control unproven past its half-life is reported as
 unproven coverage, never as a clean result. It deliberately uses no EICAR —
 waking a third-party AV would trip Aegis's own file-deletion sensors, a
 self-referential cascade in a tool whose whole value is a calm signal.
+
+## Auto-Protect tier (ROADMAP.md Phase 1 — shadow stage shipped)
+
+The operator's decided amendment to "nothing fires automatically from a
+heuristic": automatic response, tiered by **evidence class** — the shape
+commercial AV actually uses (a signature hit auto-quarantines; a behavioral
+hit gets a reputation check and a prompt), which is also what Aegis's own
+history demands. Measured basis: 314 detections, 0 true positives, 130
+benign-positives — heuristic auto-quarantine would have destroyed 130
+workflows, while deterministic auto-quarantine would have fired zero false
+times.
+
+`evidence_class(finding)` decides from the **fingerprint prefix** (the same
+discipline as `_DEADFALL_FINGERPRINTS` — `xprotect:stale:` must never ride in
+on `xprotect:detect:`'s class):
+
+- **deterministic** — attack-defined or exact-corpus-matched, no judgement to
+  get wrong: `decoy:read:`, `latch:cleared:`, `xprotect:detect:`,
+  `intel:hash:`, `intel:net:`. Tier verb: quarantine (transactional,
+  restorable) — except a decoy read, whose subject is the reading *process*
+  (the file is Aegis's own honeytoken), so it takes freeze.
+- **heuristic** — everything else. Tier verb: freeze (reversible, fail-open),
+  and only when the finding names a live process; heuristic file findings
+  remain alerts for a human. Unrecognized fingerprints classify heuristic:
+  the only cost of misclassifying downward is a human look.
+
+Rollout is staged, and each stage is a separate build:
+
+1. **Shadow (shipped).** `autoprotect shadow` arms a rehearsal: every scan
+   evaluates the full live decision — including the refusal guards live mode
+   would apply (`_is_protected_path`, `_freeze_refusal`) — and records
+   `would-quarantine` / `would-freeze` / `would-refuse` once per fingerprint
+   in `actions.jsonl`, with a running tally in `autoprotect.json` that the
+   menu bar surfaces. It acts on nothing, and like deadfall dispatch it is
+   wrapped so it can never fail the scan that feeds it. Exit criteria: ≥7
+   days or ≥50 shadow scans, *reviewed*.
+2. **Live, deterministic (not yet built).** Enablement will sit behind
+   `authorize_interactive`'s one-time out-of-band code — automation must not
+   be able to switch Aegis into acting mode, for exactly the `unlatch`
+   reason. Every automatic action leaves an `actions.jsonl` record and a
+   notary anchor: an automatic action with no witness would be the actual
+   violation.
+3. **Live, heuristic freeze (not yet built).** The reversible verb on the
+   weaker evidence class, with the human verdict arriving via the existing
+   `frozen` review queue.
+
+There is deliberately no `autoprotect live` verb until stage 2 exists — a
+verb that always refuses would be a stub, not a safety.
 
 ## Power-tier gate
 
