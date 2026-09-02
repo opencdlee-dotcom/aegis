@@ -4130,7 +4130,9 @@ def _record_health(db, health, now):
                     int(item.get("duration_ms") or 0),
                     int(item.get("item_count") or 0), detail, failures, episode))
         event_data = {"sensor_id": sensor_id, "status": status, "detail": detail,
-                      "consecutive_failures": failures}
+                      "consecutive_failures": failures,
+                      "duration_ms": int(item.get("duration_ms") or 0),
+                      "item_count": int(item.get("item_count") or 0)}
         cur = db.execute("INSERT INTO events(occurred_at,observed_at,source,event_type,"
                          "data_json) VALUES(?,?,?,?,?)",
                          (now, now, sensor_id, "sensor.health",
@@ -4788,6 +4790,63 @@ def get_sensor_health():
             "SELECT * FROM sensor_status ORDER BY sensor_id").fetchall())
     finally:
         db.close()
+
+
+# --- Scan cost: the resource budget, measured rather than assumed ---------- #
+# A monitor on a daily-driver machine has an overhead ceiling whether or not
+# anyone wrote it down. Written down: average CPU share, scan CPU over the
+# time between scans, including every command a scan spawns.
+SCAN_CPU_CEILING_PCT = 1.0
+
+
+def _cpu_seconds():
+    """CPU consumed by this process and every command it has waited on."""
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
+
+
+def _scan_cost_samples(limit=200):
+    """[(occurred_at, wall_ms, cpu_ms)] for the most recent scans, oldest
+    first. Read from the health EVENTS, which keep one row per scan, not from
+    sensor_status, which keeps only the latest."""
+    db = _event_connection()
+    try:
+        rows = db.execute(
+            "SELECT occurred_at, data_json FROM events WHERE source='scan.cost' "
+            "AND event_type='sensor.health' ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+    finally:
+        db.close()
+    out = []
+    for row in rows:
+        try:
+            d = json.loads(row["data_json"])
+            out.append((int(row["occurred_at"]), int(d.get("duration_ms") or 0),
+                        int(d.get("item_count") or 0)))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def _scan_cost_summary(samples):
+    """{wall_p50_s, wall_p95_s, cpu_mean_s, share_pct, span_h, scans} over
+    the samples, or None below two of them (a share needs a span)."""
+    samples = sorted(samples)
+    if len(samples) < 2:
+        return None
+    span = samples[-1][0] - samples[0][0]
+    if span <= 0:
+        return None
+    walls = sorted(s[1] for s in samples)
+
+    def pct(q):
+        return walls[int(round((len(walls) - 1) * q))] / 1000.0
+
+    cpu = sum(s[2] for s in samples) / 1000.0
+    return {"wall_p50_s": pct(0.5), "wall_p95_s": pct(0.95),
+            "cpu_mean_s": cpu / len(samples),
+            "share_pct": 100.0 * cpu / span, "span_h": span / 3600.0,
+            "scans": len(samples)}
 
 
 def _collect_sensor(sensor_id, fn, health, *args):
@@ -14602,6 +14661,7 @@ def _cmd_scan_locked(quiet=False):
     _PROC_ENUM_FAILED = False
     _PROC_ARGV_PARTIAL = False
     health = []
+    scan_started, cpu_started = time.monotonic(), _cpu_seconds()
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
     current = _collect_sensor("persistence.snapshot", snapshot_persistence,
@@ -14711,6 +14771,12 @@ def _cmd_scan_locked(quiet=False):
                    "were NOT vouched for" % _SIG_PROBE_FAILURES)
         if _SIG_PROBE_FAILURES else "",
         "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
+    # The scan's own cost, recorded where every other coverage fact is so it
+    # is durable per scan. duration_ms is wall time; item_count is CPU
+    # milliseconds for this process AND every command it waited on.
+    health.append({"sensor_id": "scan.cost", "status": "OK", "detail": "",
+                   "duration_ms": int((time.monotonic() - scan_started) * 1000),
+                   "item_count": int((_cpu_seconds() - cpu_started) * 1000)})
 
     # Captured BEFORE emit, which is what updates the ledger: this is the set
     # the previous scan had already reported, and the difference against it is
@@ -15919,6 +15985,18 @@ def cmd_doctor():
     print("  %s %-27s %s" % (a_mark, "positive controls", a_text))
     if a_mark != "✓":
         problems.append("assay coverage")
+    cost = _scan_cost_summary(_scan_cost_samples())
+    if cost is None:
+        print("  · %-27s no history yet (two scans needed)" % "scan cost")
+    else:
+        over = cost["share_pct"] > SCAN_CPU_CEILING_PCT
+        print("  %s %-27s cpu %.1fs/scan, wall p50 %.1fs p95 %.1fs, %.2f%% of "
+              "the last %.1fh over %d scans (ceiling %.0f%%)"
+              % ("?" if over else "✓", "scan cost", cost["cpu_mean_s"],
+                 cost["wall_p50_s"], cost["wall_p95_s"], cost["share_pct"],
+                 cost["span_h"], cost["scans"], SCAN_CPU_CEILING_PCT))
+        if over:
+            problems.append("scan cost")
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
