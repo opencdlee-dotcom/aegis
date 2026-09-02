@@ -522,7 +522,20 @@ class TestTriageWorkflow(Sandbox):
         """
         for category in ("browser-ext", "ide-ext", "wallet-integrity"):
             with self.subTest(category=category):
-                inc = self._one_incident(category=category)
+                # One fingerprint per category, and the incident looked up by
+                # its own key: reusing the default fingerprint made every
+                # subtest after the first a same-fingerprint re-observation
+                # (which now correctly folds into the first incident's count),
+                # and list_incidents()[0] is not necessarily the newest case.
+                self._one_incident(fingerprint="t-%s" % category,
+                                   category=category)
+                db = aegis._event_connection()
+                try:
+                    inc = db.execute(
+                        "SELECT id FROM incidents WHERE correlation_key=?",
+                        ("signal:t-%s" % category,)).fetchone()["id"]
+                finally:
+                    db.close()
                 notes = aegis._benign_note_for(aegis.incident_detail(inc))
                 self.assertTrue(
                     any(category in n for n in notes),

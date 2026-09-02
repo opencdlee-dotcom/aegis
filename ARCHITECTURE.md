@@ -336,13 +336,24 @@ call sequence:
 5. **The incident ratchet** (`_severity_max`) only ever steps UP: once an
    incident opened HIGH, a later regrade of the same subject cannot quietly
    lower it — de-escalation is the operator's verdict to give, not custody's.
+   The stored severity is never rewritten by a machine. What a re-grade CAN
+   do is end the incident's claim on the queue: when the latest word on a
+   signal is a sub-HIGH re-grade, `_close_regraded_incidents` closes the OPEN
+   incident with an explicit `re-graded:` resolution — the same
+   visible-and-reopenable machine exit age-out already is, made
+   evidence-driven instead of clock-driven. (Before this, five of fifteen
+   live incidents sat OPEN at HIGH while their own `signals` rows read LOW or
+   MEDIUM, with no exit but the seven-day clock.)
 
 One known asymmetry, stated so it is a decision rather than a surprise: a
 custody demotion below HIGH keeps a finding out of the *standalone-signal*
-incident path (the uncorrelated-signal floor). That is routing, not erasure —
-the finding is still logged, still joins chains and lineage, and still
-accumulates risk — but "grading demotes, it never suppresses" is true at the
-report tier and only mostly true at the incident tier.
+incident path (the uncorrelated-signal floor) — EXCEPT when that signal's
+case is already an active incident, where the demoted re-observation is
+exactly the news the incident needs and is passed through to it. That is
+routing, not erasure — the finding is still logged, still joins chains and
+lineage, and still accumulates risk (now weighted by its custody rung) — but
+"grading demotes, it never suppresses" is true at the report tier and only
+mostly true at the incident tier.
 
 #### Hashing the payload, not the interpreter
 

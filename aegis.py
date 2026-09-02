@@ -2716,10 +2716,19 @@ def _category_dismissal_weights(db, now, window=90 * 86400):
         dismissed = int(row["n"])
         if dismissed < _PRECISION_MIN_SAMPLE:
             continue
+        # COUNT(DISTINCT i.id), never COUNT(*): the join fans out to one row
+        # per EVIDENCE EVENT, so a sensor that re-emits one fact every scan
+        # (the exact noise this loop exists to damp) inflated the denominator
+        # until 23 operator dismissals bought a 2% discount. The numerator is
+        # per-incident; the denominator must be too. And the window predicate
+        # matches the DISMISSAL side (updated_at, which every dismissal
+        # touches), so an old incident triaged today counts on both sides of
+        # the ratio instead of only against the sensor.
         opened = db.execute(
-            "SELECT COUNT(*) FROM incidents i JOIN incident_events ie "
-            "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
-            "WHERE i.created_at>=? AND json_extract(e.data_json,'$.category')=?",
+            "SELECT COUNT(DISTINCT i.id) FROM incidents i "
+            "JOIN incident_events ie ON ie.incident_id=i.id "
+            "JOIN events e ON e.id=ie.event_id "
+            "WHERE i.updated_at>=? AND json_extract(e.data_json,'$.category')=?",
             (now - window, row["category"])).fetchone()[0]
         total = max(opened, dismissed)
         precision = max(0.0, (total - dismissed) / float(total)) if total else 1.0
@@ -2814,6 +2823,16 @@ def _tolerance_identity(fingerprint):
     changed = False
     if _TOLERANCE_HASH_RE.match(parts[-1]):
         parts = parts[:-1]
+        changed = True
+    # The agent-surface exec key glues its content hash INTO the command with
+    # '|' (_exec_identity: "<cmd>|<sha12>"), so the hash never stands as its
+    # own ':'-field and the strip above can never see it. Same generalization,
+    # same guard (the tail must BE a hash — a shell pipe's tail is not), one
+    # level deeper. Checked after the trailing-field strip so a target
+    # fingerprint ("...:<cmd>|<sha12>:<newsha12>") composes both forms.
+    head, sep, tail = parts[-1].rpartition("|")
+    if sep and head and _TOLERANCE_HASH_RE.match(tail.strip()):
+        parts[-1] = head
         changed = True
     normalized = []
     for part in parts:
@@ -3166,6 +3185,13 @@ def _carries_new_evidence(incoming, held):
     binary — is unseen exactly as before."""
     if not incoming:
         return False
+    if not held:
+        # An incident with NO remembered identities is not a blank slate — it
+        # is an incident whose evidence was lost (retention prune, hand-edited
+        # store). Reading amnesia as "everything is novel" permanently locked
+        # judged cases out of reattachment and refreshed last_novel_at forever;
+        # declining to claim novelty fails toward the operator's last verdict.
+        return False
     unseen = incoming - held
     if not unseen:
         return False
@@ -3369,6 +3395,19 @@ def _auto_tolerate(db, incident_id, verdicts, now, reason="auto-tolerated"):
                          "prior_verdicts": verdicts})))
 
 
+# Corroboration groups: findings carry no sensor name, and two registry
+# sensors emit multiple categories each — check_outbound emits net-outbound
+# AND net-beacon (one code path, one socket table), check_hardening emits
+# hardening AND coverage. Counting raw category strings let one sensor
+# corroborate itself, buying the min_signals 3->2 drop and the x1.5 bonus that
+# exist (Splunk RBA, above) for evidence from INDEPENDENT sources. Categories
+# absent from this map are their own group, so a new sensor fails safe.
+_RISK_SENSOR_GROUP = {
+    "net-outbound": "outbound", "net-beacon": "outbound",
+    "hardening": "hardening-posture", "coverage": "hardening-posture",
+}
+
+
 def _accumulate_risk(db, now, new_ids):
     """Open one 'risk' incident per entity whose recent findings sum past
     RISK_THRESHOLD from ≥ RISK_MIN_SIGNALS DISTINCT signals spanning at least
@@ -3401,7 +3440,15 @@ def _accumulate_risk(db, now, new_ids):
         category = f.get("category") or ""
         w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
              * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7)
-             * demote.get(category, 1.0))
+             * demote.get(category, 1.0)
+             # The custody term: without it, findings the grader had
+             # individually demoted below the notify floor — because it
+             # PROVED the operator authored them — summed straight back into
+             # a HIGH interrupt (all four live risk incidents were this
+             # shape). The sensors carry the rung as `custody`; the
+             # agent-surface diff calls it `provenance`.
+             * _RISK_CUSTODY_WEIGHT.get(
+                 f.get("custody") or f.get("provenance") or "", 1.0))
         if w <= 0:
             continue
         ek = hashlib.sha256(entity.encode("utf-8", "replace")).hexdigest()[:16]
@@ -3418,7 +3465,7 @@ def _accumulate_risk(db, now, new_ids):
         b["fps"].add(fp)
         b["weight"] += w
         b["ids"].add(row["id"])
-        b["cats"].add(category)
+        b["cats"].add(_RISK_SENSOR_GROUP.get(category, category))
         if row["id"] in new_ids:
             b["new"] = True
     for ek, b in by_entity.items():
@@ -3430,12 +3477,16 @@ def _accumulate_risk(db, now, new_ids):
         score = b["weight"] * (RISK_CORROBORATION_BONUS if multi else 1.0)
         if b["new"] and len(b["fps"]) >= min_signals \
                 and score >= RISK_THRESHOLD:
+            # Severity follows the score instead of a hardcoded "HIGH":
+            # barely past threshold is a MEDIUM worth a look, not an
+            # interrupt-grade verdict the number never supported.
+            sev = "HIGH" if score >= 2 * RISK_THRESHOLD else "MEDIUM"
             _upsert_incident(
                 db, "risk:%s" % ek,
                 "Accumulated risk on %s (%d signals across %d sensor%s, score %.1f)"
                 % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
                    "" if len(b["cats"]) == 1 else "s", score),
-                "HIGH", "risk", now, sorted(b["ids"]))
+                sev, "risk", now, sorted(b["ids"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -3987,11 +4038,24 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # notification (route_findings); a caller without a routing decides here
     # with the same function over the same memory (already built above when
     # any finding needed it).
+    active_signal_keys = None
     for event_id, f in new_events:
-        if f.get("category") in suppressed_categories or event_id in attached \
-                or SEV_ORDER.get(f.get("severity"), -1) \
-                < SEV_ORDER["HIGH"]:
+        if f.get("category") in suppressed_categories or event_id in attached:
             continue
+        if SEV_ORDER.get(f.get("severity"), -1) < SEV_ORDER["HIGH"]:
+            # Below the incident floor — EXCEPT when this signal's case is
+            # already an active incident: a demoted re-observation is exactly
+            # the news that incident needs (before this, a custody re-grade
+            # was skipped here and the incident froze at its opening severity
+            # with no exit but age-out — five of the fifteen live incidents).
+            if active_signal_keys is None:
+                marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+                active_signal_keys = {r["correlation_key"] for r in db.execute(
+                    "SELECT correlation_key FROM incidents WHERE kind='signal' "
+                    "AND status IN (%s)" % marks, _ACTIVE_INCIDENT_STATES)}
+            key = "signal:" + (f.get("case_fingerprint") or f["fingerprint"])
+            if key not in active_signal_keys:
+                continue
         verdict = (routing or {}).get(f.get("fingerprint"))
         if verdict is None:
             if memory is None:
@@ -4090,6 +4154,47 @@ _AGE_OUT_DAYS = 7
 # CRITICAL, and attack-defined evidence — a tripped decoy or latch is a fact
 # about an attacker, and a quiet week is not an acquittal.
 _AGE_OUT_KINDS = ("signal", "risk")
+
+
+def _close_regraded_incidents(db, now):
+    """Close OPEN signal incidents whose own signal was re-graded below HIGH.
+
+    The severity ratchet stands (de-escalation is the operator's verdict, not
+    custody's — the stored severity is never rewritten), but five of fifteen
+    live incidents sat OPEN at HIGH while their own `signals` rows read LOW or
+    MEDIUM: custody had re-graded the findings days earlier and the queue
+    could not follow. The design already accepts a machine exit — age-out
+    closes as FALSE_POSITIVE, visibly, reopenable — so this is the same exit
+    made evidence-driven instead of clock-driven: when the LATEST word on a
+    signal (last_seen at or after the incident's own) is a sub-HIGH re-grade,
+    the incident closes with an explicit "re-graded" resolution instead of
+    holding a week for the age-out clock.
+
+    Same discipline as age-out: no dismissals row (a machine verdict must
+    never feed backtest precision or acquired tolerance), CRITICAL is never
+    closed this way, never-tolerate prefixes are skipped, and the reattach
+    path reopens the case the moment it carries something new."""
+    rows = db.execute(
+        "SELECT i.id, i.severity AS inc_sev, i.correlation_key, "
+        "s.severity AS sig_sev FROM incidents i "
+        "JOIN signals s ON ('signal:' || s.fingerprint) = i.correlation_key "
+        "WHERE i.status='OPEN' AND i.kind='signal' "
+        "AND i.severity<>'CRITICAL' AND s.last_seen>=i.last_seen").fetchall()
+    closed = []
+    for row in rows:
+        fp = (row["correlation_key"] or "")[len("signal:"):]
+        if fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        if SEV_ORDER.get(row["sig_sev"], 99) >= SEV_ORDER["HIGH"]:
+            continue
+        closed.append((row["id"], row["sig_sev"]))
+    for incident_id, sig_sev in closed:
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=? AND status='OPEN'",
+            ("re-graded: the signal now reads %s (reopens on new evidence)"
+             % sig_sev, now, incident_id))
+    return len(closed)
 
 
 def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
@@ -4388,10 +4493,14 @@ def record_security_state(findings, sensor_health=(), now=None,
     new_events = []
     try:
         with db:
+            marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
             for original in findings:
                 f = _redact_value(dict(original))
                 occurred = _epoch(f.get("occurred_at") or f.get("ts") or now)
                 attrs = _event_attributes(f)
+                prev = db.execute(
+                    "SELECT severity FROM signals WHERE fingerprint=?",
+                    (f["fingerprint"],)).fetchone()
                 db.execute(
                     "INSERT INTO signals(fingerprint,rule_id,rule_version,category,"
                     "severity,title,detail,first_seen,last_seen,occurrence_count,"
@@ -4406,6 +4515,28 @@ def record_security_state(findings, sensor_health=(), now=None,
                      json.dumps(attrs, sort_keys=True)))
                 signal_id = db.execute("SELECT id FROM signals WHERE fingerprint=?",
                                        (f["fingerprint"],)).fetchone()[0]
+                # A persisting condition is one fact with a count, not an
+                # event per scan. When this signal's OWN case is already an
+                # ACTIVE incident holding its evidence, at the same severity,
+                # the re-observation adds nothing an event row can say —
+                # occurrence_count (incremented above) and last_seen carry it.
+                # Live cost of the old behaviour: 41-64 byte-identical rows
+                # per open signal incident, feeding the 50k retention budget.
+                # Three deliberate bounds: a SEVERITY change still records (a
+                # custody re-grade is exactly the news the incident needs); a
+                # finding with a routing verdict still records (an allowlist
+                # or tolerance decision must reach the loop that closes the
+                # case); and only kind='signal' incidents fold — a risk
+                # incident's corroborating facts must stay visible in the
+                # accumulator's event window.
+                rv = (routing or {}).get(f["fingerprint"])
+                if prev and prev["severity"] == f["severity"]                         and not (rv and rv.get("decision")) and db.execute(
+                        "SELECT 1 FROM incidents i JOIN incident_events ie "
+                        "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
+                        "WHERE i.status IN (%s) AND i.kind='signal' "
+                        "AND e.signal_id=? LIMIT 1" % marks,
+                        _ACTIVE_INCIDENT_STATES + (signal_id,)).fetchone():
+                    continue
                 cur = db.execute(
                     "INSERT INTO events(occurred_at,observed_at,source,event_type,"
                     "signal_id,data_json) VALUES(?,?,?,?,?,?)",
@@ -4422,6 +4553,12 @@ def record_security_state(findings, sensor_health=(), now=None,
             # incident in the same breath as its new evidence.
             _run_store_migrations(db, now)
             try:
+                regraded = _close_regraded_incidents(db, now)
+                if regraded:
+                    log_run("closed %d re-graded incident(s)" % regraded)
+            except Exception as e:
+                log_run("re-grade close skipped: %s" % e)
+            try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
                 _LAST_AGED_OUT = aged
@@ -4432,9 +4569,18 @@ def record_security_state(findings, sensor_health=(), now=None,
             db.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON "
                        "CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
         # Bound raw observations while retaining materialized signals/incidents.
+        # Evidence attached to an incident IS materialized state: the FK is
+        # ON DELETE CASCADE with foreign_keys=ON, so pruning a referenced row
+        # deletes the incident's evidence with it, _incident_identities goes
+        # empty, and the FALSE_POSITIVE reattach guard can never pass again —
+        # the operator's verdict is silently revoked (59 judged incidents on
+        # the reference store had been stripped this way). Exempting the
+        # referenced rows keeps the cap on the only thing it was bounding:
+        # observations nothing points at.
         with db:
             db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
-                       "ORDER BY id DESC LIMIT -1 OFFSET 50000)")
+                       "ORDER BY id DESC LIMIT -1 OFFSET 50000) "
+                       "AND id NOT IN (SELECT event_id FROM incident_events)")
     finally:
         db.close()
     return {"events": len(new_events), "health": len(sensor_health)}
@@ -4507,6 +4653,18 @@ def incident_detail(incident_id):
         # Which sensors contributed — drives the known-benign-cause lookup that
         # makes triage a match-against-known-list instead of an investigation.
         result["categories"] = sorted(_incident_categories(db, incident_id))
+        # The recurrence counter finally gets a reader: with still-true facts
+        # folded into occurrence_count instead of minting evidence rows, the
+        # honest statement of a standing incident is "seen N times since
+        # <date>", and this is where the renderer finds it.
+        key = result.get("correlation_key") or ""
+        if key.startswith("signal:"):
+            sig = db.execute(
+                "SELECT occurrence_count, first_seen FROM signals "
+                "WHERE fingerprint=?", (key[len("signal:"):],)).fetchone()
+            if sig:
+                result["occurrences"] = sig["occurrence_count"]
+                result["first_occurrence"] = sig["first_seen"]
         return result
     finally:
         db.close()
@@ -4711,6 +4869,24 @@ def _finish_persist_record(rec, prog, args):
 # Linux env keys that inject code into other processes — the LD_* family is the
 # direct analog of macOS DYLD_INSERT_LIBRARIES (T1574.006).
 _LD_INJECT_KEYS = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
+
+
+def _env_attack_defined(env):
+    """Does this EnvironmentVariables dict itself constitute the attack?
+
+    Only the loader-injection families qualify — any DYLD_* key (the whole
+    namespace: new keys appear across OS releases and an allowlist would rot)
+    and the LD_PRELOAD/LD_LIBRARY_PATH/LD_AUDIT trio. A dict of PATH/LANG/HOME
+    is an ordinary launchd/systemd idiom; treating ANY env as attack-defined
+    permanently disqualified such jobs from custody grading, pinning a benign
+    one-time change at HIGH with no exit but age-out (live incident #319)."""
+    if not isinstance(env, dict):
+        return False
+    for key in env:
+        k = str(key)
+        if k.startswith("DYLD_") or k in _LD_INJECT_KEYS:
+            return True
+    return False
 
 
 def _parse_systemd_unit(text):
@@ -5496,8 +5672,8 @@ def check_persistence(baseline_snap, current_snap):
                 # are excluded at BOTH ends — _custody_persistence refuses to
                 # return a rung for them, and _demote is told explicitly — so a
                 # payload can never be quieted by proving who moved it.
-                attack_defined = bool(rec.get("env")) or _hostile_args(
-                    rec.get("args"), rec.get("program"))
+                attack_defined = _env_attack_defined(rec.get("env")) \
+                    or _hostile_args(rec.get("args"), rec.get("program"))
                 prov = (None if attack_defined
                         else _custody_persistence(old, rec)
                         or (_custody(path, rec.get("sha256"))[0]
@@ -10996,6 +11172,24 @@ _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
 _WEAK_CUSTODY = ("worktree", "local-commit")
 
 _CUSTODY_FLOOR = {"relocated": "LOW"}
+# How much a custody-graded finding may still CORROBORATE in the risk tier.
+# The demotion ladder already lowered each finding's own severity; this factor
+# answers a different question — whether provenance-explained findings should
+# sum into an interrupt at all. A rung Aegis can trace to the operator's own
+# hand contributes nothing (a finding proved self-authored must not
+# corroborate an attack); vouched origins are heavily discounted ("origin is
+# not innocence", so not zero); weak local evidence is halved. Ungraded
+# findings keep full weight, so a real intrusion — whose signals custody
+# cannot claim — accumulates exactly as before. Built from the custody tiers
+# so a new rung inherits its tier's factor instead of silently scoring 1.0.
+_RISK_CUSTODY_WEIGHT = {}
+for _rung in _SELF_CUSTODY:
+    _RISK_CUSTODY_WEIGHT[_rung] = 0.0
+for _rung in _VOUCHED_CUSTODY:
+    _RISK_CUSTODY_WEIGHT[_rung] = 0.25
+for _rung in _WEAK_CUSTODY:
+    _RISK_CUSTODY_WEIGHT[_rung] = 0.5
+del _rung
 
 
 def _demote(severity, provenance, attack_defined=False):
@@ -11659,7 +11853,8 @@ def _custody_persistence(old, rec):
     # Environment injection and hostile argv are attack-DEFINED. They are
     # refused here as well as at the demotion gate, so no future caller can
     # reach a vouching rung by a path that skips the gate.
-    if rec.get("env") or _hostile_args(rec.get("args"), rec.get("program")):
+    if _env_attack_defined(rec.get("env")) or _hostile_args(
+            rec.get("args"), rec.get("program")):
         return None
 
     op, np_ = old.get("program"), rec.get("program")
@@ -13125,7 +13320,7 @@ def _build_surfaces(is_mac, is_linux):
         # digest (so an attacker who edits an MCP registration AND Aegis's
         # baseline breaks the hash chain).
         ("agent_surface", snapshot_agent_surface, diff_agent_surface,
-         "agent_surface"),
+         "agent_surface", False, True),   # adopt_new_entries: see _scan_surfaces
         ("session_binding", snapshot_session_binding, diff_session_binding),
         ("ext_caps", snapshot_ext_caps, diff_ext_caps),
     ]
@@ -13174,14 +13369,15 @@ SURFACES = _build_surfaces(IS_MAC, IS_LINUX)
 
 def _surface_row(row):
     """Normalize a SURFACES row to (key, snap_fn, diff_fn, writ_scope,
-    never_adopt_live). A surface with no explicit scope falls back to
+    never_adopt_live, adopt_new_entries). A surface with no explicit scope falls back to
     "persistence", so a newly added surface is governed by default rather than
     silently ungoverned — the failure that would otherwise grow a hole every
     time someone adds a sensor."""
     key, snap_fn, diff_fn = row[0], row[1], row[2]
     scope = row[3] if len(row) > 3 else "persistence"
     live = bool(row[4]) if len(row) > 4 else False
-    return key, snap_fn, diff_fn, scope, live
+    adopt_new = bool(row[5]) if len(row) > 5 else False
+    return key, snap_fn, diff_fn, scope, live, adopt_new
 
 
 # --------------------------------------------------------------------------- #
@@ -13342,6 +13538,7 @@ def check_self_protection():
     # non-attacker-writable anchor (a configured heartbeat URL is one). Falls back
     # to the legacy sha watermark for installs upgraded before a MAC was recorded
     # (the next record_selfstate writes the MAC).
+    tampered_names = set()
     for name, path in _self_watermarked():
         recorded_mac = st.get("%s_mac" % name)
         recorded = recorded_mac or st.get("%s_sha" % name)
@@ -13355,6 +13552,7 @@ def check_self_protection():
         # onto the first_run path, silently re-baselining current persistence as
         # known-good). A differing watermark => modification. Both are tampering.
         if recorded and cur_watermark != recorded:
+            tampered_names.add(name)
             deleted_why, modified_why = _SELF_TAMPER_CONSEQUENCE[name]
             if cur_watermark is None:
                 detail = ("%s was DELETED out-of-band — Aegis recorded its "
@@ -13370,6 +13568,20 @@ def check_self_protection():
                                  if cur_sha is None else "modified out-of-band"),
                 detail,
                 "self:%s:tampered:%s" % (name, (cur_sha or "deleted")[:16])))
+    # Persist WHICH stores stand accused, so record_selfstate at the end of
+    # this same scan does not re-derive their watermark from the tampered
+    # bytes. Without this flag, tampering alarms exactly once and the
+    # detecting scan itself blesses the edit as the new ground truth (found
+    # live as a 1-event self:baseline:tampered incident that ~150 later scans
+    # all read as clean). The flag is cleared only by an AUTHORIZED write —
+    # the per-store watermark helpers — never by the passage of a scan.
+    flags_changed = False
+    for name in tampered_names:
+        if not st.get("%s_tamper_since" % name):
+            st["%s_tamper_since" % name] = int(_epoch())
+            flags_changed = True
+    if flags_changed:
+        save_json(SELFSTATE, st)
     # Runtime-copy rot. The scheduled agent executes ~/.aegis/aegis.py, so a
     # stale copy means every scheduled scan runs OLD code — the detections you
     # believe you have, you do not have. Measured on the author's own machine:
@@ -13438,6 +13650,12 @@ def record_selfstate():
     # forge it without the key), and the plain sha is retained because
     # _migrate_baseline uses `baseline_sha` as its own out-of-band-edit guard.
     for name, path in _self_watermarked():
+        if st.get("%s_tamper_since" % name):
+            # This store stands accused of an out-of-band edit. Re-recording
+            # its watermark here would bless the tampered bytes and silence
+            # the alarm after one scan — the stale witness stays until an
+            # authorized write (a per-store watermark helper) clears the flag.
+            continue
         present = os.path.exists(path)
         st["%s_sha" % name] = sha256(path) if present else None
         st["%s_mac" % name] = _hmac_file(path) if present else None
@@ -13454,6 +13672,20 @@ def _record_baseline_watermark():
     present = os.path.exists(BASELINE)
     st["baseline_sha"] = sha256(BASELINE) if present else None
     st["baseline_mac"] = _hmac_file(BASELINE) if present else None
+    st.pop("baseline_tamper_since", None)   # an authorized write ends the accusation
+    save_json(SELFSTATE, st)
+
+
+def _record_allowlist_watermark():
+    """Re-watermark the allowlist right after WE rewrite it (`aegis.py allow`),
+    so the operator's own deliberate write is not read as tampering — and so it
+    CLEARS a standing accusation, which record_selfstate no longer does. Same
+    per-store discipline (and same reason) as _record_baseline_watermark."""
+    st = load_json(SELFSTATE, {})
+    present = os.path.exists(ALLOWLIST)
+    st["allowlist_sha"] = sha256(ALLOWLIST) if present else None
+    st["allowlist_mac"] = _hmac_file(ALLOWLIST) if present else None
+    st.pop("allowlist_tamper_since", None)
     save_json(SELFSTATE, st)
 
 
@@ -13466,6 +13698,7 @@ def _record_canary_watermark():
     present = os.path.exists(CANARY_STATE)
     st["canaries_sha"] = sha256(CANARY_STATE) if present else None
     st["canaries_mac"] = _hmac_file(CANARY_STATE) if present else None
+    st.pop("canaries_tamper_since", None)   # an authorized write ends the accusation
     save_json(SELFSTATE, st)
 
 
@@ -13564,7 +13797,8 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
         baseline = {}
     dirty = False
     for row in SURFACES:
-        key, snap_fn, diff_fn, writ_scope, never_adopt = _surface_row(row)
+        key, snap_fn, diff_fn, writ_scope, never_adopt, adopt_new = \
+            _surface_row(row)
         started = time.monotonic()
         try:
             cur = snap_fn()
@@ -13617,8 +13851,32 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             dirty = True
         else:
             findings += _apply_writ(diff_fn(prior, cur), writ_scope)
+            # Per-file first-sight adoption, for surfaces that opt in. Before
+            # this, baseline[key] was written ONLY on the surface's own first
+            # sighting, so a file appearing later had `old is None` forever —
+            # and diff_agent_surface deliberately silences a file's first
+            # sight, so both its exec branch and its imperative branch stayed
+            # silent on every later scan too: 271 of 558 walked files on the
+            # reference machine were present-but-never-recorded, invisible to
+            # the sensor behind a full-coverage report. Recording the NEW
+            # paths is the same KnockKnock rule the first-sighting branch
+            # documents, at file granularity; the file's next change then
+            # diffs normally. Two boundaries keep it safe: an EXISTING record
+            # is never overwritten (a changed entry keeps alerting against
+            # the reviewed bytes until the operator's verdict promotes it via
+            # _accept_into_baseline — the anti-laundering rule), and adoption
+            # is opt-in per surface, because on a live surface (listeners) a
+            # new key is an alert, not an adoptable fact.
+            if adopt_new and isinstance(prior, dict) and isinstance(cur, dict):
+                appeared = {k: v for k, v in cur.items() if k not in prior}
+                if appeared:
+                    prior.update(appeared)      # prior IS baseline[key]
+                    dirty = True
     if dirty and not first_run:
         save_json(BASELINE, baseline)
+        # The deliberate write must be re-witnessed, or the next scan reads
+        # Aegis's own adoption as out-of-band tampering.
+        _record_baseline_watermark()
     return findings, baseline
 
 
@@ -14219,8 +14477,10 @@ def _migrate_baseline(data):
     data["schema_version"] = BASELINE_SCHEMA_VERSION
     data["trust"] = data.get("trust") or "unverified"
     save_json(BASELINE, data)
-    state["baseline_sha"] = sha256(BASELINE)
-    save_json(SELFSTATE, state)
+    # Both sha AND mac: check_self_protection PREFERS the mac, so hand-writing
+    # only baseline_sha here made every MAC-bearing install read its own schema
+    # migration as HIGH out-of-band tampering at the next scan.
+    _record_baseline_watermark()
     log_run("migrated baseline schema v%d -> v%d"
             % (version, BASELINE_SCHEMA_VERSION))
     return data
@@ -14452,7 +14712,7 @@ def _cmd_baseline_locked(trust="verified"):
     current = snapshot_persistence()
     b = {"created": now_iso(), "schema_version": BASELINE_SCHEMA_VERSION,
          "persistence": current, "trust": trust}
-    for key, snap_fn, _diff, _scope, _live in map(_surface_row, SURFACES):
+    for key, snap_fn, _diff, _scope, _live, _adopt in map(_surface_row, SURFACES):
         try:
             snap = snap_fn()
         except Exception:
@@ -14472,6 +14732,7 @@ def _cmd_baseline_locked(trust="verified"):
         if snap is not None and snap is not SURFACE_PRIVILEGED:
             b[key] = snap
     save_json(BASELINE, b)
+    _record_baseline_watermark()   # the operator's own reset ends any accusation
     flush_sigcache()
     record_selfstate()
     label = "reviewed/verified" if trust == "verified" else "adopted/unverified"
@@ -14769,7 +15030,7 @@ def _acceptable_surfaces():
     persistence first because it is the one that is not in SURFACES."""
     rows = [("persistence", snapshot_persistence, check_persistence)]
     for row in SURFACES:
-        key, snap_fn, diff_fn, _scope, never_adopt = _surface_row(row)
+        key, snap_fn, diff_fn, _scope, never_adopt, _adopt = _surface_row(row)
         # A surface that is never silently adopted is one the README's
         # live-vs-residue rule says the operator must keep hearing about (an
         # active remote login is CURRENT ACCESS, not installed residue). An
@@ -15318,6 +15579,12 @@ def cmd_incident(incident_id, action=None, reason=None):
               item["correlation_key"],
               datetime.fromtimestamp(item["created_at"]).isoformat(),
               datetime.fromtimestamp(item["updated_at"]).isoformat()))
+    # The honest statement of a standing fact: one line with a count, not one
+    # evidence row per scan (still-true re-observations fold into the count).
+    if (item.get("occurrences") or 0) > 1:
+        print("  seen:     %d observations since %s" % (
+            item["occurrences"],
+            datetime.fromtimestamp(item["first_occurrence"]).isoformat()))
     for evidence in item.get("evidence", []):
         try:
             data = json.loads(evidence["data_json"])
@@ -16170,6 +16437,7 @@ def cmd_allow(path):
                 allow.append(f["fingerprint"])
                 added += 1
     save_json(ALLOWLIST, allow)
+    _record_allowlist_watermark()
     print("Allowlisted %d finding(s) matching %r." % (added, path))
     return 0
 
@@ -20002,7 +20270,7 @@ def _rehunt_lanes():
     lanes = [("persistence.snapshot", _replay_pairwise(check_persistence)),
              (BEACON_SENSOR_ID, _replay_beacon)]
     for row in SURFACES:
-        key, _snap, diff_fn, _scope, _live = _surface_row(row)
+        key, _snap, diff_fn, _scope, _live, _adopt = _surface_row(row)
         lanes.append(("surface." + key, _replay_pairwise(diff_fn)))
     return lanes
 

