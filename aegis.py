@@ -6452,6 +6452,7 @@ def check_behavior():
             (base, names, command_sha[:16]),
             fp, program=argv.split(None, 1)[0] if argv else "",
             pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha))
+    _annotate_ancestry(findings)
     return findings
 
 
@@ -18343,6 +18344,129 @@ def _iter_parents():
 _WIN_PPID_PS = (
     "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
     "(($_.ProcessId),($_.ParentProcessId)) -join $t}")
+
+_WIN_ANCESTRY_PS = (
+    "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
+    "(($_.ProcessId),($_.ParentProcessId),($_.CreationDate)) -join $t}")
+
+# Ancestry walk bound. Eight parents reaches the login session from any
+# interactive shell; past that the chain is init and says nothing new.
+ANCESTRY_MAX_DEPTH = 8
+
+
+def _parse_ps_ancestry(text):
+    """{pid: (ppid, lstart)} from `ps -axo pid=,ppid=,lstart=`. lstart is the
+    remainder of the line — a multi-word date, so it cannot be split on
+    whitespace like the two numeric columns before it."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            out[parts[0]] = (parts[1], parts[2].strip())
+    return out
+
+
+def _process_ancestry_table():
+    """{pid: (ppid, start)} for every visible process, one call per platform.
+
+    `start` is the creation token _process_start_token reads per pid, carried
+    for the whole table so a walk can refuse a parent that started AFTER its
+    child: a bare ppid is a reusable slot, and the slot's current occupant is
+    not necessarily the process that forked this one."""
+    out = {}
+    if IS_LINUX:
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except Exception:
+            return out
+        for pid in pids:
+            try:
+                with open("/proc/%s/stat" % pid, encoding="utf-8",
+                          errors="replace") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            tail = data[data.rfind(")") + 1:].split()
+            if len(tail) > 19:
+                out[pid] = (tail[1], tail[19])          # ppid, starttime
+        return out
+    if IS_WIN:
+        o, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                         "-Command", _WIN_ANCESTRY_PS], timeout=120)
+        if rc != 0 or not o:
+            return out
+        for line in o.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if len(parts) >= 3 and parts[0].strip().isdigit():
+                out[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
+        return out
+    o, _e, rc = run(["ps", "-axo", "pid=,ppid=,lstart="], timeout=15)
+    if rc != 0:
+        return out
+    return _parse_ps_ancestry(o)
+
+
+def _start_epoch(token):
+    """A comparable number from a start token, or None. Linux starttime is
+    jiffies since boot (a number already); macOS lstart is
+    'Tue Sep  2 10:00:00 2026'. Windows CreationDate is locale-formatted and
+    is left unparsed, so the reuse check does not run there — stated, not
+    hidden."""
+    if token is None:
+        return None
+    tok = str(token).strip()
+    if tok.isdigit():
+        return float(tok)
+    try:
+        return time.mktime(time.strptime(tok, "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _ancestry(pid, table, depth=ANCESTRY_MAX_DEPTH):
+    """[ppid, grandparent, ...] up the chain from `pid`, at most `depth` long.
+
+    Keyed on (pid, start) rather than pid alone: the walk stops at a parent
+    whose start is LATER than its child's, because that slot has been re-used
+    and whoever holds it now did not fork this process. A parent missing from
+    the table (the kernel, another user's process) ends the chain."""
+    chain, seen = [], {str(pid)}
+    cur = str(pid)
+    while len(chain) < depth and cur in table:
+        ppid, start = table[cur]
+        ppid = str(ppid or "")
+        if ppid not in table or ppid in seen:
+            break
+        child_t, parent_t = _start_epoch(start), _start_epoch(table[ppid][1])
+        if child_t is not None and parent_t is not None and parent_t > child_t:
+            break
+        chain.append(ppid)
+        seen.add(ppid)
+        cur = ppid
+    return chain
+
+
+def _annotate_ancestry(findings):
+    """Attach 'spawned by' lineage to process findings. Enrichment only —
+    never a new alert — and computed once per call, because a behavior
+    finding is rare and the table costs one process-table read."""
+    if not any(f.get("pid") for f in findings):
+        return
+    try:
+        table = _process_ancestry_table()
+        names = {}
+        for p, _o, exe, argv in _iter_processes():
+            head = (argv or "").split(None, 1)[0] if argv else ""
+            names[p] = os.path.basename(exe or head or "?")
+    except Exception:
+        return
+    for f in findings:
+        chain = _ancestry(f.get("pid"), table) if f.get("pid") else []
+        if not chain:
+            continue
+        f["ancestry"] = [{"pid": p, "name": names.get(p, "?")} for p in chain]
+        f["detail"] += " — spawned by: " + " <- ".join(
+            "%s(%s)" % (names.get(p, "?"), p) for p in chain)
 
 
 def _own_ancestors(parents=None):
