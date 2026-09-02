@@ -2824,6 +2824,16 @@ def _tolerance_identity(fingerprint):
     if _TOLERANCE_HASH_RE.match(parts[-1]):
         parts = parts[:-1]
         changed = True
+    # The agent-surface exec key glues its content hash INTO the command with
+    # '|' (_exec_identity: "<cmd>|<sha12>"), so the hash never stands as its
+    # own ':'-field and the strip above can never see it. Same generalization,
+    # same guard (the tail must BE a hash — a shell pipe's tail is not), one
+    # level deeper. Checked after the trailing-field strip so a target
+    # fingerprint ("...:<cmd>|<sha12>:<newsha12>") composes both forms.
+    head, sep, tail = parts[-1].rpartition("|")
+    if sep and head and _TOLERANCE_HASH_RE.match(tail.strip()):
+        parts[-1] = head
+        changed = True
     normalized = []
     for part in parts:
         if "/" in part:
