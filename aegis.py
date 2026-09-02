@@ -4156,6 +4156,47 @@ _AGE_OUT_DAYS = 7
 _AGE_OUT_KINDS = ("signal", "risk")
 
 
+def _close_regraded_incidents(db, now):
+    """Close OPEN signal incidents whose own signal was re-graded below HIGH.
+
+    The severity ratchet stands (de-escalation is the operator's verdict, not
+    custody's — the stored severity is never rewritten), but five of fifteen
+    live incidents sat OPEN at HIGH while their own `signals` rows read LOW or
+    MEDIUM: custody had re-graded the findings days earlier and the queue
+    could not follow. The design already accepts a machine exit — age-out
+    closes as FALSE_POSITIVE, visibly, reopenable — so this is the same exit
+    made evidence-driven instead of clock-driven: when the LATEST word on a
+    signal (last_seen at or after the incident's own) is a sub-HIGH re-grade,
+    the incident closes with an explicit "re-graded" resolution instead of
+    holding a week for the age-out clock.
+
+    Same discipline as age-out: no dismissals row (a machine verdict must
+    never feed backtest precision or acquired tolerance), CRITICAL is never
+    closed this way, never-tolerate prefixes are skipped, and the reattach
+    path reopens the case the moment it carries something new."""
+    rows = db.execute(
+        "SELECT i.id, i.severity AS inc_sev, i.correlation_key, "
+        "s.severity AS sig_sev FROM incidents i "
+        "JOIN signals s ON ('signal:' || s.fingerprint) = i.correlation_key "
+        "WHERE i.status='OPEN' AND i.kind='signal' "
+        "AND i.severity<>'CRITICAL' AND s.last_seen>=i.last_seen").fetchall()
+    closed = []
+    for row in rows:
+        fp = (row["correlation_key"] or "")[len("signal:"):]
+        if fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        if SEV_ORDER.get(row["sig_sev"], 99) >= SEV_ORDER["HIGH"]:
+            continue
+        closed.append((row["id"], row["sig_sev"]))
+    for incident_id, sig_sev in closed:
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=? AND status='OPEN'",
+            ("re-graded: the signal now reads %s (reopens on new evidence)"
+             % sig_sev, now, incident_id))
+    return len(closed)
+
+
 def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
     """Close OPEN incidents that stopped producing evidence, and say so.
 
@@ -4511,6 +4552,12 @@ def record_security_state(findings, sensor_health=(), now=None,
             # are candidates. Ordering matters — the reverse would age out an
             # incident in the same breath as its new evidence.
             _run_store_migrations(db, now)
+            try:
+                regraded = _close_regraded_incidents(db, now)
+                if regraded:
+                    log_run("closed %d re-graded incident(s)" % regraded)
+            except Exception as e:
+                log_run("re-grade close skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
