@@ -8494,10 +8494,35 @@ def _listener_worth_tracking(path):
     return True
 
 
-def _parse_lsof_listeners(text):
+def _browser_loopback_entries(rows):
+    """{'loopback:<path>:<port>': path} for the loopback binds a BROWSER holds
+    without a debugging flag on its command line.
+
+    Loopback listeners are dropped everywhere else in this surface (dev
+    servers churn on 127.0.0.1 constantly), and a browser is the one exception
+    worth the key: a Chromium browser opens a local TCP listener for exactly
+    one thing, DevTools remote debugging, and every path to plaintext cookies
+    from a live profile goes through it. A browser STARTED with
+    --remote-debugging-port is check_browser_automation's case and is skipped
+    here so one fact is not reported twice; what is left is the listener with
+    no flag behind it — CDP enabled in memory (injected into the running
+    browser), which no argv sensor can see. `rows` are (path, port, argv)."""
+    out = {}
+    for path, port, argv in rows:
+        if not path or not _BROWSER_EXE_RE.search(path.strip()):
+            continue
+        if "--remote-debugging" in (argv or ""):
+            continue
+        out["loopback:%s:%s" % (path, port)] = path
+    return out
+
+
+def _parse_lsof_listeners(text, loopback=False):
     """{pid: set(addr)} of NON-loopback TCP listen sockets from `lsof -Fpn`
     machine output (p<pid> / n<addr> field lines). IPv6 brackets handled;
-    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside."""
+    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside.
+    `loopback=True` inverts the filter and returns ONLY those binds (for
+    _browser_loopback_entries); the default is unchanged."""
     out = {}
     pid = None
     for line in (text or "").splitlines():
@@ -8508,15 +8533,16 @@ def _parse_lsof_listeners(text):
             pid = val
         elif tag == "n" and pid is not None and ":" in val:
             host = val.rsplit(":", 1)[0].strip("[]")
-            if host in ("127.0.0.1", "::1", "localhost"):
+            if (host in ("127.0.0.1", "::1", "localhost")) != loopback:
                 continue
             out.setdefault(pid, set()).add(val)
     return out
 
 
-def _parse_proc_net_tcp(text):
+def _parse_proc_net_tcp(text, loopback=False):
     """Pure parser: /proc/net/tcp[6] → [(port, uid, inode)] for sockets in state
-    0A (LISTEN) bound to a NON-loopback address. Addresses are little-endian
+    0A (LISTEN) bound to a NON-loopback address (`loopback=True`: ONLY the
+    loopback ones). Addresses are little-endian
     hex; loopback is 0100007F (v4) or ...0100 (v6 ::1), and 00000000 is the
     wildcard 0.0.0.0 — reachable, so kept.
 
@@ -8537,8 +8563,9 @@ def _parse_proc_net_tcp(text):
         except ValueError:
             continue
         a = addr_hex.upper()
-        if a in ("0100007F",                                  # 127.0.0.1
-                 "00000000000000000000000001000000"):         # ::1
+        is_loop = a in ("0100007F",                           # 127.0.0.1
+                        "00000000000000000000000001000000")   # ::1
+        if is_loop != loopback:
             continue
         rows.append((str(port), parts[7], parts[9]))
     return rows
@@ -8611,12 +8638,23 @@ def _snapshot_listeners_linux():
         # upgrade). The uid rides in the VALUE, which no diff compares —
         # diff_listeners has no changed_fn, so only new keys ever fire.
         snap["%s:%s" % (path or "?", port)] = {"path": path or "?", "uid": uid}
+    loop = []
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        loop.extend(_parse_proc_net_tcp(
+            _read_text(proc_file, limit=4 * 1024 * 1024), loopback=True))
+    if loop:
+        procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
+        rows = []
+        for port, _uid, inode in loop:
+            exe, argv = procs.get(inode_pid.get(inode), ("", ""))
+            rows.append((exe, port, argv))
+        snap.update(_browser_loopback_entries(rows))
     return snap
 
 
-def _parse_netstat_listen_windows(text):
+def _parse_netstat_listen_windows(text, loopback=False):
     """Pure parser: `netstat -ano` → [(port, pid)] for non-loopback TCP
-    LISTENING rows."""
+    LISTENING rows (`loopback=True`: ONLY the loopback ones)."""
     rows = []
     for line in (text or "").splitlines():
         parts = line.split()
@@ -8629,7 +8667,7 @@ def _parse_netstat_listen_windows(text):
         if not port.isdigit():
             continue
         host = host.strip("[]")
-        if host in ("127.0.0.1", "::1"):
+        if (host in ("127.0.0.1", "::1")) != loopback:
             continue
         rows.append((port, parts[4]))
     return rows
@@ -8656,13 +8694,18 @@ def _snapshot_listeners_windows():
     out, rc = _netstat_tcp_rows()
     if rc != 0 or not out:
         return None  # non-answer: netstat always prints a header when it runs
-    pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
+    procs = {pid: (exe, argv) for pid, _o, exe, argv in _iter_processes()}
     snap = {}
     for port, pid in _parse_netstat_listen_windows(out):
-        path = pid_exe.get(pid)
+        path = procs.get(pid, ("", ""))[0]
         if not _listener_worth_tracking(path):
             continue
         snap["%s:%s" % (path or "?", port)] = path or "?"
+    rows = []
+    for port, pid in _parse_netstat_listen_windows(out, loopback=True):
+        exe, argv = procs.get(pid, ("", ""))
+        rows.append((exe, port, argv))
+    snap.update(_browser_loopback_entries(rows))
     return snap
 
 
@@ -8695,6 +8738,18 @@ def snapshot_listeners():
             continue
         for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
             snap["%s:%s" % (path or "?", port)] = path or "?"
+    loop = _parse_lsof_listeners(out, loopback=True)
+    if loop:
+        # Resolved from the scan-wide process snapshot, not a `ps` per pid: a
+        # dev box holds dozens of loopback listeners and they used to cost
+        # nothing.
+        procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
+        rows = []
+        for pid, addrs in loop.items():
+            exe, argv = procs.get(pid, ("", ""))
+            for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
+                rows.append((exe, port, argv))
+        snap.update(_browser_loopback_entries(rows))
     return snap
 
 
@@ -8708,6 +8763,21 @@ def diff_listeners(prior, cur):
         else:
             path, uid = val, None
         port = key.rsplit(":", 1)[1]
+        if key.startswith("loopback:"):
+            return finding(
+                "HIGH", "session-theft",
+                "Browser accepting a local debug connection",
+                "%s is listening on loopback port %s with no "
+                "--remote-debugging-port on its command line. A Chromium "
+                "browser opens a local TCP listener for one thing — DevTools "
+                "remote debugging — so a listener that appeared without the "
+                "flag is the in-memory enable (CDP injected into the running "
+                "browser). Anything on this machine can read your live cookies "
+                "as PLAINTEXT through it, which defeats MFA. If you did not "
+                "start this, freeze the browser: aegis.py freeze <pid>."
+                % (os.path.basename(path), port),
+                "listener:%s" % key, path=path, port=port, confidence="high",
+                markers=["session-theft", "cookie", "browser-automation"])
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
         # On Linux there is no signature to lean on, so the hostile shape is
@@ -19521,6 +19591,23 @@ def _assay_lanes():
         finally:
             g["_iter_processes"], g["_own_owner"] = real_iter, real_owner
 
+    def lane_cdp_loopback(nonce):
+        """A browser holding a loopback listener with no debugging flag is
+        the injected-CDP shape and fires HIGH; the same port on a dev server,
+        and a browser that was STARTED with the flag (the argv sensor's
+        case), stay out of this surface."""
+        chrome = "/opt/assay-%s/Google Chrome" % nonce
+        hot = _browser_loopback_entries([(chrome, "9222", chrome)])
+        if len(hot) != 1:
+            return False
+        out = diff_listeners({}, hot)
+        if len(out) != 1 or out[0]["severity"] != "HIGH":
+            return False
+        return _browser_loopback_entries([
+            ("/usr/local/bin/node", "3000", "node server.js"),
+            (chrome, "9222", chrome + " --remote-debugging-port=9222"),
+            (None, "9222", "")]) == {}
+
     def lane_ext_cap_gain(_nonce):
         """An extension GAINING a session-reaching capability is reported;
         steady state is not.
@@ -19875,6 +19962,9 @@ def _assay_lanes():
          lane_agent_exec_target),
         ("session-theft", "live-profile browser automation still scores CRITICAL",
          lane_session_theft),
+        ("cdp-loopback",
+         "browser loopback listener without the flag fires; dev server and "
+         "flagged browser stay silent", lane_cdp_loopback),
         ("ext-cap-gain", "extension capability GAIN fires, steady state does not",
          lane_ext_cap_gain),
         ("glean-atoms", "retro-hunt still requires >=3 atoms and ALL of them",
