@@ -3440,7 +3440,15 @@ def _accumulate_risk(db, now, new_ids):
         category = f.get("category") or ""
         w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
              * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7)
-             * demote.get(category, 1.0))
+             * demote.get(category, 1.0)
+             # The custody term: without it, findings the grader had
+             # individually demoted below the notify floor — because it
+             # PROVED the operator authored them — summed straight back into
+             # a HIGH interrupt (all four live risk incidents were this
+             # shape). The sensors carry the rung as `custody`; the
+             # agent-surface diff calls it `provenance`.
+             * _RISK_CUSTODY_WEIGHT.get(
+                 f.get("custody") or f.get("provenance") or "", 1.0))
         if w <= 0:
             continue
         ek = hashlib.sha256(entity.encode("utf-8", "replace")).hexdigest()[:16]
@@ -3469,12 +3477,16 @@ def _accumulate_risk(db, now, new_ids):
         score = b["weight"] * (RISK_CORROBORATION_BONUS if multi else 1.0)
         if b["new"] and len(b["fps"]) >= min_signals \
                 and score >= RISK_THRESHOLD:
+            # Severity follows the score instead of a hardcoded "HIGH":
+            # barely past threshold is a MEDIUM worth a look, not an
+            # interrupt-grade verdict the number never supported.
+            sev = "HIGH" if score >= 2 * RISK_THRESHOLD else "MEDIUM"
             _upsert_incident(
                 db, "risk:%s" % ek,
                 "Accumulated risk on %s (%d signals across %d sensor%s, score %.1f)"
                 % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
                    "" if len(b["cats"]) == 1 else "s", score),
-                "HIGH", "risk", now, sorted(b["ids"]))
+                sev, "risk", now, sorted(b["ids"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -11062,6 +11074,24 @@ _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
 _WEAK_CUSTODY = ("worktree", "local-commit")
 
 _CUSTODY_FLOOR = {"relocated": "LOW"}
+# How much a custody-graded finding may still CORROBORATE in the risk tier.
+# The demotion ladder already lowered each finding's own severity; this factor
+# answers a different question — whether provenance-explained findings should
+# sum into an interrupt at all. A rung Aegis can trace to the operator's own
+# hand contributes nothing (a finding proved self-authored must not
+# corroborate an attack); vouched origins are heavily discounted ("origin is
+# not innocence", so not zero); weak local evidence is halved. Ungraded
+# findings keep full weight, so a real intrusion — whose signals custody
+# cannot claim — accumulates exactly as before. Built from the custody tiers
+# so a new rung inherits its tier's factor instead of silently scoring 1.0.
+_RISK_CUSTODY_WEIGHT = {}
+for _rung in _SELF_CUSTODY:
+    _RISK_CUSTODY_WEIGHT[_rung] = 0.0
+for _rung in _VOUCHED_CUSTODY:
+    _RISK_CUSTODY_WEIGHT[_rung] = 0.25
+for _rung in _WEAK_CUSTODY:
+    _RISK_CUSTODY_WEIGHT[_rung] = 0.5
+del _rung
 
 
 def _demote(severity, provenance, attack_defined=False):
