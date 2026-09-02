@@ -158,6 +158,26 @@ class TestLinuxSnapshotReachesTheKey(_Procs):
              aegis._listener_worth_tracking) = saved
         self.assertIn("loopback:%s:9222" % CHROME, snap)
 
+    def test_loopback_only_box_still_reaches_the_key(self):
+        """No public listener at all — the box a laptop usually is. The
+        'nothing to report' early return must not fire before the loopback
+        rows are considered, or the injected-CDP shape is invisible exactly
+        where it is likeliest."""
+        loop_only = "\n".join(l for l in PROC_TCP.splitlines()
+                              if "00000000:0050" not in l) + "\n"
+        saved = (aegis._read_text, aegis._SOCKET_INODE_SNAPSHOT,
+                 aegis._listener_worth_tracking)
+        aegis._read_text = lambda p, **kw: loop_only if p == "/proc/net/tcp" \
+            else None
+        aegis._SOCKET_INODE_SNAPSHOT = {"77001": "4242"}
+        aegis._listener_worth_tracking = lambda p: False
+        try:
+            snap = aegis._snapshot_listeners_linux()
+        finally:
+            (aegis._read_text, aegis._SOCKET_INODE_SNAPSHOT,
+             aegis._listener_worth_tracking) = saved
+        self.assertEqual({"loopback:%s:9222" % CHROME: CHROME}, snap)
+
 
 class TestAssayLane(unittest.TestCase):
     def test_cdp_loopback_lane_exists_and_passes(self):

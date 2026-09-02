@@ -122,6 +122,10 @@ class TestBehaviorFindingIsEnriched(unittest.TestCase):
 
 
 class TestLiveTable(unittest.TestCase):
+    @unittest.skipUnless(
+        aegis.IS_MAC == (sys.platform == "darwin")
+        and aegis.IS_WIN == (os.name == "nt"),
+        "live process table: the real kernel only, not a simulated body")
     def test_this_process_has_a_parent_in_the_live_table(self):
         table = aegis._process_ancestry_table()
         me = str(os.getpid())

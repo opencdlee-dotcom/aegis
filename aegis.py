@@ -4800,7 +4800,9 @@ SCAN_CPU_CEILING_PCT = 1.0
 
 
 def _cpu_seconds():
-    """CPU consumed by this process and every command it has waited on."""
+    """CPU consumed by this process and every command it has waited on.
+    On Windows os.times() reports zero for children, so the share there
+    counts this interpreter only and undercounts every spawned command."""
     t = os.times()
     return t.user + t.system + t.children_user + t.children_system
 
@@ -8670,13 +8672,14 @@ def _linux_socket_inode_pids():
 
 
 def _snapshot_listeners_linux():
-    rows = []
+    rows, loop = [], []
     for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
         text = _read_text(proc_file, limit=4 * 1024 * 1024)
         if text is None:
             continue
         rows.extend(_parse_proc_net_tcp(text))
-    if not rows:
+        loop.extend(_parse_proc_net_tcp(text, loopback=True))
+    if not rows and not loop:
         # /proc/net/tcp always exists on Linux; unreadable ⇒ non-answer.
         if not os.path.exists("/proc/net/tcp"):
             return None
@@ -8698,10 +8701,6 @@ def _snapshot_listeners_linux():
         # upgrade). The uid rides in the VALUE, which no diff compares —
         # diff_listeners has no changed_fn, so only new keys ever fire.
         snap["%s:%s" % (path or "?", port)] = {"path": path or "?", "uid": uid}
-    loop = []
-    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
-        loop.extend(_parse_proc_net_tcp(
-            _read_text(proc_file, limit=4 * 1024 * 1024), loopback=True))
     if loop:
         procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
         rows = []
@@ -22794,8 +22793,11 @@ def check_paste_guard():
             data = f.read()
     except OSError:
         return None
+    # Only whole lines are consumed: a scan racing the hook mid-append must
+    # leave the partial record for the next scan, not skip past it.
+    consumed = data.rfind(b"\n") + 1
     findings = []
-    for line in data.decode("utf-8", "replace").splitlines():
+    for line in data[:consumed].decode("utf-8", "replace").splitlines():
         try:
             rec = json.loads(line)
         except Exception:
@@ -22803,7 +22805,7 @@ def check_paste_guard():
         f = _paste_guard_finding(rec)
         if f:
             findings.append(f)
-    save_json(_guard_cursor_path(), {"offset": offset + len(data)})
+    save_json(_guard_cursor_path(), {"offset": offset + consumed})
     return findings
 
 
