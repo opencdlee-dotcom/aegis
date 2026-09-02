@@ -355,6 +355,43 @@ class TestResilience(MenubarBase):
         self.assertTrue(self.title(out))
 
 
+class TestAutoprotectLine(MenubarBase):
+    def write_autoprotect(self, obj):
+        self.make_state()
+        with open(os.path.join(self.state, "autoprotect.json"), "w",
+                  encoding="utf-8") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def test_shadow_mode_renders_the_tally(self):
+        self.healthy_state()
+        self.write_autoprotect({"mode": "shadow",
+                                "tally": {"would-quarantine": 2,
+                                          "would-freeze": 1}})
+        out = self.run_plugin()
+        self.assertIn("Auto-Protect: shadow — 2 would-quarantine · 1 "
+                      "would-freeze", out)
+
+    def test_off_or_absent_stays_silent(self):
+        self.healthy_state()
+        out = self.run_plugin()
+        self.assertNotIn("Auto-Protect", out)
+        self.write_autoprotect({"mode": "off",
+                                "tally": {"would-quarantine": 9}})
+        out = self.run_plugin()
+        self.assertNotIn("Auto-Protect", out)
+
+    def test_corrupt_autoprotect_degrades_not_crashes(self):
+        self.healthy_state()
+        self.write_autoprotect("{not json")
+        out = self.run_plugin()
+        self.assertTrue(self.title(out))
+        self.assertNotIn("Auto-Protect", out)
+        self.write_autoprotect({"mode": "shadow", "tally": "corrupt"})
+        out = self.run_plugin()
+        self.assertIn("Auto-Protect: shadow — 0 would-quarantine · 0 "
+                      "would-freeze", out)
+
+
 class TestReadOnlyProof(MenubarBase):
     def test_full_state_inventory_identical_across_repeated_runs(self):
         # run_plugin() already asserts before==after on EVERY invocation in

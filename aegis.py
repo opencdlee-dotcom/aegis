@@ -265,6 +265,10 @@ VT_API_URL = "https://www.virustotal.com/api/v3/files/"
 INTEL_DIR = os.path.join(STATE_DIR, "intel")
 INTEL_BAZAAR_FILE = os.path.join(INTEL_DIR, "malwarebazaar.json")
 INTEL_THREATFOX_FILE = os.path.join(INTEL_DIR, "threatfox.json")
+# Operator-supplied IOCs (`intel import <file>`): same store, same offline
+# lookup, no network ever — the by-hand import parses the OPERATOR'S own text
+# file (in-scope under "no parser above the user") and merges into local.json.
+INTEL_LOCAL_FILE = os.path.join(INTEL_DIR, "local.json")
 INTEL_BAZAAR_URL = "https://bazaar.abuse.ch/export/txt/sha256/recent/"
 INTEL_THREATFOX_URL = "https://threatfox.abuse.ch/export/json/recent/"
 INTEL_STALE_DAYS = 7
@@ -14640,6 +14644,15 @@ def _cmd_scan_locked(quiet=False):
             log_run("deadfall dispatched: %s" % ", ".join(fired))
     except Exception as e:
         log_run("deadfall dispatch failed: %s" % e)
+    # Auto-Protect shadow rehearsal (records only, acts on nothing) — same
+    # can-never-fail-a-scan posture as deadfall, and after emit for the same
+    # reason: the report exists before anything reads the findings twice.
+    try:
+        rehearsed = _autoprotect_shadow(findings)
+        if rehearsed:
+            log_run("autoprotect shadow: %s" % ", ".join(rehearsed))
+    except Exception as e:
+        log_run("autoprotect shadow failed: %s" % e)
     suppressed_categories = set(adopt)
     if first_run:
         suppressed_categories.update(("persistence", "shell-history"))
@@ -16188,7 +16201,7 @@ def _intel_sets():
     tampered oversize or hand-edited artifact."""
     global _INTEL_CACHE
     stamp = []
-    for path in (INTEL_BAZAAR_FILE, INTEL_THREATFOX_FILE):
+    for path in (INTEL_BAZAAR_FILE, INTEL_THREATFOX_FILE, INTEL_LOCAL_FILE):
         try:
             st = os.stat(path)
             stamp.append((path, st.st_mtime_ns, st.st_size))
@@ -16225,6 +16238,13 @@ def _intel_sets():
               _looks_like_sha256, "ThreatFox")
         adopt(doc.get("net"), net, INTEL_MAX_NET,
               _looks_like_ip_port, "ThreatFox")
+    doc = load_json(INTEL_LOCAL_FILE, None)
+    if isinstance(doc, dict):
+        # Operator intel wins over both feeds: it was placed deliberately.
+        adopt(doc.get("hashes"), hashes, INTEL_MAX_HASHES,
+              _looks_like_sha256, "Local")
+        adopt(doc.get("net"), net, INTEL_MAX_NET,
+              _looks_like_ip_port, "Local")
     _INTEL_CACHE = (stamp, hashes, net)
     return hashes, net
 
@@ -16328,17 +16348,80 @@ def _intel_threatfox_doc(raw):
     return doc, "%d hashes, %d ip:ports" % (len(hashes), len(net))
 
 
-def cmd_intel(action="status"):
+def cmd_intel(action="status", arg=None):
     """OPT-IN community IOC layer. `update` is the by-hand fetch half; scans
     then grade their OWN hashes and outbound rows against the local copy,
-    offline. Anything else prints status."""
+    offline. `import` merges the operator's own IOC file into the same store.
+    Anything else prints status."""
     ensure_state()
     if action == "update":
         return _cmd_intel_update()
+    if action == "import":
+        return _cmd_intel_import(arg)
     if action == "status":
         return _cmd_intel_status()
-    print("usage: aegis.py intel [update|status]")
+    print("usage: aegis.py intel [update|import <file>|status]")
     return 1
+
+
+def _cmd_intel_import(path):
+    """Merge operator-supplied IOCs into ~/.aegis/intel/local.json. Input is a
+    plain text file the OPERATOR wrote or vetted: one IOC per line — a sha256,
+    or an ip:port — optionally followed by a family/name; '#' starts a
+    comment. No network, ever; scans pick the merge up on the next lap via
+    _intel_sets' stat stamp. Same entry caps as the feeds."""
+    if not path:
+        print("usage: aegis.py intel import <file>")
+        return 1
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read(INTEL_MAX_FETCH_BYTES)
+    except OSError as e:
+        print("intel import: cannot read %s (%s)" % (path, e))
+        return 1
+    doc = load_json(INTEL_LOCAL_FILE, None)
+    if not isinstance(doc, dict):
+        doc = {"feed": "Local", "hashes": {}, "net": {}}
+    hashes = doc.get("hashes") if isinstance(doc.get("hashes"), dict) else {}
+    net = doc.get("net") if isinstance(doc.get("net"), dict) else {}
+    added = dupe = invalid = 0
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        key = parts[0].lower()
+        family = parts[1].strip() if len(parts) > 1 else None
+        if _looks_like_sha256(key):
+            target, cap = hashes, INTEL_MAX_HASHES
+        elif _looks_like_ip_port(key):
+            target, cap = net, INTEL_MAX_NET
+        else:
+            invalid += 1
+            continue
+        if key in target:
+            dupe += 1
+            # A re-import may still be naming a previously bare hash.
+            if family and not target[key].get("family"):
+                target[key]["family"] = family
+            continue
+        if len(target) >= cap:
+            invalid += 1
+            continue
+        target[key] = {"family": family, "first_seen": None,
+                       "source": os.path.basename(path)}
+        added += 1
+    doc.update({"feed": "Local", "hashes": hashes, "net": net,
+                "imported_at": now_iso(),
+                "count": len(hashes) + len(net)})
+    os.makedirs(INTEL_DIR, mode=0o700, exist_ok=True)
+    save_json(INTEL_LOCAL_FILE, doc)
+    log_action("intel", path, "imported", added=added, duplicate=dupe,
+               invalid=invalid, total=doc["count"])
+    print("intel import: %d added, %d duplicate, %d invalid — local store "
+          "now %d hashes, %d ip:ports"
+          % (added, dupe, invalid, len(hashes), len(net)))
+    return 0
 
 
 def _cmd_intel_update():
@@ -16399,6 +16482,15 @@ def _cmd_intel_status():
               % ("✗" if stale else "✓", name, counts, age,
                  " — STALE (>%dd; run `aegis.py intel update`)"
                  % INTEL_STALE_DAYS if stale else ""))
+    doc = load_json(INTEL_LOCAL_FILE, None)
+    if isinstance(doc, dict):
+        # Operator intel never goes stale — it was placed deliberately and
+        # only `intel import` changes it.
+        fetched = True
+        print("  ✓ %-14s %d hashes, %d ip:ports, last import %s"
+              % ("Local", len(doc.get("hashes") or {}),
+                 len(doc.get("net") or {}),
+                 doc.get("imported_at") or "n/a"))
     if not fetched:
         print("  Opt-in and by-hand: `aegis.py intel update` downloads two "
               "public abuse.ch\n  IOC exports; scans then grade their own "
@@ -16412,9 +16504,14 @@ def _intel_summary():
     docs = [d for d in (load_json(INTEL_BAZAAR_FILE, None),
                         load_json(INTEL_THREATFOX_FILE, None))
             if isinstance(d, dict)]
-    if not docs:
+    local = load_json(INTEL_LOCAL_FILE, None)
+    if not docs and not isinstance(local, dict):
         return "·", "none fetched (opt-in: aegis.py intel update)"
     hashes, net = _intel_sets()
+    if not docs:
+        # Operator-imported only: deliberate placement has no staleness.
+        return "✓", ("%d hashes / %d ip:ports (operator-imported; feeds not "
+                     "fetched)" % (len(hashes), len(net)))
     oldest = max((time.time() - _epoch(d.get("fetched_at"))) / 86400.0
                  for d in docs)
     if oldest > INTEL_STALE_DAYS:
@@ -22389,6 +22486,212 @@ def cmd_guard(action="status", rest=None):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Auto-Protect tier (ROADMAP.md Phase 1) — the operator-decided amendment to
+# "nothing fires automatically from a heuristic": automatic response, TIERED BY
+# EVIDENCE CLASS the way commercial AV actually behaves (a signature hit
+# auto-quarantines; a behavioral hit gets the reversible verb and a human).
+#
+# Evidence classes:
+#   deterministic — a finding with no benign cause or an exact corpus match:
+#       decoy FIFO read, latch cleared without unlatch, an OS engine's own
+#       malware verdict (XProtect Remediator), a known-malware hash or a live
+#       connection to a catalogued C2 (intel tier). Would-verb: quarantine
+#       (freeze for decoy reads — the subject there is the reading PROCESS;
+#       the file is Aegis's own honeytoken).
+#   heuristic — everything else. Would-verb: freeze (reversible, fail-open),
+#       and only when the finding names a live process; heuristic file
+#       findings stay alerts.
+#
+# This build ships stage 1 ONLY: shadow mode. mode=shadow evaluates the live
+# decision — including the refusal guards live would apply — and RECORDS what
+# it would have done in actions.jsonl + a running tally; it acts on nothing.
+# The live stage lands separately after the shadow exit criteria below are met
+# and will sit behind the one-time-code channel (authorize_interactive), so
+# automation can never switch Aegis to acting mode. Measured basis for the
+# split: 314 historical detections, 0 true positives, 130 benign-positives —
+# heuristic auto-quarantine would have destroyed 130 workflows; deterministic
+# auto-quarantine would have fired zero false times.
+# --------------------------------------------------------------------------- #
+
+AUTOPROTECT_FILE = os.path.join(STATE_DIR, "autoprotect.json")
+AUTOPROTECT_SHADOW_MIN_DAYS = 7
+AUTOPROTECT_SHADOW_MIN_SCANS = 50
+AUTOPROTECT_SEEN_MAX = 2000   # dedup ledger bound (mirrors SEEN_MAX doctrine)
+
+# Fingerprint prefixes, not categories — the same discipline as
+# _DEADFALL_FINGERPRINTS: `xprotect:stale:` must never ride in on
+# `xprotect:detect:`'s class.
+_DETERMINISTIC_PREFIXES = ("decoy:read:", "latch:cleared:",
+                           "xprotect:detect:", "intel:hash:", "intel:net:")
+
+
+def evidence_class(f):
+    """deterministic | heuristic, from the fingerprint alone. Deterministic
+    means attack-defined or exact-corpus-matched — evidence an automatic verb
+    could act on without judgement. Anything unrecognized is heuristic: the
+    conservative default, since the only cost of misclassifying downward is a
+    human look."""
+    fp = (f or {}).get("fingerprint") or ""
+    return ("deterministic" if fp.startswith(_DETERMINISTIC_PREFIXES)
+            else "heuristic")
+
+
+def _autoprotect_decision(f):
+    """(would_verb, refusal_reason, subject) for one finding — the same
+    decision live mode will execute, evaluated with the same guards, so the
+    shadow record is a rehearsal and not a guess. Returns (None, None, None)
+    when no tier would act: a heuristic file finding, or a finding with no
+    actionable subject (e.g. xprotect:detect carries a module name, not a
+    path — Apple's Remediator already remediated it)."""
+    fp = f.get("fingerprint") or ""
+    klass = evidence_class(f)
+    pid = f.get("pid")
+    path = f.get("path") or f.get("script_target") or f.get("executable")
+    path = str(path) if path else None
+    if fp.startswith("decoy:read:") and pid is not None:
+        verb = "would-freeze"
+    elif klass == "deterministic" and path and os.path.isabs(path):
+        verb = "would-quarantine"
+    elif klass == "heuristic" and pid is not None:
+        verb = "would-freeze"
+    else:
+        return None, None, None
+    reason = None
+    if verb == "would-quarantine":
+        if _is_protected_path(path):
+            reason = "protected-path"
+        return verb, reason, path
+    try:
+        reason = _freeze_refusal(int(pid))
+    except (TypeError, ValueError):
+        reason = "bad-pid"
+    except Exception:
+        reason = "unreadable-process-table"
+    return verb, reason, str(pid)
+
+
+def _autoprotect_shadow(findings, now=None):
+    """The scan hook: in shadow mode, record every would-action once per
+    fingerprint. Never raises past its caller's try (same posture as
+    _deadfall_dispatch: a shadow that could fail a scan would blind the
+    detector it exists to calibrate). Returns the list of verbs recorded this
+    scan, for the log_run line."""
+    state = load_json(AUTOPROTECT_FILE, None)
+    if not isinstance(state, dict) or state.get("mode") != "shadow":
+        return []
+    state["scans_in_shadow"] = int(state.get("scans_in_shadow") or 0) + 1
+    seen = state.get("seen") if isinstance(state.get("seen"), dict) else {}
+    tally = state.get("tally") if isinstance(state.get("tally"), dict) else {}
+    recorded = []
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        fp = f.get("fingerprint") or ""
+        if not fp or fp in seen:
+            continue
+        verb, reason, subject = _autoprotect_decision(f)
+        if verb is None:
+            continue
+        seen[fp] = now_iso()
+        outcome = verb if not reason else "would-refuse"
+        tally[outcome] = int(tally.get(outcome) or 0) + 1
+        extra = {"mode": "shadow", "verb": verb,
+                 "evidence": evidence_class(f), "fingerprint": fp,
+                 "category": f.get("category"), "severity": f.get("severity")}
+        if reason:
+            extra["reason"] = reason
+        log_action("autoprotect", subject, outcome, **extra)
+        recorded.append("%s %s" % (outcome, subject))
+    if len(seen) > AUTOPROTECT_SEEN_MAX:
+        for fp in sorted(seen, key=seen.get)[:len(seen)
+                                             - AUTOPROTECT_SEEN_MAX]:
+            del seen[fp]
+    state["seen"], state["tally"] = seen, tally
+    save_json(AUTOPROTECT_FILE, state)
+    return recorded
+
+
+def cmd_autoprotect(action="status"):
+    """Auto-Protect control. `shadow` arms the rehearsal, `off` stands it
+    down, `status` answers what has been measured. There is deliberately no
+    `live` verb yet: live dispatch is the next stage (ROADMAP.md Phase 1) and
+    a verb that always refuses would be a stub, not a safety."""
+    ensure_state()
+    state = load_json(AUTOPROTECT_FILE, None)
+    state = state if isinstance(state, dict) else {}
+    mode = state.get("mode") or "off"
+    if action == "status":
+        print("# Aegis Auto-Protect — tiered automatic response "
+              "(ROADMAP.md Phase 1)")
+        if mode != "shadow":
+            print("  mode: off — nothing is recorded and nothing will ever "
+                  "act.\n  `aegis.py autoprotect shadow` starts the "
+                  "rehearsal: scans then record\n  what WOULD have been "
+                  "auto-quarantined (deterministic evidence) or\n  "
+                  "auto-frozen (heuristic evidence, live process) — acting "
+                  "on nothing.")
+            return 0
+        tally = state.get("tally") or {}
+        scans = int(state.get("scans_in_shadow") or 0)
+        since = state.get("since") or "?"
+        days = max(0.0, (time.time() - _epoch(since)) / 86400.0)
+        print("  mode: shadow (since %s — %.1f days, %d scans)"
+              % (since, days, scans))
+        print("  would-quarantine: %d   would-freeze: %d   would-refuse: %d"
+              % (int(tally.get("would-quarantine") or 0),
+                 int(tally.get("would-freeze") or 0),
+                 int(tally.get("would-refuse") or 0)))
+        print("  every record: %s (action=autoprotect)" % ACTION_LOG)
+        met = (days >= AUTOPROTECT_SHADOW_MIN_DAYS
+               or scans >= AUTOPROTECT_SHADOW_MIN_SCANS)
+        if met:
+            print("  shadow exit criteria MET (>=%dd or >=%d scans): review "
+                  "the would-action\n  log above, then the live stage — "
+                  "which ships separately and enables only\n  behind the "
+                  "one-time-code channel — can be considered."
+                  % (AUTOPROTECT_SHADOW_MIN_DAYS,
+                     AUTOPROTECT_SHADOW_MIN_SCANS))
+        else:
+            print("  shadow exit criteria: %.1f/%d days, %d/%d scans"
+                  % (days, AUTOPROTECT_SHADOW_MIN_DAYS, scans,
+                     AUTOPROTECT_SHADOW_MIN_SCANS))
+        return 0
+    if action == "shadow":
+        if mode == "shadow":
+            print("Auto-Protect is already in shadow mode (since %s)."
+                  % (state.get("since") or "?"))
+            return 0
+        # Audit first, exactly like the response verbs: an enablement that
+        # cannot be recorded does not happen.
+        if not log_action("autoprotect", "shadow", "enabled"):
+            print("refuse: could not append to the action log — not "
+                  "enabling.")
+            return 1
+        save_json(AUTOPROTECT_FILE, {
+            "schema_version": 1, "mode": "shadow", "since": now_iso(),
+            "scans_in_shadow": 0, "tally": {}, "seen": {}})
+        print("Auto-Protect shadow mode ON. Scans now rehearse the tiered "
+              "decision and\nrecord would-actions (acting on nothing). "
+              "Review anytime: aegis.py autoprotect")
+        return 0
+    if action == "off":
+        if mode != "shadow":
+            print("Auto-Protect is already off.")
+            return 0
+        if not log_action("autoprotect", "off", "disabled"):
+            print("refuse: could not append to the action log — state "
+                  "unchanged.")
+            return 1
+        state["mode"] = "off"   # tallies kept: the rehearsal's record stands
+        save_json(AUTOPROTECT_FILE, state)
+        print("Auto-Protect off. Shadow tallies retained for review "
+              "(aegis.py autoprotect).")
+        return 0
+    print("usage: aegis.py autoprotect [status|shadow|off]")
+    return 1
+
+
 HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                     (detect + opt-in response; Python stdlib only)
 
@@ -22486,13 +22789,16 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   vt <path|sha256> OPT-IN VirusTotal reputation for a file/hash (sends only the
                    hash, never the file; needs AEGIS_VT_API_KEY or ~/.aegis/vt_key;
                    the scan path stays local-only regardless)
-  intel [update|status]
+  intel [update|import <file>|status]
                    OPT-IN community IOC intel (abuse.ch MalwareBazaar +
                    ThreatFox; no key, no account). `update` fetches the two
-                   PUBLIC exports by hand; scans then grade the hashes they
-                   already compute and outbound ip:port rows against the
-                   LOCAL copy, offline. Nothing fetched ⇒ the surface is
-                   simply absent and the scan path stays network-free
+                   PUBLIC exports by hand; `import` merges YOUR own IOC file
+                   (one sha256 or ip:port per line, optional family name, #
+                   comments) into the same local store, no network; scans
+                   then grade the hashes they already compute and outbound
+                   ip:port rows against the LOCAL copy, offline. Nothing
+                   fetched ⇒ the surface is simply absent and the scan path
+                   stays network-free
   canary [remove]  plant (or remove) ransomware canary/honeypot files, plus
                    any OPT-IN credential-canary tokens configured as
                    "canary_tokens": [{"path": "...", "content": "..."}] in
@@ -22519,6 +22825,15 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    and prints the sudo line for YOU. `status` needs no root
 
  RESPOND (opt-in; you run these by hand on a reviewed finding — never automatic)
+  autoprotect [status|shadow|off]
+                         Auto-Protect rehearsal (ROADMAP.md Phase 1): in
+                         shadow mode every scan records what tiered automatic
+                         response WOULD have done — deterministic evidence
+                         (decoy read, cleared latch, XProtect verdict, known-
+                         malware hash, live C2 connection) would-quarantine;
+                         heuristic evidence with a live process would-freeze —
+                         while acting on NOTHING. The live stage ships
+                         separately, only after the shadow record is reviewed
   quarantine <path>      atomically confine a file or valid .app bundle
   quarantine-list        list the quarantine store (ids to restore/destroy)
   restore <id>           reverse the native move without overwriting
@@ -22713,7 +23028,13 @@ def main(argv):
     if cmd == "vt" and len(argv) > 2:
         return cmd_vt(argv[2])
     if cmd == "intel":
-        return cmd_intel(argv[2] if len(argv) > 2 else "status")
+        return cmd_intel(argv[2] if len(argv) > 2 else "status",
+                         argv[3] if len(argv) > 3 else None)
+    if cmd == "autoprotect":
+        # Deliberately NOT behind _authorize_response_cli: every verb here
+        # records or stands down a rehearsal — nothing can act. The live
+        # stage's enablement (not yet built) is what gets the one-time code.
+        return cmd_autoprotect(argv[2] if len(argv) > 2 else "status")
     if cmd == "canary":
         return cmd_canary(argv[2] if len(argv) > 2 else "plant")
     if cmd == "watch":
