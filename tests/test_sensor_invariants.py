@@ -26,7 +26,7 @@ PORTABLE = frozenset((
     "persistence.diff", "process", "behavior", "shell-history", "hot-dir",
     "staging", "supply-chain", "session-theft", "canary", "latch", "decoy",
     "assay", "outbound", "web-protection", "hardening", "self-protection",
-    "vouch-store",
+    "vouch-store", "paste-guard",
 ))
 PLATFORM = {
     "mac": frozenset(("cron", "xprotect", "security-log", "amfid-log")),

