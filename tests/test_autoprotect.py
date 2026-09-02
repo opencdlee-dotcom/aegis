@@ -124,9 +124,12 @@ class TestAutoprotectCmd(AutoprotectSandbox):
         rows = self.actions("autoprotect")
         self.assertEqual([(r["target"], r["result"]) for r in rows],
                          [("shadow", "enabled")])
-        # 0600: the state file follows save_json's mode discipline.
-        self.assertEqual(os.stat(aegis.AUTOPROTECT_FILE).st_mode & 0o777,
-                         0o600)
+        # 0600: the state file follows save_json's mode discipline. Windows
+        # has no POSIX modes (chmod reports 0666 regardless), so the claim is
+        # only checkable where the kernel can hold it.
+        if os.name == "posix":
+            self.assertEqual(os.stat(aegis.AUTOPROTECT_FILE).st_mode & 0o777,
+                             0o600)
 
     def test_shadow_enable_is_idempotent(self):
         self.run_cmd(aegis.cmd_autoprotect, "shadow")
@@ -234,8 +237,11 @@ class TestShadowHook(AutoprotectSandbox):
         self.assertEqual(rows[-1]["target"], str(os.getpid()))
 
     def test_protected_path_would_refuse(self):
+        # STATE_DIR's subtree is protected on EVERY platform (/etc is not a
+        # protected tree on Windows), so the guard's verdict is portable.
         self.arm()
-        f = _det("intel:hash:%s:/etc/hosts" % ("b" * 64), path="/etc/hosts")
+        inside = os.path.join(aegis.STATE_DIR, "planted.bin")
+        f = _det("intel:hash:%s:%s" % ("b" * 64, inside), path=inside)
         aegis._autoprotect_shadow([f])
         rows = self.actions("autoprotect")
         self.assertEqual(rows[-1]["result"], "would-refuse")
