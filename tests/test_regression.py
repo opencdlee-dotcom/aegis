@@ -129,6 +129,7 @@ class Sandbox(unittest.TestCase):
             "AEGIS_CONFIG": os.path.join(self.state, "config.json"),
             "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
             "AGENT_SKILL_ROOTS": [],
+            "AGENT_CONFIG_FILES": [],
             # Protective-tier state. NOTARY_FILE and OBSERVATIONS_DIR are
             # written by cmd_scan itself, so omitting them here does not merely
             # leave a gap — it makes every scan-invoking test in this suite

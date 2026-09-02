@@ -10833,10 +10833,19 @@ def _credential_path_tokens():
 
 AGENT_CONFIG_ROOTS = [os.path.join(HOME, d) for d in (
     ".claude", ".codex", ".cursor", ".gemini", ".continue", ".aider",
+    ".copilot", ".hermes", ".codeium/windsurf", ".config/opencode",
+    ".config/zed",
     "Library/Application Support/Claude",
     "Library/Application Support/Code/User",
-    ".config/claude", ".config/Code/User",
+    ".config/claude", ".config/Claude", ".config/Code/User",
+    "AppData/Roaming/Claude", "AppData/Roaming/Code/User",
 )]
+
+# Registries that live as a single file OUTSIDE any agent directory, so no
+# root walk reaches them. ~/.claude.json is Claude Code's user-level
+# `mcpServers` store — the primary MCP registration on this machine — and it
+# sits in $HOME itself, a root nothing here may walk.
+AGENT_CONFIG_FILES = [os.path.join(HOME, f) for f in (".claude.json",)]
 
 # Instruction files: natural language that an agent treats as standing orders.
 AGENT_INSTRUCTION_NAMES = (
@@ -12451,6 +12460,9 @@ def _agent_config_files():
         if root not in _AGENT_SCAN_TRUNCATED_ROOTS:
             _AGENT_SCAN_TRUNCATED_ROOTS.append(root)
 
+    for p in AGENT_CONFIG_FILES:
+        if os.path.isfile(p) and not os.path.islink(p):
+            seen.append(p)
     for root in roots:
         if not os.path.isdir(root):
             continue

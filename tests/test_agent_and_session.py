@@ -45,6 +45,7 @@ class AgentSandbox(unittest.TestCase):
             "GUARD_DIR": os.path.join(self.state, "guard"),
             "GUARD_LOG": os.path.join(self.state, "guard", "observations.jsonl"),
             "AGENT_CONFIG_ROOTS": [os.path.join(self.tmp, "agentroot")],
+            "AGENT_CONFIG_FILES": [],
         }
         for k, v in overrides.items():
             self._saved[k] = getattr(aegis, k)
