@@ -23666,6 +23666,52 @@ def _autoprotect_decision(f):
     return verb, reason, str(pid)
 
 
+# The operator is asked to review the would-have log and decide whether to go
+# live. Until 2026-09-03 a record said only:
+#
+#     {"action":"autoprotect","verb":"would-freeze",
+#      "fingerprint":"behavior:bash:eval-subshell:9be65e30bc6a346e"}
+#
+# which is unreviewable — it cannot answer the one question that matters,
+# "would this have hurt me?". On the reference machine all three recorded
+# would-freezes turned out to be the operator's OWN tools (two Claude Code
+# shells and a pwsh encoded command), and nothing in the record said so; that
+# is what corrected the promotion criterion in ROADMAP.md from a clock to a
+# content test. A record you cannot judge is not evidence.
+#
+# What goes in is IDENTITY, deliberately not the full command: this lands in
+# actions.jsonl, and a shadow log that leaks a secret into the audit trail
+# would be a worse defect than the one it fixes. redact_sensitive is the same
+# scrubber every other durable writer here uses, and the preview is capped.
+_SHADOW_ARGV_PREVIEW = 160
+
+
+def _shadow_identity(f):
+    """Enough about the subject for a human to recognise it, redacted."""
+    out = {}
+    exe = f.get("executable") or f.get("path") or f.get("program")
+    if exe:
+        out["exe"] = redact_sensitive(str(exe))[:_SHADOW_ARGV_PREVIEW]
+    if f.get("owner"):
+        out["owner"] = str(f.get("owner"))
+    if f.get("pid") is not None:
+        out["pid"] = f.get("pid")
+    argv = f.get("argv") or f.get("cmdline") or f.get("command")
+    if isinstance(argv, (list, tuple)):
+        argv = " ".join(str(a) for a in argv)
+    if not argv:
+        # Behaviour findings carry the triggering command in `detail` when they
+        # carry it anywhere; it is already redacted at emit time, but redact
+        # again rather than trust the provenance of a field being copied into
+        # a new file.
+        argv = f.get("detail")
+    if argv:
+        out["cmd_preview"] = redact_sensitive(str(argv))[:_SHADOW_ARGV_PREVIEW]
+    if f.get("markers"):
+        out["markers"] = list(f.get("markers"))[:8]
+    return out
+
+
 def _autoprotect_shadow(findings, now=None):
     """The scan hook: in shadow mode, record every would-action once per
     fingerprint. Never raises past its caller's try (same posture as
@@ -23694,6 +23740,7 @@ def _autoprotect_shadow(findings, now=None):
         extra = {"mode": "shadow", "verb": verb,
                  "evidence": evidence_class(f), "fingerprint": fp,
                  "category": f.get("category"), "severity": f.get("severity")}
+        extra.update(_shadow_identity(f))
         if reason:
             extra["reason"] = reason
         log_action("autoprotect", subject, outcome, **extra)
@@ -23705,6 +23752,53 @@ def _autoprotect_shadow(findings, now=None):
     state["seen"], state["tally"] = seen, tally
     save_json(AUTOPROTECT_FILE, state)
     return recorded
+
+
+_SHADOW_SHOW_MAX = 12
+
+
+def _print_shadow_records(limit=_SHADOW_SHOW_MAX):
+    """Show what WOULD have been acted on, not just how many.
+
+    A tally cannot be reviewed. The operator is being asked whether any of
+    these is their own tool, and that question needs the subject in front of
+    them — reading actions.jsonl by hand is a step people skip, and a review
+    step people skip is a review that did not happen."""
+    rows = []
+    if not os.path.exists(ACTION_LOG):
+        print("  no would-actions recorded yet.")
+        return
+    try:
+        with open(ACTION_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("action") == "autoprotect" and r.get("mode") == "shadow":
+                    rows.append(r)
+    except Exception as e:
+        # "nothing to review" and "I could not read the review log" must not
+        # print the same way. Silence here would be a false empty, and this is
+        # the surface a promotion decision is made on.
+        print("  COULD NOT READ the would-action log (%s): %s" % (ACTION_LOG, e))
+        return
+    if not rows:
+        print("  no would-actions recorded yet.")
+        return
+    shown = rows[-limit:]
+    print("  would-actions recorded (%d shown of %d):"
+          % (len(shown), len(rows)))
+    for r in shown:
+        who = r.get("exe") or r.get("target") or "?"
+        prev = r.get("cmd_preview")
+        print("    %-16s %-14s %s" % (r.get("result") or r.get("verb") or "?",
+                                      (r.get("evidence") or "?")[:14], who))
+        if prev:
+            print("      %s" % prev[:110])
+    if len(rows) > len(shown):
+        print("    ... %d earlier record(s) in %s"
+              % (len(rows) - len(shown), ACTION_LOG))
 
 
 def cmd_autoprotect(action="status"):
@@ -23738,19 +23832,29 @@ def cmd_autoprotect(action="status"):
                  int(tally.get("would-freeze") or 0),
                  int(tally.get("would-refuse") or 0)))
         print("  every record: %s (action=autoprotect)" % ACTION_LOG)
-        met = (days >= AUTOPROTECT_SHADOW_MIN_DAYS
-               or scans >= AUTOPROTECT_SHADOW_MIN_SCANS)
-        if met:
-            print("  shadow exit criteria MET (>=%dd or >=%d scans): review "
-                  "the would-action\n  log above, then the live stage — "
-                  "which ships separately and enables only\n  behind the "
-                  "one-time-code channel — can be considered."
-                  % (AUTOPROTECT_SHADOW_MIN_DAYS,
-                     AUTOPROTECT_SHADOW_MIN_SCANS))
-        else:
-            print("  shadow exit criteria: %.1f/%d days, %d/%d scans"
-                  % (days, AUTOPROTECT_SHADOW_MIN_DAYS, scans,
-                     AUTOPROTECT_SHADOW_MIN_SCANS))
+        _print_shadow_records()
+        clock = (days >= AUTOPROTECT_SHADOW_MIN_DAYS
+                 or scans >= AUTOPROTECT_SHADOW_MIN_SCANS)
+        print("  time served: %.1f/%d days, %d/%d scans%s"
+              % (days, AUTOPROTECT_SHADOW_MIN_DAYS, scans,
+                 AUTOPROTECT_SHADOW_MIN_SCANS,
+                 " — threshold reached" if clock else ""))
+        # This used to print "shadow exit criteria MET" on the clock alone.
+        # The first six scans of real data on the reference machine recorded
+        # three would-freezes, and ALL THREE were the operator's own tools —
+        # a criterion satisfied by exactly that run would have promoted a tier
+        # that then froze their agents mid-session. Aegis cannot tell "the
+        # operator's own shell" from "an attacker's shell"; that judgement is
+        # the whole reason the rehearsal exists. So the clock is reported as
+        # what it is, and the verdict is handed to the human with the records
+        # in front of them. See ROADMAP.md Phase 1.
+        if clock:
+            print("  NOT a promotion signal on its own. Read the would-action "
+                  "list above:\n  if ANY of it is a tool you run yourself, "
+                  "the heuristic tier is not ready and\n  the window starts "
+                  "again. The deterministic tier is judged separately — its\n"
+                  "  record is 0 false fires across the whole recorded "
+                  "history.")
         return 0
     if action == "shadow":
         if mode == "shadow":
