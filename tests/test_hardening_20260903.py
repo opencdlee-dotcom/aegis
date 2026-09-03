@@ -100,9 +100,19 @@ class TestDyldInjectionIsSeen(unittest.TestCase):
         self.assertIn("T1574.006", aegis._MARKER_TECHNIQUES["dyld-inject"])
 
 
+@unittest.skipUnless(sys.platform == "darwin", "launchd is macOS-only")
 class TestLaunchdLoadedCheck(Sandbox):
     """A registered-but-unloaded agent is exactly what `launchctl bootout`
-    leaves behind, and it is silent: the plist on disk still parses."""
+    leaves behind, and it is silent: the plist on disk still parses.
+
+    macOS-only by CONSTRUCTION, not by convention: _check_launchd_loaded
+    returns [] off POSIX because os.getuid does not exist there, so on Windows
+    every assertion below reads 0 findings. simbody could not catch this --
+    it simulates a body through the IS_MAC/IS_WIN flags, and no flag can make
+    the host's os module stop having getuid. That is the same limit that
+    already cost this repo a CI cycle over a platform's clock: simbody proves
+    branch selection, never kernel surface.
+    """
 
     def setUp(self):
         Sandbox.setUp(self)
