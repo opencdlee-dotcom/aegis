@@ -434,14 +434,33 @@ try:
          % (", ".join("%s/%s" % (f.get("severity"), f.get("title"))
                       for f in fw) or "(none -- machine is hardened)"))
 
+    # Both probes below need a privilege the principal may not hold, and the
+    # rule for that is already settled three lines down for the Security event
+    # log: a DEGRADED None from an unprivileged principal is the HONEST
+    # verdict, and only a false-empty would be a lie. These two asserted
+    # `isinstance(dict)` instead, which is really "did the probe succeed" —
+    # so on a GitHub runner they flipped between pass and fail with the code
+    # unchanged (windows-live/py3.9 failed on 2026-09-03 and passed on a
+    # re-run of the same commit). A non-deterministic gate teaches people to
+    # re-run CI until it is green, which is how a real failure gets waved
+    # through. Note the privilege case, assert the shape when there IS one.
     excl = aegis.snapshot_win_exclusions()
-    check("Defender exclusion probe returned a snapshot, not a DEGRADED None",
-          isinstance(excl, dict), "%r" % (excl if excl != {} else "{} (none set)"))
+    if excl is None:
+        note("Defender exclusion probe reported DEGRADED (this principal "
+             "cannot read exclusions) -- the honest verdict, not a false empty")
+    else:
+        check("Defender exclusion probe returned a snapshot, not a false empty",
+              isinstance(excl, dict),
+              "%r" % (excl if excl != {} else "{} (none set)"))
 
     wmi = aegis.snapshot_wmi_subscriptions()
-    check("WMI-subscription probe returned a snapshot, not a DEGRADED None",
-          isinstance(wmi, dict),
-          "%r" % (wmi if wmi != {} else "{} (no subscriptions)"))
+    if wmi is None:
+        note("WMI-subscription probe reported DEGRADED (this principal cannot "
+             "read subscriptions) -- the honest verdict, not a false empty")
+    else:
+        check("WMI-subscription probe returned a snapshot, not a false empty",
+              isinstance(wmi, dict),
+              "%r" % (wmi if wmi != {} else "{} (no subscriptions)"))
 
     ev = aegis.check_windows_event_log()
     if ev is None:

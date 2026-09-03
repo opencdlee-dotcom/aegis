@@ -98,6 +98,71 @@ jobs:
         timeout-minutes: 5
         run: python selftest.py
 
+  # CLAUDE.md requires a simbody diff before any platform-shaped push, and
+  # until now that requirement lived only in a document -- so it was satisfied
+  # by whoever remembered. This job is the mechanism.
+  #
+  # It CANNOT be a naive pass/fail run. Read tests/simbody.py: the absolute
+  # failure count under a simulated body is meaningless (real macOS paths, a
+  # live codesign, /private/tmp firmlinks all fail for reasons unrelated to any
+  # change). Only the DIFF against the merge base is evidence, which is why
+  # this checks out both trees and compares two sorted FAILED lists.
+  #
+  # The base tree deliberately does NOT live under /tmp. Aegis classifies
+  # volatile paths differently, so a base tree in a temp dir changes the very
+  # verdicts being compared -- that produced two phantom "fixes" here once
+  # already, and tests/simbody.py's own worked example still showed `mktemp -d`
+  # until this job was written.
+  #
+  # Cheap by construction: a full simbody run measures ~25s, so both trees on
+  # one ubuntu runner cost about a minute against a 10-minute cap.
+  simbody-diff:
+    name: simbody diff vs merge base
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        body: ["win", "mac"]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pytest
+      - name: Simbody diff (SIM_BODY=${{ matrix.body }})
+        timeout-minutes: 9
+        env:
+          SIM_BODY: ${{ matrix.body }}
+        run: |
+          set -u
+          base_sha="$(git merge-base origin/${{ github.base_ref || 'main' }} HEAD)"
+          echo "merge base: $base_sha"
+          base_dir="$HOME/simbody-base"   # NOT /tmp -- see the comment above
+          rm -rf "$base_dir" && mkdir -p "$base_dir"
+          git archive "$base_sha" | tar -x -C "$base_dir"
+          run_one() {
+            ( cd "$1" && PYTHONPATH="$PWD/tests" python -m pytest tests/ -q \
+                -p simbody 2>&1 | grep '^FAILED' | sed 's/ - .*//' | sort )
+          }
+          run_one "$base_dir" > base.txt || true
+          run_one "$PWD"      > head.txt || true
+          echo "base failures: $(wc -l < base.txt), head failures: $(wc -l < head.txt)"
+          new="$(comm -13 base.txt head.txt)"
+          fixed="$(comm -23 base.txt head.txt)"
+          if [ -n "$fixed" ]; then
+            echo "::notice::no longer failing under SIM_BODY=${{ matrix.body }}:"
+            echo "$fixed"
+          fi
+          if [ -n "$new" ]; then
+            echo "::error::NEW failures under SIM_BODY=${{ matrix.body }}:"
+            echo "$new"
+            exit 1
+          fi
+          echo "no new failures under SIM_BODY=${{ matrix.body }}"
+
   # The live harness is its own JOB, not a step of the one above.
   #
   # It was a trailing step guarded by `if: always()` — the guard existed
