@@ -44,6 +44,16 @@ import aegis  # noqa: E402
 _REAL_STATE = os.path.join(os.path.expanduser("~"), ".aegis")
 
 
+# RUN_LOG is its own module constant, so a test that sandboxes STATE_DIR but
+# forgets RUN_LOG writes straight into the operator's live forensic log. That
+# happened: 128 fabricated "migrated baseline schema" lines and a run of
+# "deadfall latch-cleared -> firing" entries were found in the real
+# ~/.aegis/run.log -- the exact file an incident tells the operator to read.
+# Every suppressed write is reported at session end so this stays visible
+# rather than becoming a silently-tolerated leak.
+REAL_RUN_LOG_WRITES = []
+
+
 def _targets_real_state(path):
     if not path:
         return False
@@ -60,6 +70,7 @@ def _forbid_real_state_writes():
     real_conn = aegis._event_connection
     real_save = aegis.save_json
     real_ensure = aegis.ensure_state
+    real_log_run = aegis.log_run
     leaked = []
 
     def _refuse(what, path):
@@ -84,15 +95,28 @@ def _forbid_real_state_writes():
             _refuse("aegis.STATE_DIR", aegis.STATE_DIR)
         return real_ensure(*a, **k)
 
+    def guarded_log_run(msg):
+        # log_run() writes RUN_LOG with a bare open(), not save_json, and it
+        # swallows every exception -- so raising here would be silently eaten
+        # and the write would still be the caller's business. Refuse the write
+        # instead and record it: a suppressed forensic line is a test problem,
+        # a fabricated one in the operator's live run.log is a safety problem.
+        if _targets_real_state(aegis.RUN_LOG):
+            REAL_RUN_LOG_WRITES.append(str(msg)[:200])
+            return None
+        return real_log_run(msg)
+
     aegis._event_connection = guarded_conn
     aegis.save_json = guarded_save
     aegis.ensure_state = guarded_ensure
+    aegis.log_run = guarded_log_run
     try:
         yield leaked
     finally:
         aegis._event_connection = real_conn
         aegis.save_json = real_save
         aegis.ensure_state = real_ensure
+        aegis.log_run = real_log_run
 
 IS_MAC = sys.platform == "darwin"
 
@@ -266,3 +290,13 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if item.name in _POSIX_ONLY_TESTS:
                 item.add_marker(skip_posix)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Report suppressed live-log writes loudly; the guard is not a licence."""
+    if REAL_RUN_LOG_WRITES:
+        n = len(REAL_RUN_LOG_WRITES)
+        sys.stderr.write(
+            "\n%d log_run() write(s) aimed at the REAL ~/.aegis/run.log were "
+            "suppressed by tests/conftest.py. Sandbox aegis.RUN_LOG in the "
+            "offending test's setUp. First: %s\n" % (n, REAL_RUN_LOG_WRITES[0]))
