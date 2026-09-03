@@ -16111,6 +16111,59 @@ ATTCK_TECHNIQUES = {
     "T1574.006": "Hijack Execution Flow: Dynamic Linker Hijacking",
 }
 
+# Which BODIES can actually reach each technique's detection path.
+#
+# Without this, `attck` listed all 24 techniques as "wired but quiet" on every
+# platform — so a Mac reported Registry Run Keys, WMI Event Subscription and
+# Windows Service as covered, which reads as coverage and means "the sensor for
+# this lives on a different operating system". The worst case was T1574.006:
+# it was mapped ONLY to the Linux ld-preload markers, so a Mac claimed dynamic
+# linker hijacking was wired while having no DYLD coverage whatsoever (fixed
+# 2026-09-03 by the dyld-inject marker, which is why mac now appears below).
+#
+# Explicit rather than derived, because reachability runs through regex tables,
+# category names and fingerprint prefixes that no single expression captures —
+# and pinned by a test asserting every ATTCK_TECHNIQUES key appears here, so a
+# new technique cannot silently inherit "wired everywhere" again.
+_TECHNIQUE_BODIES = {
+    "T1003": ("mac", "win"),          # keychain (mac) / SAM + LSASS (win)
+    "T1014": ("linux",),              # kernel-module category
+    "T1036.005": ("mac", "linux", "win"),
+    "T1053.003": ("mac", "linux"),    # cron
+    "T1053.005": ("win",),            # schtasks
+    "T1070.004": ("mac", "linux", "win"),
+    "T1070.006": ("mac", "linux", "win"),
+    "T1098.004": ("mac", "linux"),    # xpersist authorized_keys
+    "T1218": ("win",),                # lolbin proxy exec
+    "T1543.001": ("mac",),            # LaunchAgents
+    "T1543.002": ("linux",),          # systemd units
+    "T1543.003": ("win",),            # services
+    "T1543.004": ("mac",),            # LaunchDaemons
+    "T1546.003": ("win",),            # WMI subscriptions
+    "T1546.004": ("mac", "linux"),    # shell rc
+    "T1546.013": ("win",),            # PowerShell profile
+    "T1547.001": ("win",),            # Run keys / Startup
+    "T1547.004": ("win",),            # Winlogon helper
+    "T1547.006": ("linux",),          # kernel modules
+    "T1547.013": ("linux",),          # XDG autostart
+    "T1548.001": ("mac", "linux"),    # suid surface
+    "T1556": ("mac", "linux"),        # pam.d / sudoers.d
+    "T1562.001": ("mac", "linux", "win"),  # self-protection + defender
+    "T1574.006": ("mac", "linux"),    # dyld-inject (mac) / LD_PRELOAD (linux)
+}
+
+
+def _this_body():
+    return "mac" if IS_MAC else ("win" if IS_WIN else "linux")
+
+
+def _wired_here(technique):
+    """Is this technique's detection path reachable on THIS body? An unlisted
+    technique answers True: a mapping gap must read as 'claimed', so the
+    completeness test fails loudly rather than the report quietly shrinking."""
+    return _this_body() in _TECHNIQUE_BODIES.get(technique, ("mac", "linux", "win"))
+
+
 # Idiom name (as recorded in a finding's `markers`) -> technique(s). Precise:
 # each marker name is only ever set by the one rule that means exactly this.
 _MARKER_TECHNIQUES = {
@@ -16119,6 +16172,12 @@ _MARKER_TECHNIQUES = {
     "amsi-bypass": ("T1562.001",),
     "sam-hive-dump": ("T1003",),
     "lsass-dump": ("T1003",),
+    # macOS credential dumping had three markers and no technique, so `attck`
+    # showed T1003 as a Windows-only row on a Mac while the sensors for it were
+    # sitting right there in the argv table.
+    "keychain-dump": ("T1003",),
+    "keychain-db-access": ("T1003",),
+    "keychain-security-dump": ("T1003",),
     "dyld-inject": ("T1574.006",),
     "ld-preload-injection": ("T1574.006",),
     "kernel-module": ("T1014", "T1547.006"),
@@ -16427,21 +16486,45 @@ def cmd_attck(days=180):
     print("# Aegis ATT&CK coverage — last %s days, %d recorded finding event%s\n"
           % (days, len(rows), "" if len(rows) == 1 else "s"))
     observed = [t for t in ATTCK_TECHNIQUES if t in seen]
-    quiet = [t for t in ATTCK_TECHNIQUES if t not in seen]
+    # Three buckets, not two. "Wired but quiet" used to hold every technique
+    # that had not fired, INCLUDING the ones whose sensor lives on another
+    # operating system — so a Mac read as covering Registry Run Keys and WMI
+    # subscriptions. That is not a quiet sensor; it is no sensor.
+    quiet = [t for t in ATTCK_TECHNIQUES if t not in seen and _wired_here(t)]
+    elsewhere = [t for t in ATTCK_TECHNIQUES if t not in seen and not _wired_here(t)]
+    body = _this_body()
     print("Observed on this machine (%d):" % len(observed))
     for t in sorted(observed, key=lambda t: -seen[t][0]):
         count, last = seen[t]
         print("  %-12s %-62s %3d hit%-1s last %s" % (
             t, ATTCK_TECHNIQUES[t][:62], count, "" if count == 1 else "s",
             datetime.fromtimestamp(last).strftime("%Y-%m-%d")))
-    print("\nWired but quiet in this window (%d):" % len(quiet))
+    print("\nWired on this body (%s) but quiet in this window (%d):"
+          % (body, len(quiet)))
     for t in sorted(quiet):
         print("  %-12s %s" % (t, ATTCK_TECHNIQUES[t]))
+    if elsewhere:
+        print("\nNOT covered on this body — the sensor exists for another "
+              "platform (%d):" % len(elsewhere))
+        for t in sorted(elsewhere):
+            print("  %-12s %-58s [%s]"
+                  % (t, ATTCK_TECHNIQUES[t][:58],
+                     "/".join(_TECHNIQUE_BODIES.get(t, ()))))
+    covered = len(observed) + len(quiet)
+    print("\nCoverage on %s: %d of %d technique%s in the table; the other %d "
+          "belong to another platform." % (
+              body, covered, len(ATTCK_TECHNIQUES),
+              "" if covered == 1 else "s", len(elsewhere)))
     if unmapped:
-        print("\n%d recorded finding%s did not classify to a single technique "
-              "(sensors with no 1:1 technique mapping, e.g. hot-dir drops, "
-              "XProtect harvest, canaries, hardening posture) — not counted "
-              "above, not a coverage gap." % (unmapped, "" if unmapped == 1 else "s"))
+        # Share, not just a count: "31691 findings did not classify" invites
+        # the reading that 84%% of detections are uncovered. They are mostly
+        # sensors with no 1:1 technique, which is a mapping property, not a gap.
+        pct = (100.0 * unmapped / len(rows)) if rows else 0.0
+        print("\n%d of %d recorded findings (%.0f%%) did not classify to a "
+              "single technique (sensors with no 1:1 technique mapping, e.g. "
+              "hot-dir drops, XProtect harvest, canaries, hardening posture) — "
+              "not counted above, not a coverage gap."
+              % (unmapped, len(rows), pct))
     print("\nRead-only: no incident opened, nothing notified.")
     return 0
 
