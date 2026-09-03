@@ -749,6 +749,25 @@ _HOSTILE_CONTENT_RES = [
     (re.compile(r"\b(?:procdump|comsvcs\.dll[^\n]{0,120}MiniDump|MiniDumpWriteDump)"
                 r"[^\n]{0,120}\blsass\b|\blsass\b[^\n]{0,120}\bMiniDump", re.I),
      "lsass-dump"),
+    # --- Dynamic-linker hijacking (T1574.006), both bodies ------------------
+    # macOS's twin of LD_PRELOAD had NO regex here until 2026-09-03, so the
+    # only DYLD_* awareness in the file was _DYLD_INJECT_KEYS reading a launchd
+    # plist's EnvironmentVariables. An injection set anywhere else -- a shellrc
+    # export, a cron line, an npm postinstall, a bare argv -- was invisible,
+    # while `attck` still reported T1574.006 as wired on this machine because
+    # the technique mapped to the Linux marker. One table serves argv, shellrc,
+    # cron, package hooks and untrusted file content, so this single entry
+    # covers all five surfaces at once.
+    #
+    # DYLD_LIBRARY_PATH and DYLD_FRAMEWORK_PATH have legitimate uses in build
+    # and test scripts; INSERT_LIBRARIES essentially does not. They share a
+    # marker because the grading tier, not this table, is where benign
+    # populations are handled -- and because SIP strips all of them across a
+    # protected-binary exec, which means seeing one at all says the target was
+    # not protected.
+    (re.compile(r"\bDYLD_(?:INSERT_LIBRARIES|FRAMEWORK_PATH|LIBRARY_PATH|"
+                r"FALLBACK_LIBRARY_PATH|FALLBACK_FRAMEWORK_PATH)\s*=", re.I),
+     "dyld-inject"),
     # --- Linux-native persistence/injection idioms --------------------------
     # LD_PRELOAD injection and /etc/ld.so.preload writes (T1574.006).
     (re.compile(r"\bLD_PRELOAD\s*=", re.I), "ld-preload-injection"),
@@ -10475,6 +10494,21 @@ def _skill_signature(skill_dir):
     return "|".join(parts) or "empty"
 
 
+# key -> absolute skill dir for the CURRENT scan only (see snapshot_agent_skills).
+_AGENT_SKILL_DIRS = {}
+
+
+def _skill_instruction_markers(skill_dir):
+    """Imperative markers in a skill's own instruction text, or []."""
+    if not skill_dir:
+        return []
+    for cand in ("SKILL.md", "skill.md", "AGENTS.md"):
+        p = os.path.join(skill_dir, cand)
+        if os.path.isfile(p):
+            return _imperative_signals(_read_text(p, _HOSTILE_SCAN_LIMIT))
+    return []
+
+
 def snapshot_agent_skills():
     """{root/skill: signature} for every installed AI-agent skill. Resolves
     symlinked roots (the canonical skills tree is often a symlink into a projects
@@ -10492,7 +10526,16 @@ def snapshot_agent_skills():
             d = os.path.join(root, name)
             if not os.path.isdir(d):
                 continue
-            snap["%s/%s" % (label, name)] = _skill_signature(d)
+            key = "%s/%s" % (label, name)
+            snap[key] = _skill_signature(d)
+            # The snapshot key is a LABEL, not a path, and the baseline stores
+            # only {key: signature}. diff_agent_skills needs the directory to
+            # read the skill's instructions and to give the finding a path
+            # entity, so the mapping is carried in-process for this scan rather
+            # than widened into the stored signature -- changing the signature
+            # format would invalidate every existing baseline and storm one
+            # "changed" finding per installed skill on the upgrade scan.
+            _AGENT_SKILL_DIRS[key] = d
     return snap
 
 
@@ -10505,24 +10548,52 @@ def diff_agent_skills(prior, cur):
     # _accumulate_risk, and 'agent-skill' is in no correlate() rule — the
     # durable record is real, but the "auto-correlates with a later osascript
     # phish" chain is not yet wired. The phish itself still fires CRITICAL alone.
+    def _graded(key, base_sev, base_conf):
+        """(severity, confidence, path, markers, why) for one skill.
+
+        Until 2026-09-03 both tiers were hardcoded MEDIUM, which is BELOW
+        NOTIFY_MIN_SEV — so a skill the operator did not author could appear in
+        ~/.claude/skills and never reach them. The findings also carried only
+        skill=key with no path entity, so they fed no correlation rule and no
+        risk accumulation, which the old comment here admitted. Reading the
+        skill's own instructions fixes both: concealment is attack-defined
+        (nothing legitimate tells an agent to hide what it did), and
+        credential+egress together is the stealer shape."""
+        d = _AGENT_SKILL_DIRS.get(key)
+        marks = _skill_instruction_markers(d)
+        sev, conf, why = base_sev, base_conf, ""
+        if "conceal" in marks:
+            sev, conf = "HIGH", "high"
+            why = (" Its instructions tell the agent to CONCEAL its actions — "
+                   "no legitimate skill needs that.")
+        elif "credential" in marks and "egress" in marks:
+            sev, conf = "HIGH", "high"
+            why = (" Its instructions reference credential locations AND an "
+                   "outbound channel — the stealer shape.")
+        elif marks:
+            why = (" Its instructions mention: %s." % ", ".join(marks))
+        return sev, conf, d, ["agent-skill"] + ["imperative:" + m for m in marks], why
+
     def new_fn(key, sig):
+        sev, conf, path, marks, why = _graded(key, "MEDIUM", "medium")
         return finding(
-            "MEDIUM", "agent-skill", "New AI-agent skill installed",
+            sev, "agent-skill", "New AI-agent skill installed",
             "%s appeared — AI-agent skills run with your full privileges and are "
             "a live 2026 stealer channel (a malicious SKILL.md can drive a fake "
-            "password dialog). Verify you installed it." % key,
-            "agent-skill:new:%s" % key, skill=key, confidence="medium",
-            markers=["agent-skill"])
+            "password dialog). Verify you installed it.%s" % (key, why),
+            "agent-skill:new:%s" % key, skill=key, confidence=conf,
+            path=path, markers=marks)
 
     def changed_fn(key, sig, old):
+        sev, conf, path, marks, why = _graded(key, "MEDIUM", "low")
         return finding(
-            "MEDIUM", "agent-skill", "AI-agent skill changed",
+            sev, "agent-skill", "AI-agent skill changed",
             "%s was modified — its SKILL.md or a shipped script changed. Routine "
             "when you author skills; a change you did not make is a supply-chain "
-            "hijack." % key,
+            "hijack.%s" % (key, why),
             "agent-skill:changed:%s:%s"
             % (key, hashlib.sha256(sig.encode()).hexdigest()[:12]),
-            skill=key, confidence="low", markers=["agent-skill"])
+            skill=key, confidence=conf, path=path, markers=marks)
 
     return _diff_map(prior, cur, new_fn, changed_fn)
 
@@ -13906,11 +13977,12 @@ def _self_watermarked():
     rebound after import (tests, alternate AEGIS_HOME), so a tuple frozen at
     module level would watermark the wrong files."""
     return (("allowlist", ALLOWLIST), ("baseline", BASELINE),
-            ("canaries", CANARY_STATE))
+            ("canaries", CANARY_STATE), ("config", AEGIS_CONFIG))
 
 
 _SELF_TAMPER_LABEL = {"allowlist": "allowlist", "baseline": "baseline",
-                      "canaries": "canary arming record"}
+                      "canaries": "canary arming record",
+                      "config": "operator configuration"}
 _TRUST_STORE_DELETED = ("A missing trust store forces the next scan to silently "
                         "re-baseline current persistence as known-good, "
                         "laundering any attacker-blessed state.")
@@ -13927,7 +13999,65 @@ _SELF_TAMPER_CONSEQUENCE = {
         "If you did not run `aegis.py canary`, the arming record may have been "
         "edited to drop decoys from the tripwire — or encrypted in place by the "
         "very ransomware it exists to catch."),
+    # config.json is not a trust store, but it decides WHERE the off-box beat
+    # is sent (heartbeat_url) and whether the one-time-code gate may fall back
+    # to a tty a pty-wrapper can read (authorization_require_oob). Redirecting
+    # the beat is the quietest way to remove the only witness a same-uid
+    # attacker cannot otherwise reach, and it left no trace until this file
+    # joined the watermarked set on 2026-09-03.
+    "config": (
+        "Aegis is back on its built-in defaults: any off-box heartbeat "
+        "endpoint and any hardened authorization setting are gone, silently.",
+        "If you did not edit it yourself, check `heartbeat_url` first — a "
+        "redirected beat means an off-box witness is watching an address the "
+        "attacker chose."),
 }
+
+
+# The plist EXISTING and the job being LOADED are different facts, and until
+# 2026-09-03 macOS -- the primary platform -- only ever checked the first.
+# `launchctl bootout gui/$UID/com.charlie.aegis` leaves a perfectly valid
+# plist on disk and produces ZERO findings; the monitor simply stops, and the
+# only remaining signal is the heartbeat going stale hours later. Linux has
+# checked `is-enabled`/`is-active` and Windows has parsed schtasks for
+# `Disabled` since those bodies were added. This is the missing third leg.
+#
+# Direction of failure matters here. A wrong "not loaded" is a false alarm the
+# operator learns to ignore, which is how a self-protection check dies; a wrong
+# "loaded" is a miss. So ONLY an unambiguous not-found answer is treated as
+# evidence: any other non-zero rc (a stubbed launchctl under AEGIS_TESTING, a
+# sandboxed context, an OS that changed the output) says "could not
+# determine", and this check stays silent rather than guessing.
+_LAUNCHD_ABSENT_RE = re.compile(
+    r"could not find service|no such process|not find the specified service",
+    re.I)
+
+
+def _launchd_label():
+    """The agent's label, derived from the plist path so there is one literal."""
+    return os.path.basename(SELF_PLIST)[:-len(".plist")]
+
+
+def _check_launchd_loaded():
+    findings = []
+    label = _launchd_label()
+    try:
+        target = "gui/%d/%s" % (os.getuid(), label)
+    except AttributeError:          # no getuid off POSIX; not reachable on mac
+        return findings
+    out, err, rc = run(["launchctl", "print", target], timeout=10)
+    if rc == 0:
+        return findings
+    if not _LAUNCHD_ABSENT_RE.search("%s\n%s" % (out or "", err or "")):
+        return findings             # unreadable answer is not an accusation
+    findings.append(finding(
+        "HIGH", "self-protection", "Aegis launchd agent is not loaded",
+        "%s exists on disk but launchd has no job for %s, so nothing is "
+        "scheduling scans. This is what `launchctl bootout` leaves behind, "
+        "and it is silent: the plist looks healthy. Reload with `launchctl "
+        "bootstrap gui/$(id -u) %s`, or re-run install.sh."
+        % (SELF_PLIST, label, SELF_PLIST), "self:agent:unloaded"))
+    return findings
 
 
 def _check_self_scheduler(st):
@@ -13960,6 +14090,7 @@ def _check_self_scheduler(st):
                     "stop running with no alert. Re-run install.sh to "
                     "regenerate a valid agent." % SELF_PLIST,
                     "self:agent:malformed"))
+            findings.extend(_check_launchd_loaded())
         return findings
     if IS_LINUX:
         if not st.get("installed"):
@@ -15988,6 +16119,7 @@ _MARKER_TECHNIQUES = {
     "amsi-bypass": ("T1562.001",),
     "sam-hive-dump": ("T1003",),
     "lsass-dump": ("T1003",),
+    "dyld-inject": ("T1574.006",),
     "ld-preload-injection": ("T1574.006",),
     "kernel-module": ("T1014", "T1547.006"),
     "defender-exclusion": ("T1562.001",),
