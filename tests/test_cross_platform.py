@@ -2021,7 +2021,11 @@ class TextEncodingIsPinned(unittest.TestCase):
                 # takes no encoding, so it is excluded by name.
                 if not re.search(r"\b(?:os\.fdopen|io\.open|open)\(", line):
                     continue
-                if re.search(r'"[rwax]b\+?"|\bos\.open\(|encoding=', line):
+                # Both binary spellings are legal and mean the same thing:
+                # "rb+" and "r+b". Only the first was excluded, so a correct
+                # binary open written the other way round was reported as a
+                # locale-codec hazard (2026-09-03, _trim_stdio_log).
+                if re.search(r'"[rwax]\+?b\+?"|\bos\.open\(|encoding=', line):
                     continue
                 offenders.append("%d: %s" % (lineno, line.strip()))
         self.assertEqual(offenders, [],

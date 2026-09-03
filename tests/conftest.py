@@ -96,14 +96,25 @@ def _forbid_real_state_writes():
         return real_ensure(*a, **k)
 
     def guarded_log_run(msg):
-        # log_run() writes RUN_LOG with a bare open(), not save_json, and it
-        # swallows every exception -- so raising here would be silently eaten
-        # and the write would still be the caller's business. Refuse the write
-        # instead and record it: a suppressed forensic line is a test problem,
-        # a fabricated one in the operator's live run.log is a safety problem.
-        if _targets_real_state(aegis.RUN_LOG):
+        # Ask where the write would ACTUALLY land, not where the RUN_LOG
+        # constant points: aegis.log_run resolves its path against the current
+        # STATE_DIR at call time (aegis._run_log_path), so a test that
+        # sandboxes STATE_DIR alone is now safe and must not be refused, while
+        # one that rebinds RUN_LOG alone is not safe and must be.
+        try:
+            target = aegis._run_log_path()
+        except AttributeError:          # pre-_run_log_path aegis
+            target = aegis.RUN_LOG
+        if _targets_real_state(target):
+            # This used to refuse-and-record rather than raise, on the theory
+            # that log_run swallows exceptions. It does -- but this wrapper
+            # REPLACES log_run, so the raise happens before any of that code
+            # runs and reaches the caller intact. Refusing quietly left the
+            # offending test green, which is how a leak becomes tolerated;
+            # the session-end report below stays, because a raise inside a
+            # test's own except block can still be caught by the test.
             REAL_RUN_LOG_WRITES.append(str(msg)[:200])
-            return None
+            _refuse("aegis.RUN_LOG (resolves to %s)" % target, target)
         return real_log_run(msg)
 
     aegis._event_connection = guarded_conn
@@ -293,10 +304,17 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Report suppressed live-log writes loudly; the guard is not a licence."""
+    """Report refused live-log writes loudly; the guard is not a licence.
+
+    Kept after the guard was upgraded from refuse-quietly to raise, because a
+    raise is not always visible: a test whose own `except Exception` swallows
+    it, or a code path under `try/except Exception: pass`, would otherwise turn
+    the refusal back into silence. This line is what makes the attempt itself
+    reportable, whatever the caller did with the exception.
+    """
     if REAL_RUN_LOG_WRITES:
         n = len(REAL_RUN_LOG_WRITES)
         sys.stderr.write(
             "\n%d log_run() write(s) aimed at the REAL ~/.aegis/run.log were "
-            "suppressed by tests/conftest.py. Sandbox aegis.RUN_LOG in the "
+            "REFUSED by tests/conftest.py. Sandbox aegis.STATE_DIR in the "
             "offending test's setUp. First: %s\n" % (n, REAL_RUN_LOG_WRITES[0]))

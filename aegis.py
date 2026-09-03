@@ -1529,15 +1529,189 @@ def notify(title, message):
         pass
 
 
+def _run_log_path():
+    """RUN_LOG resolved against the CURRENT STATE_DIR, at call time.
+
+    RUN_LOG is its own module constant, computed at import from the then-current
+    STATE_DIR — so a caller that redirected STATE_DIR and nothing else kept
+    writing here. The suite did exactly that: the operator's LIVE
+    ~/.aegis/run.log holds 128 fabricated "migrated baseline schema v0 -> v3"
+    lines and a run of "deadfall latch-cleared -> firing" entries that never
+    happened, in the one file an incident tells the operator to read. log_run
+    swallows every exception, so nothing ever said so.
+
+    Resolving here makes redirecting STATE_DIR SUFFICIENT, which is the thing
+    every caller already does. Callers that rebind BOTH are unaffected: they
+    set RUN_LOG to <sandbox>/run.log and STATE_DIR to <sandbox>, so the join
+    reproduces the same path.
+    """
+    try:
+        return os.path.join(STATE_DIR, os.path.basename(RUN_LOG))
+    except (AttributeError, TypeError, ValueError):
+        return RUN_LOG
+
+
 def log_run(msg):
+    path = _run_log_path()
     try:
         ensure_state()
-        _rotate_log(RUN_LOG)
-        with open(RUN_LOG, "a", encoding="utf-8") as f:
+        _rotate_log(path)
+        with open(path, "a", encoding="utf-8") as f:
             f.write("%s  %s\n" % (now_iso(), redact_sensitive(msg)))
-        os.chmod(RUN_LOG, 0o600)
+        os.chmod(path, 0o600)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Crash record — the second half of the dead-man's switch.
+#
+# main() had no top-level handler and the module ended `sys.exit(main(sys.argv))`,
+# so an unhandled exception left a traceback on stderr (which, under launchd,
+# means ~/.aegis/run.err — a file nothing read) and NO state at all. Every
+# later `doctor` then reported on the last successful scan and printed OK over
+# a monitor that had been dead since Tuesday.
+#
+# The record is deliberately NOT a heartbeat. Every liveness watcher on this
+# machine keys on the beat going STALE — `aegis.py watchdog`, the menubar's
+# skull, the root witness — so writing a beat on the way down would use the
+# crash to silence the alarm the crash is supposed to raise. The beat is left
+# to rot; this file is the ADDITIONAL signal that says why.
+# --------------------------------------------------------------------------- #
+
+CRASH_EXIT_CODE = 70            # EX_SOFTWARE: an internal fault, not a verdict
+CRASH_TRACEBACK_MAX = 8000      # keep the tail; a runaway recursion is bounded
+CRASH_FRESH_SECS = 7 * 86400    # after a week it is history, not an open fault
+
+
+def _crash_file():
+    """The durable crash marker, resolved from the CURRENT STATE_DIR (same
+    reason, and same one-line fix, as _run_log_path)."""
+    return os.path.join(STATE_DIR, "crash.json")
+
+
+def record_crash(argv=None, context=None):
+    """Record the exception being handled and return the process exit code.
+
+    MUST be called from inside an `except` block — the traceback is taken from
+    the live exception state. `traceback` is imported here rather than at
+    module scope because this is the only path in the file that needs it, and
+    because an import at the top is one more thing that can fail before a
+    crash can be written down.
+
+    Never raises: the whole point is to be the sink of last resort.
+    """
+    import traceback
+    exc = sys.exc_info()[1]
+    detail = traceback.format_exc()
+    rec = {
+        "ts": now_iso(), "epoch": int(time.time()), "pid": os.getpid(),
+        "argv": [str(a) for a in (sys.argv if argv is None else argv)],
+        "exc_type": type(exc).__name__ if exc is not None else "unknown",
+        "exc": redact_sensitive(str(exc))[:500] if exc is not None else "",
+        "context": redact_sensitive(str(context))[:200] if context else "",
+        "traceback": redact_sensitive(detail)[-CRASH_TRACEBACK_MAX:],
+    }
+    try:
+        ensure_state()
+        save_json(_crash_file(), rec)
+        os.chmod(_crash_file(), 0o600)
+    except Exception:
+        pass    # run.log below is the fallback sink; stderr is the last one
+    log_run("CRASH %s: %s%s" % (rec["exc_type"], rec["exc"],
+                                (" [%s]" % rec["context"]) if rec["context"]
+                                else ""))
+    for line in detail.rstrip().splitlines():
+        log_run("  %s" % line)
+    try:
+        sys.stderr.write(detail)
+    except Exception:
+        pass
+    return CRASH_EXIT_CODE
+
+
+def read_crash():
+    """The last recorded crash, or {}. Never auto-cleared: a crash that a later
+    successful run erases is a crash-loop nobody can see. `doctor` prints it,
+    ages it, and tells you the one line that removes it."""
+    return load_json(_crash_file(), {})
+
+
+# --------------------------------------------------------------------------- #
+# The scheduler's stdout/stderr sinks. launchd's StandardOutPath /
+# StandardErrorPath (and a systemd unit's journal-free equivalent) append for
+# the life of the install and NOTHING rotated them: _rotate_log covers run.log,
+# findings.jsonl, actions.jsonl and the notary, and never these two. The hourly
+# scan job printed its ENTIRE markdown report to stdout, so run.out reached
+# 8.6 MB on the reference machine holding output no reader has ever opened.
+# --------------------------------------------------------------------------- #
+
+STDIO_LOG_MAX_BYTES = 2 * 1024 * 1024
+STDIO_LOG_KEEP_BYTES = 256 * 1024
+
+
+def _stdio_log_paths():
+    """(run.out, run.err) under the CURRENT STATE_DIR."""
+    return (os.path.join(STATE_DIR, "run.out"),
+            os.path.join(STATE_DIR, "run.err"))
+
+
+def _trim_stdio_log(path, max_bytes=STDIO_LOG_MAX_BYTES,
+                    keep_bytes=STDIO_LOG_KEEP_BYTES):
+    """Bound run.out / run.err IN PLACE, keeping the newest `keep_bytes`.
+
+    Deliberately NOT _rotate_log. These two files are not ours to rename: the
+    scheduler opens them once, at spawn, and holds the descriptor for the life
+    of the process — in watch mode, forever. An os.replace() would leave that
+    descriptor pointed at the renamed inode, so the agent would go on writing
+    into run.out.1 while `doctor` read a run.err nothing appends to — a worse
+    failure than the growth, because it looks fixed. Rewriting through an r+b
+    handle keeps the inode; an O_APPEND writer simply resumes at the new end.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= max_bytes:
+        return False
+    try:
+        with open(path, "rb+") as f:
+            f.seek(max(0, size - keep_bytes))
+            tail = f.read()
+            f.seek(0)
+            f.write(("[aegis: %d bytes of earlier output trimmed %s]\n"
+                     % (size - len(tail), now_iso())).encode("utf-8", "replace"))
+            f.write(tail)
+            f.truncate()
+        os.chmod(path, 0o600)
+    except OSError:
+        # Windows refuses to truncate a file another process holds open, and
+        # the scheduled task there redirects no stdout sink at all — so this is
+        # a no-op on that body rather than a failure worth reporting.
+        return False
+    return True
+
+
+def _trim_stdio_logs():
+    """Trim both scheduler sinks; returns the paths actually trimmed."""
+    trimmed = [p for p in _stdio_log_paths() if _trim_stdio_log(p)]
+    if trimmed:
+        log_run("trimmed scheduler output: %s" % ", ".join(trimmed))
+    return trimmed
+
+
+def _tail_lines(path, count):
+    """Last `count` non-empty lines of a text file, or []. Reads at most the
+    final 64 KiB so a runaway log cannot be pulled into memory."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 64 * 1024))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return lines[-count:]
 
 
 def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
@@ -14633,7 +14807,21 @@ def _cmd_scan_locked(quiet=False):
     # the report's "new since last scan".
     prior_seen = set(load_json(SEEN, {}))
     routing = _route_for_scan(findings, first_run, adopt)
-    new_high = emit(findings, first_run, adopt=adopt, routing=routing)
+    # Everything from here to write_heartbeat runs BEFORE the beat, so any of
+    # it that raises takes the LIVENESS SIGNAL down with it — and a monitor
+    # that stops beating because the disk filled is indistinguishable, to every
+    # watcher on this machine, from one an attacker killed. Four calls in this
+    # tail were bare while their immediate neighbours (deadfall, autoprotect,
+    # notary, thaw) were already wrapped. They are wrapped the same way now,
+    # and what they failed at is carried into the beat instead of being
+    # rounded up to "ok": degraded is a state a scan can be in, silent is not.
+    degraded = []
+    try:
+        new_high = emit(findings, first_run, adopt=adopt, routing=routing)
+    except Exception as e:
+        log_run("emit failed (findings NOT appended, no notification): %s" % e)
+        new_high = []
+        degraded.append("emit")
     # Pre-authorized reversible response, if the operator armed any. Runs
     # AFTER emit so the report is written before anything acts on it, and is
     # wrapped because a standing order that could fail a scan — and so blind
@@ -14677,12 +14865,31 @@ def _cmd_scan_locked(quiet=False):
     # The heartbeat is written AFTER the report, so what is on disk now is the
     # PREVIOUS scan's — which is exactly the liveness fact the report needs and
     # costs no new state to obtain.
-    md = write_report(findings, first_run, incidents=incidents,
-                      sensor_health=persisted_health, prior_seen=prior_seen,
-                      aged=_LAST_AGED_OUT, routing=routing,
-                      prev_scan_at=read_heartbeat().get("epoch"))
-    flush_sigcache()
-    record_selfstate()
+    try:
+        md = write_report(findings, first_run, incidents=incidents,
+                          sensor_health=persisted_health, prior_seen=prior_seen,
+                          aged=_LAST_AGED_OUT, routing=routing,
+                          prev_scan_at=read_heartbeat().get("epoch"))
+    except Exception as e:
+        log_run("report write failed: %s" % e)
+        degraded.append("report")
+        md = ("# Aegis — %s\n\nThe report could not be written this scan: %s\n"
+              "The findings log and the event store are unaffected; see "
+              "`aegis.py doctor`.\n" % (now_iso(), e))
+    try:
+        flush_sigcache()
+    except Exception as e:
+        log_run("sigcache flush failed: %s" % e)
+        degraded.append("sigcache")
+    try:
+        record_selfstate()
+    except Exception as e:
+        # The self-protection watermarks did not advance. The NEXT scan will
+        # therefore compare against an older watermark, which over-reports
+        # rather than under-reports — the safe direction, but only if someone
+        # is told, which is what the degraded beat below is for.
+        log_run("selfstate record failed: %s" % e)
+        degraded.append("selfstate")
     # Extend the tamper-evidence chain AFTER state is settled, so the link
     # commits to what this scan actually concluded. Best-effort: a notary that
     # could fail a scan would be a liability, not a control.
@@ -14705,10 +14912,20 @@ def _cmd_scan_locked(quiet=False):
     # what an external watcher / peer agent / `aegis.py watchdog` alarms on — the
     # one signal a same-uid attacker who kills or boots-out Aegis can't suppress
     # off-box. POSTs out-of-band only if a URL is configured (else local-only).
-    write_heartbeat(status="ok", alerts=len(new_high),
+    #
+    # The beat is still WRITTEN when a tail step failed — the process really is
+    # alive, and that is exactly what separates this from a crash (see
+    # record_crash, which deliberately writes no beat) — but it must not claim
+    # "ok" for a scan whose report never reached the disk. A watcher reading a
+    # fresh beat that says `degraded:report` knows the monitor is up and the
+    # thing it produces is not.
+    write_heartbeat(status="ok" if not degraded
+                    else "degraded:" + ",".join(degraded),
+                    alerts=len(new_high),
                     top_alert=new_high[0]["title"] if new_high else None)
-    log_run("scan: %d findings, %d new-high, first_run=%s"
-            % (len(findings), len(new_high), first_run))
+    log_run("scan: %d findings, %d new-high, first_run=%s%s"
+            % (len(findings), len(new_high), first_run,
+               (", DEGRADED: " + ", ".join(degraded)) if degraded else ""))
 
     if not quiet:
         print(md)
@@ -15747,6 +15964,39 @@ def cmd_attck(days=180):
     return 0
 
 
+# How late a scheduled scan has to be before `doctor` calls the coverage
+# unknown. A multiple of the cadence rather than a constant, because a 600s
+# watch floor and an hourly interval are two different promises; the floor
+# keeps a short cadence from alarming on one skipped tick (a closed lid, a
+# sleeping laptop, a slow scan).
+DOCTOR_SCAN_STALE_FACTOR = 3
+DOCTOR_SCAN_STALE_FLOOR = 1800
+
+
+def _expected_scan_gap():
+    """(cadence_secs, armed) — how often a scan SHOULD land on this machine.
+
+    Read from the install record, because that is the only place the schedule
+    is written down: `install watch` schedules a 600s full-scan floor, `install
+    scan` an hourly StartInterval, and cmd_install stamps the mode. An
+    UNINSTALLED machine has no cadence at all and saying so is the honest
+    answer — a manual-only user whose last scan was Tuesday has no fault to
+    report. `install_interval` is read when present so a custom interval is
+    respected rather than assumed away.
+    """
+    st = load_json(SELFSTATE, {})
+    if not st.get("installed"):
+        return None, False
+    mode = st.get("install_mode") or "scan"
+    try:
+        interval = int(st.get("install_interval") or 0)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval < 60:
+        interval = 600 if mode == "watch" else 3600
+    return interval, True
+
+
 def cmd_doctor():
     """Report actual coverage and liveness; UNKNOWN is never printed as green."""
     ensure_state()
@@ -15809,7 +16059,55 @@ def cmd_doctor():
     if not health:
         print("  ? sensors                     no completed scan recorded")
         problems.append("no sensor health")
+    # Staleness is TWO questions and this command needs both answers.
+    #
+    # RELATIVE (_coverage_split): a row older than the newest row in the same
+    # batch did not run this scan. doctor read get_sensor_health() raw and
+    # painted every stored status=="OK" green, so a sensor that stopped
+    # running in July still counted as coverage in September — the exact
+    # "unknown is never green" failure this function's own docstring promises
+    # to prevent, and the failure cmd_status cites doctor's rule as the reason
+    # it fixed. The report and status already apply this helper; doctor, which
+    # taught them the rule, did not.
+    #
+    # ABSOLUTE: _coverage_split compares the rows against EACH OTHER, so it is
+    # structurally blind to the case that matters most. If the WHOLE scan
+    # stopped, all forty-odd rows share one last_run_at, nothing is relatively
+    # stale, and every sensor reads live off a monitor that has been dead for
+    # a week. Only a comparison against the CLOCK catches that.
+    live, stale, permanent, degraded = _coverage_split(health)
+    stale_ids = {h.get("sensor_id") for h in stale}
+    newest = max([h.get("last_run_at") for h in health
+                  if isinstance(h.get("last_run_at"), int)] or [0])
+    cadence, armed = _expected_scan_gap()
+    scan_dead = False
+    if health and armed and cadence:
+        limit = max(DOCTOR_SCAN_STALE_FACTOR * cadence, DOCTOR_SCAN_STALE_FLOOR)
+        age = int(time.time()) - newest if newest else None
+        scan_dead = age is None or age > limit
+        if scan_dead:
+            print("  ✗ %-27s NO SCAN HAS COMPLETED since %s — the installed "
+                  "schedule runs every %dm, so EVERY sensor row below is that "
+                  "old and none of them is evidence about now"
+                  % ("scan cadence", _ago(newest) if newest else "ever",
+                     cadence // 60))
+            problems.append("scan cadence")
+        else:
+            print("  ✓ %-27s last completed scan %s (schedule: every %dm)"
+                  % ("scan cadence", _ago(newest), cadence // 60))
+    elif health and newest:
+        print("  · %-27s last completed scan %s (no background schedule "
+              "installed; manual runs only)" % ("scan cadence", _ago(newest)))
     for item in health:
+        if scan_dead or item["sensor_id"] in stale_ids:
+            # One problem was already recorded for a dead schedule; forty more
+            # would bury it. A relatively-stale row is its own fault and keeps
+            # counting individually.
+            print("  ✗ %-27s DID NOT RUN — last reported %s"
+                  % (item["sensor_id"], _ago(item.get("last_run_at"))))
+            if not scan_dead:
+                problems.append(item["sensor_id"])
+            continue
         # PRIVILEGED = a named, OS-imposed permanent coverage gap ("i", like
         # rootwatch-absent below): shown so it is never mistaken for coverage,
         # but not a problem — nothing here is fixable or unexpectedly broken.
@@ -15835,6 +16133,67 @@ def cmd_doctor():
     print("  %s %-27s %s" % (a_mark, "positive controls", a_text))
     if a_mark != "✓":
         problems.append("assay coverage")
+    # --- liveness -----------------------------------------------------------
+    # doctor contained no read_heartbeat() call at all. The beat is the signal
+    # every OTHER watcher on this machine keys on — `aegis.py watchdog`, the
+    # menubar skull, the root witness — and doctor, the command whose docstring
+    # promises "coverage and liveness", was the one place not asking. That is
+    # how "Doctor result: OK" got printed over a monitor that had not run since
+    # it crashed three days earlier.
+    beat = read_heartbeat()
+    beat_epoch = beat.get("epoch")
+    if beat_epoch:
+        beat_age = int(time.time()) - int(beat_epoch)
+        beat_status = str(beat.get("status") or "?")
+        if beat_age > HEARTBEAT_STALE_SECS:
+            print("  ✗ %-27s STALE — last beat %s (pid %s); tolerance is %dm. "
+                  "The monitor is not running, or cannot finish a scan."
+                  % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
+                     HEARTBEAT_STALE_SECS // 60))
+            problems.append("heartbeat stale")
+        else:
+            print("  ✓ %-27s last beat %s (pid %s, status %s)"
+                  % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
+                     beat_status))
+        if beat_status != "ok" and beat_status != "?":
+            # A fresh beat that says `degraded:report` is the case the wrapped
+            # scan tail exists to report: the process is alive and the thing it
+            # produces is not. Green on liveness, still a problem.
+            print("      the last scan finished DEGRADED (%s) — that step did "
+                  "not complete; see run.log" % beat_status)
+            problems.append("degraded scan")
+    elif armed:
+        print("  ✗ %-27s NO BEAT ON RECORD though a background schedule is "
+              "installed — no scan has ever completed here"
+              % "heartbeat")
+        problems.append("heartbeat missing")
+    else:
+        print("  · %-27s no beat yet (no background schedule installed)"
+              % "heartbeat")
+    crash = read_crash()
+    if crash.get("epoch"):
+        fresh = (int(time.time()) - int(crash["epoch"])) <= CRASH_FRESH_SECS
+        print("  %s %-27s %s: %s — %s"
+              % ("✗" if fresh else "i", "last unhandled crash",
+                 _ago(crash.get("epoch")), crash.get("exc_type") or "?",
+                 (crash.get("exc") or "")[:110]))
+        print("      argv: %s%s" % (" ".join(crash.get("argv") or [])[:100],
+                                    ("  [%s]" % crash["context"])
+                                    if crash.get("context") else ""))
+        for line in (crash.get("traceback") or "").rstrip().splitlines()[-4:]:
+            print("      %s" % line[:120])
+        print("      Full record: %s (delete it once you have read it)"
+              % _crash_file())
+        if fresh:
+            problems.append("unhandled crash")
+    _out_path, err_path = _stdio_log_paths()
+    err_tail = _tail_lines(err_path, 8)
+    if err_tail:
+        print("  ✗ %-27s %s is not empty — the scheduled job is writing to "
+              "stderr:" % ("scheduled job stderr", err_path))
+        for line in err_tail:
+            print("      %s" % line[:120])
+        problems.append("scheduled job stderr")
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
@@ -16557,6 +16916,27 @@ def cmd_allow(path):
 WATCH_DEBOUNCE_SECS = 3   # let a write burst settle so it costs one scan
 WATCH_MIN_GAP_SECS = 60   # floor between event-triggered scans (battery bound)
 
+# Watch-loop survivability. The loop caught KeyboardInterrupt and nothing else,
+# so ANY other exception ended the process — and under launchd that is not a
+# stop, it is an accelerator: KeepAlive respawns, ThrottleInterval bounds the
+# respawn at 30s, and RunAtLoad makes each respawn open with an immediate FULL
+# SCAN. A watch that cannot arm its watcher therefore ran a full scan every
+# thirty seconds, forever, while doing none of the watching.
+#
+# That is not hypothetical. os.O_EVTONLY is absent on Command Line Tools Python
+# 3.9 (see the O_EVTONLY comment above), _build_watch raised AttributeError on
+# every pass, and this is exactly what the machine did.
+#
+# So: a failing iteration backs off and stays, and a PERSISTENTLY failing one
+# parks at a long sleep instead of exiting. Parking is strictly better than
+# dying — a process alive on an hourly cycle still scans, still beats, and can
+# still be diagnosed; a process that exits hands the problem to a supervisor
+# that responds to breakage by running the expensive path more often.
+WATCH_BACKOFF_BASE_SECS = 15      # first retry; doubles from here
+WATCH_BACKOFF_MAX_SECS = 900      # ceiling on the doubling (15 min)
+WATCH_FAIL_CAP = 6                # after this many in a row, stop retrying fast
+WATCH_STUCK_SLEEP_SECS = 3600     # parked: alive, quiet, still beating hourly
+
 # os.O_EVTONLY only exists in Python >= 3.10; the launchd agent runs the system
 # /usr/bin/python3 (CLT Python 3.9), where the missing attr crashed _build_watch
 # and turned watch mode into a KeepAlive crash-loop of back-to-back full scans.
@@ -16875,7 +17255,12 @@ def cmd_watch(interval=600):
     to one event scan per WATCH_MIN_GAP_SECS), and a full scan runs every
     `interval` seconds as a floor. Production: `bash install.sh watch` runs this
     under launchd KeepAlive. Falls back to plain interval polling if kqueue is
-    somehow unavailable."""
+    somehow unavailable.
+
+    An iteration that raises is logged and backed off, never fatal: under
+    KeepAlive an exit is an ACCELERATOR, not a stop (see WATCH_FAIL_CAP above
+    for the incident). KeyboardInterrupt still exits cleanly — a human at the
+    terminal means it."""
     has_kq = IS_MAC and hasattr(select, "kqueue")
     has_inotify = (not has_kq) and _inotify_libc() is not None
     if has_kq:
@@ -16888,9 +17273,13 @@ def cmd_watch(interval=600):
                 % (WATCH_POLL_SECS, interval))
     print("Aegis watch: %s. Ctrl-C to stop." % mode)
     stream = _spawn_xprotect_stream() if has_kq else None
+    consecutive = 0
     try:
         while True:
             try:
+                # This process holds run.out/run.err open for its whole life,
+                # so nothing else will ever bound them for it.
+                _trim_stdio_logs()
                 started = time.time()
                 cmd_scan(quiet=True)
                 if not has_kq:
@@ -16919,28 +17308,65 @@ def cmd_watch(interval=600):
                         if remain > 0:
                             time.sleep(remain)
                         log_run("watch: change event -> rescan")
-                    continue
-                if stream is not None and stream.poll() is not None:
-                    stream = _spawn_xprotect_stream()  # tail died → respawn
-                extra = (stream.stdout.fileno(),) if stream else ()
-                # A write landing between the scan above and this arm is missed
-                # by the kqueue; the interval floor scan covers that ms-wide gap.
-                kq, fds = _build_watch(extra)
-                try:
-                    if _wait_for_change(kq, interval):
-                        time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
-                        if stream is not None:
-                            # level-triggered read fd: MUST drain or spin
-                            _drain_fd(stream.stdout.fileno())
-                        remain = WATCH_MIN_GAP_SECS - (time.time() - started)
-                        if remain > 0:
-                            time.sleep(remain)  # rate-limit event scans
-                        log_run("watch: change event -> rescan")
-                finally:
-                    _close_watch(kq, fds)
+                else:
+                    # Was a bare `continue`. It is an `else` now so that the
+                    # success reset at the bottom is reachable from BOTH arms:
+                    # a `continue` here would have skipped it, and the backoff
+                    # would then never clear on the polled/inotify platforms.
+                    if stream is not None and stream.poll() is not None:
+                        stream = _spawn_xprotect_stream()  # tail died → respawn
+                    extra = (stream.stdout.fileno(),) if stream else ()
+                    # A write landing between the scan above and this arm is
+                    # missed by the kqueue; the interval floor scan covers that
+                    # ms-wide gap.
+                    kq, fds = _build_watch(extra)
+                    try:
+                        if _wait_for_change(kq, interval):
+                            time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
+                            if stream is not None:
+                                # level-triggered read fd: MUST drain or spin
+                                _drain_fd(stream.stdout.fileno())
+                            remain = WATCH_MIN_GAP_SECS - (time.time() - started)
+                            if remain > 0:
+                                time.sleep(remain)  # rate-limit event scans
+                            log_run("watch: change event -> rescan")
+                    finally:
+                        _close_watch(kq, fds)
+                # A completed iteration — scan AND arm — is the only evidence
+                # this loop is healthy, so the counter clears here and nowhere
+                # earlier. Resetting right after cmd_scan would have made the
+                # O_EVTONLY case (scan fine, arm broken) look recovered on
+                # every pass and reproduce the 30-second-scan pathology at 15.
+                consecutive = 0
             except KeyboardInterrupt:
                 print("\nstopped.")
                 return 0
+            except Exception as e:
+                consecutive += 1
+                log_run("watch: iteration FAILED (%d in a row): %s: %s"
+                        % (consecutive, type(e).__name__, e))
+                if consecutive >= WATCH_FAIL_CAP:
+                    # Same failure over and over is a broken build, not a
+                    # blip. Park on a long cycle and leave ONE durable record
+                    # a human can find (`doctor` prints it) — the run.log
+                    # lines above are the detail, this is the headline.
+                    backoff = WATCH_STUCK_SLEEP_SECS
+                    if consecutive == WATCH_FAIL_CAP:
+                        record_crash(
+                            ["watch", str(interval)],
+                            context=("watch loop failed %d times in a row; "
+                                     "parked at %ds — still scanning, no "
+                                     "longer watching"
+                                     % (consecutive, backoff)))
+                        print("Aegis watch: %d consecutive failures (%s). "
+                              "Staying alive on a %ds cycle rather than "
+                              "exiting into the supervisor's respawn loop; "
+                              "run `aegis.py doctor`."
+                              % (consecutive, e, backoff))
+                else:
+                    backoff = min(WATCH_BACKOFF_MAX_SECS,
+                                  WATCH_BACKOFF_BASE_SECS * (2 ** (consecutive - 1)))
+                time.sleep(backoff)
     finally:
         _stop_stream(stream)
 
@@ -20602,8 +21028,12 @@ def _install_mac(runtime, mode, interval):
     py = sys.executable or "/usr/bin/python3"
     agents = os.path.dirname(SELF_PLIST)
     os.makedirs(agents, mode=0o700, exist_ok=True)
+    # `scan --quiet`: this job's stdout IS StandardOutPath below, so a verbose
+    # scheduled scan appends the whole markdown report to run.out every hour
+    # for the life of the install and nothing ever reads it. Watch mode already
+    # calls cmd_scan(quiet=True) internally and needs no flag.
     args = [py, runtime] + (["watch", str(interval)] if mode == "watch"
-                            else ["scan"])
+                            else ["scan", "--quiet"])
     # A path containing &, <, > (e.g. ".../Work & Projects/...") MUST be
     # entity-escaped or launchd silently refuses to load the agent and the
     # whole tool never runs on schedule.
@@ -20699,8 +21129,10 @@ def _install_linux(runtime, mode, interval):
             "exec": '"%s" "%s" watch %d' % (py, runtime, interval),
             "restart": "Restart=always\nRestartSec=10"}
     else:
+        # --quiet for the same reason as the launchd plist: a oneshot's stdout
+        # goes to the journal, where an hourly markdown report is pure noise.
         service = _SYSTEMD_SERVICE % {
-            "type": "oneshot", "exec": '"%s" "%s" scan' % (py, runtime),
+            "type": "oneshot", "exec": '"%s" "%s" scan --quiet' % (py, runtime),
             "restart": ""}
     with open(os.path.join(unit_dir, "aegis.service"), "w", encoding="utf-8") as f:
         f.write(service)
@@ -20745,7 +21177,7 @@ def _install_windows(runtime, mode, interval):
         py = pyw
     action = '"%s" "%s" %s' % (py, runtime,
                                "watch %d" % interval if mode == "watch"
-                               else "scan")
+                               else "scan --quiet")
     if mode == "watch":
         # One long-running process, (re)started at each logon. `schtasks
         # /create` exposes no restart-on-failure knob (that needs the XML task
@@ -22972,7 +23404,19 @@ def _authorize_response_cli(verb, argument=None):
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "scan"
     if cmd == "scan":
-        return cmd_scan()
+        # The scheduler's stdout/stderr sinks are bounded HERE, before anything
+        # writes to them: a scheduled scan is a fresh process, so this is the
+        # one moment its run.out fd is not yet in use. (cmd_watch, which holds
+        # them open for its whole life, trims them at the top of every loop.)
+        _trim_stdio_logs()
+        # --quiet is what the INSTALLED job passes. launchd sends this process's
+        # stdout to StandardOutPath = ~/.aegis/run.out, so a verbose hourly scan
+        # appended the ENTIRE markdown report there every hour — 8.6 MB on the
+        # reference machine, of a file no code and no human has ever read.
+        # An interactive `aegis.py scan` stays verbose: printing the report to
+        # your terminal is the whole point of typing it.
+        return cmd_scan(quiet=any(a in ("--quiet", "-q", "quiet")
+                                  for a in argv[2:]))
     if cmd == "report":
         return cmd_report(full=(len(argv) > 2 and argv[2] in ("--full", "full")))
     if cmd == "status":
@@ -23153,4 +23597,30 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    # The last line used to be `sys.exit(main(sys.argv))` with no handler above
+    # it anywhere. An unhandled exception therefore left a traceback on stderr
+    # — under launchd, ~/.aegis/run.err, a file nothing read — and NO durable
+    # state at all, so every later `doctor` answered from the last SUCCESSFUL
+    # scan and printed OK over a monitor that had been dead since Tuesday. A
+    # security tool that dies quietly is worse than one that was never
+    # installed, because the operator believes they are covered.
+    #
+    # Deliberately here rather than inside main(): main() is a 180-line
+    # dispatch chain and wrapping its body would reindent every branch, which
+    # is a large diff hiding a small fix. The record itself is written by
+    # record_crash — which does NOT refresh the heartbeat, on purpose (see its
+    # comment): a crash must leave the beat rotting, because the beat going
+    # stale is the alarm every other watcher on this box is waiting for.
+    _rc = CRASH_EXIT_CODE
+    try:
+        _rc = main(sys.argv)
+    except SystemExit:
+        raise                       # an explicit exit is a decision, not a fault
+    except KeyboardInterrupt:
+        # A human at the terminal is not a crash and must not leave a crash
+        # record for the next `doctor` to alarm on.
+        sys.stderr.write("\ninterrupted.\n")
+        _rc = 130
+    except BaseException:           # noqa: B036 - a sink of last resort catches all
+        _rc = record_crash(sys.argv)
+    sys.exit(_rc)
