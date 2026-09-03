@@ -749,6 +749,25 @@ _HOSTILE_CONTENT_RES = [
     (re.compile(r"\b(?:procdump|comsvcs\.dll[^\n]{0,120}MiniDump|MiniDumpWriteDump)"
                 r"[^\n]{0,120}\blsass\b|\blsass\b[^\n]{0,120}\bMiniDump", re.I),
      "lsass-dump"),
+    # --- Dynamic-linker hijacking (T1574.006), both bodies ------------------
+    # macOS's twin of LD_PRELOAD had NO regex here until 2026-09-03, so the
+    # only DYLD_* awareness in the file was _DYLD_INJECT_KEYS reading a launchd
+    # plist's EnvironmentVariables. An injection set anywhere else -- a shellrc
+    # export, a cron line, an npm postinstall, a bare argv -- was invisible,
+    # while `attck` still reported T1574.006 as wired on this machine because
+    # the technique mapped to the Linux marker. One table serves argv, shellrc,
+    # cron, package hooks and untrusted file content, so this single entry
+    # covers all five surfaces at once.
+    #
+    # DYLD_LIBRARY_PATH and DYLD_FRAMEWORK_PATH have legitimate uses in build
+    # and test scripts; INSERT_LIBRARIES essentially does not. They share a
+    # marker because the grading tier, not this table, is where benign
+    # populations are handled -- and because SIP strips all of them across a
+    # protected-binary exec, which means seeing one at all says the target was
+    # not protected.
+    (re.compile(r"\bDYLD_(?:INSERT_LIBRARIES|FRAMEWORK_PATH|LIBRARY_PATH|"
+                r"FALLBACK_LIBRARY_PATH|FALLBACK_FRAMEWORK_PATH)\s*=", re.I),
+     "dyld-inject"),
     # --- Linux-native persistence/injection idioms --------------------------
     # LD_PRELOAD injection and /etc/ld.so.preload writes (T1574.006).
     (re.compile(r"\bLD_PRELOAD\s*=", re.I), "ld-preload-injection"),
@@ -1529,15 +1548,189 @@ def notify(title, message):
         pass
 
 
+def _run_log_path():
+    """RUN_LOG resolved against the CURRENT STATE_DIR, at call time.
+
+    RUN_LOG is its own module constant, computed at import from the then-current
+    STATE_DIR — so a caller that redirected STATE_DIR and nothing else kept
+    writing here. The suite did exactly that: the operator's LIVE
+    ~/.aegis/run.log holds 128 fabricated "migrated baseline schema v0 -> v3"
+    lines and a run of "deadfall latch-cleared -> firing" entries that never
+    happened, in the one file an incident tells the operator to read. log_run
+    swallows every exception, so nothing ever said so.
+
+    Resolving here makes redirecting STATE_DIR SUFFICIENT, which is the thing
+    every caller already does. Callers that rebind BOTH are unaffected: they
+    set RUN_LOG to <sandbox>/run.log and STATE_DIR to <sandbox>, so the join
+    reproduces the same path.
+    """
+    try:
+        return os.path.join(STATE_DIR, os.path.basename(RUN_LOG))
+    except (AttributeError, TypeError, ValueError):
+        return RUN_LOG
+
+
 def log_run(msg):
+    path = _run_log_path()
     try:
         ensure_state()
-        _rotate_log(RUN_LOG)
-        with open(RUN_LOG, "a", encoding="utf-8") as f:
+        _rotate_log(path)
+        with open(path, "a", encoding="utf-8") as f:
             f.write("%s  %s\n" % (now_iso(), redact_sensitive(msg)))
-        os.chmod(RUN_LOG, 0o600)
+        os.chmod(path, 0o600)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Crash record — the second half of the dead-man's switch.
+#
+# main() had no top-level handler and the module ended `sys.exit(main(sys.argv))`,
+# so an unhandled exception left a traceback on stderr (which, under launchd,
+# means ~/.aegis/run.err — a file nothing read) and NO state at all. Every
+# later `doctor` then reported on the last successful scan and printed OK over
+# a monitor that had been dead since Tuesday.
+#
+# The record is deliberately NOT a heartbeat. Every liveness watcher on this
+# machine keys on the beat going STALE — `aegis.py watchdog`, the menubar's
+# skull, the root witness — so writing a beat on the way down would use the
+# crash to silence the alarm the crash is supposed to raise. The beat is left
+# to rot; this file is the ADDITIONAL signal that says why.
+# --------------------------------------------------------------------------- #
+
+CRASH_EXIT_CODE = 70            # EX_SOFTWARE: an internal fault, not a verdict
+CRASH_TRACEBACK_MAX = 8000      # keep the tail; a runaway recursion is bounded
+CRASH_FRESH_SECS = 7 * 86400    # after a week it is history, not an open fault
+
+
+def _crash_file():
+    """The durable crash marker, resolved from the CURRENT STATE_DIR (same
+    reason, and same one-line fix, as _run_log_path)."""
+    return os.path.join(STATE_DIR, "crash.json")
+
+
+def record_crash(argv=None, context=None):
+    """Record the exception being handled and return the process exit code.
+
+    MUST be called from inside an `except` block — the traceback is taken from
+    the live exception state. `traceback` is imported here rather than at
+    module scope because this is the only path in the file that needs it, and
+    because an import at the top is one more thing that can fail before a
+    crash can be written down.
+
+    Never raises: the whole point is to be the sink of last resort.
+    """
+    import traceback
+    exc = sys.exc_info()[1]
+    detail = traceback.format_exc()
+    rec = {
+        "ts": now_iso(), "epoch": int(time.time()), "pid": os.getpid(),
+        "argv": [str(a) for a in (sys.argv if argv is None else argv)],
+        "exc_type": type(exc).__name__ if exc is not None else "unknown",
+        "exc": redact_sensitive(str(exc))[:500] if exc is not None else "",
+        "context": redact_sensitive(str(context))[:200] if context else "",
+        "traceback": redact_sensitive(detail)[-CRASH_TRACEBACK_MAX:],
+    }
+    try:
+        ensure_state()
+        save_json(_crash_file(), rec)
+        os.chmod(_crash_file(), 0o600)
+    except Exception:
+        pass    # run.log below is the fallback sink; stderr is the last one
+    log_run("CRASH %s: %s%s" % (rec["exc_type"], rec["exc"],
+                                (" [%s]" % rec["context"]) if rec["context"]
+                                else ""))
+    for line in detail.rstrip().splitlines():
+        log_run("  %s" % line)
+    try:
+        sys.stderr.write(detail)
+    except Exception:
+        pass
+    return CRASH_EXIT_CODE
+
+
+def read_crash():
+    """The last recorded crash, or {}. Never auto-cleared: a crash that a later
+    successful run erases is a crash-loop nobody can see. `doctor` prints it,
+    ages it, and tells you the one line that removes it."""
+    return load_json(_crash_file(), {})
+
+
+# --------------------------------------------------------------------------- #
+# The scheduler's stdout/stderr sinks. launchd's StandardOutPath /
+# StandardErrorPath (and a systemd unit's journal-free equivalent) append for
+# the life of the install and NOTHING rotated them: _rotate_log covers run.log,
+# findings.jsonl, actions.jsonl and the notary, and never these two. The hourly
+# scan job printed its ENTIRE markdown report to stdout, so run.out reached
+# 8.6 MB on the reference machine holding output no reader has ever opened.
+# --------------------------------------------------------------------------- #
+
+STDIO_LOG_MAX_BYTES = 2 * 1024 * 1024
+STDIO_LOG_KEEP_BYTES = 256 * 1024
+
+
+def _stdio_log_paths():
+    """(run.out, run.err) under the CURRENT STATE_DIR."""
+    return (os.path.join(STATE_DIR, "run.out"),
+            os.path.join(STATE_DIR, "run.err"))
+
+
+def _trim_stdio_log(path, max_bytes=STDIO_LOG_MAX_BYTES,
+                    keep_bytes=STDIO_LOG_KEEP_BYTES):
+    """Bound run.out / run.err IN PLACE, keeping the newest `keep_bytes`.
+
+    Deliberately NOT _rotate_log. These two files are not ours to rename: the
+    scheduler opens them once, at spawn, and holds the descriptor for the life
+    of the process — in watch mode, forever. An os.replace() would leave that
+    descriptor pointed at the renamed inode, so the agent would go on writing
+    into run.out.1 while `doctor` read a run.err nothing appends to — a worse
+    failure than the growth, because it looks fixed. Rewriting through an r+b
+    handle keeps the inode; an O_APPEND writer simply resumes at the new end.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= max_bytes:
+        return False
+    try:
+        with open(path, "rb+") as f:
+            f.seek(max(0, size - keep_bytes))
+            tail = f.read()
+            f.seek(0)
+            f.write(("[aegis: %d bytes of earlier output trimmed %s]\n"
+                     % (size - len(tail), now_iso())).encode("utf-8", "replace"))
+            f.write(tail)
+            f.truncate()
+        os.chmod(path, 0o600)
+    except OSError:
+        # Windows refuses to truncate a file another process holds open, and
+        # the scheduled task there redirects no stdout sink at all — so this is
+        # a no-op on that body rather than a failure worth reporting.
+        return False
+    return True
+
+
+def _trim_stdio_logs():
+    """Trim both scheduler sinks; returns the paths actually trimmed."""
+    trimmed = [p for p in _stdio_log_paths() if _trim_stdio_log(p)]
+    if trimmed:
+        log_run("trimmed scheduler output: %s" % ", ".join(trimmed))
+    return trimmed
+
+
+def _tail_lines(path, count):
+    """Last `count` non-empty lines of a text file, or []. Reads at most the
+    final 64 KiB so a runaway log cannot be pulled into memory."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 64 * 1024))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return lines[-count:]
 
 
 def _rotate_log(path, max_bytes=10 * 1024 * 1024, generations=3):
@@ -10301,6 +10494,21 @@ def _skill_signature(skill_dir):
     return "|".join(parts) or "empty"
 
 
+# key -> absolute skill dir for the CURRENT scan only (see snapshot_agent_skills).
+_AGENT_SKILL_DIRS = {}
+
+
+def _skill_instruction_markers(skill_dir):
+    """Imperative markers in a skill's own instruction text, or []."""
+    if not skill_dir:
+        return []
+    for cand in ("SKILL.md", "skill.md", "AGENTS.md"):
+        p = os.path.join(skill_dir, cand)
+        if os.path.isfile(p):
+            return _imperative_signals(_read_text(p, _HOSTILE_SCAN_LIMIT))
+    return []
+
+
 def snapshot_agent_skills():
     """{root/skill: signature} for every installed AI-agent skill. Resolves
     symlinked roots (the canonical skills tree is often a symlink into a projects
@@ -10318,7 +10526,16 @@ def snapshot_agent_skills():
             d = os.path.join(root, name)
             if not os.path.isdir(d):
                 continue
-            snap["%s/%s" % (label, name)] = _skill_signature(d)
+            key = "%s/%s" % (label, name)
+            snap[key] = _skill_signature(d)
+            # The snapshot key is a LABEL, not a path, and the baseline stores
+            # only {key: signature}. diff_agent_skills needs the directory to
+            # read the skill's instructions and to give the finding a path
+            # entity, so the mapping is carried in-process for this scan rather
+            # than widened into the stored signature -- changing the signature
+            # format would invalidate every existing baseline and storm one
+            # "changed" finding per installed skill on the upgrade scan.
+            _AGENT_SKILL_DIRS[key] = d
     return snap
 
 
@@ -10331,24 +10548,52 @@ def diff_agent_skills(prior, cur):
     # _accumulate_risk, and 'agent-skill' is in no correlate() rule — the
     # durable record is real, but the "auto-correlates with a later osascript
     # phish" chain is not yet wired. The phish itself still fires CRITICAL alone.
+    def _graded(key, base_sev, base_conf):
+        """(severity, confidence, path, markers, why) for one skill.
+
+        Until 2026-09-03 both tiers were hardcoded MEDIUM, which is BELOW
+        NOTIFY_MIN_SEV — so a skill the operator did not author could appear in
+        ~/.claude/skills and never reach them. The findings also carried only
+        skill=key with no path entity, so they fed no correlation rule and no
+        risk accumulation, which the old comment here admitted. Reading the
+        skill's own instructions fixes both: concealment is attack-defined
+        (nothing legitimate tells an agent to hide what it did), and
+        credential+egress together is the stealer shape."""
+        d = _AGENT_SKILL_DIRS.get(key)
+        marks = _skill_instruction_markers(d)
+        sev, conf, why = base_sev, base_conf, ""
+        if "conceal" in marks:
+            sev, conf = "HIGH", "high"
+            why = (" Its instructions tell the agent to CONCEAL its actions — "
+                   "no legitimate skill needs that.")
+        elif "credential" in marks and "egress" in marks:
+            sev, conf = "HIGH", "high"
+            why = (" Its instructions reference credential locations AND an "
+                   "outbound channel — the stealer shape.")
+        elif marks:
+            why = (" Its instructions mention: %s." % ", ".join(marks))
+        return sev, conf, d, ["agent-skill"] + ["imperative:" + m for m in marks], why
+
     def new_fn(key, sig):
+        sev, conf, path, marks, why = _graded(key, "MEDIUM", "medium")
         return finding(
-            "MEDIUM", "agent-skill", "New AI-agent skill installed",
+            sev, "agent-skill", "New AI-agent skill installed",
             "%s appeared — AI-agent skills run with your full privileges and are "
             "a live 2026 stealer channel (a malicious SKILL.md can drive a fake "
-            "password dialog). Verify you installed it." % key,
-            "agent-skill:new:%s" % key, skill=key, confidence="medium",
-            markers=["agent-skill"])
+            "password dialog). Verify you installed it.%s" % (key, why),
+            "agent-skill:new:%s" % key, skill=key, confidence=conf,
+            path=path, markers=marks)
 
     def changed_fn(key, sig, old):
+        sev, conf, path, marks, why = _graded(key, "MEDIUM", "low")
         return finding(
-            "MEDIUM", "agent-skill", "AI-agent skill changed",
+            sev, "agent-skill", "AI-agent skill changed",
             "%s was modified — its SKILL.md or a shipped script changed. Routine "
             "when you author skills; a change you did not make is a supply-chain "
-            "hijack." % key,
+            "hijack.%s" % (key, why),
             "agent-skill:changed:%s:%s"
             % (key, hashlib.sha256(sig.encode()).hexdigest()[:12]),
-            skill=key, confidence="low", markers=["agent-skill"])
+            skill=key, confidence=conf, path=path, markers=marks)
 
     return _diff_map(prior, cur, new_fn, changed_fn)
 
@@ -10447,10 +10692,247 @@ def read_heartbeat():
     return load_json(HEARTBEAT_FILE, {})
 
 
+# --- The beat has to be AUTHENTICATED, or the root witness is worthless ------
+#
+# Until 2026-09-02 the beat was plain JSON and every consumer read exactly one
+# field (`epoch`) without asking who wrote it. That made `rootwatch` — the ONE
+# root-privileged component in this project, and its most expensive control —
+# defeatable by two lines of shell:
+#
+#     launchctl bootout gui/$UID/com.charlie.aegis
+#     while :; do printf '{"epoch": %d}' "$(date +%s)" > ~/.aegis/heartbeat.json
+#                 sleep 300; done
+#
+# rootwatch, `cmd_watchdog` and the menu-bar plugin all went permanently quiet
+# on a monitor that had been dead for weeks. MACing the beat under the existing
+# ~/.aegis/hmac.key is the fix, and here is precisely what it does and does not
+# buy, because the difference IS the argument:
+#   * it does NOT stop a determined same-uid attacker. hmac.key is 0600 under
+#     the same uid; malware that reads it can still forge a beat. This raises
+#     forgery from `echo` to KEY THEFT — a bar, not a wall, exactly like every
+#     other control in a tool that shares a uid with its adversary.
+#   * it DOES delete the whole class of blind forgery: an `echo`, a truncation,
+#     a beat restored from backup, a script poking at ~/.aegis without knowing
+#     Aegis's internals, any tool that writes the file for another reason.
+#   * it fails CLOSED. An absent or invalid MAC reads as DEAD, never healthy.
+#     One transient follows from that and is stated in the operator message:
+#     a beat left by a PRE-UPGRADE Aegis is unsigned, so `watchdog` says
+#     "unsigned" until the next scan writes a signed one. Failing that
+#     direction is the whole point.
+#   * pid liveness closes the lazy half of the forgery: a beat that is fresh
+#     but names a process that no longer exists is DEAD, not alive.
+_HEARTBEAT_MAC_FIELDS = ("epoch", "ts", "pid", "status", "alerts", "top_alert",
+                         "mode", "notary_seq", "notary_head", "code_sha",
+                         "code_pin")
+
+
+def _heartbeat_mac(beat):
+    """MAC over the beat's MEANINGFUL fields.
+
+    Deliberately NOT over `json.dumps(beat)`: that would make the digest depend
+    on which keys a later version happens to add, so an old verifier (the
+    generated rootwatch script baked at install time, a receiver off-box) would
+    read every new beat as forged. The named list is the contract; fields
+    outside it are carried but not covered, and nothing outside it decides
+    alive-vs-dead."""
+    msg = json.dumps([[k, beat.get(k)] for k in _HEARTBEAT_MAC_FIELDS],
+                     sort_keys=True, separators=(",", ":"))
+    return hmac.new(_hmac_key(), msg.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _pid_alive(pid):
+    """True / False / None(unknown) for "does this pid name a live process".
+
+    NEVER `os.kill(pid, 0)` on Windows. CPython implements os.kill there as
+    TerminateProcess(handle, sig) for any signal that is not a console-control
+    event, so the obvious portable spelling would KILL the process it was asked
+    about, silently, with exit code 0. Windows gets OpenProcess +
+    GetExitCodeProcess through ctypes instead.
+
+    Unknown is never "dead": a pid we cannot resolve must not manufacture a
+    tamper alarm."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if IS_WIN:
+        try:
+            import ctypes                                   # stdlib
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
+            if not handle:
+                err = k32.GetLastError()
+                # 5 = ACCESS_DENIED: the process EXISTS, we may just not look
+                # at it. 87 = INVALID_PARAMETER: no such pid.
+                return True if err == 5 else (False if err == 87 else None)
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259                  # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # it exists; it is simply not ours to signal
+    except Exception:
+        return None
+
+
+def _beat_mode():
+    """'watch' when THIS process is the long-lived watch loop, else 'scan'.
+
+    Recorded in the beat because pid liveness is evidence for exactly one of
+    them. `install watch` schedules `aegis.py watch <interval>` under KeepAlive,
+    so the process that wrote the beat is still running and a dead pid is a real
+    signal; a scan-mode agent exits the instant it has written the beat, so its
+    pid is ALWAYS dead a second later and checking it would alarm on every
+    healthy install. Read off argv so the decision stays inside this helper
+    instead of threading a flag through cmd_scan/cmd_watch."""
+    return "watch" if (len(sys.argv) > 1
+                       and str(sys.argv[1]).lower() == "watch") else "scan"
+
+
+def _running_code_sha():
+    """sha256 of the aegis.py THIS process is executing.
+
+    Honest limit, the same one _runtime_copy_status carries: it is computed by
+    the very code it measures, so a swapped payload can lie about itself. The
+    value is in the notary digest and the off-box beat precisely so the lie has
+    to be told to a witness that keeps its own history."""
+    try:
+        return sha256(os.path.realpath(_SELF_PATH))
+    except Exception:
+        return None
+
+
+def _notary_head_brief():
+    """(seq, head) of the chain's last link, read from the TAIL.
+
+    A full `_notary_chain()` parse would be O(file) on something that runs on
+    every beat and is only rotated at 10MB; the last link is all a witness
+    needs. (None, None) when there is no chain yet."""
+    try:
+        size = os.path.getsize(NOTARY_FILE)
+        with open(NOTARY_FILE, "rb") as f:
+            if size > 8192:
+                f.seek(-8192, os.SEEK_END)
+            tail = f.read()
+        for raw in reversed(tail.decode("utf-8", "replace").splitlines()):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                link = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(link, dict) and link.get("head"):
+                return link.get("seq"), link.get("head")
+    except Exception:
+        pass
+    return None, None
+
+
+# The verdicts, named once so watchdog, the sensor line and the tests all say
+# the same word about the same state.
+BEAT_OK = "ok"
+BEAT_ABSENT = "absent"
+BEAT_UNSIGNED = "unsigned"
+BEAT_FORGED = "forged"
+BEAT_STALE = "stale"
+BEAT_DEAD_PID = "dead-pid"
+
+
+def heartbeat_verdict(beat, now=None):
+    """(state, human) for one beat. FAIL CLOSED — anything not provably healthy
+    is one of the dead states, never BEAT_OK.
+
+    Order matters: authenticity is checked BEFORE freshness, because a forged
+    beat's epoch is exactly the field the forger controls."""
+    now = int(time.time()) if now is None else int(now)
+    if not isinstance(beat, dict) or not beat:
+        return BEAT_ABSENT, "no heartbeat on record"
+    recorded = beat.get("mac")
+    if not recorded:
+        return (BEAT_UNSIGNED,
+                "the heartbeat carries no signature — it was written by "
+                "something that does not hold this machine's Aegis key, or by "
+                "an Aegis older than the one installed now (in which case the "
+                "next scan re-signs it)")
+    try:
+        expected = _heartbeat_mac(beat)
+    except Exception:
+        # The key itself is unreadable. Unknown is not clean.
+        return BEAT_UNSIGNED, ("the heartbeat signature could not be checked — "
+                               "%s is missing or unreadable" % HMAC_KEY_FILE)
+    if not hmac.compare_digest(str(recorded), expected):
+        return (BEAT_FORGED,
+                "the heartbeat signature does not verify — the file was "
+                "written or edited by something without this machine's Aegis "
+                "key")
+    try:
+        last = int(beat.get("epoch") or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if not last:
+        return BEAT_ABSENT, "the heartbeat carries no timestamp"
+    age = now - last
+    if age > HEARTBEAT_STALE_SECS:
+        return (BEAT_STALE, "last beat %d min ago (> %d min tolerance)"
+                % (age // 60, HEARTBEAT_STALE_SECS // 60))
+    # A fresh, correctly signed beat naming a process that is GONE. Only
+    # meaningful in watch mode (see _beat_mode): the scan-mode writer is
+    # supposed to have exited.
+    if beat.get("mode") == "watch" and _pid_alive(beat.get("pid")) is False:
+        return (BEAT_DEAD_PID,
+                "the beat is %d min old but its watch process (pid %s) no "
+                "longer exists — the monitor was killed and something is still "
+                "writing beats" % (age // 60, beat.get("pid")))
+    return BEAT_OK, "last beat %d min ago (pid %s)" % (age // 60,
+                                                       beat.get("pid", "?"))
+
+
 def _post_heartbeat(url, beat):
     """Best-effort OUT-OF-BAND beat POST. Lazy-imports urllib so the default
     (no URL) scan path never even loads networking — the same local-only-by-
-    construction guarantee as `vt`. Redacts before sending. Never raises."""
+    construction guarantee as `vt`. Redacts before sending. Never raises.
+
+    RECEIVER CONTRACT — what an off-box witness is expected to do with this.
+    Nothing here wires an endpoint; `heartbeat_url` stays opt-in exactly as it
+    was. This documents the payload so a receiver can be written against it,
+    because this is the ONE control same-uid malware cannot reach: everything
+    else in Aegis lives in a directory the adversary owns.
+        POST <heartbeat_url>
+        Content-Type: application/json
+        {"ts","epoch","pid","status","alerts","top_alert","mode",
+         "notary_seq","notary_head","code_sha","code_pin","mac"}
+    A receiver should alarm on FOUR things, in this order of value:
+      1. SILENCE. No beat within HEARTBEAT_STALE_SECS of the last one. This is
+         the only signal that survives an attacker who owns the whole box, and
+         it needs no field of the payload to be trustworthy.
+      2. code_sha CHANGED, or code_sha != code_pin. The running aegis.py is not
+         the aegis.py the operator installed — a payload swap, or an upgrade
+         nobody announced. `code_pin` is what `install` recorded; `code_sha` is
+         what is executing right now.
+      3. notary_seq STOPPED ADVANCING while beats keep arriving, or a seq that
+         was already reported comes back with a DIFFERENT notary_head. The
+         second is a rewritten local chain, which the box itself cannot prove
+         once the attacker holds the key — an off-box copy of (seq, head) can.
+      4. mac fails to verify, IF the receiver holds a copy of hmac.key. Note
+         honestly: a receiver holding that key could also forge beats, so a
+         receiver that only needs (1)-(3) should NOT be given it. The MAC's job
+         off-box is integrity-in-transit, not authentication of the host.
+    A receiver must treat every field as untrusted input from a possibly
+    compromised host. What it can trust is the SHAPE of its own history."""
     try:
         import urllib.request
         body = redact_sensitive(json.dumps(beat, sort_keys=True)).encode("utf-8")
@@ -10472,10 +10954,20 @@ def write_heartbeat(status="ok", alerts=0, top_alert=None):
     who SIGKILLs or boots-out Aegis cannot suppress off-box. If (and ONLY if) an
     off-host URL is configured, ALSO POST the beat + top alert out-of-band so
     'silence' leaves the box the same run every LOCAL sink is being suppressed.
-    Off by default → the scan/watch path stays local-only."""
+    Off by default → the scan/watch path stays local-only.
+
+    The beat is SIGNED (see the block comment above) and carries the two facts
+    an off-box witness cannot get any other way: the notary head and the hash of
+    the code that is actually running."""
+    seq, head = _notary_head_brief()
     beat = {"ts": now_iso(), "epoch": int(time.time()), "pid": os.getpid(),
             "status": status, "alerts": int(alerts),
-            "top_alert": redact_sensitive((top_alert or ""))[:200]}
+            "top_alert": redact_sensitive((top_alert or ""))[:200],
+            "mode": _beat_mode(),
+            "notary_seq": seq, "notary_head": head,
+            "code_sha": _running_code_sha(),
+            "code_pin": load_json(SELFSTATE, {}).get("code_sha")}
+    beat["mac"] = _heartbeat_mac(beat)
     try:
         save_json(HEARTBEAT_FILE, beat)
     except Exception:
@@ -12623,6 +13115,69 @@ def _migrate_exec_keys(execs):
     return out
 
 
+def _first_sight_agent_config(path, rec):
+    """Findings for a config file seen for the FIRST time, emitted BEFORE
+    _scan_surfaces adopts it into the baseline.
+
+    Silence here was the sensor's largest hole. `diff_agent_surface` gated
+    every alert on `old is not None`, and the agent_surface row opts into
+    per-file adoption (adopt_new_entries), so a path that appeared after the
+    surface was baselined was written straight into the baseline on the same
+    scan that first saw it. Net effect on the threat this sensor is FOR: an
+    agent talked into writing a NEW ~/.claude/settings.local.json with a
+    PreToolUse hook, or a NEW ~/.codex/mcp.json, produced exactly zero
+    findings on first sight and none ever after — while the same hook added
+    to an existing file was HIGH. Creating was cheaper than editing, which is
+    backwards.
+
+    Graded one rung below the edit cases on purpose. An edit to a watched
+    file is a change to something already reviewed; an appearance is a file
+    nobody has judged yet, and appearances have an honest benign population
+    (a host writes a new per-project config, a tool adds its own). So a new
+    exec entry is MEDIUM — recorded, correlatable, risk-accumulating, below
+    the notify floor — while CONTENT the imperative tables call attack-defined
+    keeps its own grade: concealment is HIGH on sight, whatever wrote it,
+    because no legitimate instruction file asks the agent to keep something
+    from its operator."""
+    out = []
+    execs = _migrate_exec_keys(rec.get("execs") or {})
+    for key, e in execs.items():
+        out.append(finding(
+            "MEDIUM", "agent-surface", "New agent config file registers an exec",
+            "%s did not exist when this surface was baselined and already "
+            "registers an executable entry: %s %s\nResolved target: %s\nAn MCP "
+            "server or tool hook runs with your full authority every time the "
+            "agent starts, and a file that arrives complete was never reviewed "
+            "by anyone. Confirm you (or a tool you ran) created it."
+            % (path, e.get("cmd"), (" ".join(e.get("args") or []))[:400],
+               e.get("target") or "(unresolved)"),
+            "agent-surface:newfile-exec:%s:%s" % (path, key),
+            path=path, program=e.get("target") or e.get("cmd"),
+            markers=["agent-surface", "exec", "first-sight"]))
+    marks = sorted(rec.get("imperatives") or [])
+    sev = _imperative_severity(marks)
+    if sev:
+        # Same asymmetry as the gained-imperative branch: provenance may only
+        # ever ESCALATE content. A directive an injected agent wrote is
+        # self-attested and still hostile, so attestation must not soften it.
+        prov = _git_provenance(path)
+        if prov == "remote-foreign" and sev == "MEDIUM":
+            sev = "HIGH"
+        out.append(finding(
+            sev, "agent-surface", "New agent instruction file carries a directive",
+            "%s appeared with instruction text matching: %s.\n%s\nAn "
+            "instruction file is an execution primitive with no shell syntax — "
+            "no signature scanner will ever flag this. Read it yourself before "
+            "the next agent session does."
+            % (path, ", ".join(marks), _PROVENANCE_NOTE.get(prov, "")),
+            "agent-surface:newfile-imperative:%s:%s:%s"
+            % (path, ",".join(marks), (rec.get("sha256") or "")[:12]),
+            path=path, provenance=prov,
+            confidence="high" if "conceal" in marks else "medium",
+            markers=["agent-surface", "instruction", "first-sight"]))
+    return out
+
+
 def diff_agent_surface(prior, cur):
     """Alert only on what an attacker must change to gain execution.
 
@@ -12647,6 +13202,26 @@ def diff_agent_surface(prior, cur):
     for path, rec in cur.items():
         old = prior.get(path)
         try:
+            if old is None:
+                # FIRST SIGHT of a config file. This branch used to be pure
+                # silence, which inverted the threat model the sensor exists
+                # to cover: EDITING ~/.claude/settings.json to add a PreToolUse
+                # hook was HIGH, while CREATING settings.local.json with the
+                # same hook emitted nothing — and _scan_surfaces then adopted
+                # the new path into the baseline, so it never emitted again
+                # either. A prompt-injected agent writes new files; it has no
+                # reason to edit one Aegis already watches.
+                #
+                # It stays quiet for the cases that earned the silence. A true
+                # first run and an upgrade never reach here at all: the whole
+                # surface is adopted in _scan_surfaces' `prior is None` branch
+                # without calling this function, so the storm-free-install and
+                # storm-free-upgrade properties are structural, not a rule
+                # here. And a file with no exec entry and no imperative marker
+                # — the overwhelming majority of ~/.claude churn — is still
+                # silent, which is what keeps the two real classes readable.
+                findings += _first_sight_agent_config(path, rec)
+                continue
             # Exec keys are settled in the STORE (baseline schema v3 re-keys a
             # legacy positional snapshot once, at load), so the steady state
             # is a plain compare — no per-scan re-hashing of every entry on
@@ -13402,11 +13977,12 @@ def _self_watermarked():
     rebound after import (tests, alternate AEGIS_HOME), so a tuple frozen at
     module level would watermark the wrong files."""
     return (("allowlist", ALLOWLIST), ("baseline", BASELINE),
-            ("canaries", CANARY_STATE))
+            ("canaries", CANARY_STATE), ("config", AEGIS_CONFIG))
 
 
 _SELF_TAMPER_LABEL = {"allowlist": "allowlist", "baseline": "baseline",
-                      "canaries": "canary arming record"}
+                      "canaries": "canary arming record",
+                      "config": "operator configuration"}
 _TRUST_STORE_DELETED = ("A missing trust store forces the next scan to silently "
                         "re-baseline current persistence as known-good, "
                         "laundering any attacker-blessed state.")
@@ -13423,7 +13999,65 @@ _SELF_TAMPER_CONSEQUENCE = {
         "If you did not run `aegis.py canary`, the arming record may have been "
         "edited to drop decoys from the tripwire — or encrypted in place by the "
         "very ransomware it exists to catch."),
+    # config.json is not a trust store, but it decides WHERE the off-box beat
+    # is sent (heartbeat_url) and whether the one-time-code gate may fall back
+    # to a tty a pty-wrapper can read (authorization_require_oob). Redirecting
+    # the beat is the quietest way to remove the only witness a same-uid
+    # attacker cannot otherwise reach, and it left no trace until this file
+    # joined the watermarked set on 2026-09-03.
+    "config": (
+        "Aegis is back on its built-in defaults: any off-box heartbeat "
+        "endpoint and any hardened authorization setting are gone, silently.",
+        "If you did not edit it yourself, check `heartbeat_url` first — a "
+        "redirected beat means an off-box witness is watching an address the "
+        "attacker chose."),
 }
+
+
+# The plist EXISTING and the job being LOADED are different facts, and until
+# 2026-09-03 macOS -- the primary platform -- only ever checked the first.
+# `launchctl bootout gui/$UID/com.charlie.aegis` leaves a perfectly valid
+# plist on disk and produces ZERO findings; the monitor simply stops, and the
+# only remaining signal is the heartbeat going stale hours later. Linux has
+# checked `is-enabled`/`is-active` and Windows has parsed schtasks for
+# `Disabled` since those bodies were added. This is the missing third leg.
+#
+# Direction of failure matters here. A wrong "not loaded" is a false alarm the
+# operator learns to ignore, which is how a self-protection check dies; a wrong
+# "loaded" is a miss. So ONLY an unambiguous not-found answer is treated as
+# evidence: any other non-zero rc (a stubbed launchctl under AEGIS_TESTING, a
+# sandboxed context, an OS that changed the output) says "could not
+# determine", and this check stays silent rather than guessing.
+_LAUNCHD_ABSENT_RE = re.compile(
+    r"could not find service|no such process|not find the specified service",
+    re.I)
+
+
+def _launchd_label():
+    """The agent's label, derived from the plist path so there is one literal."""
+    return os.path.basename(SELF_PLIST)[:-len(".plist")]
+
+
+def _check_launchd_loaded():
+    findings = []
+    label = _launchd_label()
+    try:
+        target = "gui/%d/%s" % (os.getuid(), label)
+    except AttributeError:          # no getuid off POSIX; not reachable on mac
+        return findings
+    out, err, rc = run(["launchctl", "print", target], timeout=10)
+    if rc == 0:
+        return findings
+    if not _LAUNCHD_ABSENT_RE.search("%s\n%s" % (out or "", err or "")):
+        return findings             # unreadable answer is not an accusation
+    findings.append(finding(
+        "HIGH", "self-protection", "Aegis launchd agent is not loaded",
+        "%s exists on disk but launchd has no job for %s, so nothing is "
+        "scheduling scans. This is what `launchctl bootout` leaves behind, "
+        "and it is silent: the plist looks healthy. Reload with `launchctl "
+        "bootstrap gui/$(id -u) %s`, or re-run install.sh."
+        % (SELF_PLIST, label, SELF_PLIST), "self:agent:unloaded"))
+    return findings
 
 
 def _check_self_scheduler(st):
@@ -13456,6 +14090,7 @@ def _check_self_scheduler(st):
                     "stop running with no alert. Re-run install.sh to "
                     "regenerate a valid agent." % SELF_PLIST,
                     "self:agent:malformed"))
+            findings.extend(_check_launchd_loaded())
         return findings
     if IS_LINUX:
         if not st.get("installed"):
@@ -14633,7 +15268,21 @@ def _cmd_scan_locked(quiet=False):
     # the report's "new since last scan".
     prior_seen = set(load_json(SEEN, {}))
     routing = _route_for_scan(findings, first_run, adopt)
-    new_high = emit(findings, first_run, adopt=adopt, routing=routing)
+    # Everything from here to write_heartbeat runs BEFORE the beat, so any of
+    # it that raises takes the LIVENESS SIGNAL down with it — and a monitor
+    # that stops beating because the disk filled is indistinguishable, to every
+    # watcher on this machine, from one an attacker killed. Four calls in this
+    # tail were bare while their immediate neighbours (deadfall, autoprotect,
+    # notary, thaw) were already wrapped. They are wrapped the same way now,
+    # and what they failed at is carried into the beat instead of being
+    # rounded up to "ok": degraded is a state a scan can be in, silent is not.
+    degraded = []
+    try:
+        new_high = emit(findings, first_run, adopt=adopt, routing=routing)
+    except Exception as e:
+        log_run("emit failed (findings NOT appended, no notification): %s" % e)
+        new_high = []
+        degraded.append("emit")
     # Pre-authorized reversible response, if the operator armed any. Runs
     # AFTER emit so the report is written before anything acts on it, and is
     # wrapped because a standing order that could fail a scan — and so blind
@@ -14677,12 +15326,31 @@ def _cmd_scan_locked(quiet=False):
     # The heartbeat is written AFTER the report, so what is on disk now is the
     # PREVIOUS scan's — which is exactly the liveness fact the report needs and
     # costs no new state to obtain.
-    md = write_report(findings, first_run, incidents=incidents,
-                      sensor_health=persisted_health, prior_seen=prior_seen,
-                      aged=_LAST_AGED_OUT, routing=routing,
-                      prev_scan_at=read_heartbeat().get("epoch"))
-    flush_sigcache()
-    record_selfstate()
+    try:
+        md = write_report(findings, first_run, incidents=incidents,
+                          sensor_health=persisted_health, prior_seen=prior_seen,
+                          aged=_LAST_AGED_OUT, routing=routing,
+                          prev_scan_at=read_heartbeat().get("epoch"))
+    except Exception as e:
+        log_run("report write failed: %s" % e)
+        degraded.append("report")
+        md = ("# Aegis — %s\n\nThe report could not be written this scan: %s\n"
+              "The findings log and the event store are unaffected; see "
+              "`aegis.py doctor`.\n" % (now_iso(), e))
+    try:
+        flush_sigcache()
+    except Exception as e:
+        log_run("sigcache flush failed: %s" % e)
+        degraded.append("sigcache")
+    try:
+        record_selfstate()
+    except Exception as e:
+        # The self-protection watermarks did not advance. The NEXT scan will
+        # therefore compare against an older watermark, which over-reports
+        # rather than under-reports — the safe direction, but only if someone
+        # is told, which is what the degraded beat below is for.
+        log_run("selfstate record failed: %s" % e)
+        degraded.append("selfstate")
     # Extend the tamper-evidence chain AFTER state is settled, so the link
     # commits to what this scan actually concluded. Best-effort: a notary that
     # could fail a scan would be a liability, not a control.
@@ -14705,10 +15373,20 @@ def _cmd_scan_locked(quiet=False):
     # what an external watcher / peer agent / `aegis.py watchdog` alarms on — the
     # one signal a same-uid attacker who kills or boots-out Aegis can't suppress
     # off-box. POSTs out-of-band only if a URL is configured (else local-only).
-    write_heartbeat(status="ok", alerts=len(new_high),
+    #
+    # The beat is still WRITTEN when a tail step failed — the process really is
+    # alive, and that is exactly what separates this from a crash (see
+    # record_crash, which deliberately writes no beat) — but it must not claim
+    # "ok" for a scan whose report never reached the disk. A watcher reading a
+    # fresh beat that says `degraded:report` knows the monitor is up and the
+    # thing it produces is not.
+    write_heartbeat(status="ok" if not degraded
+                    else "degraded:" + ",".join(degraded),
+                    alerts=len(new_high),
                     top_alert=new_high[0]["title"] if new_high else None)
-    log_run("scan: %d findings, %d new-high, first_run=%s"
-            % (len(findings), len(new_high), first_run))
+    log_run("scan: %d findings, %d new-high, first_run=%s%s"
+            % (len(findings), len(new_high), first_run,
+               (", DEGRADED: " + ", ".join(degraded)) if degraded else ""))
 
     if not quiet:
         print(md)
@@ -15441,6 +16119,7 @@ _MARKER_TECHNIQUES = {
     "amsi-bypass": ("T1562.001",),
     "sam-hive-dump": ("T1003",),
     "lsass-dump": ("T1003",),
+    "dyld-inject": ("T1574.006",),
     "ld-preload-injection": ("T1574.006",),
     "kernel-module": ("T1014", "T1547.006"),
     "defender-exclusion": ("T1562.001",),
@@ -15578,6 +16257,26 @@ def cmd_incident(incident_id, action=None, reason=None):
                 print("trusted identity: %s %s\n  future recurrences report "
                       "at low severity instead of interrupting; reverse with "
                       "aegis.py identity block %s %s" % (kind, fp, kind, fp))
+            # This verdict is not gated — it is the routine daily one, and a
+            # dialog here would only teach the operator to click through the
+            # dialogs that matter. But the verdict that CROSSES the tolerance
+            # floor buys permanent auto-close for a whole identity class, and
+            # acquiring that much blindness three keystrokes at a time must
+            # never be the silent case. Threshold unchanged; only its crossing
+            # is now visible, in the output and in actions.jsonl.
+            escalation = _tolerance_escalation(incident_id)
+            if escalation:
+                ident, verdicts = escalation
+                print("\nTOLERANCE GRANTED — %s now carries %d benign-positive"
+                      "\n  verdicts inside %d days. Future non-CRITICAL "
+                      "re-observations of that identity\n  open PRE-CLOSED "
+                      "('auto-tolerated') and will not alert you.\n"
+                      "  Revoke by disputing any one of them: aegis.py "
+                      "incident <id> reopen"
+                      % (ident, verdicts, _TOLERANCE_WINDOW // 86400))
+                log_action("tolerance-granted", ident, "auto-close-enabled",
+                           verdicts=verdicts, incident_id=incident_id,
+                           window_days=_TOLERANCE_WINDOW // 86400)
     item = incident_detail(incident_id)
     if not item:
         print("no such incident: %s" % incident_id)
@@ -15747,6 +16446,39 @@ def cmd_attck(days=180):
     return 0
 
 
+# How late a scheduled scan has to be before `doctor` calls the coverage
+# unknown. A multiple of the cadence rather than a constant, because a 600s
+# watch floor and an hourly interval are two different promises; the floor
+# keeps a short cadence from alarming on one skipped tick (a closed lid, a
+# sleeping laptop, a slow scan).
+DOCTOR_SCAN_STALE_FACTOR = 3
+DOCTOR_SCAN_STALE_FLOOR = 1800
+
+
+def _expected_scan_gap():
+    """(cadence_secs, armed) — how often a scan SHOULD land on this machine.
+
+    Read from the install record, because that is the only place the schedule
+    is written down: `install watch` schedules a 600s full-scan floor, `install
+    scan` an hourly StartInterval, and cmd_install stamps the mode. An
+    UNINSTALLED machine has no cadence at all and saying so is the honest
+    answer — a manual-only user whose last scan was Tuesday has no fault to
+    report. `install_interval` is read when present so a custom interval is
+    respected rather than assumed away.
+    """
+    st = load_json(SELFSTATE, {})
+    if not st.get("installed"):
+        return None, False
+    mode = st.get("install_mode") or "scan"
+    try:
+        interval = int(st.get("install_interval") or 0)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval < 60:
+        interval = 600 if mode == "watch" else 3600
+    return interval, True
+
+
 def cmd_doctor():
     """Report actual coverage and liveness; UNKNOWN is never printed as green."""
     ensure_state()
@@ -15809,7 +16541,55 @@ def cmd_doctor():
     if not health:
         print("  ? sensors                     no completed scan recorded")
         problems.append("no sensor health")
+    # Staleness is TWO questions and this command needs both answers.
+    #
+    # RELATIVE (_coverage_split): a row older than the newest row in the same
+    # batch did not run this scan. doctor read get_sensor_health() raw and
+    # painted every stored status=="OK" green, so a sensor that stopped
+    # running in July still counted as coverage in September — the exact
+    # "unknown is never green" failure this function's own docstring promises
+    # to prevent, and the failure cmd_status cites doctor's rule as the reason
+    # it fixed. The report and status already apply this helper; doctor, which
+    # taught them the rule, did not.
+    #
+    # ABSOLUTE: _coverage_split compares the rows against EACH OTHER, so it is
+    # structurally blind to the case that matters most. If the WHOLE scan
+    # stopped, all forty-odd rows share one last_run_at, nothing is relatively
+    # stale, and every sensor reads live off a monitor that has been dead for
+    # a week. Only a comparison against the CLOCK catches that.
+    live, stale, permanent, degraded = _coverage_split(health)
+    stale_ids = {h.get("sensor_id") for h in stale}
+    newest = max([h.get("last_run_at") for h in health
+                  if isinstance(h.get("last_run_at"), int)] or [0])
+    cadence, armed = _expected_scan_gap()
+    scan_dead = False
+    if health and armed and cadence:
+        limit = max(DOCTOR_SCAN_STALE_FACTOR * cadence, DOCTOR_SCAN_STALE_FLOOR)
+        age = int(time.time()) - newest if newest else None
+        scan_dead = age is None or age > limit
+        if scan_dead:
+            print("  ✗ %-27s NO SCAN HAS COMPLETED since %s — the installed "
+                  "schedule runs every %dm, so EVERY sensor row below is that "
+                  "old and none of them is evidence about now"
+                  % ("scan cadence", _ago(newest) if newest else "ever",
+                     cadence // 60))
+            problems.append("scan cadence")
+        else:
+            print("  ✓ %-27s last completed scan %s (schedule: every %dm)"
+                  % ("scan cadence", _ago(newest), cadence // 60))
+    elif health and newest:
+        print("  · %-27s last completed scan %s (no background schedule "
+              "installed; manual runs only)" % ("scan cadence", _ago(newest)))
     for item in health:
+        if scan_dead or item["sensor_id"] in stale_ids:
+            # One problem was already recorded for a dead schedule; forty more
+            # would bury it. A relatively-stale row is its own fault and keeps
+            # counting individually.
+            print("  ✗ %-27s DID NOT RUN — last reported %s"
+                  % (item["sensor_id"], _ago(item.get("last_run_at"))))
+            if not scan_dead:
+                problems.append(item["sensor_id"])
+            continue
         # PRIVILEGED = a named, OS-imposed permanent coverage gap ("i", like
         # rootwatch-absent below): shown so it is never mistaken for coverage,
         # but not a problem — nothing here is fixable or unexpectedly broken.
@@ -15835,6 +16615,67 @@ def cmd_doctor():
     print("  %s %-27s %s" % (a_mark, "positive controls", a_text))
     if a_mark != "✓":
         problems.append("assay coverage")
+    # --- liveness -----------------------------------------------------------
+    # doctor contained no read_heartbeat() call at all. The beat is the signal
+    # every OTHER watcher on this machine keys on — `aegis.py watchdog`, the
+    # menubar skull, the root witness — and doctor, the command whose docstring
+    # promises "coverage and liveness", was the one place not asking. That is
+    # how "Doctor result: OK" got printed over a monitor that had not run since
+    # it crashed three days earlier.
+    beat = read_heartbeat()
+    beat_epoch = beat.get("epoch")
+    if beat_epoch:
+        beat_age = int(time.time()) - int(beat_epoch)
+        beat_status = str(beat.get("status") or "?")
+        if beat_age > HEARTBEAT_STALE_SECS:
+            print("  ✗ %-27s STALE — last beat %s (pid %s); tolerance is %dm. "
+                  "The monitor is not running, or cannot finish a scan."
+                  % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
+                     HEARTBEAT_STALE_SECS // 60))
+            problems.append("heartbeat stale")
+        else:
+            print("  ✓ %-27s last beat %s (pid %s, status %s)"
+                  % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
+                     beat_status))
+        if beat_status != "ok" and beat_status != "?":
+            # A fresh beat that says `degraded:report` is the case the wrapped
+            # scan tail exists to report: the process is alive and the thing it
+            # produces is not. Green on liveness, still a problem.
+            print("      the last scan finished DEGRADED (%s) — that step did "
+                  "not complete; see run.log" % beat_status)
+            problems.append("degraded scan")
+    elif armed:
+        print("  ✗ %-27s NO BEAT ON RECORD though a background schedule is "
+              "installed — no scan has ever completed here"
+              % "heartbeat")
+        problems.append("heartbeat missing")
+    else:
+        print("  · %-27s no beat yet (no background schedule installed)"
+              % "heartbeat")
+    crash = read_crash()
+    if crash.get("epoch"):
+        fresh = (int(time.time()) - int(crash["epoch"])) <= CRASH_FRESH_SECS
+        print("  %s %-27s %s: %s — %s"
+              % ("✗" if fresh else "i", "last unhandled crash",
+                 _ago(crash.get("epoch")), crash.get("exc_type") or "?",
+                 (crash.get("exc") or "")[:110]))
+        print("      argv: %s%s" % (" ".join(crash.get("argv") or [])[:100],
+                                    ("  [%s]" % crash["context"])
+                                    if crash.get("context") else ""))
+        for line in (crash.get("traceback") or "").rstrip().splitlines()[-4:]:
+            print("      %s" % line[:120])
+        print("      Full record: %s (delete it once you have read it)"
+              % _crash_file())
+        if fresh:
+            problems.append("unhandled crash")
+    _out_path, err_path = _stdio_log_paths()
+    err_tail = _tail_lines(err_path, 8)
+    if err_tail:
+        print("  ✗ %-27s %s is not empty — the scheduled job is writing to "
+              "stderr:" % ("scheduled job stderr", err_path))
+        for line in err_tail:
+            print("      %s" % line[:120])
+        problems.append("scheduled job stderr")
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
@@ -16522,20 +17363,36 @@ def _intel_summary():
                  % (len(hashes), len(net), oldest))
 
 
+def _allow_matches(path):
+    """The fingerprints `allow <path>` would silence, without writing anything.
+
+    Split out of cmd_allow so the authorization gate can state the blast radius
+    BEFORE the write. It has to: the match is a SUBSTRING of the finding's
+    path, so `allow /` silences every path-bearing finding in the report, and
+    an operator approving a dialog that only said "allow" would have no way to
+    see that. Same predicate and same de-duplication as the write path — one
+    spelling of "which findings does this match", not two."""
+    allow = load_json(ALLOWLIST, [])
+    data = load_json(LATEST_JSON, {"findings": []})
+    out = []
+    for f in data.get("findings", []):
+        fp = f.get("fingerprint")
+        if not fp or fp in allow or fp in out:
+            continue
+        if path in (f.get("path") or "") or path == fp:
+            out.append(fp)
+    return out
+
+
 def cmd_allow(path):
     ensure_state()
     allow = load_json(ALLOWLIST, [])
-    added = 0
     # Allow by prefix match against any current finding fingerprint.
-    data = load_json(LATEST_JSON, {"findings": []})
-    for f in data.get("findings", []):
-        if path in (f.get("path") or "") or path == f.get("fingerprint"):
-            if f["fingerprint"] not in allow:
-                allow.append(f["fingerprint"])
-                added += 1
+    matched = _allow_matches(path)
+    allow.extend(matched)
     save_json(ALLOWLIST, allow)
     _record_allowlist_watermark()
-    print("Allowlisted %d finding(s) matching %r." % (added, path))
+    print("Allowlisted %d finding(s) matching %r." % (len(matched), path))
     return 0
 
 
@@ -16556,6 +17413,27 @@ def cmd_allow(path):
 
 WATCH_DEBOUNCE_SECS = 3   # let a write burst settle so it costs one scan
 WATCH_MIN_GAP_SECS = 60   # floor between event-triggered scans (battery bound)
+
+# Watch-loop survivability. The loop caught KeyboardInterrupt and nothing else,
+# so ANY other exception ended the process — and under launchd that is not a
+# stop, it is an accelerator: KeepAlive respawns, ThrottleInterval bounds the
+# respawn at 30s, and RunAtLoad makes each respawn open with an immediate FULL
+# SCAN. A watch that cannot arm its watcher therefore ran a full scan every
+# thirty seconds, forever, while doing none of the watching.
+#
+# That is not hypothetical. os.O_EVTONLY is absent on Command Line Tools Python
+# 3.9 (see the O_EVTONLY comment above), _build_watch raised AttributeError on
+# every pass, and this is exactly what the machine did.
+#
+# So: a failing iteration backs off and stays, and a PERSISTENTLY failing one
+# parks at a long sleep instead of exiting. Parking is strictly better than
+# dying — a process alive on an hourly cycle still scans, still beats, and can
+# still be diagnosed; a process that exits hands the problem to a supervisor
+# that responds to breakage by running the expensive path more often.
+WATCH_BACKOFF_BASE_SECS = 15      # first retry; doubles from here
+WATCH_BACKOFF_MAX_SECS = 900      # ceiling on the doubling (15 min)
+WATCH_FAIL_CAP = 6                # after this many in a row, stop retrying fast
+WATCH_STUCK_SLEEP_SECS = 3600     # parked: alive, quiet, still beating hourly
 
 # os.O_EVTONLY only exists in Python >= 3.10; the launchd agent runs the system
 # /usr/bin/python3 (CLT Python 3.9), where the missing attr crashed _build_watch
@@ -16875,7 +17753,12 @@ def cmd_watch(interval=600):
     to one event scan per WATCH_MIN_GAP_SECS), and a full scan runs every
     `interval` seconds as a floor. Production: `bash install.sh watch` runs this
     under launchd KeepAlive. Falls back to plain interval polling if kqueue is
-    somehow unavailable."""
+    somehow unavailable.
+
+    An iteration that raises is logged and backed off, never fatal: under
+    KeepAlive an exit is an ACCELERATOR, not a stop (see WATCH_FAIL_CAP above
+    for the incident). KeyboardInterrupt still exits cleanly — a human at the
+    terminal means it."""
     has_kq = IS_MAC and hasattr(select, "kqueue")
     has_inotify = (not has_kq) and _inotify_libc() is not None
     if has_kq:
@@ -16888,9 +17771,13 @@ def cmd_watch(interval=600):
                 % (WATCH_POLL_SECS, interval))
     print("Aegis watch: %s. Ctrl-C to stop." % mode)
     stream = _spawn_xprotect_stream() if has_kq else None
+    consecutive = 0
     try:
         while True:
             try:
+                # This process holds run.out/run.err open for its whole life,
+                # so nothing else will ever bound them for it.
+                _trim_stdio_logs()
                 started = time.time()
                 cmd_scan(quiet=True)
                 if not has_kq:
@@ -16919,28 +17806,65 @@ def cmd_watch(interval=600):
                         if remain > 0:
                             time.sleep(remain)
                         log_run("watch: change event -> rescan")
-                    continue
-                if stream is not None and stream.poll() is not None:
-                    stream = _spawn_xprotect_stream()  # tail died → respawn
-                extra = (stream.stdout.fileno(),) if stream else ()
-                # A write landing between the scan above and this arm is missed
-                # by the kqueue; the interval floor scan covers that ms-wide gap.
-                kq, fds = _build_watch(extra)
-                try:
-                    if _wait_for_change(kq, interval):
-                        time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
-                        if stream is not None:
-                            # level-triggered read fd: MUST drain or spin
-                            _drain_fd(stream.stdout.fileno())
-                        remain = WATCH_MIN_GAP_SECS - (time.time() - started)
-                        if remain > 0:
-                            time.sleep(remain)  # rate-limit event scans
-                        log_run("watch: change event -> rescan")
-                finally:
-                    _close_watch(kq, fds)
+                else:
+                    # Was a bare `continue`. It is an `else` now so that the
+                    # success reset at the bottom is reachable from BOTH arms:
+                    # a `continue` here would have skipped it, and the backoff
+                    # would then never clear on the polled/inotify platforms.
+                    if stream is not None and stream.poll() is not None:
+                        stream = _spawn_xprotect_stream()  # tail died → respawn
+                    extra = (stream.stdout.fileno(),) if stream else ()
+                    # A write landing between the scan above and this arm is
+                    # missed by the kqueue; the interval floor scan covers that
+                    # ms-wide gap.
+                    kq, fds = _build_watch(extra)
+                    try:
+                        if _wait_for_change(kq, interval):
+                            time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
+                            if stream is not None:
+                                # level-triggered read fd: MUST drain or spin
+                                _drain_fd(stream.stdout.fileno())
+                            remain = WATCH_MIN_GAP_SECS - (time.time() - started)
+                            if remain > 0:
+                                time.sleep(remain)  # rate-limit event scans
+                            log_run("watch: change event -> rescan")
+                    finally:
+                        _close_watch(kq, fds)
+                # A completed iteration — scan AND arm — is the only evidence
+                # this loop is healthy, so the counter clears here and nowhere
+                # earlier. Resetting right after cmd_scan would have made the
+                # O_EVTONLY case (scan fine, arm broken) look recovered on
+                # every pass and reproduce the 30-second-scan pathology at 15.
+                consecutive = 0
             except KeyboardInterrupt:
                 print("\nstopped.")
                 return 0
+            except Exception as e:
+                consecutive += 1
+                log_run("watch: iteration FAILED (%d in a row): %s: %s"
+                        % (consecutive, type(e).__name__, e))
+                if consecutive >= WATCH_FAIL_CAP:
+                    # Same failure over and over is a broken build, not a
+                    # blip. Park on a long cycle and leave ONE durable record
+                    # a human can find (`doctor` prints it) — the run.log
+                    # lines above are the detail, this is the headline.
+                    backoff = WATCH_STUCK_SLEEP_SECS
+                    if consecutive == WATCH_FAIL_CAP:
+                        record_crash(
+                            ["watch", str(interval)],
+                            context=("watch loop failed %d times in a row; "
+                                     "parked at %ds — still scanning, no "
+                                     "longer watching"
+                                     % (consecutive, backoff)))
+                        print("Aegis watch: %d consecutive failures (%s). "
+                              "Staying alive on a %ds cycle rather than "
+                              "exiting into the supervisor's respawn loop; "
+                              "run `aegis.py doctor`."
+                              % (consecutive, e, backoff))
+                else:
+                    backoff = min(WATCH_BACKOFF_MAX_SECS,
+                                  WATCH_BACKOFF_BASE_SECS * (2 ** (consecutive - 1)))
+                time.sleep(backoff)
     finally:
         _stop_stream(stream)
 
@@ -19434,9 +20358,10 @@ def _assay_lanes():
         return True
 
     def lane_agent_exec_target(nonce):
-        """All three agent-surface exec poles: a swapped resolved target
+        """All four agent-surface exec poles: a swapped resolved target
         fires, a target that MATERIALIZES under an unchanged config line
-        fires, and a first sighting stays silent.
+        fires, a FIRST SIGHTING carrying an exec is reported before it is
+        adopted, and an inert first sighting stays silent.
 
         The materialization pole is here because it was silently broken.
         _resolve_exec_target's comment promised "if the file later appears the
@@ -19457,8 +20382,18 @@ def _assay_lanes():
             return False                       # swapped target
         if len(diff_agent_surface(snap(None), snap("b" * 64))) != 1:
             return False                       # target materialized
-        if diff_agent_surface({}, snap("b" * 64)) != []:
-            return False                       # first sighting is silent
+        # First sighting: reported, not adopted in silence. This pole was
+        # inverted — every alert in the diff was gated on `old is not None`,
+        # so CREATING a config that registers an exec was cheaper than
+        # editing one, and _scan_surfaces then adopted the path on the same
+        # scan. MEDIUM, one rung under the edit cases.
+        first = diff_agent_surface({}, snap("b" * 64))
+        if len(first) != 1 or first[0]["severity"] != "MEDIUM":
+            return False
+        # ...and the benign pole that keeps the one above honest: a file that
+        # appears carrying no exec and no imperative is ordinary host churn.
+        if diff_agent_surface({}, {cfg: {"sha256": "s"}}) != []:
+            return False
         return diff_agent_surface(snap("b" * 64), snap("b" * 64)) == []
 
     def lane_session_theft(nonce):
@@ -20602,8 +21537,12 @@ def _install_mac(runtime, mode, interval):
     py = sys.executable or "/usr/bin/python3"
     agents = os.path.dirname(SELF_PLIST)
     os.makedirs(agents, mode=0o700, exist_ok=True)
+    # `scan --quiet`: this job's stdout IS StandardOutPath below, so a verbose
+    # scheduled scan appends the whole markdown report to run.out every hour
+    # for the life of the install and nothing ever reads it. Watch mode already
+    # calls cmd_scan(quiet=True) internally and needs no flag.
     args = [py, runtime] + (["watch", str(interval)] if mode == "watch"
-                            else ["scan"])
+                            else ["scan", "--quiet"])
     # A path containing &, <, > (e.g. ".../Work & Projects/...") MUST be
     # entity-escaped or launchd silently refuses to load the agent and the
     # whole tool never runs on schedule.
@@ -20699,8 +21638,10 @@ def _install_linux(runtime, mode, interval):
             "exec": '"%s" "%s" watch %d' % (py, runtime, interval),
             "restart": "Restart=always\nRestartSec=10"}
     else:
+        # --quiet for the same reason as the launchd plist: a oneshot's stdout
+        # goes to the journal, where an hourly markdown report is pure noise.
         service = _SYSTEMD_SERVICE % {
-            "type": "oneshot", "exec": '"%s" "%s" scan' % (py, runtime),
+            "type": "oneshot", "exec": '"%s" "%s" scan --quiet' % (py, runtime),
             "restart": ""}
     with open(os.path.join(unit_dir, "aegis.service"), "w", encoding="utf-8") as f:
         f.write(service)
@@ -20745,7 +21686,7 @@ def _install_windows(runtime, mode, interval):
         py = pyw
     action = '"%s" "%s" %s' % (py, runtime,
                                "watch %d" % interval if mode == "watch"
-                               else "scan")
+                               else "scan --quiet")
     if mode == "watch":
         # One long-running process, (re)started at each logon. `schtasks
         # /create` exposes no restart-on-failure knob (that needs the XML task
@@ -21233,18 +22174,29 @@ def cmd_watchdog():
     # state, so it is correctly "not armed" (no false alarm before install).
     armed = (bool(beat) or os.path.exists(BASELINE) or os.path.exists(SELF_PLIST)
              or bool(load_json(SELFSTATE, {}).get("installed")))
-    now = int(time.time())
-    last = int(beat.get("epoch") or 0)
-    age = now - last if last else None
-    stale = armed and (age is None or age > HEARTBEAT_STALE_SECS)
-    if stale:
-        human = ("no heartbeat on record" if age is None
-                 else "last beat %d min ago (> %d min tolerance)"
-                 % (age // 60, HEARTBEAT_STALE_SECS // 60))
-        msg = ("Aegis watchdog: the monitor is NOT beating — %s. It may have been "
-               "killed, unloaded (launchctl bootout), frozen, or the Mac was "
-               "asleep. Verify the agent is running (`launchctl list | grep "
-               "aegis`) and re-run install.sh if needed." % human)
+    # AUTHENTICATED liveness, not just freshness. Reading `epoch` and comparing
+    # it to now() was the whole check until 2026-09-02, which meant a
+    # `while :; do echo {"epoch":$(date +%s)} > heartbeat.json; done` kept this
+    # command, rootwatch and the menu bar quiet forever on a monitor that had
+    # been booted out. heartbeat_verdict() fails closed: unsigned, forged,
+    # stale, or fresh-but-its-process-is-gone all report NOT beating.
+    state, human = heartbeat_verdict(beat)
+    if armed and state != BEAT_OK:
+        remedy = {
+            BEAT_FORGED: ("Something WITHOUT this machine's Aegis key wrote "
+                          "that file — treat this as active tampering, not as "
+                          "a crashed agent."),
+            BEAT_UNSIGNED: ("If you just upgraded Aegis, run one scan and "
+                            "re-check; if you did not, something else is "
+                            "writing this file."),
+            BEAT_DEAD_PID: ("Fresh beats are still arriving for a process that "
+                            "does not exist — treat this as active tampering."),
+        }.get(state,
+              "It may have been killed, unloaded (launchctl bootout), frozen, "
+              "or the machine was asleep.")
+        msg = ("Aegis watchdog: the monitor is NOT beating [%s] — %s. %s "
+               "Verify the agent is running (`launchctl list | grep aegis`) "
+               "and re-run install.sh if needed." % (state, human, remedy))
         try:
             with open(WATCHDOG_ALERT, "w", encoding="utf-8") as f:
                 f.write("%s  %s\n" % (now_iso(), msg))
@@ -21252,7 +22204,7 @@ def cmd_watchdog():
         except Exception:
             pass
         notify("Aegis watchdog: monitor not beating", human)
-        log_run("watchdog: STALE (%s)" % human)
+        log_run("watchdog: %s (%s)" % (state.upper(), human))
         print(msg)
         return 1
     # Healthy — clear any stale sentinel from a prior firing.
@@ -21270,8 +22222,7 @@ def cmd_watchdog():
               "launchd agent, or install marker found) — nothing to watch. Run "
               "install.sh to start the background monitor.")
         return 0
-    print("Aegis watchdog: OK — last heartbeat %d min ago (pid %s)."
-          % (age // 60, beat.get("pid", "?")))
+    print("Aegis watchdog: OK — %s, signature verifies." % human)
     return 0
 
 
@@ -21329,9 +22280,17 @@ def cmd_bastion():
 # --------------------------------------------------------------------------- #
 
 # str.format (not %) on purpose: the generated code is full of runtime
-# %-formatting, and the only generation-time substitutions are the five
-# {name} fields. The script uses a one-line import to protect its own audit
-# budget — the ≤60-line bound is pinned by the test suite.
+# %-formatting, and the only generation-time substitutions are the {name}
+# fields. The script uses a one-line import to protect its own audit budget.
+#
+# The bound moved from 60 to 85 lines on 2026-09-02, and the reason is worth
+# recording rather than quietly editing: the witness used to read ONE field
+# (`epoch`) out of an UNSIGNED file, so `while :; do echo {"epoch":$(date
+# +%s)} > ~/.aegis/heartbeat.json; sleep 300; done` kept the most expensive
+# control in this project silent forever on a booted-out monitor. Verifying
+# the beat's MAC and its pid is the ~25 lines that close that, and 25 lines
+# to stop a two-line attack is the trade. The bound is still a bound: it
+# exists so a human reads the whole root script before installing it.
 _ROOTWATCH_TEMPLATE = '''\
 #!/usr/bin/env python3
 # aegis-rootwatch -- generated by `aegis.py rootwatch install`. Do not edit;
@@ -21419,6 +22378,17 @@ WantedBy=timers.target
 """
 
 
+# The witness reads a file the watched uid can WRITE, so it cannot be made
+# trustworthy from here. Verifying the beat's MAC was tried and reverted on
+# 2026-09-03: the key is 0600 under that same uid, so malware which owns the
+# session reads it and signs its own beats -- and the attempt cost 36 lines
+# and two crypto imports in the ONE program Aegis runs as root, blowing the
+# 60-line audit budget that is this component's actual security argument.
+# aegis.py's own watchdog does check the signature (cheap there, and it does
+# stop a writer who cannot read the key). The only witness a same-uid
+# attacker genuinely cannot reach is off-box: see _post_heartbeat, which
+# ships the notary head and the running code's hash for a remote party to
+# compare. Root is a louder speaker here, not a stronger judge.
 def _rootwatch_script_text(hb_path, uid, log_path, mac=IS_MAC):
     """Generate the privileged witness with the watched user's paths, uid and
     the watchdog's own staleness tolerance baked in at generation time."""
@@ -21749,6 +22719,38 @@ def _oob_challenge(code, purpose, target):
     return None
 
 
+# The out-of-band channel IS the guarantee, and on a headless box there is not
+# one. Falling back to `tty-only` is an honest degradation — it is recorded and
+# never claimed as equivalent — but until now it could not be REFUSED: an
+# operator who has decided a pty-wrapping parent is inside their threat model
+# had no way to say so, because the fallback happens automatically.
+#
+# So it becomes a setting, defaulting to today's behaviour, because the tradeoff
+# is real and cuts both ways:
+#   absent/false (default) — an SSH or headless session can still authorize; a
+#                            parent process that allocated this pty can read the
+#                            printed code. This is what shipped, unchanged.
+#   true                   — no out-of-band channel means no authorization. SSH,
+#                            a denied Accessibility prompt and the 120s
+#                            osascript timeout all become a hard refusal. An
+#                            operator who turns this on and then needs `unlatch`
+#                            on a headless host must edit config.json ON that
+#                            host to get back in — that lockout is the price of
+#                            the guarantee, and it is why this is not default.
+# One boolean, read at one decision point; nothing else consults it.
+_AUTH_REQUIRE_OOB_KEY = "authorization_require_oob"
+
+
+def _require_oob_channel():
+    """Is a tty-only fallback a refusal rather than a degradation?
+
+    Any non-boolean value in config.json is treated as absent: a typo
+    ("yes", 1, "true") must not silently harden the gate, and — the direction
+    that actually matters — must not silently weaken one the operator believes
+    they turned on."""
+    return _aegis_config().get(_AUTH_REQUIRE_OOB_KEY) is True
+
+
 def authorize_interactive(purpose, target):
     """Prove a human — not a script — approved this action.
 
@@ -21763,6 +22765,16 @@ def authorize_interactive(purpose, target):
     code = "%06d" % secrets.randbelow(1000000)
     channel = _oob_challenge(code, purpose, target)
     if channel is None:
+        if _require_oob_channel():
+            # Refused AFTER the attempt, never before it: whether a channel
+            # exists is only knowable by trying, and refusing on a machine that
+            # actually had a dialog available would be a lie about this session.
+            print("refuse: no out-of-band channel is available on this session "
+                  "and %s is set in config.json, so the one-time code could "
+                  "only be printed on this terminal — where the process that "
+                  "allocated it can read it. Nothing was changed."
+                  % _AUTH_REQUIRE_OOB_KEY)
+            return False, "refused-no-oob-channel"
         channel = "tty-only"
         print("Type this code to confirm\n    %s\n    %s" % (target, code))
         print("NOTE: no out-of-band channel is available on this session, so "
@@ -22969,10 +23981,135 @@ def _authorize_response_cli(verb, argument=None):
     return bool(ok and recorded)
 
 
+# --------------------------------------------------------------------------- #
+# The verbs that BLIND the monitor are gated exactly like the verbs that ACT.
+#
+# `cmd_unlatch` states the doctrine: an authorization channel is worth nothing
+# if malware can just shell out to `aegis.py unlatch`. That reasoning was only
+# ever applied to the response tier — quarantine, restore, destroy, kill,
+# neutralize, freeze, thaw — and never to the commands that turn the monitor
+# off, which is backwards. Acting is loud, bounded and reversible out of the
+# quarantine store. Blinding is silent, SELF-BLESSING (every one of these
+# re-watermarks the trust store it just rewrote, so the self-protection check
+# reads the blinding as authorized) and it is what an attacker running as this
+# same uid wants FIRST, because it buys everything else:
+#   learn start 3650             ten years of pre-closed non-CRITICAL findings,
+#                                and _set_learning_period re-watermarks, so the
+#                                tamper check blesses its own blinding
+#   baseline                     the attacker's own persistence adopted as
+#                                known-good, standing accusation cleared
+#   allow /                      substring match over the latest report, so one
+#                                character allowlists every current finding
+#   canary remove                the CRITICAL ransomware tripwire deleted, and
+#                                the deletion re-watermarked as authorized
+#   uninstall / mark-uninstalled self:agent:removed permanently disarmed
+#   intent record <path>         a forged 'self-attested' custody grade for any
+#                                file, ~/.aegis/aegis.py included
+# None of these needed a tty, a code, or a dialog before this change.
+#
+# Gated at the DISPATCHER, for the same reason _authorize_response_cli is:
+# internal cmd_* calls stay composable (setup plants canaries, cmd_uninstall
+# marks itself uninstalled, the installer adopts a first baseline through
+# `baseline-unverified`), and the CLI is the boundary an external script would
+# otherwise cross.
+# --------------------------------------------------------------------------- #
+
+def _authorize_blinding_cli(verb, purpose, target):
+    """Human gate for a CLI verb that REDUCES what Aegis can see.
+
+    `purpose` must say what is being GIVEN UP in plain words: the operator
+    reads it in a dialog with no other context, and "authorize learn" tells
+    them nothing about ten years of silence. Both outcomes are appended to
+    actions.jsonl with the channel, exactly as the response tier records them —
+    and an approval that could not be written down is refused, because
+    unauditable blinding is precisely the failure this gate exists to prevent.
+    """
+    ok, channel = authorize_interactive(purpose, target)
+    recorded = log_action(
+        "blind-auth", target, "authorized" if ok else "refused",
+        channel=channel, verb=verb, purpose=purpose)
+    return bool(ok and recorded)
+
+
+def _tolerance_escalation(incident_id, now=None):
+    """(identity, verdicts) when THIS benign-positive verdict is the one that
+    crossed the acquired-tolerance floor; None otherwise.
+
+    `incident <id> benign-positive` is deliberately NOT gated — it is the
+    routine daily verdict, and a dialog in front of it would only train the
+    operator to click through the dialogs that matter. But the third such
+    verdict on one identity is not routine: it permanently auto-closes that
+    identity class (_TOLERANCE_MIN_VERDICTS inside _TOLERANCE_WINDOW), which is
+    blindness acquired one ordinary keystroke at a time. The threshold is
+    unchanged; what changes is that CROSSING it is said out loud and written to
+    actions.jsonl instead of happening silently three verdicts ago.
+
+    Lives beside the blinding gate rather than beside _tolerance_memory because
+    it belongs to that doctrine, not to the scoring logic: it decides nothing
+    and reads nothing the scan path reads. Returns None unless the count lands
+    exactly ON the floor, so the fourth and later verdicts stay quiet — the
+    escalation already happened and repeating it is noise. Read-only, and never
+    raises: a reporting extra must not be able to fail an operator's verdict.
+    """
+    try:
+        now = _epoch(now)
+        db = _event_connection()
+        try:
+            row = db.execute(
+                "SELECT id, correlation_key, severity, subject_json "
+                "FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if row is None:
+                return None
+            ident = _incident_identity(row)[0]
+            if not ident:
+                return None
+            # Only categories tolerance can actually generalize over count:
+            # claiming "future re-observations stop alerting" for a category
+            # _signal_decision never tolerates would be a scarier lie than
+            # silence.
+            cats = {r["category"] for r in db.execute(
+                "SELECT DISTINCT category FROM dismissals WHERE incident_id=?",
+                (incident_id,)).fetchall()}
+            if not (cats & _TOLERANCE_CATEGORIES):
+                return None
+            rows = db.execute(
+                "SELECT d.incident_id, d.correlation_key, i.severity, "
+                "i.subject_json "
+                "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+                "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+                "AND d.correlation_key LIKE 'signal:%'",
+                (now - _TOLERANCE_WINDOW,)).fetchall()
+        finally:
+            db.close()
+        # Distinct INCIDENTS, not dismissal rows: transition_incident writes one
+        # row per finding category, so a two-category incident would otherwise
+        # look like two verdicts and grant tolerance an exposure early.
+        verdicts = {r["incident_id"] for r in rows
+                    if _incident_identity(r)[0] == ident}
+        if len(verdicts) != _TOLERANCE_MIN_VERDICTS:
+            return None
+        return ident, len(verdicts)
+    except Exception as e:
+        log_run("tolerance-escalation check failed: %s" % e)
+        return None
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "scan"
     if cmd == "scan":
-        return cmd_scan()
+        # The scheduler's stdout/stderr sinks are bounded HERE, before anything
+        # writes to them: a scheduled scan is a fresh process, so this is the
+        # one moment its run.out fd is not yet in use. (cmd_watch, which holds
+        # them open for its whole life, trims them at the top of every loop.)
+        _trim_stdio_logs()
+        # --quiet is what the INSTALLED job passes. launchd sends this process's
+        # stdout to StandardOutPath = ~/.aegis/run.out, so a verbose hourly scan
+        # appended the ENTIRE markdown report there every hour — 8.6 MB on the
+        # reference machine, of a file no code and no human has ever read.
+        # An interactive `aegis.py scan` stays verbose: printing the report to
+        # your terminal is the whole point of typing it.
+        return cmd_scan(quiet=any(a in ("--quiet", "-q", "quiet")
+                                  for a in argv[2:]))
     if cmd == "report":
         return cmd_report(full=(len(argv) > 2 and argv[2] in ("--full", "full")))
     if cmd == "status":
@@ -22982,6 +24119,17 @@ def main(argv):
     if cmd == "preflight":  # installer-only
         return cmd_preflight()
     if cmd == "mark-uninstalled":  # uninstaller-only
+        # Gated for the same reason as `uninstall`, and more urgently: this is
+        # the disarm WITHOUT the uninstall — one command that permanently
+        # silences self:agent:removed while the agent is still registered.
+        # uninstall.sh calls it with `|| true`, so a refusal there leaves
+        # selfstate saying "installed" and the removal alarm ARMED: a false
+        # alarm the operator can see, which is the correct way to fail.
+        if not _authorize_blinding_cli(
+                "mark-uninstalled",
+                "Disarm the alarm that fires when the Aegis agent is removed",
+                "self:agent:removed stops being reportable on this machine"):
+            return 1
         return cmd_mark_uninstalled()
     if cmd == "incidents":
         if len(argv) > 2 and argv[2] == "families":
@@ -22996,8 +24144,39 @@ def main(argv):
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
     if cmd == "learn":
+        sub = argv[2] if len(argv) > 2 else "status"
+        if sub in ("start", "extend"):
+            try:
+                days = int(argv[3]) if len(argv) > 3 else _LEARNING_DEFAULT_DAYS
+            except ValueError:
+                days = 0
+            # A request that blinds nothing costs no dialog: days <= 0 and an
+            # unparseable count fall through to cmd_learn's usage error with
+            # behaviour byte-identical to before.
+            if days > 0 and not _authorize_blinding_cli(
+                    "learn " + sub,
+                    "Stop alerting on non-CRITICAL findings for %d day(s)"
+                    % days,
+                    "every non-CRITICAL finding opens pre-closed as "
+                    "'learning' until %s"
+                    % time.strftime("%Y-%m-%d",
+                                    time.localtime(_epoch() + days * 86400))):
+                return 1
         return cmd_learn(argv)
     if cmd == "intent":
+        # `intent hook` stays ungated on purpose: it is the editor's post-write
+        # hook, non-interactive by construction, and it only ever attests the
+        # path the harness reports it just wrote. `intent record` is the
+        # hand-typed one, and it will mint a self-attested custody grade for
+        # ANY path handed to it — ~/.aegis/aegis.py included, which downgrades
+        # a payload swap of the monitor itself to "the operator wrote this".
+        if len(argv) > 3 and argv[2] == "record":
+            if not _authorize_blinding_cli(
+                    "intent record",
+                    "Attest this file as written by you, deliberately",
+                    "%s — a change to it will grade as self-attested custody "
+                    "instead of unexplained" % argv[3]):
+                return 1
         return cmd_intent(argv)
     if cmd == "signers":
         return cmd_signers(argv)
@@ -23020,10 +24199,27 @@ def main(argv):
             return 1
         return cmd_attck(days)
     if cmd == "baseline":
+        if not _authorize_blinding_cli(
+                "baseline",
+                "Adopt everything currently persisting on this machine as "
+                "known-good",
+                "the persistence set as it stands RIGHT NOW becomes the "
+                "baseline, and any standing tamper accusation is cleared"):
+            return 1
         return cmd_baseline()
     if cmd == "baseline-unverified":  # installer-only: adopt, never bless
         return cmd_baseline(trust="unverified")
     if cmd == "allow" and len(argv) > 2:
+        # The blast radius is named BEFORE the write because the argument does
+        # not reveal it: the match is a SUBSTRING of the finding's path, so
+        # `allow /` silences every path-bearing finding in the report.
+        pending = _allow_matches(argv[2])
+        if pending and not _authorize_blinding_cli(
+                "allow",
+                "Permanently silence %d current finding(s)" % len(pending),
+                "every finding whose path contains %r stops being reported "
+                "at all" % argv[2]):
+            return 1
         return cmd_allow(argv[2])
     if cmd == "vt" and len(argv) > 2:
         return cmd_vt(argv[2])
@@ -23036,7 +24232,17 @@ def main(argv):
         # stage's enablement (not yet built) is what gets the one-time code.
         return cmd_autoprotect(argv[2] if len(argv) > 2 else "status")
     if cmd == "canary":
-        return cmd_canary(argv[2] if len(argv) > 2 else "plant")
+        action = argv[2] if len(argv) > 2 else "plant"
+        if action == "remove":
+            planted = len(load_json(CANARY_STATE, {}))
+            if planted and not _authorize_blinding_cli(
+                    "canary remove",
+                    "Disarm the ransomware tripwire",
+                    "%d canary file(s) get deleted; their modification or "
+                    "deletion is the CRITICAL signal that stops firing"
+                    % planted):
+                return 1
+        return cmd_canary(action)
     if cmd == "watch":
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
     if cmd == "install":
@@ -23051,6 +24257,12 @@ def main(argv):
             return 1
         return cmd_install(mode, secs)
     if cmd == "uninstall":
+        if not _authorize_blinding_cli(
+                "uninstall",
+                "Stop the background monitor and disarm its removal alarm",
+                "nothing scans on a schedule after this, and "
+                "self:agent:removed stops being reportable"):
+            return 1
         return cmd_uninstall()
     if cmd == "setup":
         return cmd_setup()
@@ -23153,4 +24365,30 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    # The last line used to be `sys.exit(main(sys.argv))` with no handler above
+    # it anywhere. An unhandled exception therefore left a traceback on stderr
+    # — under launchd, ~/.aegis/run.err, a file nothing read — and NO durable
+    # state at all, so every later `doctor` answered from the last SUCCESSFUL
+    # scan and printed OK over a monitor that had been dead since Tuesday. A
+    # security tool that dies quietly is worse than one that was never
+    # installed, because the operator believes they are covered.
+    #
+    # Deliberately here rather than inside main(): main() is a 180-line
+    # dispatch chain and wrapping its body would reindent every branch, which
+    # is a large diff hiding a small fix. The record itself is written by
+    # record_crash — which does NOT refresh the heartbeat, on purpose (see its
+    # comment): a crash must leave the beat rotting, because the beat going
+    # stale is the alarm every other watcher on this box is waiting for.
+    _rc = CRASH_EXIT_CODE
+    try:
+        _rc = main(sys.argv)
+    except SystemExit:
+        raise                       # an explicit exit is a decision, not a fault
+    except KeyboardInterrupt:
+        # A human at the terminal is not a crash and must not leave a crash
+        # record for the next `doctor` to alarm on.
+        sys.stderr.write("\ninterrupted.\n")
+        _rc = 130
+    except BaseException:           # noqa: B036 - a sink of last resort catches all
+        _rc = record_crash(sys.argv)
+    sys.exit(_rc)

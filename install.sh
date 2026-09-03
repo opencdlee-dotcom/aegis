@@ -87,7 +87,13 @@ if [ "$MODE" = "watch" ]; then
     SCHEDULE="    <key>KeepAlive</key>      <true/>"
     DESC="event-driven watch; full scan every ${INTERVAL}s"
 else
-    PROG_TAIL="        <string>scan</string>"
+    # --quiet: this job's stdout IS StandardOutPath (~/.aegis/run.out), so a
+    # verbose scheduled scan appends the entire markdown report there every
+    # interval, forever, into a file nothing reads (8.6 MB on the reference
+    # machine). aegis.py's own installer writes the identical arguments; the
+    # two generators are compared plist-for-plist in tests/test_regression.py.
+    PROG_TAIL="        <string>scan</string>
+        <string>--quiet</string>"
     SCHEDULE="    <key>StartInterval</key>  <integer>$INTERVAL</integer>"
     DESC="every ${INTERVAL}s"
 fi

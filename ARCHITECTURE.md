@@ -1059,7 +1059,22 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   an agent's shell tool) passes it and can read a code printed to that terminal.
   The challenge channel and the response channel must therefore be different,
   and where no out-of-band channel exists the weaker guarantee is *recorded*
-  (`channel=tty-only` in `actions.jsonl`), never claimed as equivalent.
+  (`channel=tty-only` in `actions.jsonl`), never claimed as equivalent. An
+  operator who does not accept that fallback sets `authorization_require_oob`
+  in `config.json` and a missing channel becomes a refusal instead; it defaults
+  off because on a headless host it locks the operator out of `unlatch`.
+- **The gate covers the verbs that BLIND, not only the verbs that ACT.** Same
+  one-time code, same `actions.jsonl` record, applied at the dispatcher to
+  `learn start|extend`, `baseline`, `allow`, `canary remove`, `uninstall`,
+  `mark-uninstalled` and `intent record`. Blinding is the more valuable target:
+  acting is loud and reversible out of the quarantine store, while turning the
+  monitor off is silent, self-blessing (each of these re-watermarks the trust
+  store it just rewrote, so the tamper check reads the blinding as authorized)
+  and it buys the attacker everything else. Verdicts stay ungated — a dialog in
+  front of the routine daily `benign-positive` would only train the operator to
+  click through the ones that matter — but the verdict that crosses the
+  acquired-tolerance floor is announced and recorded, because permanent
+  auto-close acquired three keystrokes at a time must not be the silent case.
 - **Presence is evidence, never a control input.** Idle/lock state is forgeable
   by a same-uid process, so it may enrich a finding and must never license an
   automatic action. Any measurement an attacker can drive is a remote control if
