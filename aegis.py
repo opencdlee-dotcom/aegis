@@ -13044,6 +13044,69 @@ def _migrate_exec_keys(execs):
     return out
 
 
+def _first_sight_agent_config(path, rec):
+    """Findings for a config file seen for the FIRST time, emitted BEFORE
+    _scan_surfaces adopts it into the baseline.
+
+    Silence here was the sensor's largest hole. `diff_agent_surface` gated
+    every alert on `old is not None`, and the agent_surface row opts into
+    per-file adoption (adopt_new_entries), so a path that appeared after the
+    surface was baselined was written straight into the baseline on the same
+    scan that first saw it. Net effect on the threat this sensor is FOR: an
+    agent talked into writing a NEW ~/.claude/settings.local.json with a
+    PreToolUse hook, or a NEW ~/.codex/mcp.json, produced exactly zero
+    findings on first sight and none ever after — while the same hook added
+    to an existing file was HIGH. Creating was cheaper than editing, which is
+    backwards.
+
+    Graded one rung below the edit cases on purpose. An edit to a watched
+    file is a change to something already reviewed; an appearance is a file
+    nobody has judged yet, and appearances have an honest benign population
+    (a host writes a new per-project config, a tool adds its own). So a new
+    exec entry is MEDIUM — recorded, correlatable, risk-accumulating, below
+    the notify floor — while CONTENT the imperative tables call attack-defined
+    keeps its own grade: concealment is HIGH on sight, whatever wrote it,
+    because no legitimate instruction file asks the agent to keep something
+    from its operator."""
+    out = []
+    execs = _migrate_exec_keys(rec.get("execs") or {})
+    for key, e in execs.items():
+        out.append(finding(
+            "MEDIUM", "agent-surface", "New agent config file registers an exec",
+            "%s did not exist when this surface was baselined and already "
+            "registers an executable entry: %s %s\nResolved target: %s\nAn MCP "
+            "server or tool hook runs with your full authority every time the "
+            "agent starts, and a file that arrives complete was never reviewed "
+            "by anyone. Confirm you (or a tool you ran) created it."
+            % (path, e.get("cmd"), (" ".join(e.get("args") or []))[:400],
+               e.get("target") or "(unresolved)"),
+            "agent-surface:newfile-exec:%s:%s" % (path, key),
+            path=path, program=e.get("target") or e.get("cmd"),
+            markers=["agent-surface", "exec", "first-sight"]))
+    marks = sorted(rec.get("imperatives") or [])
+    sev = _imperative_severity(marks)
+    if sev:
+        # Same asymmetry as the gained-imperative branch: provenance may only
+        # ever ESCALATE content. A directive an injected agent wrote is
+        # self-attested and still hostile, so attestation must not soften it.
+        prov = _git_provenance(path)
+        if prov == "remote-foreign" and sev == "MEDIUM":
+            sev = "HIGH"
+        out.append(finding(
+            sev, "agent-surface", "New agent instruction file carries a directive",
+            "%s appeared with instruction text matching: %s.\n%s\nAn "
+            "instruction file is an execution primitive with no shell syntax — "
+            "no signature scanner will ever flag this. Read it yourself before "
+            "the next agent session does."
+            % (path, ", ".join(marks), _PROVENANCE_NOTE.get(prov, "")),
+            "agent-surface:newfile-imperative:%s:%s:%s"
+            % (path, ",".join(marks), (rec.get("sha256") or "")[:12]),
+            path=path, provenance=prov,
+            confidence="high" if "conceal" in marks else "medium",
+            markers=["agent-surface", "instruction", "first-sight"]))
+    return out
+
+
 def diff_agent_surface(prior, cur):
     """Alert only on what an attacker must change to gain execution.
 
@@ -13068,6 +13131,26 @@ def diff_agent_surface(prior, cur):
     for path, rec in cur.items():
         old = prior.get(path)
         try:
+            if old is None:
+                # FIRST SIGHT of a config file. This branch used to be pure
+                # silence, which inverted the threat model the sensor exists
+                # to cover: EDITING ~/.claude/settings.json to add a PreToolUse
+                # hook was HIGH, while CREATING settings.local.json with the
+                # same hook emitted nothing — and _scan_surfaces then adopted
+                # the new path into the baseline, so it never emitted again
+                # either. A prompt-injected agent writes new files; it has no
+                # reason to edit one Aegis already watches.
+                #
+                # It stays quiet for the cases that earned the silence. A true
+                # first run and an upgrade never reach here at all: the whole
+                # surface is adopted in _scan_surfaces' `prior is None` branch
+                # without calling this function, so the storm-free-install and
+                # storm-free-upgrade properties are structural, not a rule
+                # here. And a file with no exec entry and no imperative marker
+                # — the overwhelming majority of ~/.claude churn — is still
+                # silent, which is what keeps the two real classes readable.
+                findings += _first_sight_agent_config(path, rec)
+                continue
             # Exec keys are settled in the STORE (baseline schema v3 re-keys a
             # legacy positional snapshot once, at load), so the steady state
             # is a plain compare — no per-scan re-hashing of every entry on
@@ -20143,9 +20226,10 @@ def _assay_lanes():
         return True
 
     def lane_agent_exec_target(nonce):
-        """All three agent-surface exec poles: a swapped resolved target
+        """All four agent-surface exec poles: a swapped resolved target
         fires, a target that MATERIALIZES under an unchanged config line
-        fires, and a first sighting stays silent.
+        fires, a FIRST SIGHTING carrying an exec is reported before it is
+        adopted, and an inert first sighting stays silent.
 
         The materialization pole is here because it was silently broken.
         _resolve_exec_target's comment promised "if the file later appears the
@@ -20166,8 +20250,18 @@ def _assay_lanes():
             return False                       # swapped target
         if len(diff_agent_surface(snap(None), snap("b" * 64))) != 1:
             return False                       # target materialized
-        if diff_agent_surface({}, snap("b" * 64)) != []:
-            return False                       # first sighting is silent
+        # First sighting: reported, not adopted in silence. This pole was
+        # inverted — every alert in the diff was gated on `old is not None`,
+        # so CREATING a config that registers an exec was cheaper than
+        # editing one, and _scan_surfaces then adopted the path on the same
+        # scan. MEDIUM, one rung under the edit cases.
+        first = diff_agent_surface({}, snap("b" * 64))
+        if len(first) != 1 or first[0]["severity"] != "MEDIUM":
+            return False
+        # ...and the benign pole that keeps the one above honest: a file that
+        # appears carrying no exec and no imperative is ordinary host churn.
+        if diff_agent_surface({}, {cfg: {"sha256": "s"}}) != []:
+            return False
         return diff_agent_surface(snap("b" * 64), snap("b" * 64)) == []
 
     def lane_session_theft(nonce):
