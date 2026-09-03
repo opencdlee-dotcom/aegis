@@ -16042,6 +16042,26 @@ def cmd_incident(incident_id, action=None, reason=None):
                 print("trusted identity: %s %s\n  future recurrences report "
                       "at low severity instead of interrupting; reverse with "
                       "aegis.py identity block %s %s" % (kind, fp, kind, fp))
+            # This verdict is not gated — it is the routine daily one, and a
+            # dialog here would only teach the operator to click through the
+            # dialogs that matter. But the verdict that CROSSES the tolerance
+            # floor buys permanent auto-close for a whole identity class, and
+            # acquiring that much blindness three keystrokes at a time must
+            # never be the silent case. Threshold unchanged; only its crossing
+            # is now visible, in the output and in actions.jsonl.
+            escalation = _tolerance_escalation(incident_id)
+            if escalation:
+                ident, verdicts = escalation
+                print("\nTOLERANCE GRANTED — %s now carries %d benign-positive"
+                      "\n  verdicts inside %d days. Future non-CRITICAL "
+                      "re-observations of that identity\n  open PRE-CLOSED "
+                      "('auto-tolerated') and will not alert you.\n"
+                      "  Revoke by disputing any one of them: aegis.py "
+                      "incident <id> reopen"
+                      % (ident, verdicts, _TOLERANCE_WINDOW // 86400))
+                log_action("tolerance-granted", ident, "auto-close-enabled",
+                           verdicts=verdicts, incident_id=incident_id,
+                           window_days=_TOLERANCE_WINDOW // 86400)
     item = incident_detail(incident_id)
     if not item:
         print("no such incident: %s" % incident_id)
@@ -17128,20 +17148,36 @@ def _intel_summary():
                  % (len(hashes), len(net), oldest))
 
 
+def _allow_matches(path):
+    """The fingerprints `allow <path>` would silence, without writing anything.
+
+    Split out of cmd_allow so the authorization gate can state the blast radius
+    BEFORE the write. It has to: the match is a SUBSTRING of the finding's
+    path, so `allow /` silences every path-bearing finding in the report, and
+    an operator approving a dialog that only said "allow" would have no way to
+    see that. Same predicate and same de-duplication as the write path — one
+    spelling of "which findings does this match", not two."""
+    allow = load_json(ALLOWLIST, [])
+    data = load_json(LATEST_JSON, {"findings": []})
+    out = []
+    for f in data.get("findings", []):
+        fp = f.get("fingerprint")
+        if not fp or fp in allow or fp in out:
+            continue
+        if path in (f.get("path") or "") or path == fp:
+            out.append(fp)
+    return out
+
+
 def cmd_allow(path):
     ensure_state()
     allow = load_json(ALLOWLIST, [])
-    added = 0
     # Allow by prefix match against any current finding fingerprint.
-    data = load_json(LATEST_JSON, {"findings": []})
-    for f in data.get("findings", []):
-        if path in (f.get("path") or "") or path == f.get("fingerprint"):
-            if f["fingerprint"] not in allow:
-                allow.append(f["fingerprint"])
-                added += 1
+    matched = _allow_matches(path)
+    allow.extend(matched)
     save_json(ALLOWLIST, allow)
     _record_allowlist_watermark()
-    print("Allowlisted %d finding(s) matching %r." % (added, path))
+    print("Allowlisted %d finding(s) matching %r." % (len(matched), path))
     return 0
 
 
@@ -22457,6 +22493,38 @@ def _oob_challenge(code, purpose, target):
     return None
 
 
+# The out-of-band channel IS the guarantee, and on a headless box there is not
+# one. Falling back to `tty-only` is an honest degradation — it is recorded and
+# never claimed as equivalent — but until now it could not be REFUSED: an
+# operator who has decided a pty-wrapping parent is inside their threat model
+# had no way to say so, because the fallback happens automatically.
+#
+# So it becomes a setting, defaulting to today's behaviour, because the tradeoff
+# is real and cuts both ways:
+#   absent/false (default) — an SSH or headless session can still authorize; a
+#                            parent process that allocated this pty can read the
+#                            printed code. This is what shipped, unchanged.
+#   true                   — no out-of-band channel means no authorization. SSH,
+#                            a denied Accessibility prompt and the 120s
+#                            osascript timeout all become a hard refusal. An
+#                            operator who turns this on and then needs `unlatch`
+#                            on a headless host must edit config.json ON that
+#                            host to get back in — that lockout is the price of
+#                            the guarantee, and it is why this is not default.
+# One boolean, read at one decision point; nothing else consults it.
+_AUTH_REQUIRE_OOB_KEY = "authorization_require_oob"
+
+
+def _require_oob_channel():
+    """Is a tty-only fallback a refusal rather than a degradation?
+
+    Any non-boolean value in config.json is treated as absent: a typo
+    ("yes", 1, "true") must not silently harden the gate, and — the direction
+    that actually matters — must not silently weaken one the operator believes
+    they turned on."""
+    return _aegis_config().get(_AUTH_REQUIRE_OOB_KEY) is True
+
+
 def authorize_interactive(purpose, target):
     """Prove a human — not a script — approved this action.
 
@@ -22471,6 +22539,16 @@ def authorize_interactive(purpose, target):
     code = "%06d" % secrets.randbelow(1000000)
     channel = _oob_challenge(code, purpose, target)
     if channel is None:
+        if _require_oob_channel():
+            # Refused AFTER the attempt, never before it: whether a channel
+            # exists is only knowable by trying, and refusing on a machine that
+            # actually had a dialog available would be a lie about this session.
+            print("refuse: no out-of-band channel is available on this session "
+                  "and %s is set in config.json, so the one-time code could "
+                  "only be printed on this terminal — where the process that "
+                  "allocated it can read it. Nothing was changed."
+                  % _AUTH_REQUIRE_OOB_KEY)
+            return False, "refused-no-oob-channel"
         channel = "tty-only"
         print("Type this code to confirm\n    %s\n    %s" % (target, code))
         print("NOTE: no out-of-band channel is available on this session, so "
@@ -23677,6 +23755,119 @@ def _authorize_response_cli(verb, argument=None):
     return bool(ok and recorded)
 
 
+# --------------------------------------------------------------------------- #
+# The verbs that BLIND the monitor are gated exactly like the verbs that ACT.
+#
+# `cmd_unlatch` states the doctrine: an authorization channel is worth nothing
+# if malware can just shell out to `aegis.py unlatch`. That reasoning was only
+# ever applied to the response tier — quarantine, restore, destroy, kill,
+# neutralize, freeze, thaw — and never to the commands that turn the monitor
+# off, which is backwards. Acting is loud, bounded and reversible out of the
+# quarantine store. Blinding is silent, SELF-BLESSING (every one of these
+# re-watermarks the trust store it just rewrote, so the self-protection check
+# reads the blinding as authorized) and it is what an attacker running as this
+# same uid wants FIRST, because it buys everything else:
+#   learn start 3650             ten years of pre-closed non-CRITICAL findings,
+#                                and _set_learning_period re-watermarks, so the
+#                                tamper check blesses its own blinding
+#   baseline                     the attacker's own persistence adopted as
+#                                known-good, standing accusation cleared
+#   allow /                      substring match over the latest report, so one
+#                                character allowlists every current finding
+#   canary remove                the CRITICAL ransomware tripwire deleted, and
+#                                the deletion re-watermarked as authorized
+#   uninstall / mark-uninstalled self:agent:removed permanently disarmed
+#   intent record <path>         a forged 'self-attested' custody grade for any
+#                                file, ~/.aegis/aegis.py included
+# None of these needed a tty, a code, or a dialog before this change.
+#
+# Gated at the DISPATCHER, for the same reason _authorize_response_cli is:
+# internal cmd_* calls stay composable (setup plants canaries, cmd_uninstall
+# marks itself uninstalled, the installer adopts a first baseline through
+# `baseline-unverified`), and the CLI is the boundary an external script would
+# otherwise cross.
+# --------------------------------------------------------------------------- #
+
+def _authorize_blinding_cli(verb, purpose, target):
+    """Human gate for a CLI verb that REDUCES what Aegis can see.
+
+    `purpose` must say what is being GIVEN UP in plain words: the operator
+    reads it in a dialog with no other context, and "authorize learn" tells
+    them nothing about ten years of silence. Both outcomes are appended to
+    actions.jsonl with the channel, exactly as the response tier records them —
+    and an approval that could not be written down is refused, because
+    unauditable blinding is precisely the failure this gate exists to prevent.
+    """
+    ok, channel = authorize_interactive(purpose, target)
+    recorded = log_action(
+        "blind-auth", target, "authorized" if ok else "refused",
+        channel=channel, verb=verb, purpose=purpose)
+    return bool(ok and recorded)
+
+
+def _tolerance_escalation(incident_id, now=None):
+    """(identity, verdicts) when THIS benign-positive verdict is the one that
+    crossed the acquired-tolerance floor; None otherwise.
+
+    `incident <id> benign-positive` is deliberately NOT gated — it is the
+    routine daily verdict, and a dialog in front of it would only train the
+    operator to click through the dialogs that matter. But the third such
+    verdict on one identity is not routine: it permanently auto-closes that
+    identity class (_TOLERANCE_MIN_VERDICTS inside _TOLERANCE_WINDOW), which is
+    blindness acquired one ordinary keystroke at a time. The threshold is
+    unchanged; what changes is that CROSSING it is said out loud and written to
+    actions.jsonl instead of happening silently three verdicts ago.
+
+    Lives beside the blinding gate rather than beside _tolerance_memory because
+    it belongs to that doctrine, not to the scoring logic: it decides nothing
+    and reads nothing the scan path reads. Returns None unless the count lands
+    exactly ON the floor, so the fourth and later verdicts stay quiet — the
+    escalation already happened and repeating it is noise. Read-only, and never
+    raises: a reporting extra must not be able to fail an operator's verdict.
+    """
+    try:
+        now = _epoch(now)
+        db = _event_connection()
+        try:
+            row = db.execute(
+                "SELECT id, correlation_key, severity, subject_json "
+                "FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if row is None:
+                return None
+            ident = _incident_identity(row)[0]
+            if not ident:
+                return None
+            # Only categories tolerance can actually generalize over count:
+            # claiming "future re-observations stop alerting" for a category
+            # _signal_decision never tolerates would be a scarier lie than
+            # silence.
+            cats = {r["category"] for r in db.execute(
+                "SELECT DISTINCT category FROM dismissals WHERE incident_id=?",
+                (incident_id,)).fetchall()}
+            if not (cats & _TOLERANCE_CATEGORIES):
+                return None
+            rows = db.execute(
+                "SELECT d.incident_id, d.correlation_key, i.severity, "
+                "i.subject_json "
+                "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+                "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+                "AND d.correlation_key LIKE 'signal:%'",
+                (now - _TOLERANCE_WINDOW,)).fetchall()
+        finally:
+            db.close()
+        # Distinct INCIDENTS, not dismissal rows: transition_incident writes one
+        # row per finding category, so a two-category incident would otherwise
+        # look like two verdicts and grant tolerance an exposure early.
+        verdicts = {r["incident_id"] for r in rows
+                    if _incident_identity(r)[0] == ident}
+        if len(verdicts) != _TOLERANCE_MIN_VERDICTS:
+            return None
+        return ident, len(verdicts)
+    except Exception as e:
+        log_run("tolerance-escalation check failed: %s" % e)
+        return None
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "scan"
     if cmd == "scan":
@@ -23702,6 +23893,17 @@ def main(argv):
     if cmd == "preflight":  # installer-only
         return cmd_preflight()
     if cmd == "mark-uninstalled":  # uninstaller-only
+        # Gated for the same reason as `uninstall`, and more urgently: this is
+        # the disarm WITHOUT the uninstall — one command that permanently
+        # silences self:agent:removed while the agent is still registered.
+        # uninstall.sh calls it with `|| true`, so a refusal there leaves
+        # selfstate saying "installed" and the removal alarm ARMED: a false
+        # alarm the operator can see, which is the correct way to fail.
+        if not _authorize_blinding_cli(
+                "mark-uninstalled",
+                "Disarm the alarm that fires when the Aegis agent is removed",
+                "self:agent:removed stops being reportable on this machine"):
+            return 1
         return cmd_mark_uninstalled()
     if cmd == "incidents":
         if len(argv) > 2 and argv[2] == "families":
@@ -23716,8 +23918,39 @@ def main(argv):
         return cmd_incident(argv[2], argv[3] if len(argv) > 3 else None,
                             argv[4] if len(argv) > 4 else None)
     if cmd == "learn":
+        sub = argv[2] if len(argv) > 2 else "status"
+        if sub in ("start", "extend"):
+            try:
+                days = int(argv[3]) if len(argv) > 3 else _LEARNING_DEFAULT_DAYS
+            except ValueError:
+                days = 0
+            # A request that blinds nothing costs no dialog: days <= 0 and an
+            # unparseable count fall through to cmd_learn's usage error with
+            # behaviour byte-identical to before.
+            if days > 0 and not _authorize_blinding_cli(
+                    "learn " + sub,
+                    "Stop alerting on non-CRITICAL findings for %d day(s)"
+                    % days,
+                    "every non-CRITICAL finding opens pre-closed as "
+                    "'learning' until %s"
+                    % time.strftime("%Y-%m-%d",
+                                    time.localtime(_epoch() + days * 86400))):
+                return 1
         return cmd_learn(argv)
     if cmd == "intent":
+        # `intent hook` stays ungated on purpose: it is the editor's post-write
+        # hook, non-interactive by construction, and it only ever attests the
+        # path the harness reports it just wrote. `intent record` is the
+        # hand-typed one, and it will mint a self-attested custody grade for
+        # ANY path handed to it — ~/.aegis/aegis.py included, which downgrades
+        # a payload swap of the monitor itself to "the operator wrote this".
+        if len(argv) > 3 and argv[2] == "record":
+            if not _authorize_blinding_cli(
+                    "intent record",
+                    "Attest this file as written by you, deliberately",
+                    "%s — a change to it will grade as self-attested custody "
+                    "instead of unexplained" % argv[3]):
+                return 1
         return cmd_intent(argv)
     if cmd == "signers":
         return cmd_signers(argv)
@@ -23740,10 +23973,27 @@ def main(argv):
             return 1
         return cmd_attck(days)
     if cmd == "baseline":
+        if not _authorize_blinding_cli(
+                "baseline",
+                "Adopt everything currently persisting on this machine as "
+                "known-good",
+                "the persistence set as it stands RIGHT NOW becomes the "
+                "baseline, and any standing tamper accusation is cleared"):
+            return 1
         return cmd_baseline()
     if cmd == "baseline-unverified":  # installer-only: adopt, never bless
         return cmd_baseline(trust="unverified")
     if cmd == "allow" and len(argv) > 2:
+        # The blast radius is named BEFORE the write because the argument does
+        # not reveal it: the match is a SUBSTRING of the finding's path, so
+        # `allow /` silences every path-bearing finding in the report.
+        pending = _allow_matches(argv[2])
+        if pending and not _authorize_blinding_cli(
+                "allow",
+                "Permanently silence %d current finding(s)" % len(pending),
+                "every finding whose path contains %r stops being reported "
+                "at all" % argv[2]):
+            return 1
         return cmd_allow(argv[2])
     if cmd == "vt" and len(argv) > 2:
         return cmd_vt(argv[2])
@@ -23756,7 +24006,17 @@ def main(argv):
         # stage's enablement (not yet built) is what gets the one-time code.
         return cmd_autoprotect(argv[2] if len(argv) > 2 else "status")
     if cmd == "canary":
-        return cmd_canary(argv[2] if len(argv) > 2 else "plant")
+        action = argv[2] if len(argv) > 2 else "plant"
+        if action == "remove":
+            planted = len(load_json(CANARY_STATE, {}))
+            if planted and not _authorize_blinding_cli(
+                    "canary remove",
+                    "Disarm the ransomware tripwire",
+                    "%d canary file(s) get deleted; their modification or "
+                    "deletion is the CRITICAL signal that stops firing"
+                    % planted):
+                return 1
+        return cmd_canary(action)
     if cmd == "watch":
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
     if cmd == "install":
@@ -23771,6 +24031,12 @@ def main(argv):
             return 1
         return cmd_install(mode, secs)
     if cmd == "uninstall":
+        if not _authorize_blinding_cli(
+                "uninstall",
+                "Stop the background monitor and disarm its removal alarm",
+                "nothing scans on a schedule after this, and "
+                "self:agent:removed stops being reportable"):
+            return 1
         return cmd_uninstall()
     if cmd == "setup":
         return cmd_setup()
