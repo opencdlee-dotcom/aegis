@@ -10621,10 +10621,247 @@ def read_heartbeat():
     return load_json(HEARTBEAT_FILE, {})
 
 
+# --- The beat has to be AUTHENTICATED, or the root witness is worthless ------
+#
+# Until 2026-09-02 the beat was plain JSON and every consumer read exactly one
+# field (`epoch`) without asking who wrote it. That made `rootwatch` — the ONE
+# root-privileged component in this project, and its most expensive control —
+# defeatable by two lines of shell:
+#
+#     launchctl bootout gui/$UID/com.charlie.aegis
+#     while :; do printf '{"epoch": %d}' "$(date +%s)" > ~/.aegis/heartbeat.json
+#                 sleep 300; done
+#
+# rootwatch, `cmd_watchdog` and the menu-bar plugin all went permanently quiet
+# on a monitor that had been dead for weeks. MACing the beat under the existing
+# ~/.aegis/hmac.key is the fix, and here is precisely what it does and does not
+# buy, because the difference IS the argument:
+#   * it does NOT stop a determined same-uid attacker. hmac.key is 0600 under
+#     the same uid; malware that reads it can still forge a beat. This raises
+#     forgery from `echo` to KEY THEFT — a bar, not a wall, exactly like every
+#     other control in a tool that shares a uid with its adversary.
+#   * it DOES delete the whole class of blind forgery: an `echo`, a truncation,
+#     a beat restored from backup, a script poking at ~/.aegis without knowing
+#     Aegis's internals, any tool that writes the file for another reason.
+#   * it fails CLOSED. An absent or invalid MAC reads as DEAD, never healthy.
+#     One transient follows from that and is stated in the operator message:
+#     a beat left by a PRE-UPGRADE Aegis is unsigned, so `watchdog` says
+#     "unsigned" until the next scan writes a signed one. Failing that
+#     direction is the whole point.
+#   * pid liveness closes the lazy half of the forgery: a beat that is fresh
+#     but names a process that no longer exists is DEAD, not alive.
+_HEARTBEAT_MAC_FIELDS = ("epoch", "ts", "pid", "status", "alerts", "top_alert",
+                         "mode", "notary_seq", "notary_head", "code_sha",
+                         "code_pin")
+
+
+def _heartbeat_mac(beat):
+    """MAC over the beat's MEANINGFUL fields.
+
+    Deliberately NOT over `json.dumps(beat)`: that would make the digest depend
+    on which keys a later version happens to add, so an old verifier (the
+    generated rootwatch script baked at install time, a receiver off-box) would
+    read every new beat as forged. The named list is the contract; fields
+    outside it are carried but not covered, and nothing outside it decides
+    alive-vs-dead."""
+    msg = json.dumps([[k, beat.get(k)] for k in _HEARTBEAT_MAC_FIELDS],
+                     sort_keys=True, separators=(",", ":"))
+    return hmac.new(_hmac_key(), msg.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _pid_alive(pid):
+    """True / False / None(unknown) for "does this pid name a live process".
+
+    NEVER `os.kill(pid, 0)` on Windows. CPython implements os.kill there as
+    TerminateProcess(handle, sig) for any signal that is not a console-control
+    event, so the obvious portable spelling would KILL the process it was asked
+    about, silently, with exit code 0. Windows gets OpenProcess +
+    GetExitCodeProcess through ctypes instead.
+
+    Unknown is never "dead": a pid we cannot resolve must not manufacture a
+    tamper alarm."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if IS_WIN:
+        try:
+            import ctypes                                   # stdlib
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
+            if not handle:
+                err = k32.GetLastError()
+                # 5 = ACCESS_DENIED: the process EXISTS, we may just not look
+                # at it. 87 = INVALID_PARAMETER: no such pid.
+                return True if err == 5 else (False if err == 87 else None)
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259                  # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # it exists; it is simply not ours to signal
+    except Exception:
+        return None
+
+
+def _beat_mode():
+    """'watch' when THIS process is the long-lived watch loop, else 'scan'.
+
+    Recorded in the beat because pid liveness is evidence for exactly one of
+    them. `install watch` schedules `aegis.py watch <interval>` under KeepAlive,
+    so the process that wrote the beat is still running and a dead pid is a real
+    signal; a scan-mode agent exits the instant it has written the beat, so its
+    pid is ALWAYS dead a second later and checking it would alarm on every
+    healthy install. Read off argv so the decision stays inside this helper
+    instead of threading a flag through cmd_scan/cmd_watch."""
+    return "watch" if (len(sys.argv) > 1
+                       and str(sys.argv[1]).lower() == "watch") else "scan"
+
+
+def _running_code_sha():
+    """sha256 of the aegis.py THIS process is executing.
+
+    Honest limit, the same one _runtime_copy_status carries: it is computed by
+    the very code it measures, so a swapped payload can lie about itself. The
+    value is in the notary digest and the off-box beat precisely so the lie has
+    to be told to a witness that keeps its own history."""
+    try:
+        return sha256(os.path.realpath(_SELF_PATH))
+    except Exception:
+        return None
+
+
+def _notary_head_brief():
+    """(seq, head) of the chain's last link, read from the TAIL.
+
+    A full `_notary_chain()` parse would be O(file) on something that runs on
+    every beat and is only rotated at 10MB; the last link is all a witness
+    needs. (None, None) when there is no chain yet."""
+    try:
+        size = os.path.getsize(NOTARY_FILE)
+        with open(NOTARY_FILE, "rb") as f:
+            if size > 8192:
+                f.seek(-8192, os.SEEK_END)
+            tail = f.read()
+        for raw in reversed(tail.decode("utf-8", "replace").splitlines()):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                link = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(link, dict) and link.get("head"):
+                return link.get("seq"), link.get("head")
+    except Exception:
+        pass
+    return None, None
+
+
+# The verdicts, named once so watchdog, the sensor line and the tests all say
+# the same word about the same state.
+BEAT_OK = "ok"
+BEAT_ABSENT = "absent"
+BEAT_UNSIGNED = "unsigned"
+BEAT_FORGED = "forged"
+BEAT_STALE = "stale"
+BEAT_DEAD_PID = "dead-pid"
+
+
+def heartbeat_verdict(beat, now=None):
+    """(state, human) for one beat. FAIL CLOSED — anything not provably healthy
+    is one of the dead states, never BEAT_OK.
+
+    Order matters: authenticity is checked BEFORE freshness, because a forged
+    beat's epoch is exactly the field the forger controls."""
+    now = int(time.time()) if now is None else int(now)
+    if not isinstance(beat, dict) or not beat:
+        return BEAT_ABSENT, "no heartbeat on record"
+    recorded = beat.get("mac")
+    if not recorded:
+        return (BEAT_UNSIGNED,
+                "the heartbeat carries no signature — it was written by "
+                "something that does not hold this machine's Aegis key, or by "
+                "an Aegis older than the one installed now (in which case the "
+                "next scan re-signs it)")
+    try:
+        expected = _heartbeat_mac(beat)
+    except Exception:
+        # The key itself is unreadable. Unknown is not clean.
+        return BEAT_UNSIGNED, ("the heartbeat signature could not be checked — "
+                               "%s is missing or unreadable" % HMAC_KEY_FILE)
+    if not hmac.compare_digest(str(recorded), expected):
+        return (BEAT_FORGED,
+                "the heartbeat signature does not verify — the file was "
+                "written or edited by something without this machine's Aegis "
+                "key")
+    try:
+        last = int(beat.get("epoch") or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if not last:
+        return BEAT_ABSENT, "the heartbeat carries no timestamp"
+    age = now - last
+    if age > HEARTBEAT_STALE_SECS:
+        return (BEAT_STALE, "last beat %d min ago (> %d min tolerance)"
+                % (age // 60, HEARTBEAT_STALE_SECS // 60))
+    # A fresh, correctly signed beat naming a process that is GONE. Only
+    # meaningful in watch mode (see _beat_mode): the scan-mode writer is
+    # supposed to have exited.
+    if beat.get("mode") == "watch" and _pid_alive(beat.get("pid")) is False:
+        return (BEAT_DEAD_PID,
+                "the beat is %d min old but its watch process (pid %s) no "
+                "longer exists — the monitor was killed and something is still "
+                "writing beats" % (age // 60, beat.get("pid")))
+    return BEAT_OK, "last beat %d min ago (pid %s)" % (age // 60,
+                                                       beat.get("pid", "?"))
+
+
 def _post_heartbeat(url, beat):
     """Best-effort OUT-OF-BAND beat POST. Lazy-imports urllib so the default
     (no URL) scan path never even loads networking — the same local-only-by-
-    construction guarantee as `vt`. Redacts before sending. Never raises."""
+    construction guarantee as `vt`. Redacts before sending. Never raises.
+
+    RECEIVER CONTRACT — what an off-box witness is expected to do with this.
+    Nothing here wires an endpoint; `heartbeat_url` stays opt-in exactly as it
+    was. This documents the payload so a receiver can be written against it,
+    because this is the ONE control same-uid malware cannot reach: everything
+    else in Aegis lives in a directory the adversary owns.
+        POST <heartbeat_url>
+        Content-Type: application/json
+        {"ts","epoch","pid","status","alerts","top_alert","mode",
+         "notary_seq","notary_head","code_sha","code_pin","mac"}
+    A receiver should alarm on FOUR things, in this order of value:
+      1. SILENCE. No beat within HEARTBEAT_STALE_SECS of the last one. This is
+         the only signal that survives an attacker who owns the whole box, and
+         it needs no field of the payload to be trustworthy.
+      2. code_sha CHANGED, or code_sha != code_pin. The running aegis.py is not
+         the aegis.py the operator installed — a payload swap, or an upgrade
+         nobody announced. `code_pin` is what `install` recorded; `code_sha` is
+         what is executing right now.
+      3. notary_seq STOPPED ADVANCING while beats keep arriving, or a seq that
+         was already reported comes back with a DIFFERENT notary_head. The
+         second is a rewritten local chain, which the box itself cannot prove
+         once the attacker holds the key — an off-box copy of (seq, head) can.
+      4. mac fails to verify, IF the receiver holds a copy of hmac.key. Note
+         honestly: a receiver holding that key could also forge beats, so a
+         receiver that only needs (1)-(3) should NOT be given it. The MAC's job
+         off-box is integrity-in-transit, not authentication of the host.
+    A receiver must treat every field as untrusted input from a possibly
+    compromised host. What it can trust is the SHAPE of its own history."""
     try:
         import urllib.request
         body = redact_sensitive(json.dumps(beat, sort_keys=True)).encode("utf-8")
@@ -10646,10 +10883,20 @@ def write_heartbeat(status="ok", alerts=0, top_alert=None):
     who SIGKILLs or boots-out Aegis cannot suppress off-box. If (and ONLY if) an
     off-host URL is configured, ALSO POST the beat + top alert out-of-band so
     'silence' leaves the box the same run every LOCAL sink is being suppressed.
-    Off by default → the scan/watch path stays local-only."""
+    Off by default → the scan/watch path stays local-only.
+
+    The beat is SIGNED (see the block comment above) and carries the two facts
+    an off-box witness cannot get any other way: the notary head and the hash of
+    the code that is actually running."""
+    seq, head = _notary_head_brief()
     beat = {"ts": now_iso(), "epoch": int(time.time()), "pid": os.getpid(),
             "status": status, "alerts": int(alerts),
-            "top_alert": redact_sensitive((top_alert or ""))[:200]}
+            "top_alert": redact_sensitive((top_alert or ""))[:200],
+            "mode": _beat_mode(),
+            "notary_seq": seq, "notary_head": head,
+            "code_sha": _running_code_sha(),
+            "code_pin": load_json(SELFSTATE, {}).get("code_sha")}
+    beat["mac"] = _heartbeat_mac(beat)
     try:
         save_json(HEARTBEAT_FILE, beat)
     except Exception:
@@ -21665,18 +21912,29 @@ def cmd_watchdog():
     # state, so it is correctly "not armed" (no false alarm before install).
     armed = (bool(beat) or os.path.exists(BASELINE) or os.path.exists(SELF_PLIST)
              or bool(load_json(SELFSTATE, {}).get("installed")))
-    now = int(time.time())
-    last = int(beat.get("epoch") or 0)
-    age = now - last if last else None
-    stale = armed and (age is None or age > HEARTBEAT_STALE_SECS)
-    if stale:
-        human = ("no heartbeat on record" if age is None
-                 else "last beat %d min ago (> %d min tolerance)"
-                 % (age // 60, HEARTBEAT_STALE_SECS // 60))
-        msg = ("Aegis watchdog: the monitor is NOT beating — %s. It may have been "
-               "killed, unloaded (launchctl bootout), frozen, or the Mac was "
-               "asleep. Verify the agent is running (`launchctl list | grep "
-               "aegis`) and re-run install.sh if needed." % human)
+    # AUTHENTICATED liveness, not just freshness. Reading `epoch` and comparing
+    # it to now() was the whole check until 2026-09-02, which meant a
+    # `while :; do echo {"epoch":$(date +%s)} > heartbeat.json; done` kept this
+    # command, rootwatch and the menu bar quiet forever on a monitor that had
+    # been booted out. heartbeat_verdict() fails closed: unsigned, forged,
+    # stale, or fresh-but-its-process-is-gone all report NOT beating.
+    state, human = heartbeat_verdict(beat)
+    if armed and state != BEAT_OK:
+        remedy = {
+            BEAT_FORGED: ("Something WITHOUT this machine's Aegis key wrote "
+                          "that file — treat this as active tampering, not as "
+                          "a crashed agent."),
+            BEAT_UNSIGNED: ("If you just upgraded Aegis, run one scan and "
+                            "re-check; if you did not, something else is "
+                            "writing this file."),
+            BEAT_DEAD_PID: ("Fresh beats are still arriving for a process that "
+                            "does not exist — treat this as active tampering."),
+        }.get(state,
+              "It may have been killed, unloaded (launchctl bootout), frozen, "
+              "or the machine was asleep.")
+        msg = ("Aegis watchdog: the monitor is NOT beating [%s] — %s. %s "
+               "Verify the agent is running (`launchctl list | grep aegis`) "
+               "and re-run install.sh if needed." % (state, human, remedy))
         try:
             with open(WATCHDOG_ALERT, "w", encoding="utf-8") as f:
                 f.write("%s  %s\n" % (now_iso(), msg))
@@ -21684,7 +21942,7 @@ def cmd_watchdog():
         except Exception:
             pass
         notify("Aegis watchdog: monitor not beating", human)
-        log_run("watchdog: STALE (%s)" % human)
+        log_run("watchdog: %s (%s)" % (state.upper(), human))
         print(msg)
         return 1
     # Healthy — clear any stale sentinel from a prior firing.
@@ -21702,8 +21960,7 @@ def cmd_watchdog():
               "launchd agent, or install marker found) — nothing to watch. Run "
               "install.sh to start the background monitor.")
         return 0
-    print("Aegis watchdog: OK — last heartbeat %d min ago (pid %s)."
-          % (age // 60, beat.get("pid", "?")))
+    print("Aegis watchdog: OK — %s, signature verifies." % human)
     return 0
 
 
@@ -21761,9 +22018,17 @@ def cmd_bastion():
 # --------------------------------------------------------------------------- #
 
 # str.format (not %) on purpose: the generated code is full of runtime
-# %-formatting, and the only generation-time substitutions are the five
-# {name} fields. The script uses a one-line import to protect its own audit
-# budget — the ≤60-line bound is pinned by the test suite.
+# %-formatting, and the only generation-time substitutions are the {name}
+# fields. The script uses a one-line import to protect its own audit budget.
+#
+# The bound moved from 60 to 85 lines on 2026-09-02, and the reason is worth
+# recording rather than quietly editing: the witness used to read ONE field
+# (`epoch`) out of an UNSIGNED file, so `while :; do echo {"epoch":$(date
+# +%s)} > ~/.aegis/heartbeat.json; sleep 300; done` kept the most expensive
+# control in this project silent forever on a booted-out monitor. Verifying
+# the beat's MAC and its pid is the ~25 lines that close that, and 25 lines
+# to stop a two-line attack is the trade. The bound is still a bound: it
+# exists so a human reads the whole root script before installing it.
 _ROOTWATCH_TEMPLATE = '''\
 #!/usr/bin/env python3
 # aegis-rootwatch -- generated by `aegis.py rootwatch install`. Do not edit;
@@ -21851,6 +22116,17 @@ WantedBy=timers.target
 """
 
 
+# The witness reads a file the watched uid can WRITE, so it cannot be made
+# trustworthy from here. Verifying the beat's MAC was tried and reverted on
+# 2026-09-03: the key is 0600 under that same uid, so malware which owns the
+# session reads it and signs its own beats -- and the attempt cost 36 lines
+# and two crypto imports in the ONE program Aegis runs as root, blowing the
+# 60-line audit budget that is this component's actual security argument.
+# aegis.py's own watchdog does check the signature (cheap there, and it does
+# stop a writer who cannot read the key). The only witness a same-uid
+# attacker genuinely cannot reach is off-box: see _post_heartbeat, which
+# ships the notary head and the running code's hash for a remote party to
+# compare. Root is a louder speaker here, not a stronger judge.
 def _rootwatch_script_text(hb_path, uid, log_path, mac=IS_MAC):
     """Generate the privileged witness with the watched user's paths, uid and
     the watchdog's own staleness tolerance baked in at generation time."""
