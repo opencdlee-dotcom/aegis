@@ -104,15 +104,25 @@ class TestLaunchdLoadedCheck(Sandbox):
     """A registered-but-unloaded agent is exactly what `launchctl bootout`
     leaves behind, and it is silent: the plist on disk still parses."""
 
+    def setUp(self):
+        Sandbox.setUp(self)
+        # The real `run` is captured ONCE, here. Saving it inside the stub
+        # helper looked equivalent and was not: a test that stubs twice
+        # (test_an_unreadable_answer_... stubs three times) overwrote the saved
+        # value with the PREVIOUS STUB, and the cleanup lambda read the
+        # attribute at cleanup time, so aegis.run was restored to a stub and
+        # stayed stubbed for the rest of the session. That leaked into 27
+        # unrelated tests in the full run while every file passed alone.
+        self._real_run = aegis.run
+        self.addCleanup(setattr, aegis, "run", self._real_run)
+
     def _run_stub(self, out="", err="", rc=0):
         calls = []
 
         def fake_run(cmd, **kw):
             calls.append(cmd)
             return out, err, rc
-        self._saved_run = aegis.run
         aegis.run = fake_run
-        self.addCleanup(lambda: setattr(aegis, "run", self._saved_run))
         return calls
 
     def test_a_loaded_agent_is_silent(self):
