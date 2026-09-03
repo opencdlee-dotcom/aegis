@@ -14542,6 +14542,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("process", check_processes, ()),
         ("behavior", check_behavior, ()),
         ("shell-history", check_shell_history, ()),
+        ("clipboard", check_clipboard, ()),
         ("hot-dir", check_hot_dirs, ()),
         ("staging", check_staging, ()),
         ("supply-chain", check_supply_chain, ()),
@@ -21145,6 +21146,64 @@ def _clipboard_write(text):
 _CLIP_INERT = ("# Aegis blocked a clipboard command that matched a known "
                "attack pattern.\n# Restore the original with: aegis.py "
                "clipboard restore %s")
+
+
+CLIPBOARD_WATCH_KEY = "clipboard_watch"
+
+
+def check_clipboard():
+    """The pre-EXECUTION checkpoint, and the only one Aegis has.
+
+    clipboard_grammar and cmd_clipboard have been complete and tested since
+    they were written, and `clipboard` was never in this table -- so the check
+    fired only when a human typed it, which is exactly when they are least
+    likely to be under a ClickFix paste attack. This file names that class as
+    the dominant macOS initial-access vector; every other sensor here observes
+    a payload that has already run.
+
+    PRIVACY IS THE REASON THIS IS NARROW, not an afterthought. cmd_clipboard
+    already refuses to log, hash or persist a clipboard that matches nothing --
+    "password managers put secrets here; a security tool that quietly journals
+    every clipboard it sees has become the thing it defends against". A scan
+    sensor must keep that promise while writing to findings.jsonl and the
+    event store, so:
+
+      · only the CERTAIN tier emits. The suspect tier exists for lines with a
+        legitimate reading (rustup's installer is the canonical example), and
+        persisting those would journal ordinary clipboard use one benign
+        finding at a time.
+      · the fingerprint is a hash of the normalised text, so recurrence and
+        dedup work without the identity revealing the content.
+      · the preview is redacted with the same scrubber every durable writer
+        here uses, and capped.
+      · a no-match scan writes nothing at all, which is the overwhelmingly
+        common case.
+
+    Opt out with "clipboard_watch": false in config.json. Absent on a platform
+    with no unprivileged reader -- absent, not degraded, because there is
+    nothing wrong with such a host.
+    """
+    if _aegis_config().get(CLIPBOARD_WATCH_KEY) is False:
+        return []
+    text = _clipboard_read()
+    if text is None:
+        return []
+    tier, hits = clipboard_grammar(text)
+    if tier != "certain":
+        return []
+    preview = redact_sensitive(re.sub(r"\s+", " ", text.strip()))[:120]
+    digest = hashlib.sha256(
+        re.sub(r"\s+", " ", text.strip()).encode("utf-8", "replace")
+    ).hexdigest()[:16]
+    return [finding(
+        "HIGH", "clipboard", "Clipboard holds a paste-to-execute payload",
+        "The clipboard matched %s. This is the ClickFix shape: content staged "
+        "to be pasted into a terminal and run before it can be read. It has "
+        "NOT executed yet. Inspect with `aegis.py clipboard`, neutralise with "
+        "`aegis.py clipboard guard` (reversible: `clipboard restore`). "
+        "Preview: %s" % (", ".join(hits), preview),
+        "clipboard:certain:%s" % digest,
+        confidence="high", markers=["clipboard-paste-exec"] + list(hits))]
 
 
 def cmd_clipboard(action="check"):
