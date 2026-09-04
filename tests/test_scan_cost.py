@@ -26,8 +26,19 @@ class TestSummaryArithmetic(unittest.TestCase):
     def test_abstains_below_two_samples(self):
         self.assertIsNone(aegis._scan_cost_summary([]))
         self.assertIsNone(aegis._scan_cost_summary([(1000, 5000, 2000)]))
-        self.assertIsNone(aegis._scan_cost_summary([(1000, 5000, 2000),
-                                                    (1000, 5000, 2000)]))
+
+    def test_two_scans_in_one_second_are_a_window_not_an_abstention(self):
+        # occurred_at is whole seconds, so two scans inside one of them used to
+        # measure a zero span and abstain. Two samples is not "below two":
+        # that read "no history yet" on every host fast enough to scan twice in
+        # a second -- Linux CI did, macOS did not, from the same two scans --
+        # and it muted the loudest reading there is. Two scans costing 2 s of
+        # CPU inside a 1 s window are 200% of it, and doctor has to say so.
+        s = aegis._scan_cost_summary([(1000, 5000, 1000), (1000, 5000, 1000)])
+        self.assertIsNotNone(s)
+        self.assertEqual(2, s["scans"])
+        self.assertAlmostEqual(200.0, s["share_pct"])
+        self.assertGreater(s["share_pct"], aegis.SCAN_CPU_CEILING_PCT)
 
     def test_percentiles_mean_and_share(self):
         # Ten hourly scans, 4 s wall each except one 10 s outlier, 1.8 s CPU

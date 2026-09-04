@@ -5346,9 +5346,16 @@ def _scan_cost_summary(samples):
     samples = sorted(samples)
     if len(samples) < 2:
         return None
-    span = samples[-1][0] - samples[0][0]
-    if span <= 0:
-        return None
+    # occurred_at carries one-second resolution, so two scans inside the same
+    # second measure a span of zero. That is a real observation window read
+    # through a coarse clock, not a missing one — and bailing to None there
+    # reported "no history yet" on exactly the hosts fast enough to scan twice
+    # in a second (which is how this line read green on Linux CI and populated
+    # on macOS from the same two scans). Worse, it blinded the case the line
+    # exists to catch: back-to-back scans are ~100% of their own window, so the
+    # share is over any ceiling and doctor has to say so. Floor the span at the
+    # clock's own resolution rather than discarding the observation.
+    span = max(samples[-1][0] - samples[0][0], 1)
     walls = sorted(s[1] for s in samples)
 
     def pct(q):
