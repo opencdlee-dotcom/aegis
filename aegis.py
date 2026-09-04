@@ -3925,6 +3925,19 @@ def _accumulate_risk(db, now, new_ids):
             continue
         entity = _canon_entity_path(entity)
         category = f.get("category") or ""
+        # Shell-history findings never accumulate. Their entity is the history
+        # FILE, which is shared infrastructure exactly like the interpreters
+        # excluded above: every unrelated command the operator types lands in
+        # it, so three ordinary `curl`s inside one window summed past the
+        # threshold on a file no attacker touched (live incident #321 — all
+        # four "hostile" commands were the operator's own dev work). The
+        # signal each command carries is a CORRELATION leg by design — a real
+        # ClickFix paste fires the chain against the process/persistence it
+        # spawns, or stands alone at HIGH — and distinct benign commands
+        # corroborating each other is the one thing this tier must not read
+        # as a pile-up.
+        if category == "shell-history":
+            continue
         w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
              * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7)
              * demote.get(category, 1.0)
@@ -3947,6 +3960,31 @@ def _accumulate_risk(db, now, new_ids):
         # destinations was scoring one fresh signal per scan forever and could
         # reach the threshold on churn alone (_recurrence_identity).
         fp = _recurrence_identity(f)
+        rung = f.get("custody") or f.get("provenance") or ""
+        prog = _beacon_class_program(fp)
+        if prog and rung in _SELF_CUSTODY + _VOUCHED_CUSTODY:
+            # The endpoint-class fold keeps the port because "a program that
+            # starts talking on a new one is a new fact" — but a P2P client
+            # varies address AND port by design, so Syncthing's peers minted
+            # one fresh distinct signal per port and volume alone crossed the
+            # threshold THROUGH the 0.25 custody discount (live incident
+            # #310: score 11.3 on a binary whose Homebrew receipt was on
+            # disk). When custody has already proven the program's ORIGIN,
+            # its endpoint churn is not corroboration: fold every beacon to
+            # the one broad class, so it contributes at most ONE signal and
+            # still corroborates other sensors. A payload nobody installed
+            # has no receipt and keeps per-port counting exactly as before.
+            fp = "beacon:%s:#ip:#port" % prog
+        else:
+            # Same-fact content churn: a process/persistence/agent-surface
+            # fingerprint embeds the observed content hash, so the operator's
+            # own file re-edited N times scored as N distinct signals piling
+            # up. Recurring content on ONE subject is the same fact seen
+            # again, not corroboration — count it under the same generalized
+            # identity acquired tolerance already keys on. Facts that carry
+            # no hash (and every never-tolerate sensor) fold to None and keep
+            # their exact fingerprint.
+            fp = _tolerance_identity(fp) or fp
         if fp in b["fps"]:
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
@@ -17459,6 +17497,28 @@ def _accept_into_baseline(incident_ids):
             "SELECT correlation_key FROM incidents WHERE id IN (%s)" % marks,
             tuple(incident_ids)).fetchall()
             if (row[0] or "").startswith("signal:")}
+        # A correlation key is the CASE fingerprint — hashless, one per
+        # subject — while the diff below emits the exact per-content
+        # fingerprint. Matching only the exact form meant acceptance silently
+        # accepted NOTHING for any case-keyed incident (every real
+        # persistence:changed on the live store), and the verdict bought a
+        # dismissal while the sensor kept re-asserting the fact forever. The
+        # evidence set restores the bytes-you-reviewed guard the exact match
+        # was carrying: the live diff must reproduce a fingerprint that was
+        # actually recorded on a verdicted incident, so a mutation newer than
+        # the reviewed evidence is refused and stands as its own fact.
+        reviewed = set()
+        for row in db.execute(
+                "SELECT e.data_json FROM events e JOIN incident_events ie "
+                "ON ie.event_id=e.id WHERE ie.incident_id IN (%s) "
+                "AND e.event_type='observation.finding'" % marks,
+                tuple(incident_ids)):
+            try:
+                fp = json.loads(row[0]).get("fingerprint")
+            except Exception:
+                continue
+            if fp:
+                reviewed.add(fp)
     finally:
         db.close()
     if not wanted or any(w.startswith(_NEVER_TOLERATE_PREFIXES) for w in wanted):
@@ -17492,7 +17552,9 @@ def _accept_into_baseline(incident_ids):
             # whose backing command could not be read this run.
             continue
         for f in diff_fn(prior, live):
-            if f["fingerprint"] not in wanted:
+            case = f.get("case_fingerprint")
+            if f["fingerprint"] not in wanted and not (
+                    case in wanted and f["fingerprint"] in reviewed):
                 continue
             entry = _accepted_entry_key(f, prior, live)
             if entry is None:
@@ -17510,6 +17572,8 @@ def _accept_into_baseline(incident_ids):
                 prior.pop(entry, None)
             baseline[key] = prior
             wanted.discard(f["fingerprint"])
+            if case:
+                wanted.discard(case)
             accepted.append(entry)
             dirty = True
     if not dirty:
