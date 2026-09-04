@@ -23,10 +23,16 @@ from test_regression import Sandbox  # noqa: E402
 
 # Sensors gather_all schedules on every body.
 PORTABLE = frozenset((
-    "persistence.diff", "process", "behavior", "shell-history", "hot-dir",
-    "staging", "supply-chain", "session-theft", "canary", "latch", "decoy",
-    "assay", "outbound", "web-protection", "hardening", "self-protection",
-    "vouch-store", "paste-guard",
+    "persistence.diff", "process", "behavior", "shell-history", "clipboard",
+    "hot-dir", "staging", "supply-chain", "session-theft", "canary", "latch",
+    "decoy", "assay", "outbound", "web-protection", "hardening",
+    "self-protection", "vouch-store", "paste-guard",
+    # The monitor watching itself, added on main while this roster was being
+    # written on a branch: the notary (until then it ran only when a human
+    # typed `aegis.py notary`) and the event store's integrity check (until
+    # then there was none — a corrupt aegis.db silenced every incident while
+    # findings kept flowing and the report kept reading clean).
+    "notary", "event-store",
 ))
 PLATFORM = {
     "mac": frozenset(("cron", "xprotect", "security-log", "amfid-log")),
