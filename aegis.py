@@ -2852,6 +2852,39 @@ def _store_backup_note():
             % (_duration(age), bak, bak))
 
 
+# A full-page structural check is a DAILY job, not a per-scan one. Watch mode
+# can start a scan every WATCH_MIN_GAP_SECS, so "every scan" meant "every
+# minute" on a store that takes minutes to read.
+INTEGRITY_SCAN_EVERY_SECS = 24 * 3600
+
+
+def _integrity_stamp():
+    return _store_sidecar(".integrity.json")
+
+
+def _integrity_scan_due(now=None):
+    """True when the full structural check has not run inside the cadence.
+    An unreadable or missing stamp means DUE: forgetting when it last ran is
+    not a reason to skip it."""
+    now = int(time.time()) if now is None else int(now)
+    rec = load_json(_integrity_stamp(), None)
+    if not isinstance(rec, dict):
+        return True
+    try:
+        last = int(rec.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return True
+    return (now - last) >= INTEGRITY_SCAN_EVERY_SECS or last > now
+
+
+def _mark_integrity_scanned(now=None):
+    now = int(time.time()) if now is None else int(now)
+    try:
+        save_json(_integrity_stamp(), {"epoch": now, "ts": now_iso()})
+    except Exception:
+        pass          # a missed stamp only costs one extra check next scan
+
+
 def check_store_integrity():
     """Is the event store still a database, and does it still read back?
 
@@ -2863,23 +2896,44 @@ def check_store_integrity():
     no integrity path in the program at all: zero occurrences of quick_check,
     DatabaseError, backup or VACUUM in 23k lines.
 
-    quick_check is the cheap half of integrity_check (it skips the
-    index-vs-table cross-check) and is the right cost for something that runs on
-    every scan. It verifies page structure and says NOTHING about whether the
-    tables this program needs still exist — a dropped table reads as a perfectly
-    healthy database — so a sanity read follows it."""
+    quick_check is the cheap HALF of integrity_check — it skips the
+    index-vs-table cross-check — but cheap is relative to integrity_check, not
+    to a scan: it reads EVERY PAGE of the store. Measured on the reference
+    machine's live 57 MB store, warm: 0.26s. That is not a crisis, and it is
+    honestly not much — but watch mode starts a scan as often as
+    WATCH_MIN_GAP_SECS allows, so "every scan" means re-reading 57 MB roughly
+    once a minute, forever, on a laptop whose agent is otherwise careful
+    enough to run ProcessType Background with LowPriorityIO and nice 10.
+    Re-reading the whole store every minute contradicts that posture for a
+    check whose value is daily at best.
+
+    So the structural check runs on a CADENCE and the cheap checks run every
+    scan. What stays per-scan is what actually catches the failure this sensor
+    exists for: whether the tables read back at all, and the sidecar a failed
+    OPEN leaves behind. A store that corrupts between cadence runs is caught
+    by those on the very next scan — corruption does not hide from a read.
+
+    quick_check verifies page structure and says NOTHING about whether the
+    tables this program needs still exist — a dropped table reads as a
+    perfectly healthy database — so the sanity read is the more valuable half
+    anyway, and it is the half that is cheap."""
     if not os.path.exists(EVENT_DB):
         return []          # fresh install: no store yet is not a failure
     problems, severity = [], "HIGH"
     db = None
     try:
         db = sqlite3.connect(EVENT_DB, timeout=10)
-        row = db.execute("PRAGMA quick_check(1)").fetchone()
-        verdict = str(row[0]) if row else "no answer"
-        if verdict.lower() != "ok":
-            problems.append("PRAGMA quick_check reports: %s" % verdict[:300])
+        if _integrity_scan_due():
+            row = db.execute("PRAGMA quick_check(1)").fetchone()
+            verdict = str(row[0]) if row else "no answer"
+            if verdict.lower() != "ok":
+                problems.append("PRAGMA quick_check reports: %s" % verdict[:300])
+            _mark_integrity_scanned()
         for table in ("incidents", "events", "signals", "meta"):
-            db.execute("SELECT count(*) FROM %s" % table).fetchone()
+            # LIMIT 1, not count(*): this asks "does this table still exist and
+            # read back", which is the question. Counting rows answers a
+            # question nobody asked at the cost of a full table scan.
+            db.execute("SELECT 1 FROM %s LIMIT 1" % table).fetchone()
     except sqlite3.DatabaseError as e:
         problems.append("the store did not read back: %s" % str(e)[:300])
     finally:
@@ -3925,6 +3979,19 @@ def _accumulate_risk(db, now, new_ids):
             continue
         entity = _canon_entity_path(entity)
         category = f.get("category") or ""
+        # Shell-history findings never accumulate. Their entity is the history
+        # FILE, which is shared infrastructure exactly like the interpreters
+        # excluded above: every unrelated command the operator types lands in
+        # it, so three ordinary `curl`s inside one window summed past the
+        # threshold on a file no attacker touched (live incident #321 — all
+        # four "hostile" commands were the operator's own dev work). The
+        # signal each command carries is a CORRELATION leg by design — a real
+        # ClickFix paste fires the chain against the process/persistence it
+        # spawns, or stands alone at HIGH — and distinct benign commands
+        # corroborating each other is the one thing this tier must not read
+        # as a pile-up.
+        if category == "shell-history":
+            continue
         w = (_RISK_SEV_WEIGHT.get(f.get("severity"), 0.0)
              * _RISK_CONF_WEIGHT.get(f.get("confidence", "medium"), 0.7)
              * demote.get(category, 1.0)
@@ -3947,6 +4014,31 @@ def _accumulate_risk(db, now, new_ids):
         # destinations was scoring one fresh signal per scan forever and could
         # reach the threshold on churn alone (_recurrence_identity).
         fp = _recurrence_identity(f)
+        rung = f.get("custody") or f.get("provenance") or ""
+        prog = _beacon_class_program(fp)
+        if prog and rung in _SELF_CUSTODY + _VOUCHED_CUSTODY:
+            # The endpoint-class fold keeps the port because "a program that
+            # starts talking on a new one is a new fact" — but a P2P client
+            # varies address AND port by design, so Syncthing's peers minted
+            # one fresh distinct signal per port and volume alone crossed the
+            # threshold THROUGH the 0.25 custody discount (live incident
+            # #310: score 11.3 on a binary whose Homebrew receipt was on
+            # disk). When custody has already proven the program's ORIGIN,
+            # its endpoint churn is not corroboration: fold every beacon to
+            # the one broad class, so it contributes at most ONE signal and
+            # still corroborates other sensors. A payload nobody installed
+            # has no receipt and keeps per-port counting exactly as before.
+            fp = "beacon:%s:#ip:#port" % prog
+        else:
+            # Same-fact content churn: a process/persistence/agent-surface
+            # fingerprint embeds the observed content hash, so the operator's
+            # own file re-edited N times scored as N distinct signals piling
+            # up. Recurring content on ONE subject is the same fact seen
+            # again, not corroboration — count it under the same generalized
+            # identity acquired tolerance already keys on. Facts that carry
+            # no hash (and every never-tolerate sensor) fold to None and keep
+            # their exact fingerprint.
+            fp = _tolerance_identity(fp) or fp
         if fp in b["fps"]:
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
@@ -8676,7 +8768,19 @@ def snapshot_tcc():
         return {}          # no store for this user: honestly empty
     db = _sqlite_readonly(TCC_USER_DB)
     if db is None:
-        return None        # present but unopenable: DEGRADED
+        # PRIVILEGED, not DEGRADED. The store is itself TCC-protected, so this
+        # exact refusal is the NORMAL answer for the scheduled agent: an
+        # interactive shell with Full Disk Access reads 365 rows on the
+        # reference machine and the launchd agent reads none. That is a
+        # privilege wall, which snapshot_btm already models with this same
+        # value — and calling it DEGRADED made it a permanent HIGH sensor
+        # incident (24 consecutive "failures" within a day of shipping), which
+        # is how an operator learns to ignore the coverage panel.
+        #
+        # A genuine anomaly below — a schema this code cannot read, a query
+        # that raises — is still DEGRADED, because that one is not expected
+        # and is not fixed by granting anything.
+        return SURFACE_PRIVILEGED
     try:
         col = _tcc_auth_column(db)
         if col is None:
@@ -11851,9 +11955,20 @@ def diff_agent_skills(prior, cur):
             why = (" Its instructions tell the agent to CONCEAL its actions — "
                    "no legitimate skill needs that.")
         elif "credential" in marks and "egress" in marks:
-            sev, conf = "HIGH", "high"
+            # MEDIUM, not HIGH, and for the same reason as the first-sight
+            # instruction branch above. Four of the operator's own skills
+            # (canvas-lms, canvas-notebook-grader, gsd-discuss-phase,
+            # nightly-self-improvement) matched this pair on the first scan
+            # after it shipped: a grading skill talks about credentials, a
+            # self-improvement skill talks about pushing. There is no
+            # provenance here to separate "you wrote it" from "it arrived", so
+            # the pair is circumstantial. It stays a durable, correlatable
+            # record; `conceal` above remains the interrupt, because nothing
+            # legitimate tells an agent to hide what it did.
+            sev, conf = "MEDIUM", "medium"
             why = (" Its instructions reference credential locations AND an "
-                   "outbound channel — the stealer shape.")
+                   "outbound channel — worth reading, though plenty of "
+                   "legitimate skills mention both.")
         elif marks:
             why = (" Its instructions mention: %s." % ", ".join(marks))
         return sev, conf, d, ["agent-skill"] + ["imperative:" + m for m in marks], why
@@ -12136,6 +12251,39 @@ BEAT_STALE = "stale"
 BEAT_DEAD_PID = "dead-pid"
 
 
+def _scheduled_agent_pid():
+    """The pid the SCHEDULER currently runs this agent as, or None.
+
+    None means "no evidence", never "not running": every failure path here —
+    an unparseable answer, a body with no probe, a refusal — has to keep the
+    caller's accusation intact rather than clear it. Only a positive, live pid
+    is allowed to soften a verdict."""
+    if IS_MAC:
+        try:
+            target = "gui/%d/%s" % (os.getuid(), _launchd_label())
+        except AttributeError:
+            return None
+        out, _err, rc = run(["launchctl", "print", target], timeout=10)
+        if rc != 0:
+            return None
+        m = re.search(r"^\s*pid\s*=\s*(\d+)", out or "", re.M)
+        if not m:
+            return None                 # loaded but not currently running
+        pid = int(m.group(1))
+        return pid if _pid_alive(pid) is not False else None
+    if IS_LINUX:
+        out, _err, rc = run(["systemctl", "--user", "show", "aegis.service",
+                             "--property=MainPID", "--value"], timeout=10)
+        try:
+            pid = int((out or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0:
+            return None
+        return pid if _pid_alive(pid) is not False else None
+    return None
+
+
 def heartbeat_verdict(beat, now=None):
     """(state, human) for one beat. FAIL CLOSED — anything not provably healthy
     is one of the dead states, never BEAT_OK.
@@ -12177,10 +12325,34 @@ def heartbeat_verdict(beat, now=None):
     # meaningful in watch mode (see _beat_mode): the scan-mode writer is
     # supposed to have exited.
     if beat.get("mode") == "watch" and _pid_alive(beat.get("pid")) is False:
-        return (BEAT_DEAD_PID,
-                "the beat is %d min old but its watch process (pid %s) no "
-                "longer exists — the monitor was killed and something is still "
-                "writing beats" % (age // 60, beat.get("pid")))
+        # ...UNLESS the scheduler is running a DIFFERENT live agent process.
+        #
+        # Every restart produces this state legitimately: `install`, a launchd
+        # reload, or the KeepAlive respawn that the watch-loop hardening
+        # deliberately relies on. The new process has not completed its first
+        # scan yet, so the last beat still names the old pid — fresh, correctly
+        # signed, and pointing at a corpse.
+        #
+        # Measured on the reference machine 2026-09-04, one minute after a
+        # routine `aegis.py install watch`: the watchdog announced "treat this
+        # as active tampering". That is the loudest false positive this project
+        # can emit, on its most ordinary operation, and it would have taught
+        # the operator to disbelieve the one alarm that means someone is
+        # forging beats.
+        #
+        # A live agent under the scheduler's own label is evidence malware
+        # cannot manufacture without actually running the monitor. Absence of
+        # that evidence keeps the accusation: fail closed is still the rule.
+        live = _scheduled_agent_pid()
+        if live is None or live == beat.get("pid"):
+            return (BEAT_DEAD_PID,
+                    "the beat is %d min old but its watch process (pid %s) no "
+                    "longer exists — the monitor was killed and something is "
+                    "still writing beats" % (age // 60, beat.get("pid")))
+        return (BEAT_OK,
+                "last beat %d min ago from pid %s; the agent has since "
+                "restarted and is running as pid %s — the next scan re-beats"
+                % (age // 60, beat.get("pid"), live))
     return BEAT_OK, "last beat %d min ago (pid %s)" % (age // 60,
                                                        beat.get("pid", "?"))
 
@@ -14610,6 +14782,24 @@ def _first_sight_agent_config(path, rec):
             markers=["agent-surface", "exec", "first-sight"]))
     marks = sorted(rec.get("imperatives") or [])
     sev = _imperative_severity(marks)
+    # FIRST SIGHT has no provenance to lean on, and _imperative_severity was
+    # written for the CHANGED case where it does. There, credential+egress
+    # earns HIGH because git can say whether the operator typed it or a pull
+    # delivered it. Here the file simply exists, and on the scan that first
+    # walks a new surface EVERY pre-existing file is "new" at once.
+    #
+    # Measured on the reference machine the day this shipped: four HIGH
+    # incidents, all of them the operator's own email tool's AGENTS.md and
+    # CLAUDE.md, which discuss credentials and sending mail because that is
+    # what the tool does. A signal whose every instance on this machine is
+    # benign does not train attention, it trains dismissal — the precision
+    # lesson this project already paid for (314 detections, 0 true positives).
+    #
+    # So on first sight only `conceal` keeps HIGH: it is attack-defined and has
+    # no benign reading. credential+egress stays a MEDIUM record — correlatable
+    # and in the report, below the notify floor. The CHANGED path is untouched.
+    if sev == "HIGH" and "conceal" not in marks:
+        sev = "MEDIUM"
     if sev:
         # Same asymmetry as the gained-imperative branch: provenance may only
         # ever ESCALATE content. A directive an injected agent wrote is
@@ -17616,6 +17806,28 @@ def _accept_into_baseline(incident_ids):
             "SELECT correlation_key FROM incidents WHERE id IN (%s)" % marks,
             tuple(incident_ids)).fetchall()
             if (row[0] or "").startswith("signal:")}
+        # A correlation key is the CASE fingerprint — hashless, one per
+        # subject — while the diff below emits the exact per-content
+        # fingerprint. Matching only the exact form meant acceptance silently
+        # accepted NOTHING for any case-keyed incident (every real
+        # persistence:changed on the live store), and the verdict bought a
+        # dismissal while the sensor kept re-asserting the fact forever. The
+        # evidence set restores the bytes-you-reviewed guard the exact match
+        # was carrying: the live diff must reproduce a fingerprint that was
+        # actually recorded on a verdicted incident, so a mutation newer than
+        # the reviewed evidence is refused and stands as its own fact.
+        reviewed = set()
+        for row in db.execute(
+                "SELECT e.data_json FROM events e JOIN incident_events ie "
+                "ON ie.event_id=e.id WHERE ie.incident_id IN (%s) "
+                "AND e.event_type='observation.finding'" % marks,
+                tuple(incident_ids)):
+            try:
+                fp = json.loads(row[0]).get("fingerprint")
+            except Exception:
+                continue
+            if fp:
+                reviewed.add(fp)
     finally:
         db.close()
     if not wanted or any(w.startswith(_NEVER_TOLERATE_PREFIXES) for w in wanted):
@@ -17649,7 +17861,9 @@ def _accept_into_baseline(incident_ids):
             # whose backing command could not be read this run.
             continue
         for f in diff_fn(prior, live):
-            if f["fingerprint"] not in wanted:
+            case = f.get("case_fingerprint")
+            if f["fingerprint"] not in wanted and not (
+                    case in wanted and f["fingerprint"] in reviewed):
                 continue
             entry = _accepted_entry_key(f, prior, live)
             if entry is None:
@@ -17667,6 +17881,8 @@ def _accept_into_baseline(incident_ids):
                 prior.pop(entry, None)
             baseline[key] = prior
             wanted.discard(f["fingerprint"])
+            if case:
+                wanted.discard(case)
             accepted.append(entry)
             dirty = True
     if not dirty:
@@ -18728,11 +18944,31 @@ def cmd_doctor():
     _out_path, err_path = _stdio_log_paths()
     err_tail = _tail_lines(err_path, 8)
     if err_tail:
-        print("  ✗ %-27s %s is not empty — the scheduled job is writing to "
-              "stderr:" % ("scheduled job stderr", err_path))
+        try:
+            err_written = int(os.path.getmtime(err_path))
+        except OSError:
+            err_written = int(time.time())
+        # The freshness rule the crash record ten lines above already applies,
+        # for the same reason it applies there: a stack trace nothing has
+        # touched in months is history, not an open fault. Without it this
+        # check reports on the FILE and not on the JOB — one crash from a
+        # since-fixed bug held doctor red indefinitely on a monitor that was
+        # completing a scan every ten minutes, and a line that is permanently
+        # red is a line nobody reads. Present-tense "is writing" was the tell:
+        # the check never once asked when.
+        fresh = (int(time.time()) - err_written) <= CRASH_FRESH_SECS
+        print("  %s %-27s %s is not empty (last written %s) — the scheduled "
+              "job %s writing to stderr:"
+              % ("✗" if fresh else "i", "scheduled job stderr", err_path,
+                 _ago(err_written), "is" if fresh else "was"))
         for line in err_tail:
             print("      %s" % line[:120])
-        problems.append("scheduled job stderr")
+        if fresh:
+            problems.append("scheduled job stderr")
+        else:
+            print("      Older than %d days, so it is not counted against this "
+                  "verdict; delete it once you have read it."
+                  % (CRASH_FRESH_SECS // 86400))
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))

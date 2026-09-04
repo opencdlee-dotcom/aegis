@@ -52,6 +52,7 @@ _REAL_STATE = os.path.join(os.path.expanduser("~"), ".aegis")
 # Every suppressed write is reported at session end so this stays visible
 # rather than becoming a silently-tolerated leak.
 REAL_RUN_LOG_WRITES = []
+REAL_ANCHOR_WRITES = []
 
 
 def _targets_real_state(path):
@@ -94,6 +95,7 @@ def _forbid_real_state_writes():
     real_save = aegis.save_json
     real_ensure = aegis.ensure_state
     real_log_run = aegis.log_run
+    real_emit_anchor = aegis._notary_emit_anchor
     leaked = []
 
     def _refuse(what, path):
@@ -117,6 +119,23 @@ def _forbid_real_state_writes():
         if _targets_real_state(aegis.STATE_DIR):
             _refuse("aegis.STATE_DIR", aegis.STATE_DIR)
         return real_ensure(*a, **k)
+
+    def guarded_emit_anchor(seq, head):
+        # The notary's OS-log anchor is the one durable artifact a test can
+        # write that lives OUTSIDE ~/.aegis, so no path-based sandbox catches
+        # it: `logger -t aegis-notary` goes to the machine's system log
+        # whatever STATE_DIR says. A sandboxed chain starts at seq=1, so tests
+        # appended anchors for seq 1..3 that CONFLICTED with the operator's
+        # real chain — and the real notary sensor then correctly reported
+        # CRITICAL "a shadow anchor was appended to mask a rewrite".
+        #
+        # Found 2026-09-04, on the live install, by the very sensor added in
+        # the same pass. An anchor is a claim about THIS machine's chain; a
+        # chain living in a temp directory has no business making one.
+        if _targets_real_state(aegis.STATE_DIR):
+            return real_emit_anchor(seq, head)
+        REAL_ANCHOR_WRITES.append((seq, head))
+        return "absent"
 
     def guarded_log_run(msg):
         # Ask where the write would ACTUALLY land, not where the RUN_LOG
@@ -144,6 +163,7 @@ def _forbid_real_state_writes():
     aegis.save_json = guarded_save
     aegis.ensure_state = guarded_ensure
     aegis.log_run = guarded_log_run
+    aegis._notary_emit_anchor = guarded_emit_anchor
     try:
         yield leaked
     finally:
@@ -151,6 +171,7 @@ def _forbid_real_state_writes():
         aegis.save_json = real_save
         aegis.ensure_state = real_ensure
         aegis.log_run = real_log_run
+        aegis._notary_emit_anchor = real_emit_anchor
 
 IS_MAC = sys.platform == "darwin"
 
@@ -335,6 +356,11 @@ def pytest_sessionfinish(session, exitstatus):
     the refusal back into silence. This line is what makes the attempt itself
     reportable, whatever the caller did with the exception.
     """
+    if REAL_ANCHOR_WRITES:
+        sys.stderr.write(
+            "\n%d notary OS-log anchor(s) from sandboxed chains were "
+            "suppressed. Writing them pollutes the machine's real "
+            "tamper-evidence record.\n" % len(REAL_ANCHOR_WRITES))
     if REAL_RUN_LOG_WRITES:
         n = len(REAL_RUN_LOG_WRITES)
         sys.stderr.write(

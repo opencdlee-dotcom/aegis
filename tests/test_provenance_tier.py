@@ -613,6 +613,57 @@ class AcceptedStateIsDurable(unittest.TestCase):
                          "an accepted item must stop being reported at all, "
                          "not be reported and then muted")
 
+    def _open_case_incident(self, finding):
+        """As the scan's incident floor really keys it: the correlation key is
+        the CASE fingerprint (hashless, one per subject), not the per-content
+        fingerprint the diff emits."""
+        db = aegis._event_connection()
+        with db:
+            cur = db.execute(
+                "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+                "data_json) VALUES(?,?,?,?,?)",
+                (self.now, self.now, "persistence", "observation.finding",
+                 aegis.json.dumps(finding)))
+            i = aegis._upsert_incident(
+                db, "signal:" + finding["case_fingerprint"], finding["title"],
+                finding["severity"], "signal", self.now, [cur.lastrowid],
+                subject=finding.get("subject"))
+        db.close()
+        return i
+
+    def test_a_case_keyed_changed_item_promotes_the_reviewed_bytes(self):
+        """The live-store shape acceptance was silently missing. A real
+        persistence:changed incident is keyed on its case fingerprint while
+        the recomputed diff emits the hash-suffixed form, so the exact-match
+        rule accepted NOTHING for it: the verdict bought a dismissal and the
+        sensor re-asserted the fact on every scan forever (incident #319 on
+        the reference machine, 15 evidence events for one reviewed change)."""
+        old = dict(self.rec, sha256="aa" * 32)
+        aegis.save_json(aegis.BASELINE,
+                        {"persistence": {self.path: old}, "created": "x"})
+        f = self._findings()[0]
+        self.assertEqual(f["title"], "Persistence item CHANGED")
+        i = self._open_case_incident(f)
+        self.assertEqual(aegis._accept_into_baseline([i]), [self.path])
+        self.assertEqual(self._findings(), [],
+                         "a verdicted CHANGED item kept being re-asserted")
+
+    def test_a_case_keyed_verdict_never_promotes_an_unreviewed_mutation(self):
+        """The guard the exact match was carrying, kept: the live bytes must
+        reproduce evidence actually recorded on the verdicted incident. A
+        mutation newer than anything reviewed is refused and stands as its
+        own fact — the case key alone must not bless it."""
+        old = dict(self.rec, sha256="aa" * 32)
+        aegis.save_json(aegis.BASELINE,
+                        {"persistence": {self.path: old}, "created": "x"})
+        i = self._open_case_incident(self._findings()[0])
+        self.live[self.path] = dict(self.rec, sha256="bb" * 32)
+        self.assertEqual(aegis._accept_into_baseline([i]), [])
+        self.assertNotEqual(self._findings(), [],
+                            "an unreviewed mutation was blessed by its case "
+                            "key")
+        self.live[self.path] = self.rec
+
     def test_a_change_to_an_accepted_item_still_alerts(self):
         """The safety half, and the reason accepting BYTES rather than a path
         is the whole design: accepting a job must never accept its next
