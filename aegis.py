@@ -15404,14 +15404,22 @@ def diff_git_hooks(prior, cur):
                     "HIGH", "git-surface",
                     "Repo git config redirects core.%s outside the repository"
                     % key,
-                    "%s has core.%s pointing at %s, which is outside the "
+                    "%s has core.%s set to %s%s, which is outside the "
                     "repository.\ncore.hooksPath replaces the whole hook "
                     "directory and core.fsmonitor is executed on EVERY `git "
                     "status` — the command a coding agent runs more than any "
                     "other. Neither is tracked by git, so no review of this "
                     "repo would ever show it. Check it against `git -C %s "
                     "config --local --get core.%s`."
-                    % (repo, key, target, repo, key),
+                    % (repo, key, rec.get(key) or target,
+                       # The RAW configured value is what the command below
+                       # prints, so that is what leads. Showing only the
+                       # resolved path told a Windows operator to compare
+                       # `\tmp\x` against a config holding `/tmp/x` — the
+                       # message contradicted the check it prescribed.
+                       ("" if (rec.get(key) or target) == target
+                        else " (resolves to %s)" % target),
+                       repo, key),
                     "git-surface:escape:%s:%s:%s"
                     % (repo, key, _sha_key(target)),
                     path=repo, program=target, confidence="high",
