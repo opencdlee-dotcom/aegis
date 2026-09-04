@@ -2852,6 +2852,39 @@ def _store_backup_note():
             % (_duration(age), bak, bak))
 
 
+# A full-page structural check is a DAILY job, not a per-scan one. Watch mode
+# can start a scan every WATCH_MIN_GAP_SECS, so "every scan" meant "every
+# minute" on a store that takes minutes to read.
+INTEGRITY_SCAN_EVERY_SECS = 24 * 3600
+
+
+def _integrity_stamp():
+    return _store_sidecar(".integrity.json")
+
+
+def _integrity_scan_due(now=None):
+    """True when the full structural check has not run inside the cadence.
+    An unreadable or missing stamp means DUE: forgetting when it last ran is
+    not a reason to skip it."""
+    now = int(time.time()) if now is None else int(now)
+    rec = load_json(_integrity_stamp(), None)
+    if not isinstance(rec, dict):
+        return True
+    try:
+        last = int(rec.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return True
+    return (now - last) >= INTEGRITY_SCAN_EVERY_SECS or last > now
+
+
+def _mark_integrity_scanned(now=None):
+    now = int(time.time()) if now is None else int(now)
+    try:
+        save_json(_integrity_stamp(), {"epoch": now, "ts": now_iso()})
+    except Exception:
+        pass          # a missed stamp only costs one extra check next scan
+
+
 def check_store_integrity():
     """Is the event store still a database, and does it still read back?
 
@@ -2863,23 +2896,44 @@ def check_store_integrity():
     no integrity path in the program at all: zero occurrences of quick_check,
     DatabaseError, backup or VACUUM in 23k lines.
 
-    quick_check is the cheap half of integrity_check (it skips the
-    index-vs-table cross-check) and is the right cost for something that runs on
-    every scan. It verifies page structure and says NOTHING about whether the
-    tables this program needs still exist — a dropped table reads as a perfectly
-    healthy database — so a sanity read follows it."""
+    quick_check is the cheap HALF of integrity_check — it skips the
+    index-vs-table cross-check — but cheap is relative to integrity_check, not
+    to a scan: it reads EVERY PAGE of the store. Measured on the reference
+    machine's live 57 MB store, warm: 0.26s. That is not a crisis, and it is
+    honestly not much — but watch mode starts a scan as often as
+    WATCH_MIN_GAP_SECS allows, so "every scan" means re-reading 57 MB roughly
+    once a minute, forever, on a laptop whose agent is otherwise careful
+    enough to run ProcessType Background with LowPriorityIO and nice 10.
+    Re-reading the whole store every minute contradicts that posture for a
+    check whose value is daily at best.
+
+    So the structural check runs on a CADENCE and the cheap checks run every
+    scan. What stays per-scan is what actually catches the failure this sensor
+    exists for: whether the tables read back at all, and the sidecar a failed
+    OPEN leaves behind. A store that corrupts between cadence runs is caught
+    by those on the very next scan — corruption does not hide from a read.
+
+    quick_check verifies page structure and says NOTHING about whether the
+    tables this program needs still exist — a dropped table reads as a
+    perfectly healthy database — so the sanity read is the more valuable half
+    anyway, and it is the half that is cheap."""
     if not os.path.exists(EVENT_DB):
         return []          # fresh install: no store yet is not a failure
     problems, severity = [], "HIGH"
     db = None
     try:
         db = sqlite3.connect(EVENT_DB, timeout=10)
-        row = db.execute("PRAGMA quick_check(1)").fetchone()
-        verdict = str(row[0]) if row else "no answer"
-        if verdict.lower() != "ok":
-            problems.append("PRAGMA quick_check reports: %s" % verdict[:300])
+        if _integrity_scan_due():
+            row = db.execute("PRAGMA quick_check(1)").fetchone()
+            verdict = str(row[0]) if row else "no answer"
+            if verdict.lower() != "ok":
+                problems.append("PRAGMA quick_check reports: %s" % verdict[:300])
+            _mark_integrity_scanned()
         for table in ("incidents", "events", "signals", "meta"):
-            db.execute("SELECT count(*) FROM %s" % table).fetchone()
+            # LIMIT 1, not count(*): this asks "does this table still exist and
+            # read back", which is the question. Counting rows answers a
+            # question nobody asked at the cost of a full table scan.
+            db.execute("SELECT 1 FROM %s LIMIT 1" % table).fetchone()
     except sqlite3.DatabaseError as e:
         problems.append("the store did not read back: %s" % str(e)[:300])
     finally:
