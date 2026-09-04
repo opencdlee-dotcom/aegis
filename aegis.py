@@ -8645,7 +8645,19 @@ def snapshot_tcc():
         return {}          # no store for this user: honestly empty
     db = _sqlite_readonly(TCC_USER_DB)
     if db is None:
-        return None        # present but unopenable: DEGRADED
+        # PRIVILEGED, not DEGRADED. The store is itself TCC-protected, so this
+        # exact refusal is the NORMAL answer for the scheduled agent: an
+        # interactive shell with Full Disk Access reads 365 rows on the
+        # reference machine and the launchd agent reads none. That is a
+        # privilege wall, which snapshot_btm already models with this same
+        # value — and calling it DEGRADED made it a permanent HIGH sensor
+        # incident (24 consecutive "failures" within a day of shipping), which
+        # is how an operator learns to ignore the coverage panel.
+        #
+        # A genuine anomaly below — a schema this code cannot read, a query
+        # that raises — is still DEGRADED, because that one is not expected
+        # and is not fixed by granting anything.
+        return SURFACE_PRIVILEGED
     try:
         col = _tcc_auth_column(db)
         if col is None:
@@ -11753,9 +11765,20 @@ def diff_agent_skills(prior, cur):
             why = (" Its instructions tell the agent to CONCEAL its actions — "
                    "no legitimate skill needs that.")
         elif "credential" in marks and "egress" in marks:
-            sev, conf = "HIGH", "high"
+            # MEDIUM, not HIGH, and for the same reason as the first-sight
+            # instruction branch above. Four of the operator's own skills
+            # (canvas-lms, canvas-notebook-grader, gsd-discuss-phase,
+            # nightly-self-improvement) matched this pair on the first scan
+            # after it shipped: a grading skill talks about credentials, a
+            # self-improvement skill talks about pushing. There is no
+            # provenance here to separate "you wrote it" from "it arrived", so
+            # the pair is circumstantial. It stays a durable, correlatable
+            # record; `conceal` above remains the interrupt, because nothing
+            # legitimate tells an agent to hide what it did.
+            sev, conf = "MEDIUM", "medium"
             why = (" Its instructions reference credential locations AND an "
-                   "outbound channel — the stealer shape.")
+                   "outbound channel — worth reading, though plenty of "
+                   "legitimate skills mention both.")
         elif marks:
             why = (" Its instructions mention: %s." % ", ".join(marks))
         return sev, conf, d, ["agent-skill"] + ["imperative:" + m for m in marks], why
@@ -14499,6 +14522,24 @@ def _first_sight_agent_config(path, rec):
             markers=["agent-surface", "exec", "first-sight"]))
     marks = sorted(rec.get("imperatives") or [])
     sev = _imperative_severity(marks)
+    # FIRST SIGHT has no provenance to lean on, and _imperative_severity was
+    # written for the CHANGED case where it does. There, credential+egress
+    # earns HIGH because git can say whether the operator typed it or a pull
+    # delivered it. Here the file simply exists, and on the scan that first
+    # walks a new surface EVERY pre-existing file is "new" at once.
+    #
+    # Measured on the reference machine the day this shipped: four HIGH
+    # incidents, all of them the operator's own email tool's AGENTS.md and
+    # CLAUDE.md, which discuss credentials and sending mail because that is
+    # what the tool does. A signal whose every instance on this machine is
+    # benign does not train attention, it trains dismissal — the precision
+    # lesson this project already paid for (314 detections, 0 true positives).
+    #
+    # So on first sight only `conceal` keeps HIGH: it is attack-defined and has
+    # no benign reading. credential+egress stays a MEDIUM record — correlatable
+    # and in the report, below the notify floor. The CHANGED path is untouched.
+    if sev == "HIGH" and "conceal" not in marks:
+        sev = "MEDIUM"
     if sev:
         # Same asymmetry as the gained-imperative branch: provenance may only
         # ever ESCALATE content. A directive an injected agent wrote is

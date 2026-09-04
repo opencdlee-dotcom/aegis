@@ -115,6 +115,35 @@ class TestTccGrants(unittest.TestCase):
         real = aegis._sqlite_readonly
         self.addCleanup(setattr, aegis, "_sqlite_readonly", real)
         aegis._sqlite_readonly = lambda *a, **k: None
+        # PRIVILEGED, not DEGRADED, corrected 2026-09-04 against the live
+        # install: this refusal is the NORMAL answer for the scheduled agent,
+        # which has no Full Disk Access, while an interactive shell reads 365
+        # rows on the same machine. Grading the expected answer as a failure
+        # opened a permanent HIGH sensor incident (24 consecutive "failures"
+        # inside a day), which is how the coverage panel becomes noise.
+        self.assertIs(aegis.SURFACE_PRIVILEGED, aegis.snapshot_tcc())
+
+    def test_a_schema_it_cannot_read_is_still_degraded(self):
+        """The other side of that line: a privilege wall is expected and is
+        fixed by granting access; a database this code cannot parse is neither,
+        and must not be filed under the same honest-limitation heading."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        present = os.path.join(tmp, "TCC.db")
+        with open(present, "wb") as fh:
+            fh.write(b"not a database")
+        self.addCleanup(setattr, aegis, "TCC_USER_DB", aegis.TCC_USER_DB)
+        aegis.TCC_USER_DB = present
+
+        class _Db(object):
+            def execute(self, *a, **k):
+                raise RuntimeError("unreadable schema")
+
+            def close(self):
+                pass
+        real = aegis._sqlite_readonly
+        self.addCleanup(setattr, aegis, "_sqlite_readonly", real)
+        aegis._sqlite_readonly = lambda *a, **k: _Db()
         self.assertIsNone(aegis.snapshot_tcc())
 
 
