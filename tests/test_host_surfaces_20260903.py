@@ -96,7 +96,22 @@ class TestTccGrants(unittest.TestCase):
             self.assertIn("auth", rec)
 
     def test_an_unreadable_database_is_degraded_not_empty(self):
-        """A false empty is a lie: it would read as 'no app holds any grant'."""
+        """A false empty is a lie: it would read as 'no app holds any grant'.
+
+        The precondition is BUILT, not borrowed from the host. snapshot_tcc
+        answers {} for an ABSENT store and only reaches _sqlite_readonly once
+        the file exists, so stubbing the opener alone asserts nothing on a
+        machine that has no TCC.db — which is every simbody run of this file on
+        a non-Mac runner, where IS_MAC is a flag and the filesystem is not.
+        The simbody gate caught exactly that: green here, red on ubuntu."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        present = os.path.join(tmp, "TCC.db")
+        with open(present, "wb") as fh:
+            fh.write(b"not a database")
+        real_db = aegis.TCC_USER_DB
+        self.addCleanup(setattr, aegis, "TCC_USER_DB", real_db)
+        aegis.TCC_USER_DB = present
         real = aegis._sqlite_readonly
         self.addCleanup(setattr, aegis, "_sqlite_readonly", real)
         aegis._sqlite_readonly = lambda *a, **k: None
