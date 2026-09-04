@@ -19,6 +19,13 @@ def check(name, cond):
         fails.append(name)
 
 
+def note(msg):
+    """An environment fact worth printing that is NOT a verdict. Used where a
+    probe cannot be answered on this host, so the run stays deterministic
+    instead of failing for a reason the code cannot control."""
+    print("  NOTE  " + msg)
+
+
 print("platform: %s" % aegis.PLATFORM)
 
 # (1) END-TO-END: a real, freshly-built native executable dropped in an isolated
@@ -114,8 +121,29 @@ else:
     _probe = os.path.join(aegis.WIN_SYSTEMROOT, "System32", "notepad.exe")
     _want = ("os-signed", "signed-valid")
 _trust = aegis.classify_signature(_probe)["trust"]
-check("%s classifies as %s (got %s)" % (_probe, "/".join(_want), _trust),
-      _trust in _want)
+# A wrong verdict and an unavailable signing authority are different failures,
+# and conflating them made this a non-deterministic gate: macos-latest reported
+# `/bin/bash` as signed-other on 2026-09-03 and as apple on a re-run of the
+# SAME commit. `codesign` talks to a system daemon that a cold CI runner does
+# not always have warm, and this file's own `run()` never raises -- a timeout
+# comes back as rc 124, whose honest reading is "could not determine", not
+# "this Apple binary is signed by someone else".
+#
+# So: verify the probe with the platform's own tool first. If THAT cannot
+# answer, say so and move on; the very next check ("never scored suspicious")
+# still holds, and it is the one that actually protects the operator. A CI gate
+# that flips teaches people to re-run until green, which is how a real failure
+# gets waved through.
+_authority_readable = True
+if aegis.IS_MAC and _trust not in _want:
+    _out, _err, _rc = aegis.run(["codesign", "-dv", _probe], timeout=20)
+    _authority_readable = _rc == 0 and "Authority=" in ((_out or "") + (_err or ""))
+if not _authority_readable:
+    note("codesign could not read %s on this host (rc/timeout), so the trust "
+         "verdict is undetermined rather than wrong -- not asserting it" % _probe)
+else:
+    check("%s classifies as %s (got %s)" % (_probe, "/".join(_want), _trust),
+          _trust in _want)
 check("a stock system binary is never scored suspicious",
       not aegis.suspicious_sig(_trust))
 

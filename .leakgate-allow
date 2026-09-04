@@ -18,3 +18,19 @@ CorrectHorseBatteryStaple9x
 hunter2verylongsecret
 correct-horse-battery-staple
 sk-live-
+
+# Added 2026-09-03 for the redaction tests written in this pass. Same policy
+# as above: EXACT synthetic values, never a rule class.
+#
+# AKIAIOSFODNN7EXAMPLE is AWS's own published documentation example key — the
+# string ends in "EXAMPLE" precisely so it can appear in text. It is used in
+# tests/test_clipboard_sensor.py and tests/test_shadow_review.py to prove that
+# a credential in a hostile clipboard payload, or in a shadow Auto-Protect
+# record, never reaches findings.jsonl or actions.jsonl. A redaction test with
+# nothing to redact proves nothing, which is why these files must contain it.
+AKIAIOSFODNN7EXAMPLE
+
+# A self-describing fixture marker (not credential-shaped at all) proving
+# git_surface hashes another repo's hook body instead of copying it into a
+# baseline that outlives the scan. tests/test_repo_git_surface.py.
+SUPER-PRIVATE-HOOK-BODY-MARKER

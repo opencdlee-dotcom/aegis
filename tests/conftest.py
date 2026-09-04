@@ -44,6 +44,16 @@ import aegis  # noqa: E402
 _REAL_STATE = os.path.join(os.path.expanduser("~"), ".aegis")
 
 
+# RUN_LOG is its own module constant, so a test that sandboxes STATE_DIR but
+# forgets RUN_LOG writes straight into the operator's live forensic log. That
+# happened: 128 fabricated "migrated baseline schema" lines and a run of
+# "deadfall latch-cleared -> firing" entries were found in the real
+# ~/.aegis/run.log -- the exact file an incident tells the operator to read.
+# Every suppressed write is reported at session end so this stays visible
+# rather than becoming a silently-tolerated leak.
+REAL_RUN_LOG_WRITES = []
+
+
 def _targets_real_state(path):
     if not path:
         return False
@@ -55,11 +65,35 @@ def _targets_real_state(path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_repo_roots():
+    """Keep the suite out of the developer's OTHER checkouts.
+
+    `_agent_repo_roots` seeds itself from ~/.claude.json, which on a real
+    machine names every project directory an agent has ever been started in.
+    Without this, any test that calls cmd_scan, snapshot_agent_surface or
+    snapshot_git_hooks would read and hash files in 13 unrelated repositories —
+    slow, and the same class of sandbox gap this file's banner was written
+    about, one step further out: not the developer's ~/.aegis but their source
+    trees. A test that WANTS repo discovery points this list at its own fixture.
+
+    The original is captured ONCE, here, and restored by VALUE: a helper that
+    re-read the attribute at teardown time would restore whatever the last test
+    left behind, which is how a stub escapes its own test."""
+    original = aegis.AGENT_REPO_ROOT_HINTS
+    aegis.AGENT_REPO_ROOT_HINTS = []
+    try:
+        yield
+    finally:
+        aegis.AGENT_REPO_ROOT_HINTS = original
+
+
+@pytest.fixture(autouse=True)
 def _forbid_real_state_writes():
     """Refuse any durable write aimed at the developer's real ~/.aegis."""
     real_conn = aegis._event_connection
     real_save = aegis.save_json
     real_ensure = aegis.ensure_state
+    real_log_run = aegis.log_run
     leaked = []
 
     def _refuse(what, path):
@@ -84,15 +118,39 @@ def _forbid_real_state_writes():
             _refuse("aegis.STATE_DIR", aegis.STATE_DIR)
         return real_ensure(*a, **k)
 
+    def guarded_log_run(msg):
+        # Ask where the write would ACTUALLY land, not where the RUN_LOG
+        # constant points: aegis.log_run resolves its path against the current
+        # STATE_DIR at call time (aegis._run_log_path), so a test that
+        # sandboxes STATE_DIR alone is now safe and must not be refused, while
+        # one that rebinds RUN_LOG alone is not safe and must be.
+        try:
+            target = aegis._run_log_path()
+        except AttributeError:          # pre-_run_log_path aegis
+            target = aegis.RUN_LOG
+        if _targets_real_state(target):
+            # This used to refuse-and-record rather than raise, on the theory
+            # that log_run swallows exceptions. It does -- but this wrapper
+            # REPLACES log_run, so the raise happens before any of that code
+            # runs and reaches the caller intact. Refusing quietly left the
+            # offending test green, which is how a leak becomes tolerated;
+            # the session-end report below stays, because a raise inside a
+            # test's own except block can still be caught by the test.
+            REAL_RUN_LOG_WRITES.append(str(msg)[:200])
+            _refuse("aegis.RUN_LOG (resolves to %s)" % target, target)
+        return real_log_run(msg)
+
     aegis._event_connection = guarded_conn
     aegis.save_json = guarded_save
     aegis.ensure_state = guarded_ensure
+    aegis.log_run = guarded_log_run
     try:
         yield leaked
     finally:
         aegis._event_connection = real_conn
         aegis.save_json = real_save
         aegis.ensure_state = real_ensure
+        aegis.log_run = real_log_run
 
 IS_MAC = sys.platform == "darwin"
 
@@ -266,3 +324,20 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if item.name in _POSIX_ONLY_TESTS:
                 item.add_marker(skip_posix)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Report refused live-log writes loudly; the guard is not a licence.
+
+    Kept after the guard was upgraded from refuse-quietly to raise, because a
+    raise is not always visible: a test whose own `except Exception` swallows
+    it, or a code path under `try/except Exception: pass`, would otherwise turn
+    the refusal back into silence. This line is what makes the attempt itself
+    reportable, whatever the caller did with the exception.
+    """
+    if REAL_RUN_LOG_WRITES:
+        n = len(REAL_RUN_LOG_WRITES)
+        sys.stderr.write(
+            "\n%d log_run() write(s) aimed at the REAL ~/.aegis/run.log were "
+            "REFUSED by tests/conftest.py. Sandbox aegis.STATE_DIR in the "
+            "offending test's setUp. First: %s\n" % (n, REAL_RUN_LOG_WRITES[0]))

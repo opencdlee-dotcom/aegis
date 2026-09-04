@@ -470,10 +470,20 @@ class TestAttckCoverage(Sandbox):
         self.assertEqual(rc, 0)
         self.assertIn("T1548.001", out)
         self.assertIn("1 hit", out)
-        # A technique nothing fired for in this run is reported "wired but
-        # quiet", not silently omitted — the point of a coverage report.
+        # A technique nothing fired for in this run is still reported, not
+        # silently omitted — the point of a coverage report.
         self.assertIn("T1053.003", out)
-        self.assertIn("Wired but quiet", out)
+        # Wording changed 2026-09-03: "Wired but quiet" held EVERY unfired
+        # technique, including the 11 of 24 whose sensor lives on another
+        # operating system — so a Mac read as covering Registry Run Keys and
+        # WMI Event Subscription. That is not a quiet sensor, it is no sensor.
+        # The bucket now names the body it is true of.
+        self.assertIn("Wired on this body", out)
+        self.assertIn("quiet in this window", out)
+        # And the foreign techniques are reported as NOT covered here.
+        if any(not aegis._wired_here(t) for t in aegis.ATTCK_TECHNIQUES):
+            self.assertIn("NOT covered on this body", out)
+        self.assertIn("Coverage on %s:" % aegis._this_body(), out)
 
     def test_cmd_attck_counts_unmapped_separately(self):
         f = aegis.finding("MEDIUM", "hot-dir", "Unsigned executable", "d",

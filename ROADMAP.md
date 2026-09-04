@@ -37,16 +37,41 @@ The heart of Norton parity. Three stages, strictly in order:
 1. **Shadow mode (SHIPPED 2026-09-01).** New `autoprotect` state (off → shadow → live). In shadow,
    every detection that *would* auto-act writes a `would_quarantine` /
    `would_freeze` line to `actions.jsonl` with the evidence class that
-   licensed it. Menu bar shows the shadow tally. Exit criterion: ≥7 days or
-   ≥50 scans with the operator reviewing the would-have log — the same
-   shadow-first rollout ARCHITECTURE.md's power-tier gate prescribes for ES.
+   licensed it. Menu bar shows the shadow tally.
+
+   **Exit criterion corrected 2026-09-03 — it was a clock, and a clock cannot
+   see this.** The original read "≥7 days or ≥50 scans with the operator
+   reviewing the would-have log". The first six scans of real shadow data on
+   the reference machine produced a tally of **3 would-freeze, and all three
+   were the operator's own tools**: two Claude Code shells
+   (`behavior:bash:eval-subshell:*`) and one `pwsh` encoded command
+   (`behavior:pwsh:powershell-encoded-command:*`). A time-based criterion
+   would have been satisfied by exactly that run, and stage 3 would then have
+   auto-frozen the operator's AI agents mid-session.
+
+   The criterion is therefore about CONTENT, not elapsed time:
+
+   > No promotion to the live heuristic tier while any would-freeze in the
+   > review window names a process the operator recognises as their own. The
+   > window restarts when it does. Time served is necessary and nowhere near
+   > sufficient.
+
+   This is not a delay tactic. It is the same measurement that made the
+   deterministic tier safe: that tier's evidence is 0 false fires across the
+   whole recorded history, which is why it is promoted and this one is not.
 2. **Live, deterministic tier.** Auto-quarantine fires only on the
    deterministic evidence class. Uses the existing transactional quarantine
    store (protected-path refusals intact), notifies via menu bar + report, and
    prints the one-line restore command in the alert itself.
-3. **Live, heuristic tier.** Behavioral detections auto-`freeze` the process
-   tree (existing machinery: root-first suspend, ancestor/other-user guards,
-   auto-release fail-open) and open an incident for the human verdict.
+3. **Live, heuristic tier — BLOCKED on shadow evidence, not on time.**
+   Behavioral detections would auto-`freeze` the process tree (existing
+   machinery: root-first suspend, ancestor/other-user guards, auto-release
+   fail-open) and open an incident for the human verdict. The measured shadow
+   tally says this tier is not ready: every would-freeze recorded so far is an
+   operator tool, and freezing the operator's own agent mid-session is a
+   self-inflicted outage that would teach them to turn Auto-Protect off — the
+   worst possible outcome for a protection tier. See the corrected exit
+   criterion in stage 1.
 
 Enablement is an operator action behind the existing one-time-code channel
 (automation must not be able to switch Aegis to auto mode — the same reasoning
