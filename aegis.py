@@ -1238,6 +1238,74 @@ def _lock_fd(fd):
         fcntl.flock(fd, fcntl.LOCK_EX)
 
 
+def _try_lock_fd(fd):
+    """Exclusive lock WITHOUT blocking: True if taken, False if held elsewhere.
+
+    The non-blocking twin of _lock_fd, and what lets _scan_lock report a
+    contending scan instead of hanging silently behind it. The two bodies
+    differ only in the spelling of "would block": flock reports EWOULDBLOCK
+    (== EAGAIN), msvcrt's LK_NBLCK reports EDEADLK on Windows and EACCES on
+    some CRT versions. Anything else is a real error and is re-raised -- a lock
+    file we cannot lock for an UNEXPECTED reason must never be reported as
+    "someone else has it", which would turn a broken state dir into a silently
+    skipped scan."""
+    if IS_WIN:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as e:
+            if e.errno in (errno.EDEADLK, errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as e:
+            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                return False
+            raise
+
+
+# The lock file carries its holder's identity, so a contender can say WHO it is
+# standing behind rather than just "busy". Byte 0 is the byte that is actually
+# locked and the record starts AFTER it: msvcrt locks are MANDATORY on Windows
+# (LockFile byte ranges, not advisory like flock), so a record written at
+# offset 0 would be unreadable by the exact process that needs to read it.
+_LOCK_INFO_OFFSET = 1
+
+
+def _write_lock_holder(fd):
+    """Stamp pid + start time into a lock fd we hold, past the locked byte."""
+    try:
+        raw = json.dumps({"pid": os.getpid(),
+                          "started": now_iso()}).encode() + b"\n"
+        os.lseek(fd, _LOCK_INFO_OFFSET, os.SEEK_SET)
+        os.write(fd, raw)
+        os.ftruncate(fd, _LOCK_INFO_OFFSET + len(raw))
+    except (OSError, ValueError):
+        pass        # bookkeeping must never cost us a lock we already hold
+
+
+def _read_lock_holder(path):
+    """{'pid': ..., 'started': ...} for whoever holds `path`, or None.
+
+    Best-effort by construction: the record may be absent (a holder from an
+    older build), half-written (it is read unsynchronised on purpose -- taking
+    the lock to find out who holds the lock is a deadlock), or unreadable.
+    Every one of those is "cannot say", never a raise, because this only ever
+    runs to decorate a message."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(_LOCK_INFO_OFFSET)
+            raw = f.read(4096)
+        rec = json.loads(raw.split(b"\n")[0].decode("utf-8", "replace"))
+        return rec if isinstance(rec, dict) else None
+    except Exception:
+        return None
+
+
 def _unlock_fd(fd):
     if IS_WIN:
         try:
@@ -2589,31 +2657,123 @@ _EVENT_SCHEMA_SQL = """
 """
 
 
+# Bumped ONLY when _EVENT_SCHEMA_SQL or the ALTER migrations below change.
+# Stamped into the store's own `PRAGMA user_version`, which is what stops the
+# schema being re-executed on every connection open (see _event_connection).
+_EVENT_SCHEMA_VERSION = 1
+
+# Two retention buckets, not one. `events` used to keep the newest 50,000 rows
+# full stop, and _record_health writes ONE row per sensor per scan (~45). At the
+# hourly install cadence that is ~1,080 health rows a day, but watch mode runs a
+# scan per change burst, and a busy hour can put thousands into the same pool the
+# observation.finding rows live in. Health then evicts detection history — the
+# rows `replay` and the retro-hunt read — in about a day, silently, and the only
+# visible symptom is a backtest reporting that the past was quiet. A sensor
+# liveness heartbeat must never be able to outbid the evidence.
+#   _HEALTH_EVENT_CAP = 10,000 ~= 222 scans x 45 sensors ~= 9 days hourly.
+_EVENT_CAP = 50000
+_HEALTH_EVENT_CAP = 10000
+
+
+def _store_sidecar(suffix):
+    """A path beside the event store, DERIVED FROM EVENT_DB at call time.
+
+    Deliberately not a module-level constant: EVENT_DB is rebound by every
+    sandboxed test, and a constant computed at import keeps pointing at the
+    operator's real ~/.aegis. That is the exact leak the suite's backstop was
+    written for after two synthetic incidents were found sitting in the
+    developer's live store."""
+    return EVENT_DB + suffix
+
+
+def _note_store_failure(exc):
+    """Record that the event store could not be OPENED.
+
+    The store is the one durable place this failure would otherwise be written,
+    and the store is precisely what is unavailable — so the note goes in a
+    sidecar file that check_store_integrity reads back and turns into a
+    finding. Without it, a corrupt aegis.db costs exactly one run.log line
+    while findings keep flowing to findings.jsonl, and incidents, correlation,
+    custody, tolerance and the sensor-health alarms all go permanently silent
+    with nothing anywhere telling the operator."""
+    try:
+        save_json(_store_sidecar(".failure.json"),
+                  {"ts": now_iso(), "epoch": int(time.time()),
+                   "error": str(exc)[:500]})
+    except Exception:
+        pass
+
+
+_JOURNAL_MODE = None      # the mode the store ACTUALLY granted, for tests/doctor
+
+
 def _event_connection():
     ensure_state()
-    db = sqlite3.connect(EVENT_DB, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=10000")
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=FULL")
-    db.executescript(_EVENT_SCHEMA_SQL)
-    # CREATE TABLE IF NOT EXISTS never widens an existing table: a store
-    # created before subject_json existed must gain it here, or every reader
-    # that selects it fails closed into "no memory" without a word.
-    cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
-    if "subject_json" not in cols:
-        db.execute("ALTER TABLE incidents ADD COLUMN subject_json TEXT")
-    if "last_novel_at" not in cols:
-        db.execute("ALTER TABLE incidents ADD COLUMN last_novel_at INTEGER")
-        # Backfill from creation, not from updated_at: an existing row's
-        # updated_at is the last time it REPEATED itself, which is exactly the
-        # clock this column exists to stop trusting. Seeding it with
-        # created_at means a long-running incident that has said nothing new
-        # is eligible immediately, which is the correct verdict on it.
-        db.execute("UPDATE incidents SET last_novel_at=created_at "
-                   "WHERE last_novel_at IS NULL")
-    db.commit()
+    global _JOURNAL_MODE
+    db = None
+    try:
+        db = sqlite3.connect(EVENT_DB, timeout=10)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=10000")
+        # `PRAGMA journal_mode=WAL` ANSWERS with the mode it actually granted,
+        # and that answer was being thrown away. WAL is the whole reason a
+        # reader does not block the writer here; on a filesystem that cannot do
+        # it (a network share, some container overlays) SQLite silently stays in
+        # `delete` mode and every concurrent open becomes a lock contest — which
+        # is the shape of the "database is locked" reports. Read it back and say
+        # so once per process: this is an operational fact, not a finding.
+        granted = db.execute("PRAGMA journal_mode=WAL").fetchone()
+        granted = granted[0] if granted else "unknown"
+        if str(granted).lower() != "wal" and _JOURNAL_MODE != granted:
+            log_run("event store is in journal_mode=%s, not WAL — readers and "
+                    "the writer will block each other on %s"
+                    % (granted, EVENT_DB))
+        _JOURNAL_MODE = granted
+        db.execute("PRAGMA synchronous=FULL")
+        # The schema used to be re-executed on EVERY open: ~30 CREATE IF NOT
+        # EXISTS statements plus executescript's implicit COMMIT, taking a brief
+        # write lock on a file that several readers open per scan. It bought
+        # nothing after the first open and is the main "database is locked"
+        # amplifier. `user_version` is the idiomatic stamp and reads 0 both on a
+        # fresh file and on every store written before this change, so both take
+        # the create-and-migrate path exactly once. Any future schema change
+        # bumps _EVENT_SCHEMA_VERSION, which re-runs this block on every store.
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version != _EVENT_SCHEMA_VERSION:
+            db.executescript(_EVENT_SCHEMA_SQL)
+            # CREATE TABLE IF NOT EXISTS never widens an existing table: a store
+            # created before subject_json existed must gain it here, or every
+            # reader that selects it fails closed into "no memory" without a word.
+            cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+            if "subject_json" not in cols:
+                db.execute("ALTER TABLE incidents ADD COLUMN subject_json TEXT")
+            if "last_novel_at" not in cols:
+                db.execute("ALTER TABLE incidents ADD COLUMN last_novel_at INTEGER")
+                # Backfill from creation, not from updated_at: an existing row's
+                # updated_at is the last time it REPEATED itself, which is exactly
+                # the clock this column exists to stop trusting. Seeding it with
+                # created_at means a long-running incident that has said nothing
+                # new is eligible immediately, the correct verdict on it.
+                db.execute("UPDATE incidents SET last_novel_at=created_at "
+                           "WHERE last_novel_at IS NULL")
+            db.execute("PRAGMA user_version=%d" % _EVENT_SCHEMA_VERSION)
+            db.commit()
+    except sqlite3.DatabaseError as e:
+        # sqlite3.OperationalError ("database is locked", "unable to open
+        # database file") is a SUBCLASS of DatabaseError, so this one clause
+        # covers both the corrupt store and the unopenable one. It re-raises:
+        # every caller already has a failure path (record_security_state logs
+        # "event-store failure" and carries on). What did not exist was any
+        # operator-visible record afterwards — that is what the sidecar is.
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
+        _note_store_failure(e)
+        log_run("event store could not be opened: %s" % e)
+        raise
     try:
         os.chmod(EVENT_DB, 0o600)
     except OSError:
@@ -2624,6 +2784,136 @@ def _event_connection():
 def init_event_store():
     db = _event_connection()
     db.close()
+
+
+_STORE_BACKUP_INTERVAL = 24 * 3600
+
+
+def _backup_event_store(db, now=None):
+    """Keep ONE rotating fallback copy of the store, at most daily.
+
+    Uses SQLite's online-backup API on the LIVE connection rather than copying
+    the file: with WAL there are up to three files (db/-wal/-shm) and a plain
+    copy of the main file alone can capture a torn, half-committed page set — a
+    "backup" that quick_check rejects is worse than none, because it is only
+    discovered on the day it is needed.
+
+    Writes through a temp file and rotates the previous copy aside, so an
+    interrupted backup can never destroy the good one. Returns True if a copy
+    was taken. Never raises: a failed backup must not fail a scan."""
+    bak = _store_sidecar(".bak")
+    now = _epoch(now)
+    try:
+        if os.path.exists(bak) and (now - int(os.path.getmtime(bak))) \
+                < _STORE_BACKUP_INTERVAL:
+            return False
+    except OSError:
+        pass
+    tmp = _store_sidecar(".bak.tmp")
+    try:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        dst = sqlite3.connect(tmp)
+        try:
+            db.backup(dst)
+        finally:
+            dst.close()
+        if os.path.exists(bak):
+            os.replace(bak, _store_sidecar(".bak.1"))
+        os.replace(tmp, bak)
+        try:
+            os.chmod(bak, 0o600)
+        except OSError:
+            pass
+        return True
+    except Exception as e:
+        log_run("event-store backup skipped: %s" % e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _store_backup_note():
+    """One clause naming what could be fallen back to, for a finding's detail —
+    an integrity alarm that does not say whether a copy exists leaves the
+    operator holding the wrong half of the answer."""
+    bak = _store_sidecar(".bak")
+    try:
+        age = _epoch() - int(os.path.getmtime(bak))
+    except OSError:
+        return ("There is no fallback copy of the store yet, so its history "
+                "cannot be recovered from here.")
+    return ("A fallback copy taken %s ago is at %s (check it with "
+            "`sqlite3 %s 'PRAGMA quick_check'` before trusting it)."
+            % (_duration(age), bak, bak))
+
+
+def check_store_integrity():
+    """Is the event store still a database, and does it still read back?
+
+    Everything durable this tool concludes lives here: incidents, correlation,
+    custody, acquired tolerance, sensor-health episodes. A corrupt store did not
+    degrade loudly — it degraded to a single `log_run("event-store failure")`
+    line while findings kept flowing to findings.jsonl, so the report still read
+    like a working monitor while every memory it depends on was gone. There was
+    no integrity path in the program at all: zero occurrences of quick_check,
+    DatabaseError, backup or VACUUM in 23k lines.
+
+    quick_check is the cheap half of integrity_check (it skips the
+    index-vs-table cross-check) and is the right cost for something that runs on
+    every scan. It verifies page structure and says NOTHING about whether the
+    tables this program needs still exist — a dropped table reads as a perfectly
+    healthy database — so a sanity read follows it."""
+    if not os.path.exists(EVENT_DB):
+        return []          # fresh install: no store yet is not a failure
+    problems, severity = [], "HIGH"
+    db = None
+    try:
+        db = sqlite3.connect(EVENT_DB, timeout=10)
+        row = db.execute("PRAGMA quick_check(1)").fetchone()
+        verdict = str(row[0]) if row else "no answer"
+        if verdict.lower() != "ok":
+            problems.append("PRAGMA quick_check reports: %s" % verdict[:300])
+        for table in ("incidents", "events", "signals", "meta"):
+            db.execute("SELECT count(*) FROM %s" % table).fetchone()
+    except sqlite3.DatabaseError as e:
+        problems.append("the store did not read back: %s" % str(e)[:300])
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+    # A failed OPEN cannot be recorded in the store it failed to open, so
+    # _note_store_failure leaves a sidecar. Report it once and clear it: a
+    # transient "database is locked" must not become a permanent finding, and a
+    # real corruption re-notes itself on the very next open.
+    note = load_json(_store_sidecar(".failure.json"), None)
+    if isinstance(note, dict) and note.get("error"):
+        if not problems:
+            severity = "MEDIUM"     # it opens now; that failure was transient
+        problems.append("the store could not be opened at %s: %s"
+                        % (note.get("ts") or "?", str(note.get("error"))[:300]))
+        try:
+            os.remove(_store_sidecar(".failure.json"))
+        except OSError:
+            pass
+    if not problems:
+        return []
+    detail = ("%s %s Until it reads back, incidents, correlation, custody and "
+              "acquired tolerance are all unavailable — findings still reach "
+              "%s, but nothing remembers them."
+              % ("; ".join(problems), _store_backup_note(), FINDINGS_LOG))
+    return [finding(
+        severity, "self-protection",
+        "Aegis event store failed its integrity check", detail,
+        "store:integrity:%s" % hashlib.sha256(
+            "|".join(sorted(problems)).encode()).hexdigest()[:16],
+        path=EVENT_DB)]
 
 
 def _event_attributes(f):
@@ -4774,10 +5064,37 @@ def record_security_state(findings, sensor_health=(), now=None,
         # the reference store had been stripped this way). Exempting the
         # referenced rows keeps the cap on the only thing it was bounding:
         # observations nothing points at.
+        #
+        # TWO buckets, one statement each (see _EVENT_CAP/_HEALTH_EVENT_CAP).
+        # A single 50,000-row cap over the whole table let _record_health's
+        # ~45-rows-per-scan heartbeat evict observation.finding history — the
+        # rows `replay` and the retro-hunt read — because both kinds competed
+        # for the same slots and only one of them is written unconditionally.
+        # Health rows are still exempted when an incident references them
+        # (a sensor-health incident's own evidence is materialized state too).
         with db:
-            db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
-                       "ORDER BY id DESC LIMIT -1 OFFSET 50000) "
-                       "AND id NOT IN (SELECT event_id FROM incident_events)")
+            db.execute("DELETE FROM events WHERE event_type<>'sensor.health' "
+                       "AND id IN (SELECT id FROM events WHERE "
+                       "event_type<>'sensor.health' ORDER BY id DESC "
+                       "LIMIT -1 OFFSET ?) "
+                       "AND id NOT IN (SELECT event_id FROM incident_events)",
+                       (_EVENT_CAP,))
+            db.execute("DELETE FROM events WHERE event_type='sensor.health' "
+                       "AND id IN (SELECT id FROM events WHERE "
+                       "event_type='sensor.health' ORDER BY id DESC "
+                       "LIMIT -1 OFFSET ?) "
+                       "AND id NOT IN (SELECT event_id FROM incident_events)",
+                       (_HEALTH_EVENT_CAP,))
+        # Take the daily fallback copy HERE, on the connection that just wrote
+        # and pruned: the store is open, consistent and known-good at this exact
+        # point, and doing it on the live connection is what makes the copy
+        # WAL-safe. Deliberately not in check_store_integrity — that sensor runs
+        # inside gather_all, where a test with an unsandboxed EVENT_DB would put
+        # a .bak into the operator's real ~/.aegis.
+        try:
+            _backup_event_store(db, now)
+        except Exception as e:
+            log_run("event-store backup skipped: %s" % e)
     finally:
         db.close()
     return {"events": len(new_events), "health": len(sensor_health)}
@@ -5001,6 +5318,53 @@ def _collect_sensor(sensor_id, fn, health, *args):
             if isinstance(f, dict):
                 f.setdefault("sensor_id", sensor_id)
     return output
+
+
+def _collect_prep(prep_id, fn, health):
+    """Run one gather_all PREP step under the same isolation as a sensor.
+
+    The per-scan snapshots gather_all arms before its loop -- the process
+    table, the Linux socket-inode map, the Windows netstat table, and the
+    macOS `log show` prewarm (which spawns three threads and joins them with
+    timeout=50) -- sat OUTSIDE the try that isolates each sensor. Every sensor
+    below is individually wrapped so one failure cannot abort the scan; a
+    raise in any of these four aborted ALL of them, which is precisely the
+    failure _collect_sensor exists to prevent, one level up.
+
+    Returns the snapshot, or None when it failed. None is already every
+    consumer's "no cache, do it yourself" (see _iter_processes, _log_show), so
+    the dependent sensors degrade one at a time inside _collect_sensor instead
+    of the whole scan dying -- and the health row written here names the CAUSE,
+    which a pile of identical per-sensor failures would not.
+    """
+    started = time.monotonic()
+    try:
+        value, status, detail = fn(), "OK", ""
+    except Exception as e:
+        value, status, detail = None, "DEGRADED", str(e)
+    health.append({"sensor_id": prep_id, "status": status,
+                   "detail": redact_sensitive(detail),
+                   "duration_ms": int((time.monotonic() - started) * 1000),
+                   "item_count": len(value) if hasattr(value, "__len__") else 0})
+    return value
+
+
+def _budget_skipped(sensor_id, budget):
+    """Health row for a sensor the scan's wall clock never reached.
+
+    DEGRADED, never OK and never absent. A sensor that did not run is UNKNOWN
+    coverage, and reporting it as anything else is the same false-green class
+    the doctor fix closed: without this row the sensor's LAST row simply
+    stands, and _coverage_split counts it toward "38/40 sensors OK" (it only
+    lands in `stale` if some other sensor happened to write a newer row, which
+    is not guaranteed when the whole tail of the loop is skipped together).
+    The detail names the budget because "DEGRADED" with no reason sends the
+    operator hunting for a broken sensor that is working fine.
+    """
+    return {"sensor_id": sensor_id, "status": "DEGRADED",
+            "detail": "did not run: the %ds whole-scan time budget was spent "
+                      "before this sensor was reached" % int(budget),
+            "duration_ms": 0, "item_count": 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -7983,13 +8347,31 @@ def diff_loginhooks(prior, cur):
 
 
 # --- configuration profiles ---------------------------------------------------
+_PROFILE_IDENT_RE = re.compile(r"profileIdentifier:\s*(\S+)")
+# profileDisplayName is what System Settings shows; older builds print
+# profileName. Both, one pattern, so a rename is caught on either vocabulary.
+_PROFILE_NAME_RE = re.compile(r"profile(?:Display)?Name:\s*(.+?)\s*$")
+_PROFILE_NONE_RE = re.compile(r"no configuration profiles", re.I)
+
+
 def snapshot_profiles():
+    """{identifier: True} for every installed configuration profile, or None
+    when `profiles` could not be read this scan.
+
+    None rather than {}: a timeout or a failed exec is a NON-ANSWER, and
+    recording it as "this Mac has no configuration profiles" adopts a
+    false-empty that then storms every installed profile as new the moment the
+    command next succeeds — the rule snapshot_btm was rewritten around, which
+    this surface was quietly breaking by returning `snap` on rc != 0. A
+    genuine empty still reaches the baseline: `profiles list` exits 0 and
+    prints "There are no configuration profiles installed" when the answer
+    really is none (verified on macOS 26.0.1)."""
     snap = {}
     out, _, rc = run(["profiles", "list"], timeout=12)
     if rc != 0:
-        return snap
+        return None
     for line in out.splitlines():
-        m = re.search(r"profileIdentifier:\s*(\S+)", line)
+        m = _PROFILE_IDENT_RE.search(line)
         if m:
             snap[m.group(1)] = True
     return snap
@@ -8003,6 +8385,523 @@ def diff_profiles(prior, cur):
                        "certs, proxies or MDM control (an adware/DPRK vector)"
                        % ident, "profile:%s" % ident, identifier=ident)
     return _diff_map(prior, cur, new_fn)
+
+
+
+# --- configuration-profile PAYLOADS -------------------------------------------
+# snapshot_profiles only ever recorded the IDENTIFIER, so a profile whose
+# PAYLOAD is rewritten under an unchanged identifier — a new trusted root CA, a
+# proxy, a DNSSettings payload — was undetectable. This hashes the per-profile
+# text block instead.
+#
+# A SEPARATE surface rather than a richer value on `profiles`, deliberately: an
+# existing baseline holds `profiles = {ident: True}`, and re-shaping that value
+# in place would make every installed profile diff as CHANGED on the first scan
+# after the upgrade. A brand-new surface key is absent from every existing
+# baseline, so _scan_surfaces adopts it silently on first sight and the upgrade
+# is storm-free BY CONSTRUCTION rather than by a schema migration that has to be
+# right. new_fn returns None for the same reason: diff_profiles already owns "a
+# new profile was installed", and two findings for one event is noise.
+#
+# Only a digest, a line count and a redacted display name are stored. A profile
+# payload can carry a Wi-Fi PSK or an account password, and the rule the v2
+# baseline migration exists to enforce is that a secret never reaches the store
+# in the first place — so the payload text is hashed and dropped, never kept.
+
+# Most detailed first. `profiles show` prints the expanded profile including its
+# payload attributes; `list -verbose` is the fallback on builds that reject the
+# verb, and bare `list` is the last resort (identifier only — the hash then
+# still catches a name change and honestly reports nothing finer).
+_PROFILE_DUMP_CMDS = (["profiles", "show", "-verbose"],
+                      ["profiles", "list", "-verbose"],
+                      ["profiles", "list"])
+
+
+def _profile_blocks(text):
+    """{identifier: [line, ...]} — each profile's own text block, in emission
+    order. A line belongs to the most recently seen identifier; anything before
+    the first identifier is the command's header and is dropped.
+
+    Deliberately shape-agnostic. Apple has changed the `profiles` output layout
+    across releases, and this parser only has to be STABLE on one machine, not
+    correct about that layout: the comparison is a hash of the same command's
+    own output against itself. Worst case a payload edit lands in a neighbouring
+    profile's block — still detected, just attributed one profile over."""
+    blocks, cur = {}, None
+    for line in (text or "").splitlines():
+        m = _PROFILE_IDENT_RE.search(line)
+        if m:
+            cur = m.group(1)
+            blocks.setdefault(cur, [])
+        if cur is not None:
+            blocks[cur].append(line)
+    return blocks
+
+
+def snapshot_profile_payloads():
+    """{identifier: {sha256, lines, name}}, or None when `profiles` could not be
+    read at all (a non-answer is never recorded as "no profiles" — see
+    snapshot_btm)."""
+    if not IS_MAC:
+        return {}
+    text = None
+    for cmd in _PROFILE_DUMP_CMDS:
+        out, _err, rc = run(cmd, timeout=20)
+        if rc != 0:
+            continue
+        text = out
+        if (_PROFILE_IDENT_RE.search(out or "")
+                or _PROFILE_NONE_RE.search(out or "")):
+            # Either this verb produced real profile detail, or it gave the
+            # definitive "none installed" answer. Falling through on the
+            # definitive answer cost three subprocess calls per scan on the
+            # (common) machine with no profiles at all. run() pins LC_ALL=C,
+            # so the wording is not localized out from under this.
+            break
+    if text is None:
+        return None        # every spelling failed: DEGRADED, not "none"
+    snap = {}
+    for ident, lines in _profile_blocks(text).items():
+        name = None
+        for line in lines:
+            m = _PROFILE_NAME_RE.search(line)
+            if m:
+                name = redact_sensitive(m.group(1))[:120]
+                break
+        body = "\n".join(lines).encode("utf-8", "replace")
+        snap[ident] = {"sha256": hashlib.sha256(body).hexdigest(),
+                       "lines": len(lines), "name": name}
+    return snap
+
+
+def diff_profile_payloads(prior, cur):
+    def changed_fn(ident, rec, old):
+        old = old if isinstance(old, dict) else {}
+        return finding(
+            "HIGH", "config-profile", "Configuration profile PAYLOAD changed",
+            "profile %s (%s) was rewritten in place — same identifier, "
+            "different payload (%s -> %s lines). A configuration profile can "
+            "install a trusted root CA, a proxy or DNS servers; editing one in "
+            "place keeps the identifier every inventory already trusts, which "
+            "is exactly why only the payload hash can see it."
+            % (ident, rec.get("name") or "unnamed",
+               old.get("lines", "?"), rec.get("lines", "?")),
+            "profile:payload:%s:%s" % (ident, rec.get("sha256") or "?"),
+            identifier=ident, name=rec.get("name"),
+            sha256=rec.get("sha256"), prior_sha256=old.get("sha256"))
+
+    # new_fn is a deliberate no-op: diff_profiles reports a newly-installed
+    # profile, and this surface only ever speaks about payload CHANGES.
+    return _diff_map(prior, cur, lambda _i, _r: None, changed_fn)
+
+
+# --- TCC privacy grants (T1548 / "just click Allow") --------------------------
+# The highest-value unprivileged read on a Mac that Aegis was not making. The
+# per-user TCC store records WHICH application holds Screen Recording,
+# Accessibility, Input Monitoring, Microphone, Camera, Apple Events or Full Disk
+# Access — the exact capability set a RAT needs, and the exact artifact an
+# "approve this dialog" social-engineering step leaves behind.
+# _has_full_disk_access() already opens this very file, purely as a self-test;
+# nothing ever baselined what is inside it.
+TCC_USER_DB = os.path.join(HOME, "Library", "Application Support",
+                           "com.apple.TCC", "TCC.db")
+
+# auth_value: 0 denied, 1 unknown, 2 allowed, 3 limited. Only 2/3 are a grant.
+_TCC_ALLOWED = (2, 3)
+
+# Graded by GRANT, not by novelty. A new Reminders grant is a calendar app; a
+# new Screen Recording or Accessibility grant is a keylogger's whole toolchain,
+# and the difference matters more than the fact that a row appeared.
+_TCC_CRITICAL_GRANTS = frozenset((
+    "kTCCServiceAccessibility",          # drive the UI / read any window
+    "kTCCServiceScreenCapture",          # continuous screenshots
+    "kTCCServiceListenEvent",            # Input Monitoring == keylogging
+    "kTCCServicePostEvent",              # synthesize keystrokes
+    "kTCCServiceSystemPolicyAllFiles",   # Full Disk Access
+    "kTCCServiceEndpointSecurityClient",
+    "kTCCServiceDeveloperTool",          # exempts children from Gatekeeper
+))
+_TCC_SENSITIVE_GRANTS = frozenset((
+    "kTCCServiceMicrophone", "kTCCServiceCamera",
+    "kTCCServiceAppleEvents",            # drive other apps (osascript chains)
+    "kTCCServiceSystemPolicyDesktopFolder",
+    "kTCCServiceSystemPolicyDocumentsFolder",
+    "kTCCServiceSystemPolicyDownloadsFolder",
+    "kTCCServiceSystemPolicyNetworkVolumes",
+    "kTCCServiceSystemPolicyRemovableVolumes",
+    "kTCCServiceSystemPolicySysAdminFiles",
+))
+_TCC_LABELS = {
+    "kTCCServiceAccessibility": "Accessibility (full UI control)",
+    "kTCCServiceScreenCapture": "Screen Recording",
+    "kTCCServiceListenEvent": "Input Monitoring (keystroke capture)",
+    "kTCCServicePostEvent": "Synthetic input (keystroke injection)",
+    "kTCCServiceSystemPolicyAllFiles": "Full Disk Access",
+    "kTCCServiceEndpointSecurityClient": "Endpoint Security client",
+    "kTCCServiceDeveloperTool": "Developer Tool (Gatekeeper exemption)",
+    "kTCCServiceMicrophone": "Microphone",
+    "kTCCServiceCamera": "Camera",
+    "kTCCServiceAppleEvents": "Apple Events (control other apps)",
+    "kTCCServiceSystemPolicyDesktopFolder": "Desktop folder",
+    "kTCCServiceSystemPolicyDocumentsFolder": "Documents folder",
+    "kTCCServiceSystemPolicyDownloadsFolder": "Downloads folder",
+    "kTCCServiceSystemPolicyNetworkVolumes": "Network volumes",
+    "kTCCServiceSystemPolicyRemovableVolumes": "Removable volumes",
+    "kTCCServiceSystemPolicySysAdminFiles": "System administration files",
+}
+# The `access` auth column, newest spelling first. Interpolated into SQL, so it
+# may ONLY ever come from this tuple.
+_TCC_AUTH_COLUMNS = ("auth_value", "allowed")
+# A Mac carries a few hundred rows (379 on the reference machine). The cap is a
+# blast radius, not a budget; ORDER BY makes a truncated set stable so the tail
+# does not oscillate in and out of the baseline.
+_TCC_ROW_CAP = 5000
+
+
+def _tcc_label(service):
+    return _TCC_LABELS.get(service) or re.sub(r"^kTCCService", "",
+                                              service or "?")
+
+
+def _tcc_grade(service):
+    if service in _TCC_CRITICAL_GRANTS:
+        return "HIGH"
+    if service in _TCC_SENSITIVE_GRANTS:
+        return "MEDIUM"
+    return None      # ungraded: recorded, never reported (see diff_tcc)
+
+
+def _tcc_auth_column(db):
+    """The name of the authorization column, or None when the schema has moved
+    somewhere this sensor does not understand. Apple renamed `allowed` to
+    `auth_value` in 10.15 and has reshaped the table since; guessing would
+    produce a confident wrong answer, so an unrecognized schema is a
+    non-answer."""
+    try:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(access)")}
+    except Exception:
+        return None
+    if not {"client", "service"} <= cols:
+        return None
+    for name in _TCC_AUTH_COLUMNS:
+        if name in cols:
+            return name
+    return None
+
+
+def snapshot_tcc():
+    """{"<service>|<client>": {"auth": int}} for the per-user TCC store, or None
+    when the store exists but cannot be read.
+
+    None, never {}: the store is itself TCC-protected, so the same machine
+    answers differently depending on who asks — an interactive shell with Full
+    Disk Access gets the rows, a launchd agent without it gets a refusal
+    (_has_full_disk_access exists precisely because of that split). Recording
+    the refusal as "this Mac has granted nothing" is a lie the size of the whole
+    surface, and it would storm every grant on the machine as new the first time
+    the agent IS granted access. A non-answer is DEGRADED — snapshot_btm's rule,
+    one surface over."""
+    if not IS_MAC:
+        return {}
+    if not os.path.exists(TCC_USER_DB):
+        return {}          # no store for this user: honestly empty
+    db = _sqlite_readonly(TCC_USER_DB)
+    if db is None:
+        return None        # present but unopenable: DEGRADED
+    try:
+        col = _tcc_auth_column(db)
+        if col is None:
+            return None
+        rows = db.execute(
+            "SELECT client, service, %s FROM access "
+            "ORDER BY service, client LIMIT %d" % (col, _TCC_ROW_CAP)
+        ).fetchall()
+    except Exception:
+        return None
+    finally:
+        db.close()
+    snap = {}
+    for client, service, auth in rows:
+        if not client or not service:
+            continue
+        try:
+            auth = int(auth)
+        except (TypeError, ValueError):
+            auth = -1
+        snap["%s|%s" % (service, client)] = {"auth": auth}
+    return snap
+
+
+def diff_tcc(prior, cur):
+    def _split(key):
+        service, _sep, client = str(key).partition("|")
+        return service, client
+
+    def _grant_finding(key, rec, was):
+        service, client = _split(key)
+        sev = _tcc_grade(service)
+        if sev is None:
+            # The long tail (iCloud/Ubiquity/Liverpool and friends) is hundreds
+            # of rows that turn over whenever an app is opened for the first
+            # time. Recorded silently so a LATER flip on a graded service is
+            # still a clean single event; never reported, because a monitor
+            # that speaks about kTCCServiceReminders is a monitor nobody reads.
+            return None
+        verb = ("granted" if was is None else
+                "flipped from denied to ALLOWED for")
+        return finding(
+            sev, "tcc", "Privacy grant: %s" % _tcc_label(service),
+            "%s %s %s — a TCC grant is what an 'approve this dialog' step "
+            "leaves behind, and %s is the capability itself, not a hint of "
+            "one. Verify you granted it (System Settings > Privacy & "
+            "Security > %s); revoking it there removes the capability."
+            % (client, verb, _tcc_label(service), _tcc_label(service),
+               _tcc_label(service)),
+            "tcc:%s:%s:%s" % ("new" if was is None else "regrant",
+                              service, _sha_key(client)),
+            client=client, service=service, grant=_tcc_label(service),
+            auth=rec.get("auth"), prior_auth=was)
+
+    def new_fn(key, rec):
+        if rec.get("auth") not in _TCC_ALLOWED:
+            return None    # a DENIED row is baselined silently; the flip to
+                           # allowed is what changed_fn reports
+        return _grant_finding(key, rec, None)
+
+    def changed_fn(key, rec, old):
+        was = old.get("auth") if isinstance(old, dict) else None
+        if rec.get("auth") not in _TCC_ALLOWED:
+            return None    # revoked or downgraded — the safe direction
+        if was in _TCC_ALLOWED:
+            return None    # still allowed; some other field moved
+        return _grant_finding(key, rec, was)
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+# --- persistent DNS / proxy / resolver configuration --------------------------
+# Only /etc/hosts was covered, so a DNS or proxy hijack that survives a reboot
+# was invisible. Three at-rest artifacts, no live network state:
+#
+#   dns:<service-uuid>      manually-configured DNS servers + search domains
+#   proxy:<service-uuid>    web / secure-web / SOCKS / PAC settings
+#   resolver:<path>         content hash of every /etc/resolver/ drop-in
+#
+# Read straight out of SystemConfiguration's own preferences plist (world-
+# readable, one file) rather than by shelling `networksetup`, which costs five
+# subprocess calls PER network service — nine services on the reference machine.
+#
+# `scutil --dns` is deliberately NOT used. It reports the EFFECTIVE resolver,
+# which on a laptop changes with every Wi-Fi network and every VPN bring-up
+# (this machine's own Tailscale resolver moves in and out of it, and its
+# `reach :` flags change without any configuration changing at all). That is
+# environment, not persistence, and a surface that alerts on it teaches the
+# operator to ignore the tool. A resolver an attacker sets to STICK is written
+# here, into /etc/resolver, or into a configuration profile — and profile
+# payloads are hashed by snapshot_profile_payloads, so the three together leave
+# no persistent gap.
+SC_PREFERENCES = "/Library/Preferences/SystemConfiguration/preferences.plist"
+RESOLVER_DIR = "/etc/resolver"
+
+# FTPPassive is deliberately absent: it is on by default everywhere and carries
+# no security meaning. ExceptionsList is kept — a hostile profile widening the
+# bypass list is how a proxy gets to see traffic it otherwise would not.
+_SC_PROXY_KEYS = ("HTTPEnable", "HTTPProxy", "HTTPPort",
+                  "HTTPSEnable", "HTTPSProxy", "HTTPSPort",
+                  "SOCKSEnable", "SOCKSProxy", "SOCKSPort",
+                  "FTPEnable", "FTPProxy", "FTPPort",
+                  "RTSPEnable", "RTSPProxy", "RTSPPort",
+                  "GopherEnable", "GopherProxy", "GopherPort",
+                  "ProxyAutoConfigEnable", "ProxyAutoConfigURLString",
+                  "ProxyAutoDiscoveryEnable", "ExceptionsList")
+_SC_PROXY_ENABLES = ("HTTPEnable", "HTTPSEnable", "SOCKSEnable", "FTPEnable",
+                     "RTSPEnable", "GopherEnable", "ProxyAutoConfigEnable",
+                     "ProxyAutoDiscoveryEnable")
+_SC_SERVICE_CAP = 64
+_RESOLVER_ENTRY_CAP = 200
+
+
+def _sc_scalar(value):
+    """plist values reduced to something json.dump can store. bytes and
+    datetimes appear in real SystemConfiguration plists and are not
+    serializable; stringifying is lossless enough for a comparison whose only
+    job is 'did this change'."""
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_sc_scalar(v) for v in value]
+    return str(value)
+
+
+def _proxy_enabled(rec):
+    px = (rec or {}).get("proxy") or {}
+    return sorted(k for k in _SC_PROXY_ENABLES if px.get(k))
+
+
+def snapshot_netconfig():
+    """{key: rec} of persistent DNS/proxy/resolver configuration; None when the
+    SystemConfiguration store exists but could not be read."""
+    if not IS_MAC:
+        return {}
+    snap = {}
+    try:
+        with open(SC_PREFERENCES, "rb") as f:
+            prefs = plistlib.load(f)
+    except Exception:
+        # The plist is a fixture of every macOS install. Failing to read one
+        # that EXISTS is a non-answer, and adopting the false-empty would storm
+        # every network service the moment the read next succeeds.
+        if os.path.exists(SC_PREFERENCES):
+            return None
+        prefs = None
+    services = (prefs or {}).get("NetworkServices")
+    if isinstance(services, dict):
+        for sid, svc in sorted(services.items())[:_SC_SERVICE_CAP]:
+            if not isinstance(svc, dict):
+                continue
+            name = str(svc.get("UserDefinedName") or "")[:80]
+            dns = svc.get("DNS")
+            dns = dns if isinstance(dns, dict) else {}
+            px = svc.get("Proxies")
+            px = px if isinstance(px, dict) else {}
+            # _redact_value before anything crosses the baseline edge: a PAC
+            # URL or proxy host can carry userinfo credentials, and the v2
+            # migration exists because ProgramArguments once persisted a secret
+            # in plaintext.
+            snap["dns:" + str(sid)] = _redact_value({
+                "name": name,
+                "servers": [_sc_scalar(v)
+                            for v in (dns.get("ServerAddresses") or [])],
+                "domains": [_sc_scalar(v)
+                            for v in (dns.get("SearchDomains") or [])],
+            })
+            snap["proxy:" + str(sid)] = _redact_value({
+                "name": name,
+                "proxy": {k: _sc_scalar(px[k])
+                          for k in _SC_PROXY_KEYS if k in px},
+            })
+    try:
+        names = sorted(os.listdir(RESOLVER_DIR))[:_RESOLVER_ENTRY_CAP]
+    except Exception:
+        names = []          # absent on a stock Mac; absence is a real answer
+    for name in names:
+        p = os.path.join(RESOLVER_DIR, name)
+        if not os.path.isfile(p):
+            continue
+        h = sha256(p)
+        if h:
+            snap["resolver:" + p] = {"sha256": h}
+    return snap
+
+
+def diff_netconfig(prior, cur):
+    def _dns_detail(rec):
+        return "servers=%s domains=%s" % (
+            ", ".join(rec.get("servers") or []) or "(none)",
+            ", ".join(rec.get("domains") or []) or "(none)")
+
+    def new_fn(key, rec):
+        kind = str(key).split(":", 1)[0]
+        if kind == "resolver":
+            return finding(
+                "HIGH", "network-config", "New /etc/resolver DNS override",
+                "%s appeared — a resolver drop-in silently redirects every "
+                "lookup for one domain to a chosen nameserver, needs root to "
+                "write, and survives reboots."
+                % str(key).split(":", 1)[1],
+                "netconfig:resolver:new:%s" % rec.get("sha256"),
+                path=str(key).split(":", 1)[1], sha256=rec.get("sha256"))
+        if kind == "dns":
+            if not rec.get("servers"):
+                # A network service appearing with no manual DNS is an adapter
+                # being added (a dock, a phone tether), not a hijack.
+                return None
+            return finding(
+                "HIGH", "network-config", "Manual DNS servers configured",
+                "network service %s now has manually-set DNS (%s) — DHCP "
+                "no longer decides where this Mac's lookups go."
+                % (rec.get("name") or key, _dns_detail(rec)),
+                "netconfig:dns:new:%s:%s"
+                % (key, _sha_key(_dns_detail(rec))),
+                service=rec.get("name"), servers=rec.get("servers"),
+                domains=rec.get("domains"))
+        if kind == "proxy":
+            on = _proxy_enabled(rec)
+            if not on:
+                return None
+            return finding(
+                "HIGH", "network-config", "Proxy enabled on a network service",
+                "network service %s appeared with %s enabled — a proxy sees "
+                "every request that goes through it."
+                % (rec.get("name") or key, ", ".join(on)),
+                "netconfig:proxy:new:%s:%s" % (key, ",".join(on)),
+                service=rec.get("name"), enabled=on,
+                proxy=rec.get("proxy"))
+        return None
+
+    def changed_fn(key, rec, old):
+        kind = str(key).split(":", 1)[0]
+        old = old if isinstance(old, dict) else {}
+        if kind == "resolver":
+            return finding(
+                "HIGH", "network-config", "/etc/resolver override CHANGED",
+                "%s was rewritten — the nameserver a scoped domain resolves "
+                "through is not what it was." % str(key).split(":", 1)[1],
+                "netconfig:resolver:changed:%s" % rec.get("sha256"),
+                path=str(key).split(":", 1)[1], sha256=rec.get("sha256"),
+                prior_sha256=old.get("sha256"))
+        if kind == "dns":
+            servers_moved = (rec.get("servers") or []) != (old.get("servers")
+                                                           or [])
+            domains_moved = (rec.get("domains") or []) != (old.get("domains")
+                                                           or [])
+            if not (servers_moved or domains_moved):
+                # Only the service's display name moved: a rename, not a
+                # redirect. Graded on WHAT changed, not on the fact that the
+                # record differs, so a cosmetic edit cannot borrow a DNS
+                # hijack's severity.
+                return finding(
+                    "LOW", "network-config", "Network service renamed",
+                    "network service %s was renamed (was %s)."
+                    % (rec.get("name") or key, old.get("name") or "?"),
+                    "netconfig:dns:rename:%s:%s"
+                    % (key, _sha_key(str(rec.get("name")))),
+                    service=rec.get("name"))
+            return finding(
+                "HIGH" if servers_moved else "MEDIUM", "network-config",
+                "DNS configuration CHANGED" if servers_moved
+                else "DNS search domains CHANGED",
+                "network service %s: %s (was %s) — a changed resolver is how "
+                "traffic is silently redirected without touching /etc/hosts."
+                % (rec.get("name") or key, _dns_detail(rec),
+                   _dns_detail(old)),
+                "netconfig:dns:changed:%s:%s"
+                % (key, _sha_key(_dns_detail(rec))),
+                service=rec.get("name"), servers=rec.get("servers"),
+                domains=rec.get("domains"),
+                prior_servers=old.get("servers"))
+        if kind == "proxy":
+            was, on = _proxy_enabled(old), _proxy_enabled(rec)
+            turned_on = [k for k in on if k not in was]
+            if not turned_on and rec.get("proxy") == old.get("proxy"):
+                return None      # name-only edit
+            return finding(
+                "HIGH" if turned_on else "MEDIUM", "network-config",
+                "Proxy settings CHANGED",
+                "network service %s: %s%s — a proxy or PAC URL sees and can "
+                "rewrite every request routed through it."
+                % (rec.get("name") or key,
+                   ("newly enabled: %s; " % ", ".join(turned_on))
+                   if turned_on else "",
+                   "enabled now: %s" % (", ".join(on) or "(none)")),
+                "netconfig:proxy:changed:%s:%s"
+                % (key, _sha_key(json.dumps(rec.get("proxy") or {},
+                                            sort_keys=True, default=str))),
+                service=rec.get("name"), enabled=on, turned_on=turned_on,
+                proxy=rec.get("proxy"))
+        return None
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
 
 
 # --- extra persistence files (extended cron / periodic / StartupItems) --------
@@ -8101,6 +9000,145 @@ def diff_extra_persistence(prior, cur):
         return f
     return _diff_map(prior, cur, _mk("New system-persistence file", "appeared"),
                      _mk("System-persistence file CHANGED", "changed"))
+
+
+
+# --- Python startup hooks (sitecustomize / usercustomize / .pth) --------------
+# check_supply_chain explicitly disclaims pip. That is defensible for wheel
+# CONTENT — auditing package source is a package-manager problem — but these
+# three are not package content, they are pure persistence: CPython's site
+# module imports sitecustomize and usercustomize at every interpreter start,
+# and site.addpackage() exec()s any .pth line beginning with "import ". They
+# live in site-packages, which is in _PKG_SKIP_DIRS, so nothing in Aegis was
+# looking at them at all.
+#
+# Only .pth files that actually EXECUTE are recorded. A .pth whose lines are
+# plain paths cannot run anything, and the path-only kind is what `pip install
+# -e` scatters by the dozen — on the reference machine two of the six .pth
+# files present were path-only. Recording those would be churn on a box where
+# the operator runs uv and pip all day; recording the executable kind is a
+# handful of files that each run code in every Python process that starts.
+_PY_STARTUP_FILES = ("sitecustomize.py", "usercustomize.py")
+_PY_SITE_DIR_CAP = 12       # site directories to inspect
+_PY_SITE_ENTRY_CAP = 2000   # names to consider per directory
+_PY_PTH_READ_LIMIT = 64 * 1024
+
+
+def _python_site_dirs():
+    """The site directories whose startup hooks execute in AEGIS'S OWN
+    interpreter: the active prefix's site-packages (which IS the virtualenv's
+    when Aegis runs inside one) plus the per-user site directory.
+
+    Not every venv on the box, deliberately: a .pth only runs for the
+    interpreter that owns it, so a project venv Aegis never executes under is
+    not a persistence surface for this process — and enumerating every venv on
+    a developer's machine is a walk with no end."""
+    import site
+    dirs = []
+    for getter in ("getsitepackages", "getusersitepackages"):
+        fn = getattr(site, getter, None)
+        if not callable(fn):
+            continue
+        try:
+            got = fn()
+        except Exception:
+            continue
+        dirs.extend([got] if isinstance(got, str) else list(got))
+    if not dirs:
+        # Very old virtualenv shims ship a `site` without either accessor.
+        dirs = [os.path.join(sys.prefix, "Lib", "site-packages")]
+        lib = os.path.join(sys.prefix, "lib")
+        try:
+            dirs += [os.path.join(lib, n, "site-packages")
+                     for n in sorted(os.listdir(lib))
+                     if n.startswith("python")]
+        except Exception:
+            pass
+    out = []
+    for d in dirs:
+        if isinstance(d, str) and d not in out and os.path.isdir(d):
+            out.append(d)
+    return out[:_PY_SITE_DIR_CAP]
+
+
+# Resolved once at import, exactly like SHELL_RC_FILES / EXTRA_PERSIST_DIRS /
+# BROWSER_EXT_ROOTS above. A module-level LIST rather than a call inside the
+# snapshot, so a test can pin the surface off the developer's real
+# site-packages the same way it pins every other host-reading surface — a
+# sensor with no pinnable global makes every scan-level test read live host
+# state, which is the gap tests/conftest.py exists to catch.
+PY_SITE_DIRS = _python_site_dirs()
+
+
+def _pth_executes(path):
+    """True when a .pth file carries a line CPython will exec() at startup.
+    site.addpackage's own rule, spelled the same way it spells it."""
+    text = _read_text(path, _PY_PTH_READ_LIMIT) or ""
+    return any(line.startswith(("import ", "import\t"))
+               for line in text.splitlines())
+
+
+def snapshot_python_site():
+    """{path: sha256} for every Python startup hook that executes. Content
+    hashes, not (mtime, size): a same-size edit to a one-line .pth is exactly
+    the shape this has to catch, and a coarse key has already hidden one here."""
+    snap = {}
+    for d in _python_site_dirs():
+        try:
+            # Filter BEFORE the cap. Capping the raw listing instead would let
+            # a site-packages with thousands of entries push the .pth files off
+            # the end alphabetically, and a silently-dropped hook is worse than
+            # no hook surface at all.
+            names = sorted(n for n in os.listdir(d)
+                           if n in _PY_STARTUP_FILES
+                           or n.endswith(".pth"))[:_PY_SITE_ENTRY_CAP]
+        except Exception:
+            continue
+        for name in names:
+            p = os.path.join(d, name)
+            if name not in _PY_STARTUP_FILES and not _pth_executes(p):
+                continue
+            h = sha256(p)
+            if h:
+                snap[p] = h
+    return snap
+
+
+def diff_python_site(prior, cur):
+    def _mk(is_new):
+        def f(p, h, *old):
+            name = os.path.basename(p)
+            startup = name in _PY_STARTUP_FILES
+            # The hostile markers ride along as CONTEXT and do NOT set the
+            # severity. An executing .pth is NORMAL: setuptools ships
+            # distutils-precedence.pth, `pip install -e` ships an __editable__
+            # finder, and coverage ships one containing a literal exec() call —
+            # grading on _hostile_content would have made coverage's own
+            # a1_coverage.pth a HIGH alert on the reference machine's first scan
+            # (verified 2026-09-03). Severity comes from the EVENT instead:
+            # sitecustomize/usercustomize existing at all is rare and is the
+            # textbook hook, and an existing hook rewritten in place is worse
+            # than a new one because the bytes that changed were already
+            # trusted.
+            hostile = _hostile_content(_read_text(p, _PY_PTH_READ_LIMIT) or "")
+            sev = "HIGH" if (startup or not is_new) else "MEDIUM"
+            return finding(
+                sev, "persistence",
+                "Python startup hook %s" % ("appeared" if is_new
+                                            else "CHANGED"),
+                "%s %s — %s runs in EVERY Python process started by this "
+                "interpreter, before any script does%s. Confirm the package "
+                "that owns it."
+                % (p, "appeared" if is_new else "was modified in place",
+                   "sitecustomize/usercustomize is imported by the site module"
+                   if startup else "an 'import' line in a .pth is exec()d by "
+                   "site.addpackage",
+                   " — hostile pattern(s): %s" % ", ".join(hostile)
+                   if hostile else ""),
+                "pysite:%s:%s:%s" % ("new" if is_new else "changed", p, h),
+                path=p, sha256=h, hostile=hostile)
+        return f
+    return _diff_map(prior, cur, _mk(True), _mk(False))
 
 
 # --- browser extensions -------------------------------------------------------
@@ -8667,6 +9705,116 @@ def diff_btm(prior, cur):
             "btm:changed:%s:%s" % (ident, url or "?"),
             identifier=ident, name=rec.get("name"),
             team=rec.get("team"), url=url, path=path)
+
+    return _diff_map(prior, cur, new_fn, changed_fn)
+
+
+
+# --- Background Task Management STORE (the file behind the walled tool) -------
+# snapshot_btm() shells `sfltool dumpbtm`, which macOS 26 moved behind
+# system.privilege.admin — so on this machine the PARSED view of Login Items and
+# SMAppService registrations is permanently SURFACE_PRIVILEGED, and modern
+# login-item persistence (the registration path that leaves NO LaunchAgents
+# plist) was a permanent zero. The store ITSELF is world-readable: 0644
+# root:wheel at /private/var/db/com.apple.backgroundtaskmanagement, verified on
+# macOS 26.0.1, where the wall is up. A content hash is therefore a change
+# tripwire the authorization wall cannot take away.
+#
+# Deliberately NOT parsed. The .btm format is an undocumented, versioned Apple
+# archive; a parser would be wrong on the next release and would claim to know
+# things it does not. "The background-items store changed and no launchd plist
+# did" is actionable on its own, and that correlation — not a field listing — is
+# the whole point. snapshot_btm keeps its honest PRIVILEGED status; this runs
+# ALONGSIDE it, never instead of it.
+BTM_STORE_DIRS = ("/private/var/db/com.apple.backgroundtaskmanagement",
+                  os.path.join(HOME, "Library", "Application Support",
+                               "com.apple.backgroundtaskmanagement"))
+_BTM_STORE_PREFIX = "BackgroundItems-v"
+_BTM_STORE_SUFFIX = ".btm"
+
+
+def snapshot_btm_store():
+    """{path: {sha256, size}}; None when store files exist but none could be
+    hashed.
+
+    mtime is deliberately NOT part of the compared value — a touch with no
+    content change would then fire a bogus "store changed". It is read fresh at
+    REPORTING time instead (see diff_btm_store), so the finding still answers
+    "when" without the comparison depending on it.
+
+    {} when no store directory exists at all, which is the honest answer on a
+    macOS old enough to predate Background Task Management. None when a
+    directory holds BackgroundItems-v*.btm files and not one of them could be
+    read — that is a refusal, and recording it as "no background items" is the
+    false-empty snapshot_btm's whole docstring exists to forbid."""
+    if not IS_MAC:
+        return {}
+    snap, saw_files = {}, False
+    for d in BTM_STORE_DIRS:
+        try:
+            names = sorted(os.listdir(d))
+        except Exception:
+            continue
+        for name in names:
+            if not (name.startswith(_BTM_STORE_PREFIX)
+                    and name.endswith(_BTM_STORE_SUFFIX)):
+                continue
+            saw_files = True
+            p = os.path.join(d, name)
+            h = sha256(p)
+            if h is None:
+                continue
+            try:
+                size = os.path.getsize(p)
+            except Exception:
+                size = None
+            snap[p] = {"sha256": h, "size": size}
+    if saw_files and not snap:
+        return None
+    return snap
+
+
+def diff_btm_store(prior, cur):
+    def _measured(p):
+        try:
+            return _iso_short(os.stat(p).st_mtime)
+        except Exception:
+            return "?"
+
+    def _walled():
+        # Tailor the advice to whether the parsed view is actually gone on this
+        # machine, rather than asserting a wall that may not be up here.
+        return (" `sfltool dumpbtm` is walled behind admin authorization on "
+                "this machine, so this hash is the ONLY view of the store."
+                if _wall_seen("btm") else
+                " Cross-check with `sfltool dumpbtm` for the item list.")
+
+    def new_fn(p, rec):
+        # A new versioned store file appears when macOS itself moves to a newer
+        # BTM schema (v9 -> v13 -> v16 on the reference machine). Worth
+        # recording, not worth an alarm.
+        return finding(
+            "LOW", "btm", "New background-items store file",
+            "%s appeared (%s bytes, last written %s) — usually a macOS upgrade "
+            "moving to a newer Background Task Management schema."
+            % (p, rec.get("size"), _measured(p)),
+            "btmstore:new:%s:%s" % (p, rec.get("sha256")),
+            path=p, sha256=rec.get("sha256"), size=rec.get("size"))
+
+    def changed_fn(p, rec, old):
+        old = old if isinstance(old, dict) else {}
+        return finding(
+            "MEDIUM", "btm", "Background-items store CHANGED",
+            "%s changed (%s -> %s bytes, last written %s). Something "
+            "registered, unregistered or re-pointed a Login Item / "
+            "SMAppService background item. If no launchd plist changed in this "
+            "same scan, the registration left NO plist behind — which is "
+            "exactly how modern login-item persistence hides.%s"
+            % (p, old.get("size"), rec.get("size"), _measured(p), _walled()),
+            "btmstore:changed:%s:%s" % (p, rec.get("sha256")),
+            path=p, sha256=rec.get("sha256"),
+            prior_sha256=old.get("sha256"), size=rec.get("size"),
+            measured_at=_measured(p))
 
     return _diff_map(prior, cur, new_fn, changed_fn)
 
@@ -11342,6 +12490,35 @@ AGENT_REPO_CONFIG_NAMES = (
     ".mcp.json", ".cursorrules", "CLAUDE.md", "AGENTS.md", "GEMINI.md",
 )
 
+# ...and until 2026-09-03 that tuple had exactly ONE reader, `_intent_worthy`.
+# The constant described a persistence surface nobody walked: no sensor ever
+# opened a project directory, so a `.mcp.json` or an `AGENTS.md` that arrived in
+# any repo was never examined — including in Aegis's own checkout, which carries
+# both. The comment above was a correct threat model with no detector under it.
+#
+# Finding the repos is the hard half. A home-wide walk is precisely the DoS the
+# caps below exist to prevent, so the roots are not SEARCHED for, they are READ
+# from the list the agent already keeps: ~/.claude.json records every directory
+# Claude Code has been started in (`projects`) and every checkout it has matched
+# to a GitHub remote (`githubRepoPaths`). Free, exact, and it tracks the
+# operator's real working set instead of a guess at one.
+#
+# A LIST, for two reasons: a body with a different agent installed can gain its
+# own hint file, and a test can empty it. The second matters more than it looks
+# — a sandboxed test that silently read the developer's real checkouts would be
+# both slow and a privacy leak, the same class of sandbox gap conftest.py's
+# banner was written about.
+AGENT_REPO_ROOT_HINTS = [os.path.join(HOME, ".claude.json")]
+
+# A third ceiling, on the number of ROOTS. `projects` is append-only and grows
+# for the life of the install (51 entries on the reference machine), so an
+# unbounded root list would eventually reintroduce the home-wide walk by
+# accretion. A root cut by this cap is NOT "partially covered" — it is not
+# looked at at all, which is the exact defect the per-root cap was added to
+# fix, so a dropped root is reported by NAME through that same channel rather
+# than being absorbed.
+_AGENT_REPO_ROOT_CAP = 48
+
 # Two ceilings, because one global ceiling is order-dependent starvation.
 # The walk used to take a single 400-file budget and RETURN the moment it ran
 # out, in root order — so the roots reached last were not "partially covered",
@@ -12919,6 +14096,104 @@ def _resolve_exec_target(command, args):
     return target, sha256(target)
 
 
+def _under_or_equal(child, parent):
+    """Is `child` inside `parent`, or `parent` itself? Windows compares
+    case-insensitively because its filesystem does — the same split
+    `_is_trusted_prefix` already makes."""
+    if not child or not parent:
+        return False
+    a, b = os.path.normpath(child), os.path.normpath(parent)
+    if IS_WIN:
+        a, b = os.path.normcase(a), os.path.normcase(b)
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep)
+
+
+def _known_project_paths():
+    """Every project directory the operator's agents already record, read from
+    the hint files in AGENT_REPO_ROOT_HINTS. No walk, no guessing, no network —
+    this is a config read, and it is the whole reason repo coverage costs
+    nothing."""
+    out = []
+    for hint in AGENT_REPO_ROOT_HINTS:
+        data = load_json(hint, None)
+        if not isinstance(data, dict):
+            continue
+        projects = data.get("projects")
+        if isinstance(projects, dict):
+            out += [k for k in projects if isinstance(k, str)]
+        # {"<owner>/<repo>": ["/path/one", "/path/two"]} — the same checkout
+        # often appears under BOTH keys, which the realpath dedupe settles.
+        gh = data.get("githubRepoPaths")
+        if isinstance(gh, dict):
+            for v in gh.values():
+                if isinstance(v, list):
+                    out += [p for p in v if isinstance(p, str)]
+    return out
+
+
+def _agent_repo_roots():
+    """(roots, dropped): the git repositories worth watching, plus the ones a
+    cap refused. Operator-declared roots come first, so the cap eats a
+    discovered hint before it eats an explicit instruction.
+
+    Three filters, each measured on the reference machine's real 51-entry
+    project list rather than reasoned about:
+
+      * A root must BE a git repository — `.git` present, a directory in a
+        normal clone and a FILE in a worktree or submodule. Both questions this
+        list answers are git-shaped (config that arrives by `git pull`, hooks
+        that run on `git status`), and `projects` also records plain
+        directories an agent was merely started in: ~/Desktop and ~/Documents
+        contributed 7 candidate files and 0 repositories.
+      * Never HOME, never an ancestor of HOME, never the filesystem root. The
+        reference machine's `projects` list contains `~` ITSELF, and adopting
+        that one entry converts this bounded read into the home-wide walk the
+        budgets exist to prevent.
+      * Nested roots collapse into their outermost ancestor. ~/Ai/Universe and
+        five of its own children are all registered projects; walking each
+        separately would read one tree six times and spend six root budgets on
+        it.
+    """
+    cfg = load_json(os.path.join(STATE_DIR, "config.json"), {})
+    extra = cfg.get("agent_repo_roots") if isinstance(cfg, dict) else None
+    cand = []
+    if isinstance(extra, list):
+        cand += [str(r) for r in extra]
+    cand += _known_project_paths()
+
+    home = os.path.realpath(HOME)
+    seen, repos = set(), []
+    for raw in cand:
+        try:
+            r = os.path.realpath(os.path.expanduser(raw))
+        except Exception:
+            continue
+        if r in seen:
+            continue
+        seen.add(r)
+        if len(r.rstrip(os.sep)) < 2 or _under_or_equal(home, r):
+            continue
+        if not os.path.isdir(r):
+            continue
+        if not os.path.exists(os.path.join(r, ".git")):
+            continue
+        repos.append(r)
+
+    # Shortest first so a parent is always considered before its own children;
+    # the discovery order is then restored, because which roots survive the cap
+    # must follow INTENT (config before hint), not path length.
+    kept = []
+    for r in sorted(repos, key=lambda p: (len(p), p)):
+        if any(_under_or_equal(r, k) for k in kept):
+            continue
+        kept.append(r)
+    order = {}
+    for i, r in enumerate(repos):
+        order.setdefault(r, i)
+    kept.sort(key=lambda p: order.get(p, 1 << 30))
+    return kept[:_AGENT_REPO_ROOT_CAP], kept[_AGENT_REPO_ROOT_CAP:]
+
+
 def _agent_config_files():
     """Every agent config/instruction file worth watching, discovered by shape
     under a bounded set of roots. Hard-capped: a home-wide walk is both a
@@ -12933,17 +14208,43 @@ def _agent_config_files():
     _AGENT_SCAN_TRUNCATED[0] = False
     del _AGENT_SCAN_TRUNCATED_ROOTS[:]
     seen = []
-    roots = list(AGENT_CONFIG_ROOTS)
+    # (root, repo_scoped). An agent's own config directory is walked by SHAPE:
+    # any JSON/TOML under it is a candidate, because the whole point of shape
+    # discovery is that a hardcoded path list rots. A REPOSITORY is walked by
+    # NAME only. A checkout is full of JSON that is not agent config —
+    # package.json, tsconfig.json, every fixture and lockfile — and taking
+    # those by shape would spend a root's entire 500-file budget on noise
+    # before ever reaching its CLAUDE.md, which is the starvation defect in a
+    # new costume.
+    roots = [(r, False) for r in AGENT_CONFIG_ROOTS]
     cfg = load_json(os.path.join(STATE_DIR, "config.json"), {})
     extra = cfg.get("agent_repo_roots") if isinstance(cfg, dict) else None
     if isinstance(extra, list):
-        roots += [os.path.expanduser(str(r)) for r in extra[:16]]
+        # Deliberately still SHAPE-scoped. This key predates repo discovery and
+        # an operator may already be pointing it at a plain agent directory;
+        # narrowing it now would silently delete coverage they already have.
+        roots += [(os.path.expanduser(str(r)), False) for r in extra[:16]]
+    repo_roots, repo_dropped = _agent_repo_roots()
+    known = set()
+    for r, _repo in roots:
+        try:
+            known.add(os.path.realpath(r))
+        except Exception:
+            known.add(r)
+    roots += [(r, True) for r in repo_roots if r not in known]
+
     def _starved(root):
         _AGENT_SCAN_TRUNCATED[0] = True
         if root not in _AGENT_SCAN_TRUNCATED_ROOTS:
             _AGENT_SCAN_TRUNCATED_ROOTS.append(root)
 
-    for root in roots:
+    # A root refused by the ROOT cap was not partially walked, it was never
+    # opened — indistinguishable from clean unless it is named, which is the
+    # whole lesson the per-root cap was added for. Same flag, same finding.
+    for root in repo_dropped:
+        _starved(root)
+
+    for root, repo_scoped in roots:
         if not os.path.isdir(root):
             continue
         if len(seen) >= _AGENT_SCAN_FILE_CAP:
@@ -12967,8 +14268,12 @@ def _agent_config_files():
                 p = os.path.join(dirpath, fn)
                 if os.path.islink(p):
                     continue
-                if (fn.endswith((".json", ".toml")) or
-                        fn in AGENT_INSTRUCTION_NAMES):
+                if repo_scoped:
+                    take = fn in AGENT_REPO_CONFIG_NAMES
+                else:
+                    take = (fn.endswith((".json", ".toml")) or
+                            fn in AGENT_INSTRUCTION_NAMES)
+                if take:
                     seen.append(p)
                     # Checked AFTER the append, as the single-budget version
                     # was: a cap of 1 must truncate on the first candidate.
@@ -13856,6 +15161,323 @@ def cmd_glean(mode="new"):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Git hooks and git config — the highest-frequency execution surface on a
+# machine that runs coding agents, and until now the only completely unwatched
+# one.
+#
+# A file in `.git/hooks` executes on ordinary git commands, and `core.fsmonitor`
+# executes on EVERY `git status` — which an AI coding agent issues constantly,
+# many times a minute. On the reference machine that makes this surface fire
+# more often than launchd does, and nothing observed it.
+#
+# It is also the one persistence surface that no code review can ever reach:
+# `.git` is not tracked BY git, so a hook has no diff, no PR and no blame. A
+# `git pull` cannot install one — but a Makefile target, an npm postinstall, or
+# an agent talked into running a single line can, and from then on it runs
+# forever with the operator's full authority. `core.fsmonitor = /tmp/x` in one
+# repo's `.git/config` is three words and a reverse shell on the next status.
+#
+# Read the config file directly rather than shelling out to `git config`:
+# invoking git inside a repository whose configuration is the very thing under
+# suspicion hands that configuration a vote (aliases, and `include.path`
+# pulling in a file of its own choosing). Parsing costs a regex and answers the
+# question without giving the subject a turn.
+# --------------------------------------------------------------------------- #
+
+_GIT_HOOK_CAP = 64                  # hooks per repo; more than this is not a repo
+_GIT_CONFIG_CAP = 1 << 20
+# Section header, then `key = value` under it. Hand-parsed rather than handed to
+# configparser, which rejects git's bare `key` (meaning true) and mangles the
+# `[section "subsection"]` header form.
+_GIT_SECTION_RE = re.compile(r'^\s*\[([^\]\s]+)(?:\s+"([^"]*)")?\s*\]')
+_GIT_KV_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*?)\s*$")
+# Values that are booleans, not paths. `core.fsmonitor = true` selects git's
+# built-in watcher and executes nothing of the repo's choosing.
+_GIT_BOOLISH = ("true", "false", "yes", "no", "on", "off", "0", "1")
+
+
+def _git_common_dir(repo):
+    """The directory holding this repo's `config` and `hooks`, or None.
+
+    `.git` is a directory in a normal clone and a FILE reading `gitdir: <path>`
+    in a worktree or a submodule; a worktree's gitdir then points at
+    `<common>/worktrees/<name>` and defers to `<common>` — recorded in a
+    `commondir` file — for both config and hooks. Aegis's own agents each work
+    in a worktree, so the file form is not an exotic case here, it is the
+    common one, and silently skipping it would have left this sensor blind in
+    exactly the trees it was written for."""
+    g = os.path.join(repo, ".git")
+    if os.path.isdir(g):
+        return g
+    m = re.match(r"\s*gitdir:\s*(.+?)\s*$", _read_text(g, 4096) or "")
+    if not m:
+        return None
+    d = m.group(1)
+    d = os.path.normpath(d if os.path.isabs(d) else os.path.join(repo, d))
+    common = (_read_text(os.path.join(d, "commondir"), 4096) or "").strip()
+    if common:
+        d = os.path.normpath(common if os.path.isabs(common)
+                             else os.path.join(d, common))
+    return d if os.path.isdir(d) else None
+
+
+def _git_core_values(config_text):
+    """{lowercased key: value} for the `[core]` section of a git config body."""
+    out = {}
+    section = None
+    for line in (config_text or "").splitlines():
+        s = line.strip()
+        if not s or s[0] in "#;":
+            continue
+        m = _GIT_SECTION_RE.match(line)
+        if m:
+            section = m.group(1).lower()
+            continue
+        if section != "core":
+            continue
+        m = _GIT_KV_RE.match(line)
+        if m:
+            v = m.group(2)
+            if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                v = v[1:-1]
+            out[m.group(1).lower()] = v
+    return out
+
+
+def _git_abspath(repo, value):
+    """A git config path value resolved the way git resolves it: `~` expanded,
+    a relative path taken against the repository top level."""
+    p = os.path.expanduser((value or "").strip())
+    if not p:
+        return None
+    return os.path.normpath(p if os.path.isabs(p) else os.path.join(repo, p))
+
+
+def _git_path_escape(repo, value):
+    """The resolved target of a git config path value when it lands OUTSIDE the
+    repository, else None.
+
+    Outside-the-repo is the discriminator that carries the signal. A hooks
+    directory or a filesystem-monitor command inside the checkout is at least
+    visible to whoever reviews the checkout; one pointing at /tmp, or at a
+    dotfile in HOME, is execution the repository redirects somewhere nobody
+    reviewing the repository will look."""
+    v = (value or "").strip()
+    if not v or v.lower() in _GIT_BOOLISH:
+        return None
+    p = _git_abspath(repo, v)
+    return None if (p is None or _under_or_equal(p, repo)) else p
+
+
+def snapshot_git_hooks():
+    """{repo: record} for every discovered git repository.
+
+    Content-keyed throughout. A repository is identified by its path, a hook by
+    its NAME — `pre-commit` IS the trigger, not a position in a listing — and
+    every change is carried by a content HASH, never by an (mtime, size) pair:
+    this file has already paid twice for a coarse key that let a same-size edit
+    through.
+
+    Copies no bytes out of the operator's other repositories. What is stored is
+    a hash, a hook name, the NAMES of any hostile shell patterns matched, and
+    redacted config values — enough to say what changed, never enough to
+    reconstruct what a private repo contains."""
+    snap = {}
+    roots, _dropped = _agent_repo_roots()
+    for repo in roots:
+        gd = _git_common_dir(repo)
+        if not gd:
+            continue
+        cfg_text = _read_text(os.path.join(gd, "config"), _GIT_CONFIG_CAP) or ""
+        core = _git_core_values(cfg_text)
+        rec = {"config_sha": hashlib.sha256(
+            cfg_text.encode("utf-8", "replace")).hexdigest()[:16]}
+        escapes = {}
+        for key in ("hookspath", "fsmonitor"):
+            val = core.get(key)
+            if val is None:
+                continue
+            rec[key] = redact_sensitive(val)
+            out = _git_path_escape(repo, val)
+            if out:
+                escapes[key] = redact_sensitive(out)
+        if escapes:
+            rec["escapes"] = escapes
+        hooks_dir = _git_abspath(repo, core["hookspath"]) \
+            if core.get("hookspath") else os.path.join(gd, "hooks")
+        # The hooks DIRECTORY is part of the record, so redirecting it is a
+        # change even when no individual hook body moved.
+        rec["hooks_dir"] = redact_sensitive(hooks_dir or "")
+        hooks = {}
+        try:
+            names = sorted(os.listdir(hooks_dir))
+        except Exception:
+            names = []
+        for name in names:
+            # `.sample` is what git ships in every clone: inert by extension,
+            # identical everywhere, and 12 per repo of pure baseline weight.
+            if name.endswith(".sample") or name.startswith("."):
+                continue
+            hp = os.path.join(hooks_dir, name)
+            if not os.path.isfile(hp):
+                continue
+            h = sha256(hp)
+            ent = {"sha256": (h or "")[:16],
+                   # Windows git does not consult the POSIX exec bit, and
+                   # os.access(X_OK) there answers a question nobody asked, so
+                   # a hook is treated as runnable rather than graded on a bit
+                   # that means nothing on that body.
+                   "exec": True if IS_WIN else bool(os.access(hp, os.X_OK))}
+            marks = _hostile_content(_read_text(hp, _HOSTILE_SCAN_LIMIT) or "")
+            if marks:
+                ent["hostile"] = marks
+            hooks[name] = ent
+            if len(hooks) >= _GIT_HOOK_CAP:
+                break
+        if hooks:
+            rec["hooks"] = hooks
+        snap[repo] = rec
+    return snap
+
+
+def _git_hook_grade(ent):
+    """(severity, confidence, why) for one hook body."""
+    marks = ent.get("hostile") or []
+    if marks:
+        return ("HIGH", "high",
+                "Its body matches hostile shell patterns: %s." % ", ".join(marks))
+    if not ent.get("exec"):
+        return ("LOW", "low",
+                "It is not executable, so git will not run it as it stands. "
+                "One chmod changes that — and because the exec bit is part of "
+                "what this sensor hashes, that chmod is itself a change you "
+                "will see.")
+    # No hostile idiom and runnable: a durable, correlatable record BELOW the
+    # notify floor. Developers install hooks on purpose (`pre-commit install`,
+    # husky, this repo's own agent-authorship guard), so a bare hook is not
+    # worth an interrupt — but it is worth a line in the report and a fact for
+    # correlation, because the interrupt-worthy version of this is the one
+    # whose body already matched above.
+    return ("MEDIUM", "medium", "")
+
+
+def diff_git_hooks(prior, cur):
+    """First-sight policy, stated deliberately — the sibling agent-surface
+    sensor was just rewritten for getting exactly this question backwards.
+
+    FIRST SIGHT OF A REPOSITORY IS SILENT, with one exception. A repo the
+    operator clones, or opens in an agent for the first time, arrives carrying
+    whatever hooks it already had; that is installed residue, and the
+    KnockKnock rule the rest of this file follows adopts residue rather than
+    alerting on it. Without that rule, `install` and every coverage change
+    would open one finding per hook per repo — the storm this file has paid
+    for repeatedly. The exception is a config that ALREADY redirects
+    `core.hooksPath` or `core.fsmonitor` outside the repository: that is not
+    residue, it is live execution aimed somewhere the repository does not own,
+    and it belongs in the same class as `never_adopt_live`'s "an active login
+    at install time is CURRENT ACCESS, not leftovers". So an escape is heard on
+    the very first scan that sees the repo, and everything else there is
+    adopted.
+
+    FIRST SIGHT OF A HOOK INSIDE AN ALREADY-KNOWN REPO ALERTS, graded no lower
+    than an edit to a hook already there. That is the deliberate opposite of
+    the inversion `_first_sight_agent_config` exists to fix, and the asymmetry
+    that made creating cheaper than editing does not apply here: an agent-config
+    file that appears has an honest benign population (a host writes a new
+    per-project config), while `.git/hooks` has no such traffic — nothing
+    routinely drops files there, `git pull` cannot, and nothing reviews it if
+    something does. Appearing and being edited are the same event: new code now
+    runs on `git status`.
+    """
+    out = []
+    prior = prior or {}
+    for repo, rec in cur.items():
+        old = prior.get(repo)
+        try:
+            esc = rec.get("escapes") or {}
+            old_esc = (old or {}).get("escapes") or {}
+            for key, target in sorted(esc.items()):
+                if old is not None and old_esc.get(key) == target:
+                    continue
+                out.append(finding(
+                    "HIGH", "git-surface",
+                    "Repo git config redirects core.%s outside the repository"
+                    % key,
+                    "%s has core.%s set to %s%s, which is outside the "
+                    "repository.\ncore.hooksPath replaces the whole hook "
+                    "directory and core.fsmonitor is executed on EVERY `git "
+                    "status` — the command a coding agent runs more than any "
+                    "other. Neither is tracked by git, so no review of this "
+                    "repo would ever show it. Check it against `git -C %s "
+                    "config --local --get core.%s`."
+                    % (repo, key, rec.get(key) or target,
+                       # The RAW configured value is what the command below
+                       # prints, so that is what leads. Showing only the
+                       # resolved path told a Windows operator to compare
+                       # `\tmp\x` against a config holding `/tmp/x` — the
+                       # message contradicted the check it prescribed.
+                       ("" if (rec.get(key) or target) == target
+                        else " (resolves to %s)" % target),
+                       repo, key),
+                    "git-surface:escape:%s:%s:%s"
+                    % (repo, key, _sha_key(target)),
+                    path=repo, program=target, confidence="high",
+                    markers=["git-surface", "git-config", "exec"]))
+            if old is None:
+                # See the docstring: residue is adopted, the escape above is
+                # not. _scan_surfaces records this repo on this same scan
+                # (adopt_new_entries), so it is judged from here on.
+                continue
+
+            hooks = rec.get("hooks") or {}
+            old_hooks = old.get("hooks") or {}
+            hooks_dir = rec.get("hooks_dir") or os.path.join(repo, ".git", "hooks")
+            for name in sorted(hooks):
+                ent = hooks[name]
+                oe = old_hooks.get(name)
+                if oe == ent:
+                    continue
+                sev, conf, why = _git_hook_grade(ent)
+                verb = "installed" if oe is None else "changed"
+                out.append(finding(
+                    sev, "git-surface", "Git hook %s: %s" % (verb, name),
+                    "%s %s in %s.\nA git hook runs on ordinary git commands — "
+                    "`%s` fires on every matching operation, and an agent runs "
+                    "those constantly. `.git` is not tracked by git, so this "
+                    "file has no diff, no blame and no review; a `git pull` "
+                    "cannot have delivered it, so something that ran here "
+                    "wrote it. %s"
+                    % (name, verb, hooks_dir, name, why),
+                    "git-surface:hook:%s:%s:%s"
+                    % (repo, name, ent.get("sha256") or ""),
+                    path=os.path.join(hooks_dir, name), confidence=conf,
+                    markers=["git-surface", "git-hook", "exec"]))
+
+            if old.get("config_sha") != rec.get("config_sha"):
+                # Deliberately LOW/low — below the notify floor, a report line
+                # and nothing more. `.git/config` changes on every `git remote
+                # add` and every upstream set, so grading it higher would bury
+                # the two branches above in its churn. It is kept because it is
+                # the ONLY evidence this sensor produces for the config keys it
+                # does not parse (`include.path`, aliases), and an honest
+                # "something here changed" outranks a silent gap.
+                out.append(finding(
+                    "LOW", "git-surface", "Repo git config changed",
+                    "%s/.git/config changed. Aegis parses core.hooksPath and "
+                    "core.fsmonitor by name; every other key — include.path, "
+                    "aliases, filters — is only visible as this hash moving. "
+                    "Read it with `git -C %s config --local --list` if you did "
+                    "not change it." % (repo, repo),
+                    "git-surface:config:%s:%s"
+                    % (repo, rec.get("config_sha") or ""),
+                    path=os.path.join(repo, ".git", "config"),
+                    confidence="low", markers=["git-surface", "git-config"]))
+        except Exception:
+            continue
+    return out
+
+
 # Registry: (baseline-key, snapshot-fn, diff-fn). Order = report order within tier.
 # Baseline-diffed surfaces. Portable ones run everywhere; a surface with no
 # meaning on a platform is simply ABSENT from its registry rather than reported
@@ -13900,15 +15522,38 @@ def _build_surfaces(is_mac, is_linux):
         # baseline breaks the hash chain).
         ("agent_surface", snapshot_agent_surface, diff_agent_surface,
          "agent_surface", False, True),   # adopt_new_entries: see _scan_surfaces
+        # Git hooks and git config, over the SAME repo roots the agent-surface
+        # walk discovers. adopt_new_entries: a repository seen for the first
+        # time is adopted rather than alerted (diff_git_hooks explains the one
+        # exception), which is what keeps a fresh clone — and this sensor's own
+        # first scan on an existing install — storm-free.
+        ("git_hooks", snapshot_git_hooks, diff_git_hooks,
+         "persistence", False, True),
         ("session_binding", snapshot_session_binding, diff_session_binding),
         ("ext_caps", snapshot_ext_caps, diff_ext_caps),
+        # Portable on purpose: sitecustomize/usercustomize/.pth execute on
+        # every Python start on all three bodies, and site.getsitepackages()
+        # resolves per-interpreter rather than from a platform constant.
+        ("python_site", snapshot_python_site, diff_python_site),
     ]
     if is_mac:
         surfaces += [
             ("xprotect_corpus", snapshot_xprotect_corpus, diff_xprotect_corpus),
             ("loginhooks", snapshot_loginhooks, diff_loginhooks),
             ("profiles", snapshot_profiles, diff_profiles),
+            # Payload hashes live in their own key so an existing baseline's
+            # `profiles = {ident: True}` never has to be re-shaped in place —
+            # a surface absent from the baseline is adopted silently on first
+            # sight, which makes the upgrade storm-free by construction.
+            ("profile_payloads", snapshot_profile_payloads,
+             diff_profile_payloads),
+            ("tcc", snapshot_tcc, diff_tcc),
+            ("netconfig", snapshot_netconfig, diff_netconfig),
             ("btm", snapshot_btm, diff_btm),
+            # The at-rest half of BTM. `btm` above is SURFACE_PRIVILEGED on
+            # macOS 26; the store file it reads is still world-readable, so the
+            # tripwire survives the wall that took the parsed view away.
+            ("btm_store", snapshot_btm_store, diff_btm_store),
             # never_adopt_live: an active remote login present at
             # install/upgrade time is a CURRENT-ACCESS threat, not
             # installed-residue — the README's live-vs-residue rule says the
@@ -14524,6 +16169,52 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
 # --------------------------------------------------------------------------- #
 
 
+# The whole-scan wall clock. Every subprocess is bounded INDIVIDUALLY (run()
+# defaults to timeout=15 and returns rc 124 rather than raising) but nothing
+# bounded their SUM, and the sum is the only number the schedule cares about:
+# classify_signature costs up to 32s per uncached binary (12s `codesign -dv`
+# plus 20s `--verify --strict`), check_hot_dirs calls it on every unsigned
+# Mach-O among up to 2000 entries per hot dir, and _finish_persist_record
+# calls it once per launchd program. A cold sigcache plus one stalled network
+# mount under ~/Downloads is a 60-90 minute scan against an HOURLY schedule.
+# _PKG_TIME_BUDGET already did this for one sensor; this is the same pattern
+# raised to the loop.
+#
+# HOW THE DEFAULT IS PICKED: from the cadence this machine actually installed
+# (_expected_scan_gap -- 600s for `install watch`, 3600s for `install scan`,
+# or a custom StartInterval), never from a constant. A 600s watch floor and an
+# hourly timer are two different promises, which is the same reasoning
+# DOCTOR_SCAN_STALE_FACTOR is built on. HALF the cadence, because the sensor
+# loop is the bulk of a scan but not all of it -- _scan_surfaces, grading,
+# routing and the report all run after gather_all returns -- so leaving the
+# other half for the tail keeps a budget-limited scan inside one tick instead
+# of running into the next one. Floored at 60s so a nonsense interval cannot
+# disable the sensor loop outright, capped at 1800s because a scan that has
+# been running half an hour is already a fault worth reporting whatever the
+# cadence is, and defaulted to the 3600s scan-mode cadence on an UNINSTALLED
+# machine, where a by-hand scan has no schedule to reason from.
+_SCAN_BUDGET_FRACTION = 0.5
+_SCAN_BUDGET_FLOOR = 60.0
+_SCAN_BUDGET_CAP = 1800.0
+# Module-level so a test can pin it, the same idiom as SUPPLY_CHAIN_ROOTS /
+# HOT_DIRS. None = derive from the installed cadence; <= 0 = no deadline.
+SCAN_TIME_BUDGET = None
+
+
+def _scan_time_budget():
+    """Seconds gather_all may spend in its sensor loop, or None for unbounded."""
+    if SCAN_TIME_BUDGET is not None:
+        return SCAN_TIME_BUDGET if SCAN_TIME_BUDGET > 0 else None
+    try:
+        cadence, armed = _expected_scan_gap()
+    except Exception:
+        cadence, armed = None, False
+    if not armed or not cadence:
+        cadence = 3600
+    return max(_SCAN_BUDGET_FLOOR,
+               min(_SCAN_BUDGET_CAP, cadence * _SCAN_BUDGET_FRACTION))
+
+
 def gather_all(baseline_snap, current_snap, health=None):
     health_sink = health if health is not None else []
     findings = []
@@ -14542,6 +16233,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("process", check_processes, ()),
         ("behavior", check_behavior, ()),
         ("shell-history", check_shell_history, ()),
+        ("clipboard", check_clipboard, ()),
         ("hot-dir", check_hot_dirs, ()),
         ("staging", check_staging, ()),
         ("supply-chain", check_supply_chain, ()),
@@ -14571,6 +16263,15 @@ def gather_all(baseline_snap, current_snap, health=None):
         # verifying is the most interesting event on the machine, so it is a
         # first-class sensor rather than a check buried in the grader.
         ("vouch-store", check_vouch_store, ()),
+        # The two self-witness sensors. Both verify machinery this program's
+        # own conclusions rest on, and neither existed as a sensor: the notary
+        # only ran when a human typed `aegis.py notary`, and the event store
+        # had no integrity path at all — a corrupt aegis.db silenced every
+        # incident permanently while findings kept flowing and the report kept
+        # reading clean. A monitor has to be able to say "I am the thing that
+        # broke", or it is only ever reporting on everything else.
+        ("notary", check_notary, ()),
+        ("event-store", check_store_integrity, ()),
     ]
     if IS_MAC:
         sensors += [
@@ -14598,24 +16299,55 @@ def gather_all(baseline_snap, current_snap, health=None):
     # cannot strand a stale snapshot into the next scan.
     global _PROC_SNAPSHOT, _SOCKET_INODE_SNAPSHOT, _NETSTAT_SNAPSHOT, \
         _LOG_SHOW_CACHE
+    # Every prep below goes through _collect_prep, which gives it the same
+    # isolation _collect_sensor gives a sensor: a raise here used to abort the
+    # entire sensor loop that these snapshots merely make FASTER. Each is set
+    # to None first (forced fresh per call, so cmd_watch's long-lived loop
+    # always re-walks) and cleared in `finally` (so a by-hand command after the
+    # scan sees the live table, and a mid-loop exception cannot strand a stale
+    # snapshot into the next scan). A failed prep leaves None, which every
+    # consumer already reads as "no cache" and handles by doing the work
+    # itself.
     _PROC_SNAPSHOT = None
-    _PROC_SNAPSHOT = list(_iter_processes())
+    _PROC_SNAPSHOT = _collect_prep("prep.process-table",
+                                   lambda: list(_iter_processes()), health_sink)
     # Same one-walk-per-scan discipline for the two other tables that more than
     # one sensor consumes: the Linux /proc socket-inode map (listeners+outbound)
     # and the Windows netstat TCP table (listeners+outbound). Each was gathered
     # twice per scan; arm once here, share below, clear in finally.
+    # Recorded only on the platform that HAS the table, so a table that cannot
+    # exist here is absent rather than permanently DEGRADED -- the same rule
+    # the sensor list above follows.
     _SOCKET_INODE_SNAPSHOT = None
-    _SOCKET_INODE_SNAPSHOT = _linux_socket_inode_pids() if IS_LINUX else None
     _NETSTAT_SNAPSHOT = None
-    _NETSTAT_SNAPSHOT = _netstat_tcp_rows() if IS_WIN else None
+    _LOG_SHOW_CACHE = None
+    if IS_LINUX:
+        _SOCKET_INODE_SNAPSHOT = _collect_prep(
+            "prep.socket-inode", _linux_socket_inode_pids, health_sink)
+    if IS_WIN:
+        _NETSTAT_SNAPSHOT = _collect_prep(
+            "prep.netstat", _netstat_tcp_rows, health_sink)
     # macOS: the three independent `log show` harvests (xprotect / syspolicy /
     # amfid) have no cross-dependency, so run them CONCURRENTLY once up front
     # instead of serially inside the sensor loop (measured 4.8s -> 2.1s on-host).
     # The sensors read this cache via _log_show; same commands, same output.
-    _LOG_SHOW_CACHE = None
-    _LOG_SHOW_CACHE = _prewarm_log_show() if IS_MAC else None
+    if IS_MAC:
+        _LOG_SHOW_CACHE = _collect_prep("prep.log-show", _prewarm_log_show,
+                                        health_sink)
+    # The deadline starts HERE, not at process start: _cmd_scan_locked already
+    # took the persistence snapshot before calling us, and a budget that
+    # pretended to cover work it cannot interrupt would be a lie about what it
+    # bounds. What it does bound is the loop below, which is where the
+    # unbounded per-binary signature cost actually lives.
+    budget = _scan_time_budget()
+    deadline = (time.monotonic() + budget) if budget else None
     try:
         for sensor_id, fn, args in sensors:
+            # BETWEEN sensors, never inside one: a sensor is not interruptible
+            # and half a sensor's output is worse than none of it.
+            if deadline is not None and time.monotonic() >= deadline:
+                health_sink.append(_budget_skipped(sensor_id, budget))
+                continue
             findings += _collect_sensor(sensor_id, fn, health_sink, *args)
     finally:
         _PROC_SNAPSHOT = None
@@ -14627,8 +16359,11 @@ def gather_all(baseline_snap, current_snap, health=None):
     # snapshot's. Scheduled only when local intel EXISTS: a machine that never
     # ran `intel update` has no "intel" sensor at all (absent, not degraded).
     if any(_intel_sets()):
-        findings += _collect_sensor("intel", check_intel, health_sink,
-                                    current_snap, findings)
+        if deadline is not None and time.monotonic() >= deadline:
+            health_sink.append(_budget_skipped("intel", budget))
+        else:
+            findings += _collect_sensor("intel", check_intel, health_sink,
+                                        current_snap, findings)
     # Stamp the human-presence regime once per scan (not per finding — the
     # probe shells out, and paying that per finding would be absurd). This is
     # EVIDENCE ONLY and must stay that way: idle time is forgeable by a
@@ -15126,22 +16861,83 @@ def _migrate_baseline(data):
 
 
 @contextmanager
-def _scan_lock():
+def _scan_lock(wait=False, what="scan", quiet=False):
+    """The one-writer lock. Yields True if we took it, False if someone has it.
+
+    NON-BLOCKING by default, and that is the whole point. It used to be an
+    unconditional flock(LOCK_EX) with no message and no holder record, so a
+    by-hand `aegis.py scan` fired while the scheduled scan or the watch daemon
+    was mid-scan simply HUNG -- no output, no way to tell it apart from a
+    crash -- until the other one finished. Once a scan could run for an hour
+    (nothing bounded the SUM of its subprocess timeouts; see
+    _scan_time_budget), the operator's own diagnostic scan hung with it: the
+    escape hatch shared the wedge it was being used to diagnose.
+
+    Skipping is also the RIGHT answer on the scheduled path. A launchd /
+    systemd / Task Scheduler tick that exits because a scan is already running
+    is a tick that did not pile a second full scan onto a machine already
+    doing one, and the next tick is at most one cadence away -- whereas
+    blocking turns a slow scan into a queue of scans, each holding a process
+    and a state-dir fd. `wait=True` is for the callers whose work must
+    actually happen rather than be retried later (cmd_baseline, `scan
+    --wait`).
+
+    On contention the holder's pid and start time come from the lock file
+    itself (_write_lock_holder), because "a scan is already running" without a
+    pid is not something an operator can act on.
+    """
     ensure_state()
     path = os.path.join(STATE_DIR, ".scan.lock")
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    got = False
     try:
-        _lock_fd(fd)
-        yield
+        try:
+            # Windows locks a byte RANGE, and a zero-length file has no byte 0
+            # to range over. POSIX flock does not care; do it on both bodies so
+            # the file has one shape everywhere.
+            if os.fstat(fd).st_size == 0:
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"#")
+        except OSError:
+            pass
+        if wait:
+            _lock_fd(fd)
+            got = True
+        else:
+            got = _try_lock_fd(fd)
+        if got:
+            _write_lock_holder(fd)
+        else:
+            holder = _read_lock_holder(path) or {}
+            msg = ("another %s is already running (pid %s, started %s) -- "
+                   "skipping this one instead of queueing behind it. Re-run "
+                   "with --wait to block until it finishes."
+                   % (what, holder.get("pid", "unknown"),
+                      holder.get("started", "unknown")))
+            log_run("%s skipped: %s" % (what, msg))
+            if not quiet:
+                print("Aegis: " + msg)
+        yield got
     finally:
-        _unlock_fd(fd)
+        # Only unlock what we actually took. On POSIX unlocking an fd we never
+        # locked is a harmless no-op (the holder owns a different open file
+        # description), but on Windows it raises, and swallowing that raise
+        # would hide a real one.
+        if got:
+            _unlock_fd(fd)
         os.close(fd)
 
 
-def cmd_scan(quiet=False):
+def cmd_scan(quiet=False, wait=False):
     # A watch-triggered scan and a manual/interval scan may overlap. One writer
     # owns baseline/seen/sigcache/report state at a time; readers keep working.
-    with _scan_lock():
+    # Contention exits 0 on purpose: the work is being done right now by the
+    # process that holds the lock, so this is not a fault, and a nonzero exit
+    # would make launchd/systemd report one every time two ticks brushed past
+    # each other.
+    with _scan_lock(what="scan", wait=wait, quiet=quiet) as acquired:
+        if not acquired:
+            return 0
         return _cmd_scan_locked(quiet)
 
 
@@ -15394,7 +17190,15 @@ def _cmd_scan_locked(quiet=False):
 
 
 def cmd_baseline(trust="verified"):
-    with _scan_lock():
+    # wait=True deliberately -- this is the caller _scan_lock's opt-in exists
+    # for. A baseline is operator- or installer-initiated, is on no schedule
+    # (so it cannot pile up), and is worthless if it silently does not happen:
+    # skipping the installer's `baseline-unverified` would leave the machine
+    # with NO baseline, and the next scan would alert on every persistence
+    # item it has. Queueing behind one scan is the correct trade here.
+    with _scan_lock(what="baseline", wait=True) as acquired:
+        if not acquired:            # unreachable while wait=True; belt+braces
+            return 1
         return _cmd_baseline_locked(trust)
 
 
@@ -16111,6 +17915,59 @@ ATTCK_TECHNIQUES = {
     "T1574.006": "Hijack Execution Flow: Dynamic Linker Hijacking",
 }
 
+# Which BODIES can actually reach each technique's detection path.
+#
+# Without this, `attck` listed all 24 techniques as "wired but quiet" on every
+# platform — so a Mac reported Registry Run Keys, WMI Event Subscription and
+# Windows Service as covered, which reads as coverage and means "the sensor for
+# this lives on a different operating system". The worst case was T1574.006:
+# it was mapped ONLY to the Linux ld-preload markers, so a Mac claimed dynamic
+# linker hijacking was wired while having no DYLD coverage whatsoever (fixed
+# 2026-09-03 by the dyld-inject marker, which is why mac now appears below).
+#
+# Explicit rather than derived, because reachability runs through regex tables,
+# category names and fingerprint prefixes that no single expression captures —
+# and pinned by a test asserting every ATTCK_TECHNIQUES key appears here, so a
+# new technique cannot silently inherit "wired everywhere" again.
+_TECHNIQUE_BODIES = {
+    "T1003": ("mac", "win"),          # keychain (mac) / SAM + LSASS (win)
+    "T1014": ("linux",),              # kernel-module category
+    "T1036.005": ("mac", "linux", "win"),
+    "T1053.003": ("mac", "linux"),    # cron
+    "T1053.005": ("win",),            # schtasks
+    "T1070.004": ("mac", "linux", "win"),
+    "T1070.006": ("mac", "linux", "win"),
+    "T1098.004": ("mac", "linux"),    # xpersist authorized_keys
+    "T1218": ("win",),                # lolbin proxy exec
+    "T1543.001": ("mac",),            # LaunchAgents
+    "T1543.002": ("linux",),          # systemd units
+    "T1543.003": ("win",),            # services
+    "T1543.004": ("mac",),            # LaunchDaemons
+    "T1546.003": ("win",),            # WMI subscriptions
+    "T1546.004": ("mac", "linux"),    # shell rc
+    "T1546.013": ("win",),            # PowerShell profile
+    "T1547.001": ("win",),            # Run keys / Startup
+    "T1547.004": ("win",),            # Winlogon helper
+    "T1547.006": ("linux",),          # kernel modules
+    "T1547.013": ("linux",),          # XDG autostart
+    "T1548.001": ("mac", "linux"),    # suid surface
+    "T1556": ("mac", "linux"),        # pam.d / sudoers.d
+    "T1562.001": ("mac", "linux", "win"),  # self-protection + defender
+    "T1574.006": ("mac", "linux"),    # dyld-inject (mac) / LD_PRELOAD (linux)
+}
+
+
+def _this_body():
+    return "mac" if IS_MAC else ("win" if IS_WIN else "linux")
+
+
+def _wired_here(technique):
+    """Is this technique's detection path reachable on THIS body? An unlisted
+    technique answers True: a mapping gap must read as 'claimed', so the
+    completeness test fails loudly rather than the report quietly shrinking."""
+    return _this_body() in _TECHNIQUE_BODIES.get(technique, ("mac", "linux", "win"))
+
+
 # Idiom name (as recorded in a finding's `markers`) -> technique(s). Precise:
 # each marker name is only ever set by the one rule that means exactly this.
 _MARKER_TECHNIQUES = {
@@ -16119,6 +17976,12 @@ _MARKER_TECHNIQUES = {
     "amsi-bypass": ("T1562.001",),
     "sam-hive-dump": ("T1003",),
     "lsass-dump": ("T1003",),
+    # macOS credential dumping had three markers and no technique, so `attck`
+    # showed T1003 as a Windows-only row on a Mac while the sensors for it were
+    # sitting right there in the argv table.
+    "keychain-dump": ("T1003",),
+    "keychain-db-access": ("T1003",),
+    "keychain-security-dump": ("T1003",),
     "dyld-inject": ("T1574.006",),
     "ld-preload-injection": ("T1574.006",),
     "kernel-module": ("T1014", "T1547.006"),
@@ -16427,21 +18290,45 @@ def cmd_attck(days=180):
     print("# Aegis ATT&CK coverage — last %s days, %d recorded finding event%s\n"
           % (days, len(rows), "" if len(rows) == 1 else "s"))
     observed = [t for t in ATTCK_TECHNIQUES if t in seen]
-    quiet = [t for t in ATTCK_TECHNIQUES if t not in seen]
+    # Three buckets, not two. "Wired but quiet" used to hold every technique
+    # that had not fired, INCLUDING the ones whose sensor lives on another
+    # operating system — so a Mac read as covering Registry Run Keys and WMI
+    # subscriptions. That is not a quiet sensor; it is no sensor.
+    quiet = [t for t in ATTCK_TECHNIQUES if t not in seen and _wired_here(t)]
+    elsewhere = [t for t in ATTCK_TECHNIQUES if t not in seen and not _wired_here(t)]
+    body = _this_body()
     print("Observed on this machine (%d):" % len(observed))
     for t in sorted(observed, key=lambda t: -seen[t][0]):
         count, last = seen[t]
         print("  %-12s %-62s %3d hit%-1s last %s" % (
             t, ATTCK_TECHNIQUES[t][:62], count, "" if count == 1 else "s",
             datetime.fromtimestamp(last).strftime("%Y-%m-%d")))
-    print("\nWired but quiet in this window (%d):" % len(quiet))
+    print("\nWired on this body (%s) but quiet in this window (%d):"
+          % (body, len(quiet)))
     for t in sorted(quiet):
         print("  %-12s %s" % (t, ATTCK_TECHNIQUES[t]))
+    if elsewhere:
+        print("\nNOT covered on this body — the sensor exists for another "
+              "platform (%d):" % len(elsewhere))
+        for t in sorted(elsewhere):
+            print("  %-12s %-58s [%s]"
+                  % (t, ATTCK_TECHNIQUES[t][:58],
+                     "/".join(_TECHNIQUE_BODIES.get(t, ()))))
+    covered = len(observed) + len(quiet)
+    print("\nCoverage on %s: %d of %d technique%s in the table; the other %d "
+          "belong to another platform." % (
+              body, covered, len(ATTCK_TECHNIQUES),
+              "" if covered == 1 else "s", len(elsewhere)))
     if unmapped:
-        print("\n%d recorded finding%s did not classify to a single technique "
-              "(sensors with no 1:1 technique mapping, e.g. hot-dir drops, "
-              "XProtect harvest, canaries, hardening posture) — not counted "
-              "above, not a coverage gap." % (unmapped, "" if unmapped == 1 else "s"))
+        # Share, not just a count: "31691 findings did not classify" invites
+        # the reading that 84%% of detections are uncovered. They are mostly
+        # sensors with no 1:1 technique, which is a mapping property, not a gap.
+        pct = (100.0 * unmapped / len(rows)) if rows else 0.0
+        print("\n%d of %d recorded findings (%.0f%%) did not classify to a "
+              "single technique (sensors with no 1:1 technique mapping, e.g. "
+              "hot-dir drops, XProtect harvest, canaries, hardening posture) — "
+              "not counted above, not a coverage gap."
+              % (unmapped, len(rows), pct))
     print("\nRead-only: no incident opened, nothing notified.")
     return 0
 
@@ -19551,18 +21438,61 @@ def _ts_short(epoch_val):
 
 _NOTARY_TAG = "aegis-notary"
 _NOTARY_MARK = "AEGIS-ANCHOR"
+# The exact phrase that appears in every problem the ROOT-OWNED log store
+# corroborates, and in no other. check_notary grades on it (those are the
+# CRITICAL ones — an attacker cannot edit a past anchor), so the classifier and
+# the wording it classifies are one definition and cannot drift apart.
+_NOTARY_EXTERNAL_MARK = "the OS log store"
 
 
 def _notary_state_digest():
     """One digest over the state whose silent mutation would matter: the trust
-    stores, the self-protection watermark, and the open-incident set."""
+    stores, the self-protection watermark, the AUDIT LOG, the config that
+    decides where evidence is sent, the PROGRAM ITSELF, and the open-incident
+    set.
+
+    Three of those are new, and each was a hole with a name. actions.jsonl is
+    the file a `latch:cleared` finding literally tells the operator to go read
+    — it was the corroborating record for every automatic action and the chain
+    committed to none of it. config.json decides whether a heartbeat leaves the
+    box at all, so editing it is how you make the off-box witness stop
+    receiving without touching anything the chain covered. And the running
+    aegis.py is the thing doing all the concluding: a swapped payload changed
+    every verdict downstream while the chain went on certifying the state
+    around it.
+
+    What this buys, split honestly, because the halves are not equal:
+      * LOCALLY: nothing preventive. A same-uid attacker edits actions.jsonl,
+        the next scan appends a link committing to the edited bytes, and that
+        link is internally consistent. What the digest buys locally is a DATE:
+        the last link written before the edit still commits to the old bytes,
+        so the change is bracketed in time and cannot be made to look old.
+      * OFF-BOX: this is where it becomes evidence. The heartbeat ships
+        (notary_seq, notary_head, code_sha, code_pin) to a receiver the
+        attacker cannot reach, so a head that changes for a seq already
+        reported, or a code_sha that stops matching code_pin, is a fact about
+        the host that the host does not get a vote on. See _post_heartbeat's
+        receiver contract — this digest is what makes that head mean something.
+
+    code_pin is already covered transitively (it lives in SELFSTATE, hashed
+    below), but it is folded in by name as well: the pin and the running hash
+    are the pair a receiver compares, and a reader of this function should not
+    have to know SELFSTATE's contents to see that both are committed to."""
     h = hashlib.sha256()
-    for path in (BASELINE, ALLOWLIST, SELFSTATE):
-        try:
-            with open(path, "rb") as f:
-                h.update(hashlib.sha256(f.read()).digest())
-        except Exception:
-            h.update(b"\x00" * 32)
+    # sha256() is chunked; ACTION_LOG runs to 10MB before _rotate_log moves it
+    # aside, so a whole-file read() here would be the wrong shape. The first
+    # three digests are byte-identical to what the previous read()-based loop
+    # produced, so nothing about existing chains is disturbed — and in any case
+    # _notary_verify recomputes each head from the STORED state string, never
+    # from a fresh digest, so changing this function can never invalidate links
+    # that were already written.
+    for path in (BASELINE, ALLOWLIST, SELFSTATE, ACTION_LOG, AEGIS_CONFIG):
+        digest = sha256(path)
+        h.update(bytes.fromhex(digest) if digest else b"\x00" * 32)
+    st = load_json(SELFSTATE, {})
+    pin = st.get("code_sha") if isinstance(st, dict) else None
+    h.update(("code_pin=%s|code_sha=%s"
+              % (pin or "none", _running_code_sha() or "none")).encode())
     try:
         rows = list_incidents(active_only=True)
         h.update(json.dumps(sorted(str(r.get("id")) for r in rows)).encode())
@@ -19686,10 +21616,14 @@ def notary_append():
     return link
 
 
-def _notary_verify():
+def _notary_verify(with_anchors=True):
     """Reconcile the local chain against itself and against the OS log store.
 
-    Returns (problems, checked, anchors_status)."""
+    Returns (problems, checked, anchors_status). `with_anchors=False` runs the
+    local half only — a file parse — and answers "not-checked" for the external
+    half; check_notary uses it to keep a change-driven `watch` loop from
+    shelling out to `log show` on every burst. The default is unchanged, so
+    `aegis.py notary` and every existing caller still do the full check."""
     chain = _notary_chain()
     problems = []
     if not chain:
@@ -19717,6 +21651,8 @@ def _notary_verify():
                             "by something without the local key" % seq)
         prev_head = link.get("head") or prev_head
 
+    if not with_anchors:
+        return problems, len(chain), "not-checked"
     res = _notary_read_anchors()
     if res is None:
         return problems, len(chain), "unavailable"
@@ -19736,8 +21672,9 @@ def _notary_verify():
     # this link. The old last-wins collapse hid exactly this (siege finding).
     for seq in sorted(s for s in conflicts if isinstance(s, int)):
         problems.append(
-            "seq=%s: the OS log store holds TWO conflicting anchors — a shadow "
-            "anchor was appended to mask a rewrite of this link" % seq)
+            "seq=%s: %s holds TWO conflicting anchors — a shadow anchor was "
+            "appended to mask a rewrite of this link"
+            % (seq, _NOTARY_EXTERNAL_MARK))
     matched = 0
     for link in chain:
         if not isinstance(link, dict):
@@ -19748,9 +21685,10 @@ def _notary_verify():
         matched += 1
         if want != link.get("head"):
             problems.append(
-                "seq=%s: the anchor in the OS log store says head=%s but the "
-                "local chain says head=%s — the local chain was rewritten"
-                % (link.get("seq"), want[:16], (link.get("head") or "?")[:16]))
+                "seq=%s: the anchor in %s says head=%s but the local chain "
+                "says head=%s — the local chain was rewritten"
+                % (link.get("seq"), _NOTARY_EXTERNAL_MARK, want[:16],
+                   (link.get("head") or "?")[:16]))
     # Tail truncation: the IMMEDIATE successor of the local chain's last link is
     # anchored in the root-owned store, but the local link is gone — recent
     # history was dropped (siege finding: a dropped tail showed no sequence gap and
@@ -19760,10 +21698,77 @@ def _notary_verify():
     # non-contiguous seqs, which must not read as truncation.
     if isinstance(max_local, int) and (max_local + 1) in anchors:
         problems.append(
-            "seq=%s is anchored in the OS log store but absent from the local "
-            "chain, whose last link is seq=%s — the chain was truncated to drop "
-            "recent history" % (max_local + 1, max_local))
+            "seq=%s is anchored in %s but absent from the local chain, whose "
+            "last link is seq=%s — the chain was truncated to drop recent "
+            "history" % (max_local + 1, _NOTARY_EXTERNAL_MARK, max_local))
     return problems, len(chain), "ok:%d-anchors-matched" % matched
+
+
+_NOTARY_ANCHOR_INTERVAL = 3600
+_NOTARY_ANCHOR_LAST = 0
+
+
+def check_notary():
+    """Verify the tamper-evidence chain on every scan.
+
+    _notary_verify did real work — chain linkage, per-link MAC, sequence gaps,
+    anchor-vs-local head mismatch, shadow anchors, tail truncation — and NOTHING
+    called it outside `aegis.py notary`, a command an operator types only once
+    they already suspect something. A control that runs only when you already
+    know is not a control, it is a confirmation. Wiring it in as a sensor is
+    what turns a broken chain into an incident with a reminder clock instead of
+    a fact sitting in a file waiting to be asked for.
+
+    Severity splits on WHO corroborates the problem, which is the same split the
+    module comment above draws between erasure- and forgery-resistance:
+      * HIGH — purely local inconsistency (a MAC that does not verify, a link
+        that does not chain, a sequence gap). Real evidence, but a same-uid
+        attacker who read hmac.key could have produced a consistent chain
+        instead, so this is "tampering was not silent", never proof.
+      * CRITICAL — a problem the OS log store corroborates. Those anchors are
+        root-owned: the attacker could not edit a past one, so a disagreement
+        between them and the local file is the one thing on this box they could
+        not stage-manage.
+
+    Not a finding: no chain at all (a fresh install writes its first link at the
+    END of its first scan, so the sensor legitimately sees nothing on that run),
+    and an anchor channel this platform cannot read back. Absence of history is
+    not evidence of tampering, and neither is a log store that ages anchors out.
+    """
+    global _NOTARY_ANCHOR_LAST
+    if not os.path.exists(NOTARY_FILE):
+        return []
+    now = _epoch()
+    # The external half shells out to `log show` / journalctl / Get-WinEvent —
+    # measured ~4s on macOS against a 1.7GB store, against a 24h read-back
+    # window. Hourly is plenty for that window, and the throttle only ever bites
+    # in `watch` mode: a one-shot `scan` is a fresh process where this global is
+    # always cold, so a scheduled install checks the anchors on every run.
+    with_anchors = (now - _NOTARY_ANCHOR_LAST) >= _NOTARY_ANCHOR_INTERVAL
+    problems, checked, status = _notary_verify(with_anchors=with_anchors)
+    if with_anchors and status not in ("unavailable", "not-checked", "empty"):
+        _NOTARY_ANCHOR_LAST = now
+    if not problems:
+        return []
+    corroborated = [p for p in problems if _NOTARY_EXTERNAL_MARK in p]
+    severity = "CRITICAL" if corroborated else "HIGH"
+    detail = ("The tamper-evidence chain over %d link(s) does not verify: %s. "
+              "%s Run `aegis.py notary` for the full reconciliation."
+              % (checked, "; ".join(problems[:6]),
+                 ("The OS log store's own anchors contradict the local file, "
+                  "and those need root to write — treat this as an "
+                  "unexplained rewrite of Aegis's own record."
+                  if corroborated else
+                  "Nothing outside this box corroborates it yet, so read it as "
+                  "'the chain was edited by something without the local key', "
+                  "not as proof of an unforgeable record.")))
+    return [finding(
+        severity, "self-protection", "Aegis tamper-evidence chain does not verify",
+        detail,
+        "notary:broken:%s" % hashlib.sha256(
+            "|".join(sorted(problems)).encode()).hexdigest()[:16],
+        path=NOTARY_FILE, problem_count=len(problems),
+        anchors=status)]
 
 
 def cmd_notary(action="verify"):
@@ -21062,6 +23067,64 @@ def _clipboard_write(text):
 _CLIP_INERT = ("# Aegis blocked a clipboard command that matched a known "
                "attack pattern.\n# Restore the original with: aegis.py "
                "clipboard restore %s")
+
+
+CLIPBOARD_WATCH_KEY = "clipboard_watch"
+
+
+def check_clipboard():
+    """The pre-EXECUTION checkpoint, and the only one Aegis has.
+
+    clipboard_grammar and cmd_clipboard have been complete and tested since
+    they were written, and `clipboard` was never in this table -- so the check
+    fired only when a human typed it, which is exactly when they are least
+    likely to be under a ClickFix paste attack. This file names that class as
+    the dominant macOS initial-access vector; every other sensor here observes
+    a payload that has already run.
+
+    PRIVACY IS THE REASON THIS IS NARROW, not an afterthought. cmd_clipboard
+    already refuses to log, hash or persist a clipboard that matches nothing --
+    "password managers put secrets here; a security tool that quietly journals
+    every clipboard it sees has become the thing it defends against". A scan
+    sensor must keep that promise while writing to findings.jsonl and the
+    event store, so:
+
+      · only the CERTAIN tier emits. The suspect tier exists for lines with a
+        legitimate reading (rustup's installer is the canonical example), and
+        persisting those would journal ordinary clipboard use one benign
+        finding at a time.
+      · the fingerprint is a hash of the normalised text, so recurrence and
+        dedup work without the identity revealing the content.
+      · the preview is redacted with the same scrubber every durable writer
+        here uses, and capped.
+      · a no-match scan writes nothing at all, which is the overwhelmingly
+        common case.
+
+    Opt out with "clipboard_watch": false in config.json. Absent on a platform
+    with no unprivileged reader -- absent, not degraded, because there is
+    nothing wrong with such a host.
+    """
+    if _aegis_config().get(CLIPBOARD_WATCH_KEY) is False:
+        return []
+    text = _clipboard_read()
+    if text is None:
+        return []
+    tier, hits = clipboard_grammar(text)
+    if tier != "certain":
+        return []
+    preview = redact_sensitive(re.sub(r"\s+", " ", text.strip()))[:120]
+    digest = hashlib.sha256(
+        re.sub(r"\s+", " ", text.strip()).encode("utf-8", "replace")
+    ).hexdigest()[:16]
+    return [finding(
+        "HIGH", "clipboard", "Clipboard holds a paste-to-execute payload",
+        "The clipboard matched %s. This is the ClickFix shape: content staged "
+        "to be pasted into a terminal and run before it can be read. It has "
+        "NOT executed yet. Inspect with `aegis.py clipboard`, neutralise with "
+        "`aegis.py clipboard guard` (reversible: `clipboard restore`). "
+        "Preview: %s" % (", ".join(hits), preview),
+        "clipboard:certain:%s" % digest,
+        confidence="high", markers=["clipboard-paste-exec"] + list(hits))]
 
 
 def cmd_clipboard(action="check"):
@@ -23583,6 +25646,52 @@ def _autoprotect_decision(f):
     return verb, reason, str(pid)
 
 
+# The operator is asked to review the would-have log and decide whether to go
+# live. Until 2026-09-03 a record said only:
+#
+#     {"action":"autoprotect","verb":"would-freeze",
+#      "fingerprint":"behavior:bash:eval-subshell:9be65e30bc6a346e"}
+#
+# which is unreviewable — it cannot answer the one question that matters,
+# "would this have hurt me?". On the reference machine all three recorded
+# would-freezes turned out to be the operator's OWN tools (two Claude Code
+# shells and a pwsh encoded command), and nothing in the record said so; that
+# is what corrected the promotion criterion in ROADMAP.md from a clock to a
+# content test. A record you cannot judge is not evidence.
+#
+# What goes in is IDENTITY, deliberately not the full command: this lands in
+# actions.jsonl, and a shadow log that leaks a secret into the audit trail
+# would be a worse defect than the one it fixes. redact_sensitive is the same
+# scrubber every other durable writer here uses, and the preview is capped.
+_SHADOW_ARGV_PREVIEW = 160
+
+
+def _shadow_identity(f):
+    """Enough about the subject for a human to recognise it, redacted."""
+    out = {}
+    exe = f.get("executable") or f.get("path") or f.get("program")
+    if exe:
+        out["exe"] = redact_sensitive(str(exe))[:_SHADOW_ARGV_PREVIEW]
+    if f.get("owner"):
+        out["owner"] = str(f.get("owner"))
+    if f.get("pid") is not None:
+        out["pid"] = f.get("pid")
+    argv = f.get("argv") or f.get("cmdline") or f.get("command")
+    if isinstance(argv, (list, tuple)):
+        argv = " ".join(str(a) for a in argv)
+    if not argv:
+        # Behaviour findings carry the triggering command in `detail` when they
+        # carry it anywhere; it is already redacted at emit time, but redact
+        # again rather than trust the provenance of a field being copied into
+        # a new file.
+        argv = f.get("detail")
+    if argv:
+        out["cmd_preview"] = redact_sensitive(str(argv))[:_SHADOW_ARGV_PREVIEW]
+    if f.get("markers"):
+        out["markers"] = list(f.get("markers"))[:8]
+    return out
+
+
 def _autoprotect_shadow(findings, now=None):
     """The scan hook: in shadow mode, record every would-action once per
     fingerprint. Never raises past its caller's try (same posture as
@@ -23611,6 +25720,7 @@ def _autoprotect_shadow(findings, now=None):
         extra = {"mode": "shadow", "verb": verb,
                  "evidence": evidence_class(f), "fingerprint": fp,
                  "category": f.get("category"), "severity": f.get("severity")}
+        extra.update(_shadow_identity(f))
         if reason:
             extra["reason"] = reason
         log_action("autoprotect", subject, outcome, **extra)
@@ -23622,6 +25732,53 @@ def _autoprotect_shadow(findings, now=None):
     state["seen"], state["tally"] = seen, tally
     save_json(AUTOPROTECT_FILE, state)
     return recorded
+
+
+_SHADOW_SHOW_MAX = 12
+
+
+def _print_shadow_records(limit=_SHADOW_SHOW_MAX):
+    """Show what WOULD have been acted on, not just how many.
+
+    A tally cannot be reviewed. The operator is being asked whether any of
+    these is their own tool, and that question needs the subject in front of
+    them — reading actions.jsonl by hand is a step people skip, and a review
+    step people skip is a review that did not happen."""
+    rows = []
+    if not os.path.exists(ACTION_LOG):
+        print("  no would-actions recorded yet.")
+        return
+    try:
+        with open(ACTION_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("action") == "autoprotect" and r.get("mode") == "shadow":
+                    rows.append(r)
+    except Exception as e:
+        # "nothing to review" and "I could not read the review log" must not
+        # print the same way. Silence here would be a false empty, and this is
+        # the surface a promotion decision is made on.
+        print("  COULD NOT READ the would-action log (%s): %s" % (ACTION_LOG, e))
+        return
+    if not rows:
+        print("  no would-actions recorded yet.")
+        return
+    shown = rows[-limit:]
+    print("  would-actions recorded (%d shown of %d):"
+          % (len(shown), len(rows)))
+    for r in shown:
+        who = r.get("exe") or r.get("target") or "?"
+        prev = r.get("cmd_preview")
+        print("    %-16s %-14s %s" % (r.get("result") or r.get("verb") or "?",
+                                      (r.get("evidence") or "?")[:14], who))
+        if prev:
+            print("      %s" % prev[:110])
+    if len(rows) > len(shown):
+        print("    ... %d earlier record(s) in %s"
+              % (len(rows) - len(shown), ACTION_LOG))
 
 
 def cmd_autoprotect(action="status"):
@@ -23655,19 +25812,29 @@ def cmd_autoprotect(action="status"):
                  int(tally.get("would-freeze") or 0),
                  int(tally.get("would-refuse") or 0)))
         print("  every record: %s (action=autoprotect)" % ACTION_LOG)
-        met = (days >= AUTOPROTECT_SHADOW_MIN_DAYS
-               or scans >= AUTOPROTECT_SHADOW_MIN_SCANS)
-        if met:
-            print("  shadow exit criteria MET (>=%dd or >=%d scans): review "
-                  "the would-action\n  log above, then the live stage — "
-                  "which ships separately and enables only\n  behind the "
-                  "one-time-code channel — can be considered."
-                  % (AUTOPROTECT_SHADOW_MIN_DAYS,
-                     AUTOPROTECT_SHADOW_MIN_SCANS))
-        else:
-            print("  shadow exit criteria: %.1f/%d days, %d/%d scans"
-                  % (days, AUTOPROTECT_SHADOW_MIN_DAYS, scans,
-                     AUTOPROTECT_SHADOW_MIN_SCANS))
+        _print_shadow_records()
+        clock = (days >= AUTOPROTECT_SHADOW_MIN_DAYS
+                 or scans >= AUTOPROTECT_SHADOW_MIN_SCANS)
+        print("  time served: %.1f/%d days, %d/%d scans%s"
+              % (days, AUTOPROTECT_SHADOW_MIN_DAYS, scans,
+                 AUTOPROTECT_SHADOW_MIN_SCANS,
+                 " — threshold reached" if clock else ""))
+        # This used to print "shadow exit criteria MET" on the clock alone.
+        # The first six scans of real data on the reference machine recorded
+        # three would-freezes, and ALL THREE were the operator's own tools —
+        # a criterion satisfied by exactly that run would have promoted a tier
+        # that then froze their agents mid-session. Aegis cannot tell "the
+        # operator's own shell" from "an attacker's shell"; that judgement is
+        # the whole reason the rehearsal exists. So the clock is reported as
+        # what it is, and the verdict is handed to the human with the records
+        # in front of them. See ROADMAP.md Phase 1.
+        if clock:
+            print("  NOT a promotion signal on its own. Read the would-action "
+                  "list above:\n  if ANY of it is a tool you run yourself, "
+                  "the heuristic tier is not ready and\n  the window starts "
+                  "again. The deterministic tier is judged separately — its\n"
+                  "  record is 0 false fires across the whole recorded "
+                  "history.")
         return 0
     if action == "shadow":
         if mode == "shadow":
@@ -23722,7 +25889,10 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    raw copy (by hand only — the scan path stays offline)
 
  DETECT (default; runs on the scheduled interval, never destructive)
-  scan             run all checks once; update report; alert on new HIGH+
+  scan [--wait]    run all checks once; update report; alert on new HIGH+.
+                   If another scan already holds the lock this one names the
+                   holder and exits 0 rather than hanging; --wait queues
+                   behind it instead
   report [--full]  print the latest report. The default is the BRIEF report:
                    one verdict line, what is new since the last scan, open
                    CRITICALs, and degraded coverage. `--full` renders every
@@ -24108,8 +26278,12 @@ def main(argv):
         # reference machine, of a file no code and no human has ever read.
         # An interactive `aegis.py scan` stays verbose: printing the report to
         # your terminal is the whole point of typing it.
+        # --wait restores the pre-2026-09-03 behaviour for a caller that really
+        # does want to queue: block until a running scan finishes rather than
+        # reporting it and exiting.
         return cmd_scan(quiet=any(a in ("--quiet", "-q", "quiet")
-                                  for a in argv[2:]))
+                                  for a in argv[2:]),
+                        wait=any(a == "--wait" for a in argv[2:]))
     if cmd == "report":
         return cmd_report(full=(len(argv) > 2 and argv[2] in ("--full", "full")))
     if cmd == "status":

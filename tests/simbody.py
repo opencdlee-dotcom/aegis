@@ -25,10 +25,18 @@ meaningful. Plenty of cases fail here for reasons that have nothing to do with
 your change (real macOS paths, a live `codesign`, `/private/tmp` firmlinks).
 What is meaningful is the DIFF against the same run on your merge base:
 
-    base=$(mktemp -d) && git archive origin/main | tar -x -C "$base"
+    base=~/simbody-base && rm -rf "$base" && mkdir -p "$base"   # NOT mktemp -d
+    git archive "$(git merge-base origin/main HEAD)" | tar -x -C "$base"
     run() { (cd "$1" && SIM_REPO="$1" SIM_BODY="$2" PYTHONPATH="$PWD/tests" \
             python -m pytest tests/ -q -p simbody 2>&1 | grep '^FAILED' | sed 's/ - .*//' | sort); }
     diff <(run "$base" linux) <(run . linux)      # empty => no new failures
+
+The base tree must NOT live under /tmp. Aegis classifies volatile paths
+differently, so a base checkout in a temp dir changes the very verdicts being
+compared -- that is not hypothetical, it produced two phantom "fixes" here.
+The recipe above said `mktemp -d` until 2026-09-03. CI now runs this diff for
+both `win` and `mac` on every push and PR (.github/workflows/ci.yml,
+job `simbody-diff`), so it is a gate rather than a habit.
 
 WHAT IT DOES NOT SIMULATE, and never will: os.sep, path parsing, case
 sensitivity, file locking, subprocess behaviour, or anything the real kernel

@@ -65,6 +65,29 @@ def _targets_real_state(path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_repo_roots():
+    """Keep the suite out of the developer's OTHER checkouts.
+
+    `_agent_repo_roots` seeds itself from ~/.claude.json, which on a real
+    machine names every project directory an agent has ever been started in.
+    Without this, any test that calls cmd_scan, snapshot_agent_surface or
+    snapshot_git_hooks would read and hash files in 13 unrelated repositories —
+    slow, and the same class of sandbox gap this file's banner was written
+    about, one step further out: not the developer's ~/.aegis but their source
+    trees. A test that WANTS repo discovery points this list at its own fixture.
+
+    The original is captured ONCE, here, and restored by VALUE: a helper that
+    re-read the attribute at teardown time would restore whatever the last test
+    left behind, which is how a stub escapes its own test."""
+    original = aegis.AGENT_REPO_ROOT_HINTS
+    aegis.AGENT_REPO_ROOT_HINTS = []
+    try:
+        yield
+    finally:
+        aegis.AGENT_REPO_ROOT_HINTS = original
+
+
+@pytest.fixture(autouse=True)
 def _forbid_real_state_writes():
     """Refuse any durable write aimed at the developer's real ~/.aegis."""
     real_conn = aegis._event_connection
