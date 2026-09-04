@@ -74,7 +74,7 @@ jobs:
   windows:
     name: windows-latest / py${{ matrix.python }}
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -91,9 +91,38 @@ jobs:
       # slow. Sized with real headroom over MEASURED durations (see the job
       # comment) — not the guess that previously turned a clean pass into a
       # KeyboardInterrupt failure four seconds past an undersized cap.
+      # MEASURED, not guessed — this file has now been burned three times by a
+      # cap sized from a stale number, each time surfacing as a KeyboardInterrupt
+      # that reads exactly like a test failure:
+      #   2026-08-23  1424-1467s (23:44-24:27) against a 35-minute cap
+      #   2026-09-04  cut off AT 2101s (35:01) with 892 passed and ZERO failures
+      # The suite grew ~140 cases in one branch and Windows runs ~5.2x slower
+      # per case than macOS, so growth here is nonlinear in a way nobody feels
+      # locally. 60 minutes is roughly 1.7x the last observed floor.
+      #
+      # The cap is raised AND the run now publishes its own duration against it,
+      # because the previous comment asked the next person to "re-measure rather
+      # than nudge the constant" and a request is not a mechanism. This warns at
+      # 75% so the cap is renegotiated from data BEFORE a run dies at it.
       - name: Test suite
-        timeout-minutes: 35
-        run: python -m pytest tests/ -q --durations=25
+        timeout-minutes: 60
+        shell: pwsh
+        run: |
+          $cap = 60 * 60
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          python -m pytest tests/ -q --durations=25
+          $rc = $LASTEXITCODE
+          $sw.Stop()
+          $secs = [int]$sw.Elapsed.TotalSeconds
+          $pct = [int](100 * $secs / $cap)
+          $line = "Windows suite: ${secs}s of a ${cap}s cap (${pct}%)"
+          Write-Host $line
+          if ($pct -ge 75) {
+            Write-Host "::warning::$line - re-measure and raise the cap before a run dies at it"
+          } else {
+            Write-Host "::notice::$line"
+          }
+          exit $rc
       - name: selftest.py (real detection logic on this machine)
         timeout-minutes: 5
         run: python selftest.py
