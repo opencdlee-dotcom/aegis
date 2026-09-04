@@ -12061,6 +12061,39 @@ BEAT_STALE = "stale"
 BEAT_DEAD_PID = "dead-pid"
 
 
+def _scheduled_agent_pid():
+    """The pid the SCHEDULER currently runs this agent as, or None.
+
+    None means "no evidence", never "not running": every failure path here —
+    an unparseable answer, a body with no probe, a refusal — has to keep the
+    caller's accusation intact rather than clear it. Only a positive, live pid
+    is allowed to soften a verdict."""
+    if IS_MAC:
+        try:
+            target = "gui/%d/%s" % (os.getuid(), _launchd_label())
+        except AttributeError:
+            return None
+        out, _err, rc = run(["launchctl", "print", target], timeout=10)
+        if rc != 0:
+            return None
+        m = re.search(r"^\s*pid\s*=\s*(\d+)", out or "", re.M)
+        if not m:
+            return None                 # loaded but not currently running
+        pid = int(m.group(1))
+        return pid if _pid_alive(pid) is not False else None
+    if IS_LINUX:
+        out, _err, rc = run(["systemctl", "--user", "show", "aegis.service",
+                             "--property=MainPID", "--value"], timeout=10)
+        try:
+            pid = int((out or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0:
+            return None
+        return pid if _pid_alive(pid) is not False else None
+    return None
+
+
 def heartbeat_verdict(beat, now=None):
     """(state, human) for one beat. FAIL CLOSED — anything not provably healthy
     is one of the dead states, never BEAT_OK.
@@ -12102,10 +12135,34 @@ def heartbeat_verdict(beat, now=None):
     # meaningful in watch mode (see _beat_mode): the scan-mode writer is
     # supposed to have exited.
     if beat.get("mode") == "watch" and _pid_alive(beat.get("pid")) is False:
-        return (BEAT_DEAD_PID,
-                "the beat is %d min old but its watch process (pid %s) no "
-                "longer exists — the monitor was killed and something is still "
-                "writing beats" % (age // 60, beat.get("pid")))
+        # ...UNLESS the scheduler is running a DIFFERENT live agent process.
+        #
+        # Every restart produces this state legitimately: `install`, a launchd
+        # reload, or the KeepAlive respawn that the watch-loop hardening
+        # deliberately relies on. The new process has not completed its first
+        # scan yet, so the last beat still names the old pid — fresh, correctly
+        # signed, and pointing at a corpse.
+        #
+        # Measured on the reference machine 2026-09-04, one minute after a
+        # routine `aegis.py install watch`: the watchdog announced "treat this
+        # as active tampering". That is the loudest false positive this project
+        # can emit, on its most ordinary operation, and it would have taught
+        # the operator to disbelieve the one alarm that means someone is
+        # forging beats.
+        #
+        # A live agent under the scheduler's own label is evidence malware
+        # cannot manufacture without actually running the monitor. Absence of
+        # that evidence keeps the accusation: fail closed is still the rule.
+        live = _scheduled_agent_pid()
+        if live is None or live == beat.get("pid"):
+            return (BEAT_DEAD_PID,
+                    "the beat is %d min old but its watch process (pid %s) no "
+                    "longer exists — the monitor was killed and something is "
+                    "still writing beats" % (age // 60, beat.get("pid")))
+        return (BEAT_OK,
+                "last beat %d min ago from pid %s; the agent has since "
+                "restarted and is running as pid %s — the next scan re-beats"
+                % (age // 60, beat.get("pid"), live))
     return BEAT_OK, "last beat %d min ago (pid %s)" % (age // 60,
                                                        beat.get("pid", "?"))
 
