@@ -20,7 +20,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling import
 import aegis  # noqa: E402
-from test_regression import Sandbox  # noqa: E402
+from test_regression import Sandbox, needs_real_scan_lock  # noqa: E402
 
 
 def _cfg(*names):
@@ -71,6 +71,7 @@ class TestExplicitFileIsWalked(Sandbox):
         self.assertEqual([], aegis._agent_config_files())
 
 
+@needs_real_scan_lock
 class TestNewServerFiresOnScan(Sandbox):
     def setUp(self):
         super().setUp()

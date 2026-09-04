@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling import
 import aegis  # noqa: E402
-from test_regression import Sandbox  # noqa: E402
+from test_regression import Sandbox, needs_real_scan_lock  # noqa: E402
 
 # Sensors gather_all schedules on every body.
 PORTABLE = frozenset((
@@ -85,6 +85,7 @@ class TestRosterMatchesSource(unittest.TestCase):
                          "schedules: %s" % sorted(ghosts))
 
 
+@needs_real_scan_lock
 class TestEverySensorReportsHealthEveryScan(Sandbox):
     def _health_ids(self):
         return {row["sensor_id"] for row in aegis.get_sensor_health()}
