@@ -96,6 +96,19 @@ LOCKING_IS_REAL = (aegis.msvcrt is not None) if aegis.IS_WIN else True
 needs_real_scan_lock = unittest.skipUnless(
     LOCKING_IS_REAL, "simulated Windows on a POSIX host has no msvcrt.locking")
 
+# The flags agree with the kernel underneath them. simbody flips IS_MAC/IS_WIN
+# to run this suite as another body, which is the whole point of it — and
+# exactly why a test whose SUBJECT is the real host must not run under it. The
+# every-sensor-reports-health roster is one: under SIM_BODY=mac on a Linux
+# runner it demands health rows from macOS sensors whose kernel is not there,
+# and the resulting failure says nothing about the invariant. Same shape as
+# test_process_ancestry.TestLiveTable's guard, which reached this conclusion
+# first; shared here so the next one does not have to reach it again.
+ON_A_REAL_BODY = (aegis.IS_MAC == (sys.platform == "darwin")
+                  and aegis.IS_WIN == (os.name == "nt"))
+needs_the_real_body = unittest.skipUnless(
+    ON_A_REAL_BODY, "the real kernel only, not a simulated body")
+
 
 class Sandbox(unittest.TestCase):
     """Base: redirect all aegis state/scan surfaces into a throwaway tmp dir."""
