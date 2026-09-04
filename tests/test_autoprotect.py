@@ -149,20 +149,39 @@ class TestAutoprotectCmd(AutoprotectSandbox):
         self.assertEqual(state.get("mode"), "off")
         self.assertEqual(state.get("tally"), {"would-quarantine": 3})
 
-    def test_status_reports_exit_criteria_progress_then_met(self):
+    def test_status_reports_time_served_and_never_declares_readiness(self):
+        """Rewritten 2026-09-03. This asserted that crossing 7 days or 50
+        scans printed "shadow exit criteria MET".
+
+        It cannot. The first six scans of real shadow data on the reference
+        machine recorded three would-freezes and ALL THREE were the operator's
+        own tools — two Claude Code shells and a pwsh encoded command. A
+        criterion satisfied by exactly that run would have promoted a tier
+        that then froze the operator's agents mid-session.
+
+        Aegis cannot tell the operator's own shell from an attacker's; making
+        that call is the entire reason the rehearsal exists. So the clock is
+        reported as TIME SERVED, and the verdict is handed to the human with
+        the would-action records in front of them. See ROADMAP.md Phase 1.
+        """
         self.run_cmd(aegis.cmd_autoprotect, "shadow")
         rc, out = self.run_cmd(aegis.cmd_autoprotect, "status")
         self.assertEqual(rc, 0)
-        self.assertIn("shadow exit criteria:", out)
+        self.assertIn("time served:", out)
         self.assertNotIn("criteria MET", out)
+
         state = self.ap_state()
         state["since"] = aegis.datetime.fromtimestamp(
             time.time() - 8 * 86400).isoformat()
         aegis.save_json(aegis.AUTOPROTECT_FILE, state)
         rc, out = self.run_cmd(aegis.cmd_autoprotect, "status")
-        self.assertIn("criteria MET", out)
-        # The rehearsal never claims the live stage exists.
-        self.assertIn("ships separately", out.replace("\n", " "))
+        flat = out.replace("\n", " ")
+        # The threshold is reported...
+        self.assertIn("threshold reached", flat)
+        # ...and immediately disclaimed as a promotion signal.
+        self.assertNotIn("criteria MET", flat)
+        self.assertIn("NOT a promotion signal", flat)
+        self.assertIn("a tool you run yourself", flat)
 
     def test_unknown_action_prints_usage(self):
         rc, out = self.run_cmd(aegis.cmd_autoprotect, "live")
