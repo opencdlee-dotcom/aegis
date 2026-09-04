@@ -18558,11 +18558,31 @@ def cmd_doctor():
     _out_path, err_path = _stdio_log_paths()
     err_tail = _tail_lines(err_path, 8)
     if err_tail:
-        print("  ✗ %-27s %s is not empty — the scheduled job is writing to "
-              "stderr:" % ("scheduled job stderr", err_path))
+        try:
+            err_written = int(os.path.getmtime(err_path))
+        except OSError:
+            err_written = int(time.time())
+        # The freshness rule the crash record ten lines above already applies,
+        # for the same reason it applies there: a stack trace nothing has
+        # touched in months is history, not an open fault. Without it this
+        # check reports on the FILE and not on the JOB — one crash from a
+        # since-fixed bug held doctor red indefinitely on a monitor that was
+        # completing a scan every ten minutes, and a line that is permanently
+        # red is a line nobody reads. Present-tense "is writing" was the tell:
+        # the check never once asked when.
+        fresh = (int(time.time()) - err_written) <= CRASH_FRESH_SECS
+        print("  %s %-27s %s is not empty (last written %s) — the scheduled "
+              "job %s writing to stderr:"
+              % ("✗" if fresh else "i", "scheduled job stderr", err_path,
+                 _ago(err_written), "is" if fresh else "was"))
         for line in err_tail:
             print("      %s" % line[:120])
-        problems.append("scheduled job stderr")
+        if fresh:
+            problems.append("scheduled job stderr")
+        else:
+            print("      Older than %d days, so it is not counted against this "
+                  "verdict; delete it once you have read it."
+                  % (CRASH_FRESH_SECS // 86400))
     incidents = list_incidents()
     print("\n  %s active incident%s" %
           (len(incidents), "" if len(incidents) == 1 else "s"))
