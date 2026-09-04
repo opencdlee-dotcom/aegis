@@ -44,6 +44,16 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
 
+# simbody flips IS_WIN, so _lock_fd takes the msvcrt branch -- but msvcrt does
+# not exist on a POSIX host, and no flag can conjure it. tests/simbody.py says
+# so in its own docstring: it does not simulate file locking, subprocess
+# behaviour, or anything the real kernel decides. Skipping here is honest;
+# the Windows leg of CI runs these for real.
+_LOCKING_IS_REAL = (aegis.msvcrt is not None) if aegis.IS_WIN else True
+_needs_real_lock = unittest.skipUnless(
+    _LOCKING_IS_REAL,
+    "simulated Windows on a POSIX host has no msvcrt.locking")
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -324,6 +334,7 @@ with aegis._scan_lock(wait=True, quiet=True) as got:
 '''
 
 
+@_needs_real_lock
 class TestConcurrentScans(Sandbox):
     """A REAL second process, holding the REAL lock file.
 
@@ -457,6 +468,7 @@ class TestConcurrentScans(Sandbox):
         self.assertIsNone(aegis._read_lock_holder(junk))
 
 
+@_needs_real_lock
 class TestBaselineStillWaits(Sandbox):
     """cmd_baseline is the caller the wait opt-in exists for."""
 

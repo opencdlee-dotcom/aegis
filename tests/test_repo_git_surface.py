@@ -411,6 +411,9 @@ class TestGitHookIdentity(RepoSandbox):
 
     @unittest.skipUnless(IS_POSIX, "the POSIX exec bit is not what git on "
                                    "Windows consults")
+    @unittest.skipIf(aegis.IS_WIN, "the exec bit is a POSIX concept: git for "
+                                   "Windows runs a hook regardless, which is "
+                                   "why the snapshot hard-codes exec=True there")
     def test_a_non_executable_hook_is_low_until_it_is_chmodded(self):
         r = self.repo("chmod")
         prior = self._snap(r)

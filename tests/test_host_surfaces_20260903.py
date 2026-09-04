@@ -30,7 +30,12 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
 
-IS_MAC = sys.platform == "darwin"
+# Gate on the flag the SIMULATED body sets, not on the host's sys.platform.
+# tests/simbody.py flips aegis's platform flags before test modules import, so
+# a class gated on sys.platform still runs under SIM_BODY=win on a Mac and then
+# fails against the Windows branch of the code it is testing. That is the exact
+# defect class simbody exists to surface, and it surfaced this file.
+IS_MAC = aegis.IS_MAC
 
 
 def _fingerprints(found):
