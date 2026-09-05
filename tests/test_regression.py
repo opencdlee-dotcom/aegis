@@ -81,6 +81,35 @@ def ps_rows(legacy):
     return out
 
 
+# A scan takes an exclusive lock, and on Windows that lock is msvcrt.locking.
+# simbody flips IS_WIN but cannot conjure msvcrt on a POSIX host — it says so in
+# its own report header: "flags only, NOT the real kernel". So under
+# SIM_BODY=win every test that runs a REAL cmd_scan dies inside the lock, on a
+# line with nothing to do with what it is testing, and the simbody diff reports
+# it as a regression the change did not cause.
+#
+# Skipping is the honest answer rather than a concession: the windows-latest leg
+# runs every one of these for real, against a real kernel, on every PR. This
+# lives here, beside Sandbox, because four separate files need it and a marker
+# copied four times is a marker that will disagree with itself.
+LOCKING_IS_REAL = (aegis.msvcrt is not None) if aegis.IS_WIN else True
+needs_real_scan_lock = unittest.skipUnless(
+    LOCKING_IS_REAL, "simulated Windows on a POSIX host has no msvcrt.locking")
+
+# The flags agree with the kernel underneath them. simbody flips IS_MAC/IS_WIN
+# to run this suite as another body, which is the whole point of it — and
+# exactly why a test whose SUBJECT is the real host must not run under it. The
+# every-sensor-reports-health roster is one: under SIM_BODY=mac on a Linux
+# runner it demands health rows from macOS sensors whose kernel is not there,
+# and the resulting failure says nothing about the invariant. Same shape as
+# test_process_ancestry.TestLiveTable's guard, which reached this conclusion
+# first; shared here so the next one does not have to reach it again.
+ON_A_REAL_BODY = (aegis.IS_MAC == (sys.platform == "darwin")
+                  and aegis.IS_WIN == (os.name == "nt"))
+needs_the_real_body = unittest.skipUnless(
+    ON_A_REAL_BODY, "the real kernel only, not a simulated body")
+
+
 class Sandbox(unittest.TestCase):
     """Base: redirect all aegis state/scan surfaces into a throwaway tmp dir."""
 
@@ -129,6 +158,7 @@ class Sandbox(unittest.TestCase):
             "AEGIS_CONFIG": os.path.join(self.state, "config.json"),
             "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
             "AGENT_SKILL_ROOTS": [],
+            "AGENT_CONFIG_FILES": [],
             # Protective-tier state. NOTARY_FILE and OBSERVATIONS_DIR are
             # written by cmd_scan itself, so omitting them here does not merely
             # leave a gap — it makes every scan-invoking test in this suite

@@ -84,7 +84,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install --upgrade pip pytest
+      - run: python -m pip install --upgrade pip pytest pytest-xdist
       # Per-step caps bound a different hang than the job cap above: a single
       # probe blocking forever (a PowerShell child that never returns, a
       # schtasks call waiting on a lock) rather than the whole run simply being
@@ -104,13 +104,27 @@ jobs:
       # because the previous comment asked the next person to "re-measure rather
       # than nudge the constant" and a request is not a mechanism. This warns at
       # 75% so the cap is renegotiated from data BEFORE a run dies at it.
+      #
+      # `-n auto` is what makes the raised cap likely to hold rather than be the
+      # fourth number to be outgrown. The cost driver here is process spawning,
+      # which Windows charges ~5.2x for and which is embarrassingly parallel:
+      # the runner has cores idle while one worker blocks on schtasks. Measured
+      # on this branch's tree, `-n 4` on 8 cores: 9m08s wall against 19m15s of
+      # CPU, same 1612 passed. pytest-xdist is a CI-only dev dependency — the
+      # product stays stdlib-only, which is the whole reason it is added here
+      # and not to a requirements file.
+      #
+      # ubuntu and macOS stay deliberately SERIAL. They are the control: a test
+      # that only passes with the whole suite to itself, or that leaks state
+      # into another, still has a leg that will catch it — and those legs are
+      # cheap enough (22-37s) that parallelism buys nothing there anyway.
       - name: Test suite
         timeout-minutes: 60
         shell: pwsh
         run: |
           $cap = 60 * 60
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          python -m pytest tests/ -q --durations=25
+          python -m pytest tests/ -q -n auto --durations=25
           $rc = $LASTEXITCODE
           $sw.Stop()
           $secs = [int]$sw.Elapsed.TotalSeconds

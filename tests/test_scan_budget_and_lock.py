@@ -45,14 +45,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
 
 # simbody flips IS_WIN, so _lock_fd takes the msvcrt branch -- but msvcrt does
-# not exist on a POSIX host, and no flag can conjure it. tests/simbody.py says
-# so in its own docstring: it does not simulate file locking, subprocess
-# behaviour, or anything the real kernel decides. Skipping here is honest;
-# the Windows leg of CI runs these for real.
-_LOCKING_IS_REAL = (aegis.msvcrt is not None) if aegis.IS_WIN else True
-_needs_real_lock = unittest.skipUnless(
-    _LOCKING_IS_REAL,
-    "simulated Windows on a POSIX host has no msvcrt.locking")
+# not exist on a POSIX host, and no flag can conjure it. This file first wrote
+# that marker; it now shares one definition with the other four files that hit
+# the same wall. See test_regression.needs_real_scan_lock.
+from test_regression import needs_real_scan_lock as _needs_real_lock  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

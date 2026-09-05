@@ -45,6 +45,7 @@ class CustodySandbox(unittest.TestCase):
             "SIGCACHE": os.path.join(self.state, "sigcache.json"),
             "FLEET_SIGNERS": os.path.join(self.state, "allowed_signers"),
             "AGENT_CONFIG_ROOTS": [os.path.join(self.tmp, "agentroot")],
+            "AGENT_CONFIG_FILES": [],
         }
         for k, v in overrides.items():
             self._saved[k] = getattr(aegis, k)

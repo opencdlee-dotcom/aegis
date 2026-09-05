@@ -1095,6 +1095,25 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   coverage-degraded incident the way a transient failure (still DEGRADED)
   does. Denied data is never interpreted as an empty or clean snapshot.
 - Uninstall retains evidence by default. Purge requires the explicit `--purge`.
+- **A benign read is never persisted.** A sensor that reads content it does not
+  own the meaning of — the clipboard, an executed command line, a config body,
+  a window title — records nothing about a clean read: not the text, not a
+  hash, not a "seen at" row. Only the hostile verdict and the evidence that
+  earned it are written, and that evidence passes through `redact_sensitive`
+  first. The clipboard and paste-guard surfaces set this rule (password managers
+  put secrets on the clipboard; a tool that journals every clipboard it sees
+  has become the thing it defends against); every later sensor inherits it
+  rather than deciding retention ad hoc.
+- **Every sensor reports health on every scan.** A sensor that can fail
+  silently — a command that times out, a file that stops being readable, a
+  hook that was never installed — emits a `sensor_status` row each scan, OK or
+  otherwise, so a dead sensor is DEGRADED/FAILED in `doctor` rather than
+  green-by-omission. Health is emitted on the good scans too: a row written
+  only on failure pins the last failure as current forever
+  (`process.enumerate`, 2026-08-26, three days of a stale "could not be read").
+  A sensor that cannot exist on this platform is *absent*, never permanently
+  DEGRADED. `tests/test_sensor_invariants.py` holds the roster and fails when a
+  sensor is registered without a health row.
 
 ## Protective tier (opt-in, by hand)
 
