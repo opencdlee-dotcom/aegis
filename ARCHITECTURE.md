@@ -1114,6 +1114,29 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   A sensor that cannot exist on this platform is *absent*, never permanently
   DEGRADED. `tests/test_sensor_invariants.py` holds the roster and fails when a
   sensor is registered without a health row.
+- **A non-answer is never rendered as a verdict.** A sensor has two ways of not
+  answering. The whole-sensor form is `return None`, which `_collect_sensor`
+  turns into DEGRADED and `_scan_surfaces` refuses to baseline. The per-item
+  form — a file found and then not stat'd, read or parsed; a process whose
+  argv could not be taken; a registry value denied — goes through
+  `unexamined(subject, why, exc)`, the one ledger for "I found this and could
+  not examine it". It records against the sensor the scan is running, notes
+  the gap on that sensor's health row (which stays OK: the three-strikes
+  coverage incident is for a sensor that stopped answering, not for one
+  unreadable file in `~/Downloads`), and `check_coverage` emits one finding
+  per sensor with gaps, fingerprinted on the set of subjects, so a stable gap
+  is one acceptable incident and a new one re-alerts. ENOENT/ESRCH gaps are
+  *absent*: counted on the row, never alarmed — nothing can be examined about
+  a thing that is not there. A sensor that concludes from a fact another
+  sensor could not take (`_browser_loopback_entries` reading "no debugging
+  flag" off an argv the `ps` call never returned) consults that sensor's
+  partial flag first and declines rather than accuses. The invariant is
+  checked against the source by AST in `tests/test_sensor_invariants.py`:
+  every silent `except` in a sensor function is a whole-sensor non-answer, an
+  absence (`FileNotFoundError`), on the ledger, or on the allowlist with its
+  reason. Case: 2026-09-04, an unparseable agent config recorded as exec-free,
+  oversize configs vanishing from the surface, and a failed argv probe firing
+  HIGH session-theft against every browser at once — 31 sites of one shape.
 
 ## Protective tier (opt-in, by hand)
 
