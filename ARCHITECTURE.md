@@ -1125,9 +1125,16 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   coverage incident is for a sensor that stopped answering, not for one
   unreadable file in `~/Downloads`), and `check_coverage` emits one finding
   per sensor with gaps, fingerprinted on the set of subjects, so a stable gap
-  is one acceptable incident and a new one re-alerts. ENOENT/ESRCH gaps are
-  *absent*: counted on the row, never alarmed — nothing can be examined about
-  a thing that is not there. A sensor that concludes from a fact another
+  is one acceptable incident and a new one re-alerts. Identity is the set of
+  gap *kinds* ("larger than the read cap", "is not parseable JSON"), not the
+  set of subjects: the first live install reported 121 churning session and
+  telemetry files, and a subject-keyed fingerprint re-alerted every scan.
+  ENOENT/ESRCH gaps are *absent*, and EPERM anywhere or EACCES outside `HOME`
+  is a *privilege wall* the unprivileged agent is not meant to cross; both are
+  counted on the row, never alarmed — nothing can be examined about a thing
+  that is not there, and a boundary the design forbids crossing is not a
+  fault. A retired sensor id is declared in `_RETIRED_SENSOR_IDS` so its
+  health row cannot haunt `doctor` as "DID NOT RUN". A sensor that concludes from a fact another
   sensor could not take (`_browser_loopback_entries` reading "no debugging
   flag" off an argv the `ps` call never returned) consults that sensor's
   partial flag first and declines rather than accuses. The invariant is
