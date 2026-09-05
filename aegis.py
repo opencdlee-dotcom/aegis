@@ -2130,6 +2130,24 @@ def _classify_linux(path):
 # a DEGRADED sensor rather than letting the silence read as "everything signed".
 _SIG_PROBE_FAILURES = 0
 
+# Every PowerShell-backed probe in this file is sized against ONE measurement: a
+# COLD powershell.exe on a real machine took 21.4s JUST TO START. A cap at or
+# near that is not a timeout, it is a coin flip on whether the interpreter
+# finished booting -- and this file's rule is that a probe which cannot answer
+# must return a non-answer, so a too-tight cap does not degrade gracefully. It
+# converts a working sensor into a permanent coverage gap on exactly the
+# machines that are slowest, and it does it silently.
+WIN_PS_COLD_START_CEILING = 90
+
+# Three call sites deliberately stay TIGHTER than the ceiling, because there a
+# hang costs more than a miss. They are the allowlist in
+# tests/test_powershell_timeouts.py, and adding a fourth means arguing for it:
+#   notify()                     25s  best-effort toast. The finding is already
+#                                     in the store and in status/report, and a
+#                                     90s hang would stall the scan that found it.
+#   _clipboard_read/_write()     30s  up to four calls in one deadfall cycle, so
+#                                     the worst case is 4x whatever this is.
+
 _WIN_SIG_PS = (
     "$s=Get-AuthenticodeSignature -LiteralPath $env:AEGIS_SIG_PATH;"
     "$sub=$null;if($s.SignerCertificate){$sub=$s.SignerCertificate.Subject};"
@@ -2139,11 +2157,10 @@ _WIN_SIG_PS = (
 def _classify_windows(path):
     global _SIG_PROBE_FAILURES
     result = {"trust": "unknown", "team": None, "authority": None}
-    # 90s, not 30s: a COLD powershell.exe on a real machine was measured at
-    # 21.4s just to start, and the old ceiling left almost no margin. A timeout
-    # here is not a cheap miss -- see below.
+    # The cold-start ceiling, not a local number: a timeout here is not a cheap
+    # miss -- see below.
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                      _WIN_SIG_PS], timeout=90,
+                      _WIN_SIG_PS], timeout=WIN_PS_COLD_START_CEILING,
                      extra_env={"AEGIS_SIG_PATH": path})
     if rc != 0 or not out:
         # The probe FAILED; that is not a verdict of "fine". suspicious_sig()
@@ -11797,8 +11814,14 @@ _WIN_REMOTE_SESSION_PS = (
 
 
 def _snapshot_auth_sessions_win():
+    # 30s here was below the cold-start ceiling, and it showed: this probe and
+    # the signature probe -- the only two things that reach the OS through the
+    # same run(["powershell", ...]) call -- each flaked once in a single CI
+    # session, both green on rerun. The signature probe had already been raised
+    # for exactly this reason; this one never was.
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                      _WIN_REMOTE_SESSION_PS], timeout=30)
+                      _WIN_REMOTE_SESSION_PS],
+                     timeout=WIN_PS_COLD_START_CEILING)
     # Probe failure ⇒ non-answer, same rule every other Windows PS-backed
     # surface here follows (snapshot_win_exclusions et al.) — never a false
     # empty that would storm the moment the probe next succeeds.
@@ -21050,8 +21073,15 @@ def _process_start_token(pid):
     if IS_WIN:
         script = ("$p=Get-CimInstance Win32_Process -Filter 'ProcessId = %d' "
                   "-ErrorAction SilentlyContinue;if($p){$p.CreationDate}" % pid)
+        # 15s was BELOW the measured cold start, so on a cold interpreter this
+        # could not return in time by construction. It fails closed --
+        # _process_matches() reads a None token as PID reuse and refuses -- so
+        # the cost was not a wrong action but no action: every response bound to
+        # this token would decline, on exactly the cold machine where the first
+        # action after boot happens.
         out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive",
-                          "-Command", script], timeout=15)
+                          "-Command", script],
+                         timeout=WIN_PS_COLD_START_CEILING)
     else:
         out, _, rc = run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
     token = (out or "").strip()
