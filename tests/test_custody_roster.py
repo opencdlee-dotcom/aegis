@@ -14,8 +14,9 @@ severity by that rung and never suppresses, never touches attack-DEFINED
 evidence, and only ever moves down. `_RISK_CUSTODY_WEIGHT` keeps the demoted
 findings from summing back into a HIGH.
 
-Measured when this file was written: **139 `finding()` call sites, 10 pass a
-rung.** There is no post-hoc enrichment — `_collect_sensor` sets only
+Measured when this file was written: **139 `finding()` call sites, 10 passed a
+rung.** Wiring `_diff_map`'s `subject_fn` for the four path-keyed surfaces took
+that to 14; the remaining 61 debt sites are the rest of this file's roster. There is no post-hoc enrichment — `_collect_sensor` sets only
 `sensor_id` — so the other 129 emit findings the grader is structurally unable
 to demote, because they never tell it who authored the subject. That is the
 whole of the benign-positive problem this monitor keeps re-solving one surface
@@ -51,8 +52,12 @@ an identifier there, a socket key elsewhere. The fix is one optional
 the rung is attached once in the shared code instead of 24 times in closures.
 Same lesson as the outbound sensor's "the socket was never the subject".
 
-Doing that is NOT this file's job. This file only makes sure the gap is
-visible, named, and unable to grow while nobody is looking.
+That hook now exists (`_grade_by_subject`), and four surfaces use it —
+`diff_shellrc`, `diff_wallet`, `diff_python_site`, `diff_extra_persistence`,
+the ones whose key IS a path and whose value carries the content hash. The other
+~21 need a line each saying what their key stands for, which is a decision per
+surface and not a sweep. GradeBySubject below exercises the hook; the roster
+here only proves the wiring exists, never that it works.
 """
 import ast
 import os
@@ -93,7 +98,11 @@ GRADED = {
     ("check_persistence", "persistence"),
     ("check_processes", "process"),
     ("diff_agent_surface", "agent-surface"),
+    ("diff_extra_persistence._mk.f", "persistence"),
     ("diff_listeners.new_fn", "net-listener"),
+    ("diff_python_site._mk.f", "persistence"),
+    ("diff_shellrc._mk.f", "shell-init"),
+    ("diff_wallet._mk.f", "wallet-integrity"),
 }
 
 CUSTODY_DEBT = {
@@ -127,7 +136,6 @@ CUSTODY_DEBT = {
     ("diff_btm_store.new_fn", "btm"): 1,
     ("diff_com_hijack.changed_fn", "com-hijack"): 1,
     ("diff_com_hijack.new_fn", "com-hijack"): 1,
-    ("diff_extra_persistence._mk.f", "persistence"): 1,
     ("diff_git_hooks", "git-surface"): 3,
     ("diff_ide_ext.new_fn", "ide-ext"): 1,
     ("diff_ifeo.changed_fn", "ifeo"): 1,
@@ -138,14 +146,11 @@ CUSTODY_DEBT = {
     ("diff_netconfig.new_fn", "network-config"): 3,
     ("diff_profile_payloads.changed_fn", "config-profile"): 1,
     ("diff_profiles.new_fn", "config-profile"): 1,
-    ("diff_python_site._mk.f", "persistence"): 1,
     ("diff_session_binding.changed_fn", "session-binding"): 1,
     ("diff_session_binding.new_fn", "session-binding"): 1,
-    ("diff_shellrc._mk.f", "shell-init"): 1,
     ("diff_suid.changed_fn", "suid"): 1,
     ("diff_suid.new_fn", "suid"): 1,
     ("diff_tcc._grant_finding", "tcc"): 1,
-    ("diff_wallet._mk.f", "wallet-integrity"): 1,
     ("diff_wmi_subscriptions.changed_fn", "wmi"): 1,
     ("diff_wmi_subscriptions.new_fn", "wmi"): 1,
 }
@@ -153,16 +158,47 @@ CUSTODY_DEBT = {
 # Pinned totals. Both are ratchets: sites may move from DEBT to GRADED, never
 # the other way, and a brand-new emitter belongs in one of the three rosters
 # before it belongs on main.
-DEBT_SITES_MAX = 65
+DEBT_SITES_MAX = 61
 MIN_CALL_SITES = 130
+
+
+class _SubjectGraded(ast.NodeVisitor):
+    """Functions that hand _diff_map a subject_fn, so their findings are graded
+    at runtime rather than at the call site.
+
+    Without this the roster measures a SYNTACTIC proxy (does this call pass
+    custody=) for a RUNTIME property (does this finding carry a rung), and the
+    moment grading moved into _diff_map the proxy stopped tracking the thing it
+    proxies -- reporting debt that had actually been paid. Same class of defect
+    as the sensors this file exists to police.
+    """
+
+    def __init__(self):
+        self.stack = []
+        self.surfaces = set()
+
+    def visit_FunctionDef(self, node):
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node):
+        if (isinstance(node.func, ast.Name) and node.func.id == "_diff_map"
+                and any(k.arg == "subject_fn" for k in node.keywords)):
+            if self.stack:
+                self.surfaces.add(self.stack[0])
+        self.generic_visit(node)
 
 
 class _Emitters(ast.NodeVisitor):
     """(category, qualified function, lineno, carries_a_rung) per finding()."""
 
-    def __init__(self):
+    def __init__(self, subject_graded=()):
         self.stack = []
         self.rows = []
+        self.subject_graded = frozenset(subject_graded)
 
     def visit_FunctionDef(self, node):
         self.stack.append(node.name)
@@ -177,9 +213,13 @@ class _Emitters(ast.NodeVisitor):
             if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
                 cat = node.args[1].value
             kw = {k.arg for k in node.keywords if k.arg}
+            graded = bool(kw & {"custody", "provenance"})
+            # ...or the surface hands _diff_map a subject_fn, which attaches the
+            # rung and demotes for every finding it returns.
+            if not graded and self.stack and self.stack[0] in self.subject_graded:
+                graded = True
             self.rows.append((cat, ".".join(self.stack) or "<module>",
-                              node.lineno,
-                              bool(kw & {"custody", "provenance"})))
+                              node.lineno, graded))
         self.generic_visit(node)
 
 
@@ -188,7 +228,9 @@ def _emitters():
     # and a textual search for finding( matches inside them.
     with open(aegis.__file__, encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
-    v = _Emitters()
+    sg = _SubjectGraded()
+    sg.visit(tree)
+    v = _Emitters(sg.surfaces)
     v.visit(tree)
     return v.rows
 
@@ -264,6 +306,89 @@ class CustodyRoster(unittest.TestCase):
             "Roster entries that name emitters this tree no longer has. "
             "Remove them — a stale roster silently stops checking: %r"
             % (stale,))
+
+
+class GradeBySubject(unittest.TestCase):
+    """_diff_map's subject_fn hook, exercised rather than merely present.
+
+    The roster above is an AST audit: it proves the wiring EXISTS. Only this
+    proves the wiring WORKS, and the refusals matter more than the happy path --
+    a demotion applied where it should not be is a security regression, while a
+    demotion missed is only noise.
+    """
+
+    def setUp(self):
+        self._real = aegis._custody
+        aegis._custody = lambda path, sha: ("self-committed", "NOTE")
+
+    def tearDown(self):
+        aegis._custody = self._real
+
+    @staticmethod
+    def _one(new_fn, subject_fn):
+        return aegis._diff_map({}, {"/tmp/x": "sha"}, new_fn,
+                               subject_fn=subject_fn)
+
+    def test_the_rung_lands_and_the_severity_demotes(self):
+        out = self._one(
+            lambda k, v: aegis.finding("HIGH", "persistence", "t", "d", "fp"),
+            lambda k, v: (k, v))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["custody"], "self-committed")
+        # self-committed is _SELF_CUSTODY, whose target is LOW.
+        self.assertEqual(out[0]["severity"], "LOW")
+        self.assertIn("NOTE", out[0]["detail"])
+
+    def test_a_finding_that_already_carries_a_rung_is_left_alone(self):
+        out = self._one(
+            lambda k, v: aegis.finding("HIGH", "persistence", "t", "d", "fp",
+                                       custody="operator-vouched"),
+            lambda k, v: (k, v))
+        self.assertEqual(out[0]["custody"], "operator-vouched")
+        self.assertEqual(out[0]["severity"], "HIGH",
+                         "the surface graded it itself; this must not re-grade")
+
+    def test_attack_defined_evidence_is_never_demoted(self):
+        out = self._one(
+            lambda k, v: aegis.finding("CRITICAL", "persistence", "t", "d",
+                                       "fp", attack_defined=True),
+            lambda k, v: (k, v))
+        self.assertEqual(
+            out[0]["severity"], "CRITICAL",
+            "knowing who wrote a payload is not a reason to stop calling it "
+            "a payload")
+        self.assertIsNone(out[0].get("custody"))
+
+    def test_a_raising_subject_fn_leaves_the_finding_at_full_severity(self):
+        def boom(k, v):
+            raise RuntimeError("no subject")
+        out = self._one(
+            lambda k, v: aegis.finding("HIGH", "persistence", "t", "d", "fp"),
+            boom)
+        self.assertEqual(out[0]["severity"], "HIGH",
+                         "failing to establish custody is a reason to keep "
+                         "alarming, never to stop")
+
+    def test_no_subject_means_no_grading(self):
+        out = self._one(
+            lambda k, v: aegis.finding("HIGH", "persistence", "t", "d", "fp"),
+            lambda k, v: None)
+        self.assertEqual(out[0]["severity"], "HIGH")
+        self.assertIsNone(out[0].get("custody"))
+
+    def test_no_rung_means_no_change(self):
+        aegis._custody = lambda path, sha: (None, "")
+        out = self._one(
+            lambda k, v: aegis.finding("HIGH", "persistence", "t", "d", "fp"),
+            lambda k, v: (k, v))
+        self.assertEqual(out[0]["severity"], "HIGH")
+        self.assertIsNone(out[0].get("custody"))
+
+    def test_omitting_subject_fn_is_byte_for_byte_the_old_behaviour(self):
+        mk = lambda k, v: aegis.finding("HIGH", "persistence", "t", "d", "fp")
+        out = aegis._diff_map({}, {"/tmp/x": "sha"}, mk)
+        self.assertEqual(out[0]["severity"], "HIGH")
+        self.assertIsNone(out[0].get("custody"))
 
 
 if __name__ == "__main__":

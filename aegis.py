@@ -8361,10 +8361,61 @@ def _read_text(path, limit=512 * 1024):
         return None
 
 
-def _diff_map(prior, cur, new_fn, changed_fn=None):
+def _grade_by_subject(f, subject_fn, key, value):
+    """Attach the custody rung for this finding's SUBJECT and demote by it.
+
+    The custody ladder is the only thing in this program that can tell the
+    operator's own work from an arrival, and it was reaching 10 of 139
+    `finding()` call sites. The reason is mechanical rather than conceptual:
+    `_custody(path, sha)` grades a FILE, while a snapshot diff is keyed by
+    whatever that surface happens to identify its objects by -- a path here, a
+    profile identifier there, an extension id, a socket key. Only the surface
+    knows which of those is a filesystem object, so it hands one over and the
+    grading happens here, once, instead of in twenty closures.
+
+    Three refusals, all deliberate:
+
+      * a finding that already carries a rung is left alone -- the surface
+        graded it itself and knows more than this does;
+      * attack-DEFINED evidence is never graded, the same refusal `_demote()`
+        makes, made again here so no future caller reaches a demotion by a path
+        that skips the gate;
+      * anything that raises leaves the finding at full severity. Failing to
+        establish custody is a reason to keep alarming, never to stop.
+    """
+    if f.get("custody") or f.get("provenance") or f.get("attack_defined"):
+        return
+    try:
+        subject = subject_fn(key, value)
+    except Exception:
+        return
+    if not subject:
+        return
+    path, content_sha = subject
+    if not path:
+        return
+    try:
+        rung, note = _custody(path, content_sha)
+    except Exception:
+        return
+    if not rung:
+        return
+    f["custody"] = rung
+    f["severity"] = _demote(f["severity"], rung)
+    if note:
+        f["detail"] = redact_sensitive(f["detail"] + "\n" + note)
+
+
+def _diff_map(prior, cur, new_fn, changed_fn=None, subject_fn=None):
     """Generic snapshot diff: call new_fn(id, val) for keys absent from prior and
     changed_fn(id, val, old) for keys whose value changed. Callables return a
-    finding (or None to skip). Never raises on a single bad entry."""
+    finding (or None to skip). Never raises on a single bad entry.
+
+    subject_fn(key, value) -> (path, content_sha) names the filesystem object
+    this key stands for, so the finding can be graded by its custody. Opt-in per
+    surface: passing it asserts that this surface's key IS a path, which is a
+    thing only the surface knows. Omit it and behaviour is exactly as before.
+    """
     findings = []
     prior = prior or {}
     for k, v in cur.items():
@@ -8376,6 +8427,8 @@ def _diff_map(prior, cur, new_fn, changed_fn=None):
             else:
                 f = None
             if f:
+                if subject_fn is not None:
+                    _grade_by_subject(f, subject_fn, k, v)
                 findings.append(f)
         except Exception:
             continue
@@ -8410,8 +8463,14 @@ def diff_shellrc(prior, cur):
                            "shellrc:%s:%s:%s" % (tag, p, rec["sha256"]),
                            path=p, hostile=hs, sha256=rec["sha256"])
         return f
+    # The key IS the path and the value carries the content hash, which is
+    # exactly what _custody() grades on. An rc file the operator's own commit
+    # touched is not the same event as one that appeared from nowhere.
     return _diff_map(prior, cur, _mk("New shell startup file", "appeared"),
-                     _mk("Shell startup file CHANGED", "changed"))
+                     _mk("Shell startup file CHANGED", "changed"),
+                     subject_fn=lambda pth, rec: (
+                         pth, (rec or {}).get("sha256")
+                         if isinstance(rec, dict) else None))
 
 
 # --- legacy Login/Logout hooks ------------------------------------------------
@@ -9103,7 +9162,8 @@ def diff_extra_persistence(prior, cur):
                            path=p, sha256=h, hostile=hs)
         return f
     return _diff_map(prior, cur, _mk("New system-persistence file", "appeared"),
-                     _mk("System-persistence file CHANGED", "changed"))
+                     _mk("System-persistence file CHANGED", "changed"),
+                     subject_fn=lambda pth, h: (pth, h))
 
 
 
@@ -9242,7 +9302,8 @@ def diff_python_site(prior, cur):
                 "pysite:%s:%s:%s" % ("new" if is_new else "changed", p, h),
                 path=p, sha256=h, hostile=hostile)
         return f
-    return _diff_map(prior, cur, _mk(True), _mk(False))
+    return _diff_map(prior, cur, _mk(True), _mk(False),
+                     subject_fn=lambda pth, h: (pth, h))
 
 
 # --- browser extensions -------------------------------------------------------
@@ -9593,7 +9654,8 @@ def diff_wallet(prior, cur):
                            path=p, sha256=h)
         return f
     return _diff_map(prior, cur, _mk("New wallet file", "appeared"),
-                     _mk("Wallet file CHANGED", "changed"))
+                     _mk("Wallet file CHANGED", "changed"),
+                     subject_fn=lambda pth, h: (pth, h))
 
 
 # --- Background Task Management (Login Items + SMAppService agents) ------------
