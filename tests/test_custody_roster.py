@@ -84,6 +84,18 @@ NO_AUTHORED_SUBJECT = {
     "decoy": "aegis's own tripwire — attack-defined by construction",
     "latch": "aegis's own tripwire — attack-defined by construction",
     "assay": "aegis's own tripwire — attack-defined by construction",
+    # A command line typed or pasted into an interactive shell is not an
+    # artifact anyone authored ON DISK, so there is nothing for _custody to
+    # trace. The category already carries a STRICTLY BETTER discriminator of
+    # the same kind: `pasted` (True / False / unknown) is literally "did a
+    # human compose this or did it arrive from somewhere else", and
+    # _paste_guard_finding already grades severity by it — certain+pasted is
+    # HIGH, the same text typed by hand is LOW, because `curl … | sh` is how
+    # rustup is documented. Adding a custody rung on top would grade the
+    # wrong subject.
+    "paste-guard": "a shell command line, not an authored file — the category "
+                   "carries its own paste provenance, which is the better "
+                   "discriminator",
 }
 
 GRADED = {
