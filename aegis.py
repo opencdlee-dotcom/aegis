@@ -10292,8 +10292,21 @@ def diff_listeners(prior, cur):
             path, uid = val, None
         port = key.rsplit(":", 1)[1]
         if key.startswith("loopback:"):
+            # ATTACK-DEFINED, declared rather than left implicit. The subject
+            # here is a Chromium binary, which is always validly signed by
+            # Google — so grading custody on it the way the sibling
+            # net-listener finding does would demote a genuine in-memory CDP
+            # injection every single time, on the strength of Google's
+            # signature. _grade_binary(attack_defined=True) is the existing
+            # way to say "this evidence is not demotable by provenance": it
+            # returns the severity untouched and no rung, and passing that
+            # rung records the decision at the call site, which is what the
+            # custody roster asks for. A listener with no
+            # --remote-debugging-port has no benign reading.
+            graded, rung, _note = _grade_binary("HIGH", path,
+                                                attack_defined=True)
             return finding(
-                "HIGH", "session-theft",
+                graded, "session-theft",
                 "Browser accepting a local debug connection",
                 "%s is listening on loopback port %s with no "
                 "--remote-debugging-port on its command line. A Chromium "
@@ -10305,6 +10318,7 @@ def diff_listeners(prior, cur):
                 "start this, freeze the browser: aegis.py freeze <pid>."
                 % (os.path.basename(path), port),
                 "listener:%s" % key, path=path, port=port, confidence="high",
+                custody=rung,
                 markers=["session-theft", "cookie", "browser-automation"])
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
