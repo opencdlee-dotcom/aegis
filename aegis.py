@@ -14953,8 +14953,9 @@ def check_coverage():
             "Sensor found items it could not examine: %s" % sid,
             "%s located %d item(s) and could not read or parse them, so what "
             "they hold is UNKNOWN, not clean%s. Kind(s): %s. Examples: %s%s. "
-            "Fix the read (permission, size, syntax) or accept this incident "
-            "to stop it re-alerting for these kinds of gap."
+            "This is digest-routed (below the incident floor) and re-appears "
+            "only when a new KIND of gap shows up; fix the read (permission, "
+            "size, syntax) to clear it."
             % (sid, len(gaps),
                (" -- and this surface registers what RUNS, so an entry the "
                 "operator cannot see may be one that executes")

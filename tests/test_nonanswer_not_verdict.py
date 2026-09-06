@@ -247,6 +247,12 @@ class TheCoverageFinding(LedgerFixture):
         self.assertEqual("coverage", hot["category"])
         self.assertIn("2 item(s)", hot["detail"])
         self.assertIn("UNKNOWN, not clean", hot["detail"])
+        # MEDIUM/LOW never become incidents (the floor is HIGH); the first
+        # live report told the operator to "accept this incident" -- one that
+        # could not exist. The text must describe where the finding actually
+        # goes.
+        self.assertIn("digest-routed", hot["detail"])
+        self.assertNotIn("accept this incident", hot["detail"])
         self.assertEqual(["/x/a", "/x/b"], hot["unexamined"])
 
     def test_an_exec_registering_surface_is_medium(self):
