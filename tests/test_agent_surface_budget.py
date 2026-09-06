@@ -31,15 +31,18 @@ class AgentBudgetBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._saved = (aegis.AGENT_CONFIG_ROOTS, aegis._AGENT_SCAN_FILE_CAP,
-                       aegis._AGENT_SCAN_ROOT_CAP, aegis.STATE_DIR)
+                       aegis._AGENT_SCAN_ROOT_CAP, aegis.STATE_DIR,
+                       aegis.AGENT_CONFIG_FILES)
         aegis.STATE_DIR = os.path.join(self.tmp, ".aegis")
+        aegis.AGENT_CONFIG_FILES = []
         os.makedirs(aegis.STATE_DIR)
         aegis._AGENT_SCAN_TRUNCATED[0] = False
         del aegis._AGENT_SCAN_TRUNCATED_ROOTS[:]
 
     def tearDown(self):
         (aegis.AGENT_CONFIG_ROOTS, aegis._AGENT_SCAN_FILE_CAP,
-         aegis._AGENT_SCAN_ROOT_CAP, aegis.STATE_DIR) = self._saved
+         aegis._AGENT_SCAN_ROOT_CAP, aegis.STATE_DIR,
+         aegis.AGENT_CONFIG_FILES) = self._saved
         aegis._AGENT_SCAN_TRUNCATED[0] = False
         del aegis._AGENT_SCAN_TRUNCATED_ROOTS[:]
         shutil.rmtree(self.tmp, ignore_errors=True)

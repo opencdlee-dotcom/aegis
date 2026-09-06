@@ -1095,6 +1095,55 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   coverage-degraded incident the way a transient failure (still DEGRADED)
   does. Denied data is never interpreted as an empty or clean snapshot.
 - Uninstall retains evidence by default. Purge requires the explicit `--purge`.
+- **A benign read is never persisted.** A sensor that reads content it does not
+  own the meaning of — the clipboard, an executed command line, a config body,
+  a window title — records nothing about a clean read: not the text, not a
+  hash, not a "seen at" row. Only the hostile verdict and the evidence that
+  earned it are written, and that evidence passes through `redact_sensitive`
+  first. The clipboard and paste-guard surfaces set this rule (password managers
+  put secrets on the clipboard; a tool that journals every clipboard it sees
+  has become the thing it defends against); every later sensor inherits it
+  rather than deciding retention ad hoc.
+- **Every sensor reports health on every scan.** A sensor that can fail
+  silently — a command that times out, a file that stops being readable, a
+  hook that was never installed — emits a `sensor_status` row each scan, OK or
+  otherwise, so a dead sensor is DEGRADED/FAILED in `doctor` rather than
+  green-by-omission. Health is emitted on the good scans too: a row written
+  only on failure pins the last failure as current forever
+  (`process.enumerate`, 2026-08-26, three days of a stale "could not be read").
+  A sensor that cannot exist on this platform is *absent*, never permanently
+  DEGRADED. `tests/test_sensor_invariants.py` holds the roster and fails when a
+  sensor is registered without a health row.
+- **A non-answer is never rendered as a verdict.** A sensor has two ways of not
+  answering. The whole-sensor form is `return None`, which `_collect_sensor`
+  turns into DEGRADED and `_scan_surfaces` refuses to baseline. The per-item
+  form — a file found and then not stat'd, read or parsed; a process whose
+  argv could not be taken; a registry value denied — goes through
+  `unexamined(subject, why, exc)`, the one ledger for "I found this and could
+  not examine it". It records against the sensor the scan is running, notes
+  the gap on that sensor's health row (which stays OK: the three-strikes
+  coverage incident is for a sensor that stopped answering, not for one
+  unreadable file in `~/Downloads`), and `check_coverage` emits one finding
+  per sensor with gaps, fingerprinted on the set of subjects, so a stable gap
+  is one acceptable incident and a new one re-alerts. Identity is the set of
+  gap *kinds* ("larger than the read cap", "is not parseable JSON"), not the
+  set of subjects: the first live install reported 121 churning session and
+  telemetry files, and a subject-keyed fingerprint re-alerted every scan.
+  ENOENT/ESRCH gaps are *absent*, and EPERM anywhere or EACCES outside `HOME`
+  is a *privilege wall* the unprivileged agent is not meant to cross; both are
+  counted on the row, never alarmed — nothing can be examined about a thing
+  that is not there, and a boundary the design forbids crossing is not a
+  fault. A retired sensor id is declared in `_RETIRED_SENSOR_IDS` so its
+  health row cannot haunt `doctor` as "DID NOT RUN". A sensor that concludes from a fact another
+  sensor could not take (`_browser_loopback_entries` reading "no debugging
+  flag" off an argv the `ps` call never returned) consults that sensor's
+  partial flag first and declines rather than accuses. The invariant is
+  checked against the source by AST in `tests/test_sensor_invariants.py`:
+  every silent `except` in a sensor function is a whole-sensor non-answer, an
+  absence (`FileNotFoundError`), on the ledger, or on the allowlist with its
+  reason. Case: 2026-09-04, an unparseable agent config recorded as exec-free,
+  oversize configs vanishing from the surface, and a failed argv probe firing
+  HIGH session-theft against every browser at once — 31 sites of one shape.
 
 ## Protective tier (opt-in, by hand)
 
