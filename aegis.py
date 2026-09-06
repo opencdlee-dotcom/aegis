@@ -19345,14 +19345,23 @@ def cmd_doctor():
     beat = read_heartbeat()
     beat_epoch = beat.get("epoch")
     if beat_epoch:
-        beat_age = int(time.time()) - int(beat_epoch)
         beat_status = str(beat.get("status") or "?")
-        if beat_age > HEARTBEAT_STALE_SECS:
-            print("  ✗ %-27s STALE — last beat %s (pid %s); tolerance is %dm. "
-                  "The monitor is not running, or cannot finish a scan."
-                  % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
-                     HEARTBEAT_STALE_SECS // 60))
-            problems.append("heartbeat stale")
+        # Ask the same fail-closed verdict `watchdog` asks, instead of
+        # re-deriving liveness from `epoch` alone. Raw arithmetic here trusted
+        # the two fields an attacker controls most cheaply: a killed monitor
+        # whose heartbeat.json was kept fresh by `while :; do echo ... ; done`
+        # — the exact attack cmd_watchdog's docstring names as the reason the
+        # beat is signed at all — printed "✓ heartbeat last beat just now"
+        # here and on `status`. `watchdog` would have said FORGED, but it
+        # needs a SECOND agent, and nothing on a one-agent machine schedules
+        # one, so the only two commands an operator actually runs were the
+        # only two that believed the file.
+        beat_state, beat_human = heartbeat_verdict(beat)
+        if beat_state != BEAT_OK:
+            print("  ✗ %-27s %s — %s. The monitor is not running, cannot "
+                  "finish a scan, or something else is writing this file."
+                  % ("heartbeat", beat_state.upper(), beat_human))
+            problems.append("heartbeat %s" % beat_state)
         else:
             print("  ✓ %-27s last beat %s (pid %s, status %s)"
                   % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
@@ -19559,11 +19568,20 @@ def cmd_status():
     # Survivability (dead-man's switch) + capability posture.
     emit("\n# Survivability")
     beat = read_heartbeat()
+    # ONE verdict for this whole section: the liveness row below and the
+    # watchdog-alert row further down must never be able to disagree about
+    # the same beat, and in watch mode the verdict shells out to the
+    # scheduler probe — so it is asked once, not once per row.
+    beat_state, beat_human = heartbeat_verdict(beat)
     if beat.get("epoch"):
-        age = int(time.time()) - int(beat["epoch"])
-        mark = "✓" if age <= HEARTBEAT_STALE_SECS else "✗"
-        emit("  %s %-32s last beat %d min ago (pid %s)"
-              % (mark, "Heartbeat", age // 60, beat.get("pid", "?")))
+        # Fail closed, exactly as doctor and `watchdog` do. Comparing `epoch`
+        # to now() was the whole check here, which rendered a forged or
+        # unsigned beat as a green tick on the screen an operator reads most.
+        if beat_state == BEAT_OK:
+            emit("  ✓ %-32s %s" % ("Heartbeat", beat_human))
+        else:
+            emit("  ✗ %-32s %s — %s"
+                  % ("Heartbeat", beat_state.upper(), beat_human))
     else:
         emit("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
     emit("  %s %-32s %s" % (
@@ -19590,12 +19608,12 @@ def cmd_status():
         # standing problem. Status is read-only; the sentinel is cleared by
         # the command that owns it.
         fired = _epoch(last.split("  ", 1)[0]) if last[:4].isdigit() else None
-        state, human = heartbeat_verdict(beat)
-        if (fired is not None and state == BEAT_OK
+        if (fired is not None and beat_state == BEAT_OK
                 and int(beat.get("epoch") or 0) >= fired):
             emit("  i %-32s fired %s; the monitor has beaten since (%s). "
                  "Clear it: `aegis.py watchdog`"
-                 % ("Watchdog alert (resolved)", last.split("  ", 1)[0], human))
+                 % ("Watchdog alert (resolved)", last.split("  ", 1)[0],
+                    beat_human))
         else:
             emit("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
     fda = _has_full_disk_access()
