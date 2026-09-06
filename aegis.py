@@ -124,7 +124,7 @@ written locally so an unavailable sensor can never masquerade as clean coverage.
 
 STATE  -> ~/.aegis/   (aegis.db, baseline.json, findings.jsonl, latest.md,
                        quarantine transactions, actions.jsonl audit, ...)
-USAGE  -> aegis.py [install [watch] [secs]|uninstall]
+USAGE  -> aegis.py [install [watch|scan] [secs]|uninstall]
           aegis.py [scan|report|status|doctor|incidents|incident|baseline|
                     allow <path>|vt <path|sha>|
                     canary|watch]
@@ -24840,13 +24840,39 @@ def _install_windows(runtime, mode, interval):
     return 0, "scheduled task %s registered (%s)" % (SELF_WIN_TASK, mode)
 
 
-def cmd_install(mode="scan", interval=None):
-    """Register Aegis to run in the background on this OS."""
+def cmd_install(mode=None, interval=None):
+    """Register Aegis to run in the background on this OS.
+
+    `mode=None` means "keep whatever is already installed". That is the form
+    an operator types -- `aegis.py install`, the documented refresh after
+    editing aegis.py -- and it used to mean "scan", so every routine refresh
+    silently replaced a watch-mode monitor (KeepAlive, a resident process, a
+    600s beat) with a StartInterval timer at 3600s. _refresh_line() has
+    guarded against exactly that downgrade since it was written; it could only
+    guard the line `update-check` prints, never the line a human types.
+    Naming "scan" or "watch" still overrides the record, so a deliberate
+    change is unaffected -- and a bare refresh keeps the recorded interval
+    too, because refreshing an install should reinstall THAT install.
+    """
+    recorded = load_json(SELFSTATE, {})
+    inherit = mode is None
+    if inherit:
+        mode = recorded.get("install_mode") or "scan"
+        if recorded.get("install_mode"):
+            print("Keeping the installed %s mode "
+                  "(`install scan` / `install watch` changes it)." % mode)
     if mode not in ("scan", "watch"):
-        print("usage: aegis.py install [watch] [interval_seconds]")
+        print("usage: aegis.py install [watch|scan] [interval_seconds]")
         return 1
     if interval is None:
-        interval = 600 if mode == "watch" else 3600
+        interval = 0
+        if inherit:
+            try:
+                interval = int(recorded.get("install_interval") or 0)
+            except (TypeError, ValueError):
+                interval = 0
+        if interval < 60:
+            interval = 600 if mode == "watch" else 3600
     if interval < 60:
         print("interval must be at least 60 seconds")
         return 1
@@ -24872,6 +24898,7 @@ def cmd_install(mode="scan", interval=None):
     state["installed"] = True
     state["installed_at"] = now_iso()
     state["install_mode"] = mode
+    state["install_interval"] = interval
     # Stamp WHERE this install was cut from. The scheduled agent IS the runtime
     # copy, so _runtime_copy_status() can only ever answer 'self' there and the
     # one process whose staleness actually costs detections was structurally
@@ -27047,9 +27074,12 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                     (detect + opt-in response; Python stdlib only)
 
  SETUP
-  install [watch] [secs] register the background monitor for this OS
+  install [watch|scan] [secs] register the background monitor for this OS
                    (launchd agent / systemd --user timer / Scheduled Task).
-                   Default: a scan every 3600s; `watch` = change-driven
+                   With NO mode named it KEEPS the installed one, so the
+                   refresh after editing aegis.py cannot downgrade a
+                   watch-mode monitor. New box: a scan every 3600s;
+                   `watch` = change-driven
                    monitoring with a [secs] full-scan floor (default 600)
   uninstall        remove that registration (local evidence is kept)
   setup            guided, idempotent walkthrough of the OPT-IN tiers (monitor,
@@ -27593,13 +27623,13 @@ def main(argv):
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
     if cmd == "install":
         rest = argv[2:]
-        mode = "scan"
-        if rest and rest[0] == "watch":
-            mode, rest = "watch", rest[1:]
+        mode = None                     # None = keep the installed mode
+        if rest and rest[0] in ("watch", "scan"):
+            mode, rest = rest[0], rest[1:]
         try:
             secs = int(rest[0]) if rest else None
         except ValueError:
-            print("usage: aegis.py install [watch] [interval_seconds]")
+            print("usage: aegis.py install [watch|scan] [interval_seconds]")
             return 1
         return cmd_install(mode, secs)
     if cmd == "uninstall":

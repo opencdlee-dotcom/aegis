@@ -194,9 +194,11 @@ printed over two open CRITICAL chains.
 # Register the background monitor for THIS OS (launchd agent on macOS,
 # systemd --user timer on Linux, Scheduled Task on Windows). Idempotent:
 # re-run to change mode/interval or to refresh the runtime copy.
-python3 aegis.py install                 # a scan every hour (default)
+python3 aegis.py install                 # KEEP the installed mode+interval
+                                         #   (a scan every hour on a new box)
 python3 aegis.py install 1800            # ...every 30 minutes
 python3 aegis.py install watch           # change-driven + 600s full-scan floor
+python3 aegis.py install scan            # back to interval mode, explicitly
 python3 aegis.py uninstall               # remove the registration, keep evidence
 
 python3 aegis.py setup                   # guided, idempotent walkthrough of the
