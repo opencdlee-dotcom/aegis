@@ -533,7 +533,7 @@ class TestCorruptBaseline(Sandbox):
     def test_corrupt_baseline_alerts_and_does_not_retrust(self):
         aegis.cmd_scan(quiet=True)  # clean first-run baseline
         # attacker plants a new adhoc launch item AND corrupts the baseline
-        self.write_plist("com.evil.plist", [self.adhoc_binary("/tmp/aegis_rt_pl")])
+        self.write_plist("com.evil.plist", [self.adhoc_binary(os.path.join(self.tmp, "pl"))])
         with open(aegis.BASELINE, "w") as f:
             f.write("{ this is not valid json ")
         self.notifications.clear()
@@ -548,7 +548,6 @@ class TestCorruptBaseline(Sandbox):
                             for f in data["findings"]))
         # …and something HIGH+ actually notified (not silent).
         self.assertTrue(self.notifications)
-        subprocess.run(["rm", "-f", "/tmp/aegis_rt_pl"], check=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -604,11 +603,10 @@ class TestFirstRunScoping(Sandbox):
                         "a hot-dir threat present before install must alert")
 
     def test_persistence_at_first_scan_stays_silent(self):
-        self.write_plist("com.evil.plist", [self.adhoc_binary("/tmp/aegis_rt_p2")])
+        self.write_plist("com.evil.plist", [self.adhoc_binary(os.path.join(self.tmp, "p2"))])
         aegis.cmd_scan(quiet=True)
         self.assertEqual(self.notifications, [],
                          "first-run persistence is baselined silently")
-        subprocess.run(["rm", "-f", "/tmp/aegis_rt_p2"], check=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -677,7 +675,7 @@ class TestRiskyLocations(Sandbox):
 # --------------------------------------------------------------------------- #
 class TestSigcacheKeying(Sandbox):
     def test_cache_invalidates_and_does_not_orphan(self):
-        p = self.adhoc_binary("/tmp/aegis_rt_sc")
+        p = self.adhoc_binary(os.path.join(self.tmp, "sc"))
         try:
             aegis.classify_signature(p)
             stat1 = aegis._sigcache[p]["stat"]
@@ -782,12 +780,11 @@ class TestNeverRepeat(Sandbox):
 
     def test_second_scan_of_unchanged_world_is_quiet(self):
         aegis.cmd_scan(quiet=True)
-        self.write_plist("com.evil.plist", [self.adhoc_binary("/tmp/aegis_rt_nr")])
+        self.write_plist("com.evil.plist", [self.adhoc_binary(os.path.join(self.tmp, "nr"))])
         aegis.cmd_scan(quiet=True)
         n = len(self.notifications)
         aegis.cmd_scan(quiet=True)
         self.assertEqual(len(self.notifications), n)
-        subprocess.run(["rm", "-f", "/tmp/aegis_rt_nr"], check=False)
 
 
 # =========================================================================== #

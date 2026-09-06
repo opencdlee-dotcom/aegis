@@ -3337,6 +3337,19 @@ _TOLERANCE_HASH_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
 # never-tolerated and the process sensor grades signatures independently.
 _TOLERANCE_VERSION_RE = re.compile(
     r"(?<![0-9A-Za-z])\d+(?:\.\d+){1,3}(?![0-9A-Za-z])")
+# macOS App Translocation (Gatekeeper path randomization) runs an app that was
+# never moved out of its download or DMG from a read-only nullfs mount at
+# /var/folders/<u>/<t>/T/AppTranslocation/<UUID>/d/. The UUID is minted per
+# mount, so the SAME notarized app presents a brand-new path on every relaunch
+# and every identity derived from it — fingerprint, case key, endpoint class —
+# is orphaned. Version normalization cannot help: a hex UUID has no dotted
+# decimal run. Live cost: Obsidian, Developer-ID signed and notarization
+# stapled, minted a fresh HIGH beacon incident per endpoint per launch and
+# could never accumulate the verdicts that would silence it, because the class
+# key those verdicts attach to moved every time. Same precedent as the version
+# regex: this only ever names the CASE, never what the bytes are.
+_TRANSLOCATION_UUID_RE = re.compile(
+    r"(/AppTranslocation/)[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}(/)")
 # Only surfaces whose benign churn is hash- or version-shaped may generalize
 # at all — an allowlist, matching the deadfall discipline, never a blocklist.
 _TOLERANCE_CATEGORIES = frozenset((
@@ -3362,7 +3375,8 @@ def _program_subject(path):
     file. Nothing else is generalized: the digest still identifies the bytes,
     and this only ever names the CASE those bytes belong to.
     """
-    return _TOLERANCE_VERSION_RE.sub("#", path or "")
+    return _TOLERANCE_VERSION_RE.sub(
+        "#", _TRANSLOCATION_UUID_RE.sub(r"\1#\2", path or ""))
 
 
 def _tolerance_identity(fingerprint):
@@ -4770,6 +4784,20 @@ _AGE_OUT_DAYS = 7
 # CRITICAL, and attack-defined evidence — a tripped decoy or latch is a fact
 # about an attacker, and a quiet week is not an acquittal.
 _AGE_OUT_KINDS = ("signal", "risk")
+# A STATE assertion is not an event, and the age-out's premise does not hold
+# for one. "Nothing new in 7d" means a process stopped running or a file
+# stopped appearing — but a posture finding says the same sentence every scan
+# precisely BECAUSE the exposure is still there, so silence is the condition
+# persisting, not the incident going stale. Worse, the resolution it writes
+# ("reopens on new evidence") cannot be honoured here: a signal incident
+# embeds its fingerprint IN the correlation key, so a matched key always
+# implies the same evidence, _carries_new_evidence is never true, and the
+# reattach at the FALSE_POSITIVE branch swallows every later observation
+# forever. Live cost: `hardening:macos:patchgap:26.0.1` — a real 307-day gap
+# with 12 offered updates — was 17 hours from being filed as a false positive
+# and permanently muted while the Mac stayed unpatched. State findings leave
+# by _close_cleared_state_incidents instead, when the condition actually goes.
+_STATE_FINGERPRINT_PREFIXES = ("hardening:",)
 
 
 def _close_regraded_incidents(db, now):
@@ -4810,6 +4838,63 @@ def _close_regraded_incidents(db, now):
             "updated_at=?,next_reminder_at=NULL WHERE id=? AND status='OPEN'",
             ("re-graded: the signal now reads %s (reopens on new evidence)"
              % sig_sev, now, incident_id))
+    return len(closed)
+
+
+def _close_cleared_state_incidents(db, observed, now):
+    """Close OPEN state-assertion incidents whose condition is no longer true.
+
+    State findings are exempt from the age-out clock (see
+    _STATE_FINGERPRINT_PREFIXES), so they need the one honest exit a posture
+    assertion has: the sensor looked again and the condition was gone. That is
+    evidence, not a timer, and it is the same machine-exit discipline
+    _close_regraded_incidents holds — no dismissals row, so a machine verdict
+    never feeds backtest precision or acquired tolerance.
+
+    RESOLVED, not FALSE_POSITIVE: the finding was right when it was made and
+    the exposure genuinely ended. Filing a corrected posture as a misdetection
+    would teach the precision ledger a lie.
+
+    The guard that makes this safe is the sensor-ran check. Absence of a
+    finding is ambiguous — the condition cleared, OR the sensor that would
+    have reported it failed, was denied permission, or never ran. Reading the
+    second as the first is exactly how a dead sensor renders green. So a
+    state incident closes only when its OWN sensor answered OK in this scan;
+    a sensor that did not answer leaves its incidents standing.
+    An EMPTY finding set is not a special case and must not short-circuit
+    here: "the sensor ran and found nothing" is precisely what a cleared
+    condition looks like. The sensor-ran check below is the guard that makes
+    the distinction, and it is the only one that can.
+    """
+    closed = []
+    for row in db.execute(
+            "SELECT id, correlation_key FROM incidents WHERE status='OPEN' "
+            "AND kind='signal' AND correlation_key LIKE 'signal:%'").fetchall():
+        key = row["correlation_key"] or ""
+        fp = key[len("signal:"):]
+        if not fp.startswith(_STATE_FINGERPRINT_PREFIXES):
+            continue
+        if fp in observed:
+            continue          # still true this scan
+        sensor = db.execute(
+            "SELECT e.source FROM events e JOIN incident_events ie "
+            "ON ie.event_id=e.id WHERE ie.incident_id=? "
+            "ORDER BY e.id DESC LIMIT 1", (row["id"],)).fetchone()
+        if not sensor or not sensor["source"]:
+            continue          # cannot prove who owned it — leave it standing
+        ok = db.execute(
+            "SELECT 1 FROM sensor_status WHERE sensor_id=? AND status='OK' "
+            "AND last_ok_at>=?", (sensor["source"], now)).fetchone()
+        if not ok:
+            continue          # the sensor did not answer this scan
+        closed.append(row["id"])
+    for incident_id in closed:
+        db.execute(
+            "UPDATE incidents SET status='RESOLVED',resolution=?,"
+            "updated_at=?,last_seen=?,next_reminder_at=NULL "
+            "WHERE id=? AND status='OPEN'",
+            ("condition cleared: the sensor looked again and it is gone",
+             now, now, incident_id))
     return len(closed)
 
 
@@ -4862,6 +4947,9 @@ def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
         key = row["correlation_key"] or ""
         fp = key[len("signal:"):] if key.startswith("signal:") else key
         if fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        # A persisting CONDITION is not an incident that went quiet.
+        if fp.startswith(_STATE_FINGERPRINT_PREFIXES):
             continue
         aged.append(row["id"])
     if not aged:
@@ -5174,6 +5262,14 @@ def record_security_state(findings, sensor_health=(), now=None,
                     log_run("closed %d re-graded incident(s)" % regraded)
             except Exception as e:
                 log_run("re-grade close skipped: %s" % e)
+            try:
+                cleared = _close_cleared_state_incidents(
+                    db, {f["fingerprint"] for f in findings
+                         if f.get("fingerprint")}, now)
+                if cleared:
+                    log_run("closed %d cleared state incident(s)" % cleared)
+            except Exception as e:
+                log_run("state-clear close skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
@@ -15237,12 +15333,18 @@ def _first_sight_agent_config(path, rec):
     if sev == "HIGH" and "conceal" not in marks:
         sev = "MEDIUM"
     if sev:
-        # Same asymmetry as the gained-imperative branch: provenance may only
-        # ever ESCALATE content. A directive an injected agent wrote is
-        # self-attested and still hostile, so attestation must not soften it.
+        # Provenance is still recorded and still rides on the finding — but it
+        # does NOT re-escalate here, and the two lines above are why. The
+        # CHANGED branch may escalate on `remote-foreign` because there it
+        # means "a pull DELIVERED this directive", an event against a reviewed
+        # baseline. On FIRST SIGHT there is no baseline: `remote-foreign` is
+        # the resting state of every vendored checkout on the machine, so the
+        # predicate selects "this file lives in a repo you cloned", not
+        # "something changed". Escalating on it put back exactly the HIGHs the
+        # `conceal`-only rule three lines up was written to remove — measured
+        # here as 0 true positives, most recently two SKILL.md files sitting
+        # untouched in a third-party agent framework the operator installed.
         prov = _git_provenance(path)
-        if prov == "remote-foreign" and sev == "MEDIUM":
-            sev = "HIGH"
         out.append(finding(
             sev, "agent-surface", "New agent instruction file carries a directive",
             "%s appeared with instruction text matching: %s.\n%s\nAn "
