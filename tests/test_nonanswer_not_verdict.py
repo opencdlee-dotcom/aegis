@@ -140,14 +140,33 @@ class TheLedger(LedgerFixture):
         self.assertIn("gone before", aegis._coverage_note("hot-dir"))
         self.assertEqual([], aegis.check_coverage())
 
-    def test_a_denied_read_is_a_real_gap(self):
+    def test_a_denied_read_inside_home_is_a_real_gap(self):
         def sensor():
-            aegis.unexamined("/x/a", "could not be read",
+            aegis.unexamined(os.path.join(aegis.HOME, "x", "a"),
+                             "could not be read",
                              PermissionError(errno.EACCES, "denied"))
             return []
         aegis._run_as_sensor("hot-dir", sensor)
         self.assertEqual(1, len(aegis._gaps("hot-dir")))
         self.assertIn("NOT examined", aegis._coverage_note("hot-dir"))
+
+    def test_a_privilege_wall_is_counted_never_alarmed(self):
+        # The BTM store on the first live install: root-only, reported as a
+        # MEDIUM coverage finding every scan. The agent is forbidden the
+        # privilege that would lift it, so it is the boundary, not a fault.
+        def sensor():
+            aegis.unexamined("/private/var/db/com.apple.backgroundtaskmanagement",
+                             "could not be listed",
+                             PermissionError(errno.EACCES, "denied"))
+            aegis.unexamined(os.path.join(aegis.HOME, "Library", "Mail"),
+                             "could not be listed",
+                             PermissionError(errno.EPERM, "tcc"))
+            return []
+        aegis._run_as_sensor("surface.btm_store", sensor)
+        self.assertEqual([], aegis._gaps("surface.btm_store"))
+        self.assertIn("2 item(s) behind a privilege wall",
+                      aegis._coverage_note("surface.btm_store"))
+        self.assertEqual([], aegis.check_coverage())
 
     def test_never_raises(self):
         class Bad(object):
@@ -236,17 +255,39 @@ class TheCoverageFinding(LedgerFixture):
         self.assertEqual("MEDIUM", out[0]["severity"])
         self.assertIn("registers what RUNS", out[0]["detail"])
 
-    def test_the_fingerprint_is_stable_for_the_same_set(self):
-        self._gap("hot-dir", "/x/b", "/x/a")
+    def _kind(self, sid, why, *subjects):
+        def sensor():
+            for s in subjects:
+                aegis.unexamined(s, why)
+        aegis._run_as_sensor(sid, sensor)
+
+    def test_identity_is_the_set_of_kinds_not_of_subjects(self):
+        # The first live install: 121 agent-surface items, session transcripts
+        # past the read cap and JSONL telemetry under .json names, churning
+        # hourly. Keyed on subjects that was a MEDIUM re-alert every scan.
+        self._kind("hot-dir", "larger than the read cap", "/x/b", "/x/a")
         one = aegis.check_coverage()[0]["fingerprint"]
         aegis._reset_unexamined()
-        self._gap("hot-dir", "/x/a", "/x/b", "/x/a")
+        self._kind("hot-dir", "larger than the read cap", "/x/c", "/x/d", "/x/e")
         two = aegis.check_coverage()[0]["fingerprint"]
-        self.assertEqual(one, two, "order and repeats must not re-alert")
+        self.assertEqual(one, two, "more files of a known kind are the same "
+                         "fact; the detail carries the current count")
         aegis._reset_unexamined()
-        self._gap("hot-dir", "/x/a", "/x/b", "/x/c")
+        self._kind("hot-dir", "larger than the read cap", "/x/a")
+        self._kind("hot-dir", "could not be read: denied", "/x/z")
         three = aegis.check_coverage()[0]["fingerprint"]
-        self.assertNotEqual(one, three, "a new unreadable item is a new fact")
+        self.assertNotEqual(one, three, "a new KIND of gap is a new fact")
+        f = aegis.check_coverage()[0]
+        self.assertEqual(["could not be read", "larger than the read cap"],
+                         f["kinds"])
+        self.assertIn("Kind(s):", f["detail"])
+
+    def test_the_detail_after_the_colon_does_not_split_a_kind(self):
+        self._kind("hot-dir", "is not parseable JSON: Expecting value", "/a")
+        one = aegis.check_coverage()[0]["fingerprint"]
+        aegis._reset_unexamined()
+        self._kind("hot-dir", "is not parseable JSON: Extra data", "/b")
+        self.assertEqual(one, aegis.check_coverage()[0]["fingerprint"])
 
     def test_truncation_and_ledger_gaps_both_survive(self):
         self._gap("surface.agent_surface", "/x/mcp.json")
@@ -322,6 +363,70 @@ class AgentConfigNonAnswers(LedgerFixture):
         self.assertEqual(1, len(aegis._gaps(self.SID)), aegis._UNEXAMINED)
 
 
+class JsonWithComments(unittest.TestCase):
+    """VS Code, Cursor and Zed write JSONC. Strict json.loads recorded VS
+    Code's settings.json -- where `mcp.servers` lives -- as unparseable on the
+    reference machine, so the surface had never read it."""
+
+    def test_comments_and_trailing_commas_parse(self):
+        text = ('{\n  // editor\n  "mcp": { "servers": { "x": {\n'
+                '    "command": "npx", /* why */ "args": ["-y", "pkg",],\n'
+                '  }, }, },\n  "s": "http://not.a/comment", }')
+        obj = aegis._loads_jsonc(text)
+        self.assertEqual("http://not.a/comment", obj["s"])
+        self.assertEqual(
+            [("mcp.servers.x", "npx", ["-y", "pkg"])],
+            aegis._agent_exec_entries(obj))
+
+    def test_a_string_holding_slashes_is_not_a_comment(self):
+        self.assertEqual({"u": "a//b /* c */"},
+                         aegis._loads_jsonc('{"u": "a//b /* c */"}'))
+
+    def test_strict_json_takes_the_fast_path_unchanged(self):
+        self.assertEqual({"a": [1]}, aegis._loads_jsonc('{"a": [1]}'))
+
+    def test_a_truly_broken_file_still_raises(self):
+        with self.assertRaises(ValueError):
+            aegis._loads_jsonc('{"mcpServers": {"x": {"command":')
+        with self.assertRaises(ValueError):
+            aegis._loads_jsonc('{"a":1}\n{"a":2}\n')     # JSONL under .json
+
+
+class RetiredSensorIds(Sandbox):
+    """A renamed sensor left its old health row forever: doctor said
+    'agent-surface-coverage DID NOT RUN' and went DEGRADED on the first scan
+    after the rename."""
+
+    def test_the_ghost_row_and_its_incident_are_retired(self):
+        aegis.ensure_state()
+        db = aegis._event_connection()
+        try:
+            now = int(aegis.time.time())
+            db.execute("INSERT INTO sensor_status(sensor_id,status,last_run_at,"
+                       "duration_ms,item_count,detail,consecutive_failures) "
+                       "VALUES('agent-surface-coverage','OK',?,0,0,'',0)",
+                       (now - 3600,))
+            aegis._upsert_incident(db, "sensor:agent-surface-coverage",
+                                   "Security coverage degraded: x", "HIGH",
+                                   "sensor-health", now - 3600, [])
+            db.commit()
+            aegis._record_health(db, [{"sensor_id": "coverage", "status": "OK",
+                                       "detail": "", "duration_ms": 0,
+                                       "item_count": 0}], now)
+            db.commit()
+            ids = [r["sensor_id"] for r in db.execute(
+                "SELECT sensor_id FROM sensor_status").fetchall()]
+            self.assertNotIn("agent-surface-coverage", ids)
+            self.assertIn("coverage", ids)
+            row = db.execute("SELECT status, resolution FROM incidents WHERE "
+                             "correlation_key='sensor:agent-surface-coverage'"
+                             ).fetchone()
+            self.assertEqual("RESOLVED", row["status"])
+            self.assertIn("retired", row["resolution"])
+        finally:
+            db.close()
+
+
 class TheSizeThatCouldNotBeRead(Sandbox):
     """`cur_size = 0` on ANY exception alerted HIGH 'findings log truncated'
     on a log that merely could not be stat'd. Gone is still truncation."""
@@ -363,7 +468,10 @@ class TheSizeThatCouldNotBeRead(Sandbox):
             aegis.FINDINGS_LOG = saved
         self.assertFalse(any("truncated" in fp for fp in fps),
                          "a size that could not be read is not a size of 0")
-        self.assertEqual(1, len(aegis._gaps("self-protection")))
+        # Recorded on the ledger. (The sandbox lives outside HOME, so this
+        # particular denial classifies as a privilege wall rather than a gap;
+        # the real FINDINGS_LOG is under ~/.aegis and would be a gap.)
+        self.assertEqual(1, len(aegis._UNEXAMINED.get("self-protection", [])))
 
 
 class AncestryThatCouldNotBeRead(LedgerFixture):

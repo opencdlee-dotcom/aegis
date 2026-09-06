@@ -4690,7 +4690,25 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         elif decision == "learning":
             _auto_tolerate(db, incident_id, 0, now, reason="learning-period")
 
+# sensor ids that no longer exist -> what replaced them. Health rows are keyed
+# by id and read back whole, so a renamed sensor left its old row in
+# sensor_status forever: doctor reported "agent-surface-coverage DID NOT RUN"
+# (and the whole result DEGRADED) on the very first scan after the rename to
+# "coverage", and would have every scan after. A rename declares its
+# predecessor here; the row and any open coverage incident on it are retired.
+_RETIRED_SENSOR_IDS = {"agent-surface-coverage": "coverage"}
+
+
 def _record_health(db, health, now):
+    for old, new in _RETIRED_SENSOR_IDS.items():
+        if db.execute("DELETE FROM sensor_status WHERE sensor_id=?",
+                      (old,)).rowcount:
+            db.execute("UPDATE incidents SET status='RESOLVED',resolution=?,"
+                       "updated_at=?,last_seen=?,next_reminder_at=NULL WHERE "
+                       "correlation_key=? AND status IN (%s)" %
+                       ",".join("?" for _ in _ACTIVE_INCIDENT_STATES),
+                       ("sensor id retired; it is reported as %r now" % new,
+                        now, now, "sensor:" + old) + _ACTIVE_INCIDENT_STATES)
     for item in health:
         sensor_id = str(item.get("sensor_id") or "unknown")
         status = str(item.get("status") or "FAILED").upper()
@@ -5513,8 +5531,19 @@ def _scan_cost_summary(samples):
 # Nothing can be examined about a thing that is not there, and a hot directory
 # churns constantly; a finding that tracked that churn would be the noise the
 # risk tier already had to learn to discount.
+#
+# An item behind a PRIVILEGE WALL is recorded the same way. The agent runs
+# unprivileged by design (README/ARCHITECTURE forbid granting the shared
+# interpreter Full Disk Access), so a denial the operator cannot lift without
+# breaking that rule is the documented boundary, not a coverage fault: EPERM
+# anywhere (macOS TCC answers EPERM, and root-only stores like
+# /private/var/db/com.apple.backgroundtaskmanagement do too) and EACCES on a
+# path outside HOME. EACCES INSIDE HOME stays a real gap -- a file the
+# operator's own uid cannot read is anomalous. The first live install reported
+# the BTM store as a MEDIUM coverage finding every scan for exactly this.
 _CURRENT_SENSOR = [None]
-_UNEXAMINED = {}                 # sensor_id -> [(subject, why, absent)]
+_UNEXAMINED = {}                 # sensor_id -> [(subject, why, state)]
+_GAP, _ABSENT, _PRIVILEGED = "gap", "absent", "privileged"
 _UNEXAMINED_CAP = 500            # per sensor per scan; past it, count only
 _UNEXAMINED_OVERFLOW = {}        # sensor_id -> entries dropped at the cap
 # Surfaces that register what RUNS: a gap there is a possible exec entry the
@@ -5538,17 +5567,34 @@ def unexamined(subject, why, exc=None):
     real gap. Outside a scan the sensor id is "(direct)", which check_coverage
     ignores, so by-hand calls and tests record without alerting."""
     try:
-        absent = isinstance(exc, FileNotFoundError) or (
-            isinstance(exc, OSError)
-            and getattr(exc, "errno", None) in (errno.ENOENT, errno.ESRCH))
+        subject, why = str(subject)[:240], str(why)[:160]
         sid = _CURRENT_SENSOR[0] or "(direct)"
         lst = _UNEXAMINED.setdefault(sid, [])
         if len(lst) >= _UNEXAMINED_CAP:
             _UNEXAMINED_OVERFLOW[sid] = _UNEXAMINED_OVERFLOW.get(sid, 0) + 1
             return
-        lst.append((str(subject)[:240], str(why)[:160], bool(absent)))
+        lst.append((subject, why, _gap_state(subject, exc)))
     except Exception:
         pass
+
+
+def _gap_state(subject, exc):
+    """_ABSENT, _PRIVILEGED or _GAP for the error a probe raised on `subject`."""
+    if not isinstance(exc, OSError):
+        return _GAP
+    code = getattr(exc, "errno", None)
+    if isinstance(exc, FileNotFoundError) or code in (errno.ENOENT, errno.ESRCH):
+        return _ABSENT
+    if code == errno.EPERM:
+        return _PRIVILEGED
+    if code == errno.EACCES:
+        home = os.path.realpath(HOME)
+        try:
+            inside = os.path.realpath(subject).startswith(home + os.sep)
+        except Exception:
+            inside = subject.startswith(HOME)
+        return _GAP if inside else _PRIVILEGED
+    return _GAP
 
 
 def _reset_unexamined():
@@ -5557,9 +5603,18 @@ def _reset_unexamined():
 
 
 def _gaps(sensor_id):
-    """[(subject, why)] the sensor could not examine, ABSENT ones excluded."""
-    return [(s, w) for s, w, absent in _UNEXAMINED.get(sensor_id, ())
-            if not absent]
+    """[(subject, why)] the sensor could not examine; ABSENT and PRIVILEGED
+    ones excluded."""
+    return [(s, w) for s, w, state in _UNEXAMINED.get(sensor_id, ())
+            if state == _GAP]
+
+
+def _gap_kind(why):
+    """The KIND of a gap, from its `why`: the text before any ':' detail.
+    "is not parseable JSON: Expecting value" and "is not parseable JSON:
+    Extra data" are one kind. Identity for the coverage finding hangs on the
+    set of kinds, not the set of subjects (see check_coverage)."""
+    return (why or "").split(":", 1)[0].strip().lower()
 
 
 def _coverage_note(sensor_id):
@@ -5567,8 +5622,9 @@ def _coverage_note(sensor_id):
     rows = _UNEXAMINED.get(sensor_id) or []
     if not rows:
         return ""
-    real = sum(1 for _s, _w, absent in rows if not absent)
-    gone = len(rows) - real
+    real = sum(1 for _s, _w, st in rows if st == _GAP)
+    gone = sum(1 for _s, _w, st in rows if st == _ABSENT)
+    walled = sum(1 for _s, _w, st in rows if st == _PRIVILEGED)
     over = _UNEXAMINED_OVERFLOW.get(sensor_id, 0)
     parts = []
     if real:
@@ -5576,6 +5632,9 @@ def _coverage_note(sensor_id):
                      "finding)" % real)
     if gone:
         parts.append("%d item(s) gone before they could be read" % gone)
+    if walled:
+        parts.append("%d item(s) behind a privilege wall this unprivileged "
+                     "agent is not meant to cross" % walled)
     if over:
         parts.append("%d more past the ledger cap" % over)
     return "; ".join(parts)
@@ -14862,11 +14921,20 @@ def check_coverage():
     LAST in _cmd_scan_locked, after every sensor and surface has run, because
     the ledger is only complete then.
 
-    Fingerprinted on the sensor and the SET of subjects: a gap that persists
-    unchanged is one incident (which the operator can accept, like any other),
-    and a new unreadable file re-alerts as a new fact rather than hiding under
-    a standing "coverage partial". `absent` gaps never reach here -- a thing
-    that is not there cannot be examined, and churn is not coverage loss."""
+    Fingerprinted on the sensor and the SET of gap KINDS ("larger than the
+    read cap", "is not parseable JSON", "could not be listed"...), not on the
+    subjects. The first live install reported 121 agent-surface items: session
+    transcripts past the read cap and telemetry that is JSONL under a .json
+    name. Those files churn every hour, and a fingerprint on the subject set
+    would have re-alerted a MEDIUM on every scan -- the volume-defeats-discount
+    shape the risk tier had to be taught out of. What the operator judges is
+    "this sensor has a blind spot of this KIND"; a new kind (a permission
+    denial appearing where there was only oversize) is a new fact and
+    re-alerts; another file of a known kind is the same fact, and the
+    incident's last_seen and this detail carry the current count and
+    examples. `absent` and `privileged` gaps never reach here -- a thing that
+    is not there cannot be examined, a wall the design forbids crossing is not
+    a fault, and churn is not coverage loss."""
     out = list(check_agent_surface_coverage())
     for sid in sorted(_UNEXAMINED):
         if sid == "(direct)":
@@ -14875,6 +14943,7 @@ def check_coverage():
         if not gaps:
             continue
         subjects = sorted(set(s for s, _w in gaps))
+        kinds = sorted(set(_gap_kind(w) for _s, w in gaps))
         shown = ["%s (%s)" % (s.replace(HOME, "~"), w)
                  for s, w in sorted(gaps)[:6]]
         more = len(gaps) - len(shown)
@@ -14883,24 +14952,54 @@ def check_coverage():
             "MEDIUM" if exec_surface else "LOW", "coverage",
             "Sensor found items it could not examine: %s" % sid,
             "%s located %d item(s) and could not read or parse them, so what "
-            "they hold is UNKNOWN, not clean%s: %s%s. Fix the read (permission, "
-            "size, syntax) or accept this incident to stop it re-alerting for "
-            "this set of items."
+            "they hold is UNKNOWN, not clean%s. Kind(s): %s. Examples: %s%s. "
+            "Fix the read (permission, size, syntax) or accept this incident "
+            "to stop it re-alerting for these kinds of gap."
             % (sid, len(gaps),
                (" -- and this surface registers what RUNS, so an entry the "
                 "operator cannot see may be one that executes")
                if exec_surface else "",
-               "; ".join(shown), " (+%d more)" % more if more > 0 else ""),
+               "; ".join(kinds), "; ".join(shown),
+               " (+%d more)" % more if more > 0 else ""),
             "coverage:unexamined:%s:%s"
-            % (sid, hashlib.sha256(",".join(subjects).encode("utf-8", "replace"))
+            % (sid, hashlib.sha256("|".join(kinds).encode("utf-8", "replace"))
                .hexdigest()[:12]),
             confidence="high", markers=["coverage", sid],
-            sensor=sid, unexamined=subjects[:32]))
+            sensor=sid, kinds=kinds, unexamined=subjects[:32]))
     return out
 
 
 _AGENT_SCAN_TRUNCATED = [False]     # set by _agent_config_files, read by health
 _AGENT_SCAN_TRUNCATED_ROOTS = []    # WHICH roots were cut short, same writer
+
+
+_JSONC_TOKEN_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'          # a string, kept verbatim
+    r"|//[^\n]*"                    # a line comment
+    r"|/\*.*?\*/",                  # a block comment
+    re.S)
+_JSONC_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _loads_jsonc(text):
+    """json.loads, then a JSONC retry: comments and trailing commas removed
+    OUTSIDE string literals.
+
+    VS Code, Cursor and Zed write JSON-with-comments, and VS Code's
+    settings.json is where `mcp.servers` (an exec registration) lives. Strict
+    parsing recorded that file as "is not parseable JSON" on the reference
+    machine -- i.e. the surface had never once read the one editor config most
+    likely to carry a server command. A file that still fails after the
+    lenient pass raises like before, so a truncated or hostile config is still
+    a recorded gap, not a clean read."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    stripped = _JSONC_TOKEN_RE.sub(
+        lambda m: m.group(0) if m.group(0).startswith('"') else " ", text)
+    stripped = _JSONC_TRAILING_COMMA_RE.sub(r"\1", stripped)
+    return json.loads(stripped)
 
 
 def snapshot_agent_surface():
@@ -14929,7 +15028,7 @@ def snapshot_agent_surface():
         entries = []
         if p.endswith(".json"):
             try:
-                entries = _agent_exec_entries(json.loads(text))
+                entries = _agent_exec_entries(_loads_jsonc(text))
             except Exception as e:
                 # NOT the same as "this config declares no exec entries",
                 # which is what an empty list means everywhere else here. A
