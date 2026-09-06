@@ -124,7 +124,7 @@ written locally so an unavailable sensor can never masquerade as clean coverage.
 
 STATE  -> ~/.aegis/   (aegis.db, baseline.json, findings.jsonl, latest.md,
                        quarantine transactions, actions.jsonl audit, ...)
-USAGE  -> aegis.py [install [watch] [secs]|uninstall]
+USAGE  -> aegis.py [install [watch|scan] [secs]|uninstall]
           aegis.py [scan|report|status|doctor|incidents|incident|baseline|
                     allow <path>|vt <path|sha>|
                     canary|watch]
@@ -19345,14 +19345,23 @@ def cmd_doctor():
     beat = read_heartbeat()
     beat_epoch = beat.get("epoch")
     if beat_epoch:
-        beat_age = int(time.time()) - int(beat_epoch)
         beat_status = str(beat.get("status") or "?")
-        if beat_age > HEARTBEAT_STALE_SECS:
-            print("  ✗ %-27s STALE — last beat %s (pid %s); tolerance is %dm. "
-                  "The monitor is not running, or cannot finish a scan."
-                  % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
-                     HEARTBEAT_STALE_SECS // 60))
-            problems.append("heartbeat stale")
+        # Ask the same fail-closed verdict `watchdog` asks, instead of
+        # re-deriving liveness from `epoch` alone. Raw arithmetic here trusted
+        # the two fields an attacker controls most cheaply: a killed monitor
+        # whose heartbeat.json was kept fresh by `while :; do echo ... ; done`
+        # — the exact attack cmd_watchdog's docstring names as the reason the
+        # beat is signed at all — printed "✓ heartbeat last beat just now"
+        # here and on `status`. `watchdog` would have said FORGED, but it
+        # needs a SECOND agent, and nothing on a one-agent machine schedules
+        # one, so the only two commands an operator actually runs were the
+        # only two that believed the file.
+        beat_state, beat_human = heartbeat_verdict(beat)
+        if beat_state != BEAT_OK:
+            print("  ✗ %-27s %s — %s. The monitor is not running, cannot "
+                  "finish a scan, or something else is writing this file."
+                  % ("heartbeat", beat_state.upper(), beat_human))
+            problems.append("heartbeat %s" % beat_state)
         else:
             print("  ✓ %-27s last beat %s (pid %s, status %s)"
                   % ("heartbeat", _ago(beat_epoch), beat.get("pid", "?"),
@@ -19559,11 +19568,20 @@ def cmd_status():
     # Survivability (dead-man's switch) + capability posture.
     emit("\n# Survivability")
     beat = read_heartbeat()
+    # ONE verdict for this whole section: the liveness row below and the
+    # watchdog-alert row further down must never be able to disagree about
+    # the same beat, and in watch mode the verdict shells out to the
+    # scheduler probe — so it is asked once, not once per row.
+    beat_state, beat_human = heartbeat_verdict(beat)
     if beat.get("epoch"):
-        age = int(time.time()) - int(beat["epoch"])
-        mark = "✓" if age <= HEARTBEAT_STALE_SECS else "✗"
-        emit("  %s %-32s last beat %d min ago (pid %s)"
-              % (mark, "Heartbeat", age // 60, beat.get("pid", "?")))
+        # Fail closed, exactly as doctor and `watchdog` do. Comparing `epoch`
+        # to now() was the whole check here, which rendered a forged or
+        # unsigned beat as a green tick on the screen an operator reads most.
+        if beat_state == BEAT_OK:
+            emit("  ✓ %-32s %s" % ("Heartbeat", beat_human))
+        else:
+            emit("  ✗ %-32s %s — %s"
+                  % ("Heartbeat", beat_state.upper(), beat_human))
     else:
         emit("  ? %-32s no beat yet (run a scan)" % "Heartbeat")
     emit("  %s %-32s %s" % (
@@ -19590,12 +19608,12 @@ def cmd_status():
         # standing problem. Status is read-only; the sentinel is cleared by
         # the command that owns it.
         fired = _epoch(last.split("  ", 1)[0]) if last[:4].isdigit() else None
-        state, human = heartbeat_verdict(beat)
-        if (fired is not None and state == BEAT_OK
+        if (fired is not None and beat_state == BEAT_OK
                 and int(beat.get("epoch") or 0) >= fired):
             emit("  i %-32s fired %s; the monitor has beaten since (%s). "
                  "Clear it: `aegis.py watchdog`"
-                 % ("Watchdog alert (resolved)", last.split("  ", 1)[0], human))
+                 % ("Watchdog alert (resolved)", last.split("  ", 1)[0],
+                    beat_human))
         else:
             emit("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
     fda = _has_full_disk_access()
@@ -24822,13 +24840,39 @@ def _install_windows(runtime, mode, interval):
     return 0, "scheduled task %s registered (%s)" % (SELF_WIN_TASK, mode)
 
 
-def cmd_install(mode="scan", interval=None):
-    """Register Aegis to run in the background on this OS."""
+def cmd_install(mode=None, interval=None):
+    """Register Aegis to run in the background on this OS.
+
+    `mode=None` means "keep whatever is already installed". That is the form
+    an operator types -- `aegis.py install`, the documented refresh after
+    editing aegis.py -- and it used to mean "scan", so every routine refresh
+    silently replaced a watch-mode monitor (KeepAlive, a resident process, a
+    600s beat) with a StartInterval timer at 3600s. _refresh_line() has
+    guarded against exactly that downgrade since it was written; it could only
+    guard the line `update-check` prints, never the line a human types.
+    Naming "scan" or "watch" still overrides the record, so a deliberate
+    change is unaffected -- and a bare refresh keeps the recorded interval
+    too, because refreshing an install should reinstall THAT install.
+    """
+    recorded = load_json(SELFSTATE, {})
+    inherit = mode is None
+    if inherit:
+        mode = recorded.get("install_mode") or "scan"
+        if recorded.get("install_mode"):
+            print("Keeping the installed %s mode "
+                  "(`install scan` / `install watch` changes it)." % mode)
     if mode not in ("scan", "watch"):
-        print("usage: aegis.py install [watch] [interval_seconds]")
+        print("usage: aegis.py install [watch|scan] [interval_seconds]")
         return 1
     if interval is None:
-        interval = 600 if mode == "watch" else 3600
+        interval = 0
+        if inherit:
+            try:
+                interval = int(recorded.get("install_interval") or 0)
+            except (TypeError, ValueError):
+                interval = 0
+        if interval < 60:
+            interval = 600 if mode == "watch" else 3600
     if interval < 60:
         print("interval must be at least 60 seconds")
         return 1
@@ -24854,6 +24898,7 @@ def cmd_install(mode="scan", interval=None):
     state["installed"] = True
     state["installed_at"] = now_iso()
     state["install_mode"] = mode
+    state["install_interval"] = interval
     # Stamp WHERE this install was cut from. The scheduled agent IS the runtime
     # copy, so _runtime_copy_status() can only ever answer 'self' there and the
     # one process whose staleness actually costs detections was structurally
@@ -27029,9 +27074,12 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                     (detect + opt-in response; Python stdlib only)
 
  SETUP
-  install [watch] [secs] register the background monitor for this OS
+  install [watch|scan] [secs] register the background monitor for this OS
                    (launchd agent / systemd --user timer / Scheduled Task).
-                   Default: a scan every 3600s; `watch` = change-driven
+                   With NO mode named it KEEPS the installed one, so the
+                   refresh after editing aegis.py cannot downgrade a
+                   watch-mode monitor. New box: a scan every 3600s;
+                   `watch` = change-driven
                    monitoring with a [secs] full-scan floor (default 600)
   uninstall        remove that registration (local evidence is kept)
   setup            guided, idempotent walkthrough of the OPT-IN tiers (monitor,
@@ -27575,13 +27623,13 @@ def main(argv):
         return cmd_watch(int(argv[2]) if len(argv) > 2 else 600)
     if cmd == "install":
         rest = argv[2:]
-        mode = "scan"
-        if rest and rest[0] == "watch":
-            mode, rest = "watch", rest[1:]
+        mode = None                     # None = keep the installed mode
+        if rest and rest[0] in ("watch", "scan"):
+            mode, rest = rest[0], rest[1:]
         try:
             secs = int(rest[0]) if rest else None
         except ValueError:
-            print("usage: aegis.py install [watch] [interval_seconds]")
+            print("usage: aegis.py install [watch|scan] [interval_seconds]")
             return 1
         return cmd_install(mode, secs)
     if cmd == "uninstall":

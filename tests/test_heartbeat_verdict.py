@@ -20,7 +20,10 @@ malware cannot manufacture without actually running the monitor. Absence of
 that evidence keeps the accusation — fail closed is still the rule, and these
 tests pin both directions.
 """
+import contextlib
+import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -28,7 +31,9 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling import
 import aegis  # noqa: E402
+from test_regression import Sandbox  # noqa: E402
 
 DEAD_PID = 999_999          # never a live pid on any supported body
 LIVE_PID = 4242
@@ -149,3 +154,80 @@ class ScheduledAgentPid(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# Who actually CONSULTS the verdict
+# --------------------------------------------------------------------------- #
+# The verdict above fails closed, and every test in this file proves it does.
+# None of them asked the question that matters to an operator: do the screens
+# a human actually reads USE it? They did not. `heartbeat_verdict` had exactly
+# two callers -- cmd_watchdog and the watchdog-alert row -- while cmd_doctor
+# and cmd_status each re-derived liveness from `epoch` with raw arithmetic and
+# printed `beat["status"]` straight out of the file.
+#
+# So the attack cmd_watchdog's own docstring names as the reason the beat is
+# signed at all --
+#     while :; do echo '{"epoch":'$(date +%s)',"status":"ok"}' > heartbeat.json; done
+# -- still produced a green heartbeat row on BOTH of those screens. On this
+# machine nothing schedules `aegis.py watchdog` (it is documented as needing a
+# second agent), so the only two commands an operator ever runs were the only
+# two that trusted the file.
+_HEARTBEAT_ROW = re.compile(r"^\s*(\S)\s+[Hh]eartbeat\s")
+
+
+class ScreensMustUseTheVerdict(Sandbox):
+    """A forged or unsigned beat must not render green on doctor or status."""
+
+    def _rows(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        marks = []
+        for line in buf.getvalue().splitlines():
+            m = _HEARTBEAT_ROW.match(line)
+            if m:
+                marks.append((m.group(1), line))
+        self.assertTrue(marks, "no heartbeat row rendered by %s" % fn.__name__)
+        return marks
+
+    def _corrupt(self, mutate):
+        beat = aegis.read_heartbeat()
+        mutate(beat)
+        aegis.save_json(aegis.HEARTBEAT_FILE, beat)
+
+    def test_a_genuine_fresh_beat_is_green_on_both_screens(self):
+        aegis.write_heartbeat()
+        for fn in (aegis.cmd_doctor, aegis.cmd_status):
+            for mark, line in self._rows(fn):
+                self.assertEqual("✓", mark, line)
+
+    def test_an_unsigned_fresh_beat_is_never_green_on_either_screen(self):
+        aegis.write_heartbeat()
+        self._corrupt(lambda b: b.pop("mac", None))
+        for fn in (aegis.cmd_doctor, aegis.cmd_status):
+            for mark, line in self._rows(fn):
+                self.assertNotEqual(
+                    "✓", mark,
+                    "%s renders an UNSIGNED beat as healthy: %s"
+                    % (fn.__name__, line))
+
+    def test_a_forged_fresh_beat_is_never_green_on_either_screen(self):
+        aegis.write_heartbeat()
+        self._corrupt(lambda b: b.__setitem__("mac", "0" * 64))
+        for fn in (aegis.cmd_doctor, aegis.cmd_status):
+            for mark, line in self._rows(fn):
+                self.assertNotEqual(
+                    "✓", mark,
+                    "%s renders a FORGED beat as healthy: %s"
+                    % (fn.__name__, line))
+
+    def test_both_screens_reach_the_verdict_helper(self):
+        """Structural pin: the behavioural tests above can only fail closed if
+        the screens keep asking. Same idiom as
+        test_doctor_and_status_cannot_disagree."""
+        import inspect
+        for fn in (aegis.cmd_doctor, aegis.cmd_status):
+            self.assertIn("heartbeat_verdict", inspect.getsource(fn),
+                          "%s re-derives liveness instead of asking the "
+                          "fail-closed verdict" % fn.__name__)
