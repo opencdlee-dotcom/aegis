@@ -69,6 +69,45 @@ class TestHeartbeat(Sandbox):
         # No heartbeat AND no baseline → a fresh install is not "dead".
         self.assertEqual(aegis.cmd_watchdog(), 0)
 
+    def test_status_resolves_a_watchdog_alert_the_beat_has_outlived(self):
+        # Nothing on a single-agent Mac ever runs `aegis.py watchdog` twice: the
+        # sentinel it wrote at 06:17 on 2026-09-04 was still rendered as
+        # "Watchdog ALERT (unresolved)" a day later, three lines under a
+        # heartbeat status had just verified as fresh and signed. The alert
+        # must stay visible (an outage happened, and the next human should
+        # hear about it) but it is history, not a standing problem.
+        aegis.save_json(aegis.HEARTBEAT_FILE,
+                        {"epoch": int(time.time()) - aegis.HEARTBEAT_STALE_SECS - 60,
+                         "pid": 1})
+        self.assertEqual(aegis.cmd_watchdog(), 1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            aegis.cmd_status()
+        stale = [l for l in buf.getvalue().splitlines() if "watchdog alert" in l.lower()]
+        # A problem row is printed twice: in the attention header and in place.
+        self.assertTrue(stale and all(l.strip().startswith("✗") for l in stale), stale)
+        # The monitor recovers: a fresh SIGNED beat newer than the firing.
+        aegis.write_heartbeat()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            aegis.cmd_status()
+        rows = [l for l in buf.getvalue().splitlines() if "watchdog alert" in l.lower()]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0].strip().startswith("i"), rows)
+        self.assertIn("resolved", rows[0])
+        self.assertIn("aegis.py watchdog", rows[0],
+                      "the row must name the one command that clears it")
+        self.assertTrue(os.path.exists(aegis.WATCHDOG_ALERT),
+                        "status is read-only; it must not clear the sentinel")
+        # An UNSIGNED fresh beat is not recovery: heartbeat_verdict fails
+        # closed, and so must this row.
+        aegis.save_json(aegis.HEARTBEAT_FILE, {"epoch": int(time.time()), "pid": 1})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            aegis.cmd_status()
+        rows = [l for l in buf.getvalue().splitlines() if "watchdog alert" in l.lower()]
+        self.assertTrue(rows and all(l.strip().startswith("✗") for l in rows), rows)
+
 
 # --------------------------------------------------------------------------- #
 # #5 — HMAC-watermarked trust-store tamper evidence
