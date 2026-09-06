@@ -19578,7 +19578,26 @@ def cmd_status():
                 last = f.read().strip().splitlines()[-1]
         except Exception:
             last = "(unreadable)"
-        emit("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
+        # Only a healthy run of `aegis.py watchdog` clears this sentinel, and
+        # on a single-agent machine nothing schedules that command — so one
+        # firing read as "unresolved" for days under a Heartbeat row this same
+        # screen had just verified as fresh. Resolve it against the evidence
+        # the watchdog itself would use: a SIGNED, live beat newer than the
+        # firing (heartbeat_verdict fails closed, so an unsigned or forged
+        # beat does not resolve anything; a signed live beat from the firing's
+        # own second is newer than whatever stale beat made it fire). The row stays — an outage happened
+        # and the next human should hear about it — but as history, not as a
+        # standing problem. Status is read-only; the sentinel is cleared by
+        # the command that owns it.
+        fired = _epoch(last.split("  ", 1)[0]) if last[:4].isdigit() else None
+        state, human = heartbeat_verdict(beat)
+        if (fired is not None and state == BEAT_OK
+                and int(beat.get("epoch") or 0) >= fired):
+            emit("  i %-32s fired %s; the monitor has beaten since (%s). "
+                 "Clear it: `aegis.py watchdog`"
+                 % ("Watchdog alert (resolved)", last.split("  ", 1)[0], human))
+        else:
+            emit("  ✗ %-32s %s" % ("Watchdog ALERT (unresolved)", last))
     fda = _has_full_disk_access()
     emit("  %s %-32s %s" % (
         "✓" if fda else "·", "Full Disk Access",
