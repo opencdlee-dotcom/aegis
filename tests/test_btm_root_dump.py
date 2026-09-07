@@ -106,3 +106,19 @@ class BtmRootDump(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoPasswordDialogFromTheSuite(unittest.TestCase):
+    """The conftest backstop itself. Deliberately does NOT stub aegis.run --
+    a test that stubs it replaces the guard, which is correct (a stub cannot
+    prompt) but would make this assertion vacuous."""
+
+    def test_running_sfltool_from_a_test_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            aegis.run(aegis.BTM_DUMP_CMD, timeout=1)
+        self.assertIn("password dialog", str(caught.exception))
+
+    def test_ordinary_commands_still_run(self):
+        out, _err, rc = aegis.run(["/bin/echo", "ok"], timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn("ok", out)

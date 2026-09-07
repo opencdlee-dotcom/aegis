@@ -401,14 +401,23 @@ class TestAssayCoverageSurfaced(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._f = aegis.ASSAY_FILE
+        self._reg = aegis._assay_lanes
         aegis.ASSAY_FILE = os.path.join(self.tmp, "assay.json")
 
     def tearDown(self):
         aegis.ASSAY_FILE = self._f
+        aegis._assay_lanes = self._reg
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _lanes(self, lanes):
+        """Declare which lanes EXIST as well as what is recorded about them.
+
+        The denominator comes from the lane registry rather than the state
+        file, so that a lane added to the source but never run counts as
+        unproven instead of vanishing. A fixture must therefore say what the
+        source contains, or it asserts "2/2 proven" against the real 21."""
         aegis.save_json(aegis.ASSAY_FILE, lanes)
+        aegis._assay_lanes = lambda: [(lid, "", None) for lid in lanes]
 
     def test_never_run_is_a_question_mark_never_a_tick(self):
         mark, text = aegis._assay_coverage_line()

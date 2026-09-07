@@ -175,6 +175,49 @@ def _forbid_real_state_writes():
 
 IS_MAC = sys.platform == "darwin"
 
+# --------------------------------------------------------------------------- #
+# No test may raise an authorization dialog on the operator's screen.
+#
+# `sfltool dumpbtm` sits behind system.privilege.admin on macOS 26, and every
+# call spawns SecurityAgent -- a PASSWORD PROMPT -- about a second after the
+# authorization request, whatever timeout the caller passes. Measured on the
+# reference Mac: 29 dialogs in 45 minutes under a change-driven watch.
+#
+# No test does this today: test_regression.Sandbox pins BTM_DUMP_CMD to an echo
+# stub and each BTM test stubs aegis.run, and an exec trace over every path
+# that can reach snapshot_btm recorded 1960 subprocesses and zero sfltool. But
+# that is CONVENTION, not enforcement -- files such as
+# tests/test_scan_budget_and_lock.py roll their own sandbox without inheriting
+# either -- so the next scan-level test written outside them would prompt the
+# operator for a password out of a green suite, on their own machine, with no
+# indication which test did it. This makes the convention enforceable.
+# --------------------------------------------------------------------------- #
+_PROMPTING_TOOLS = ("sfltool",)
+
+
+@pytest.fixture(autouse=True)
+def _no_authorization_prompts():
+    real_run = aegis.run
+
+    def guarded_run(cmd, *a, **k):
+        head = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
+        if os.path.basename(str(head)) in _PROMPTING_TOOLS:
+            raise AssertionError(
+                "this test would raise a macOS password dialog by running %r. "
+                "Pin aegis.BTM_DUMP_CMD in the test's sandbox (see "
+                "tests/test_regression.py Sandbox) or stub aegis.run." % (cmd,))
+        return real_run(cmd, *a, **k)
+
+    aegis.run = guarded_run
+    try:
+        yield
+    finally:
+        # Unconditional: a test that swaps aegis.run and forgets to restore it
+        # currently leaks its stub into every later test in the session.
+        aegis.run = real_run
+
+
+
 
 # --------------------------------------------------------------------------- #
 # The trust vocabulary is PER-PLATFORM, and a test that hard-codes one body's

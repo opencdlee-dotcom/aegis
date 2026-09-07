@@ -982,9 +982,70 @@ _LOGSHOW_PREDICATES = (_PRED_XPROTECT, _PRED_SYSPOLICY, _PRED_AMFID)
 _LOG_SHOW_CACHE = None
 
 
+# The widest default window, and what it used to be unconditionally.
+_LOG_SHOW_DEFAULT_MAX_H = 6
+# Frozen for the duration of one scan by _prewarm_log_show. The prewarm cache
+# is keyed by the exact argv, window string included, so a window that changed
+# between prewarming and reading would miss the cache and re-run `log show`
+# LIVE inside the sensor loop -- the precise cost this prewarm exists to avoid.
+# A scan can straddle an hour boundary, so this must not be recomputed.
+_LOG_SHOW_WINDOW = None
+
+
+def _last_scan_epoch():
+    """Epoch of the last COMPLETED scan, or None if unknown.
+
+    Read from the meta row record_security_state() stamps when a scan finishes,
+    so it is the real completion time and not a schedule's opinion of one."""
+    try:
+        db = _event_connection()
+        try:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='last_scan'").fetchone()
+        finally:
+            db.close()
+        return int(row["value"]) if row and row["value"] else None
+    except Exception:
+        return None
+
+
+def _log_show_default_hours():
+    """How many hours of unified log to re-read when no caller specifies.
+
+    This was a flat 6h on every scan, and it dominated the scan: prep.log-show
+    measured 45.11s mean, 77% of a 58.7s scan, with 170 of 181 samples pinned
+    at the 45s cap -- a cap that returns NOTHING and was then read downstream
+    as "clean". Under `install watch` it is six hours of log re-parsed every
+    eleven minutes, and the launchd agent runs at background QoS
+    (ProcessType=Background, Nice 10) where identical work measured ~1.8x its
+    foreground cost on this arm64 box.
+
+    So the window follows the REAL elapsed time since the last completed scan,
+    doubled for margin. Keyed on elapsed time rather than on the configured
+    cadence deliberately: launchd defers StartInterval on battery -- which has
+    already cost this machine 12 unmonitored hours once -- and a window sized
+    from the schedule would silently skip the deferred stretch it most needs
+    to read.
+
+    Floored at 1h and capped at the previous 6h default, so this can only ever
+    read LESS log than before and never more. A gap longer than 6h is still
+    covered only to 6h, exactly as before: that pre-existing hole is neither
+    widened nor closed here."""
+    last = _last_scan_epoch()
+    if not last:
+        return _LOG_SHOW_DEFAULT_MAX_H
+    gap = _epoch() - last
+    if gap <= 0:
+        return _LOG_SHOW_DEFAULT_MAX_H
+    return max(1, min(_LOG_SHOW_DEFAULT_MAX_H,
+                      int(math.ceil(gap * 2 / 3600.0))))
+
+
 def _log_show_window(window_hours):
     if window_hours is None:
-        window_hours = 6  # default cadence-sized window; capped 1..48h
+        if _LOG_SHOW_WINDOW is not None:
+            return _LOG_SHOW_WINDOW      # frozen for this scan
+        window_hours = _log_show_default_hours()
     return "%dh" % max(1, min(int(window_hours), 48))
 
 
@@ -1011,7 +1072,10 @@ def _prewarm_log_show(window_hours=None):
     run() verbatim — all its path/env/timeout hardening — one thread per command;
     run() is stateless, so this is safe."""
     import threading
+    global _LOG_SHOW_WINDOW
+    _LOG_SHOW_WINDOW = None              # size this scan's window from scratch
     win = _log_show_window(window_hours)
+    _LOG_SHOW_WINDOW = win               # ...then freeze it for the whole scan
     results = {}
     lock = threading.Lock()
 
@@ -1019,6 +1083,15 @@ def _prewarm_log_show(window_hours=None):
         argv = ["log", "show", "--last", win, "--style", "ndjson",
                 "--predicate", pred]
         out, _, rc = run(argv, timeout=45)
+        if rc != 0 or not out:
+            # A harvest that timed out examined NOTHING, and every consumer of
+            # this cache turns an empty result into "found nothing wrong". That
+            # is the byte-identical-to-clean shape the coverage ledger exists
+            # to catch, so the non-answer is recorded as a non-answer.
+            unexamined("log show %s %s" % (win, pred),
+                       "rc=%s, %d bytes -- this predicate was not read, so any "
+                       "verdict drawn from it is about no evidence" % (
+                           rc, len(out or "")))
         with lock:
             results[tuple(argv)] = (out, rc)
 
@@ -10366,7 +10439,18 @@ def snapshot_btm():
     A third outcome exists since macOS 26: dumpbtm refuses without interactive
     admin authorization. That is not a flake — it will fail identically on
     every scan this OS ever runs — so it returns SURFACE_PRIVILEGED and is
-    recorded as a permanent, named coverage gap rather than a degraded sensor."""
+    recorded as a permanent, named coverage gap rather than a degraded sensor.
+
+    Two things follow from that refusal being INTERACTIVE. Its cost is a
+    password dialog, not the seconds it blocks, so a wall this machine has
+    proven is re-probed at most daily rather than every scan; and because a
+    cancelled dialog is silent (sfltool dies on the timeout with empty stderr,
+    matching no marker), the wall is also learned from a RUN of markerless
+    non-answers, or it could never be learned here at all.
+
+    Where a root-maintained dump exists it is preferred over probing entirely:
+    it answers every scan, with no authorization request and so no dialog, and
+    a wall lifted by the operator installing the daemon is noticed at once."""
     # A root-maintained dump, where one exists, answers without any probe at
     # all -- no authorization request, so no password dialog, ever.
     handled, supplied = _btm_from_root_dump()
@@ -24304,6 +24388,23 @@ def cmd_assay():
     return 1 if failed else 0
 
 
+def _assay_lane_ids(state=None):
+    """Every lane id that SHOULD be proven: the source registry, unioned with
+    whatever the state file still remembers.
+
+    The union matters in both directions -- a lane added to the source but
+    never run must show up as unproven, and a lane deleted from the source must
+    not keep counting as proven from a stale record."""
+    ids = set()
+    try:
+        ids.update(lane[0] for lane in _assay_lanes())
+    except Exception:
+        pass
+    if isinstance(state, dict):
+        ids.update(state)
+    return sorted(ids)
+
+
 def _assay_coverage_state():
     """How much of the detector coverage is currently PROVEN, not asserted.
 
@@ -24323,7 +24424,18 @@ def _assay_coverage_state():
         return None
     now = _epoch()
     stale, broken, oldest = [], [], 0.0
-    for lane_id, rec in sorted(state.items()):
+    # Enumerate the LANE REGISTRY, not the state file. Taking the denominator
+    # from len(state) meant a lane added to the source but never yet run was
+    # neither proven nor stale -- it was invisible, and the coverage line
+    # reported completeness over a denominator that had quietly shrunk to
+    # whatever happened to have been run before ("19 of 19 proven" against a
+    # 21-lane source). A control nobody has ever exercised is precisely the one
+    # most likely not to work, so it is counted, and counted as unproven.
+    for lane_id in _assay_lane_ids(state):
+        rec = state.get(lane_id)
+        if rec is None:
+            stale.append(lane_id)          # never run at all = never proven
+            continue
         if not rec.get("ok"):
             broken.append(lane_id)
             continue
@@ -24331,7 +24443,8 @@ def _assay_coverage_state():
         oldest = max(oldest, age)
         if age * 86400.0 > ASSAY_HALF_LIFE_SECS:
             stale.append(lane_id)
-    return {"total": len(state), "proven": len(state) - len(stale) - len(broken),
+    total = len(_assay_lane_ids(state))
+    return {"total": total, "proven": total - len(stale) - len(broken),
             "stale": stale, "broken": broken, "oldest_days": oldest}
 
 
@@ -24364,9 +24477,12 @@ def check_assay():
     if not isinstance(state, dict) or not state:
         return []
     now, stale, broken = _epoch(), [], []
-    for lane_id, rec in sorted(state.items()):
-        if not rec.get("ok"):
-            broken.append(lane_id)
+    # Registry, not state file -- see _assay_coverage_state: a lane that has
+    # never been run must not be silently absent from its own coverage report.
+    for lane_id in _assay_lane_ids(state):
+        rec = state.get(lane_id)
+        if rec is None or not rec.get("ok"):
+            (stale if rec is None else broken).append(lane_id)
         elif now - rec.get("last_ok", 0) > ASSAY_HALF_LIFE_SECS:
             stale.append(lane_id)
     findings = []

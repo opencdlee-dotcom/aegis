@@ -520,7 +520,16 @@ class TestAssay(ProtectiveSandbox):
     def test_no_assay_run_means_the_sensor_is_silent(self):
         self.assertEqual([], aegis.check_assay())
 
+    def _only_lane(self, lane_id):
+        """Pin the registry to the one lane this fixture describes: coverage is
+        now counted against the lane SOURCE, so the other 20 real lanes would
+        otherwise (correctly) be reported as never proven."""
+        real = aegis._assay_lanes
+        self.addCleanup(lambda: setattr(aegis, "_assay_lanes", real))
+        aegis._assay_lanes = lambda: [(lane_id, "", None)]
+
     def test_a_failing_control_is_reported_as_lost_coverage(self):
+        self._only_lane("hostile-argv")
         aegis.save_json(aegis.ASSAY_FILE,
                         {"hostile-argv": {"ok": False, "last_run": aegis._epoch(),
                                           "last_ok": None}})
@@ -529,6 +538,7 @@ class TestAssay(ProtectiveSandbox):
         self.assertEqual("HIGH", found[0]["severity"])
 
     def test_a_stale_control_is_reported_as_unproven(self):
+        self._only_lane("hostile-argv")
         old = aegis._epoch() - (aegis.ASSAY_HALF_LIFE_SECS + 86400)
         aegis.save_json(aegis.ASSAY_FILE,
                         {"hostile-argv": {"ok": True, "last_run": old,
