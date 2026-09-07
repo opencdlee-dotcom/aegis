@@ -15,9 +15,26 @@ watch-mode install to scan mode". That defence covered the line printed by
 
 Measured on the reference machine: watch/600 through 2026-09-04T08:57, then
 five bare `install` refreshes, and by 2026-09-05T21:44 the record read
-scan/3600. launchd then deferred that StartInterval on battery for twelve
-hours -- `runs = 1`, seventeen minutes after a full wake -- while the machine
-believed it was monitored hourly.
+scan/3600. What followed is the cost, stated only as far as it was actually
+observed:
+
+    scan mode   2026-09-05T21:46 -> 2026-09-06T10:14   748 min, ZERO scans
+    watch mode  2026-09-06T10:35 -> 20:37              109 scans, median gap
+                                                       1.8 min, worst 125 min
+
+Both windows are the same laptop cycling sleep/DarkWake on battery, so the
+comparison is like-for-like. WHY launchd ran the StartInterval job 0 times
+across that window was NOT established -- the job was loaded, its last exit
+was 0, and `runs` was still 1 twenty-seven minutes after a full wake, but
+that is where the evidence stops. `ProcessType Background` deferral is a
+guess and is recorded here as one. The fix does not rest on it: KeepAlive
+holds a process rather than arming a timer, and 109 scans against 0 is the
+whole argument.
+
+Note what the watch-mode column does NOT claim: a 125-minute worst gap is
+70% of HEARTBEAT_STALE_SECS, so a long enough sleep still ages the beat past
+tolerance and still trips `watchdog`. Watch mode makes the monitor RESUME
+promptly; it does not make a sleeping laptop monitored.
 
 Also pinned here: cmd_install never wrote `install_interval`, though
 _expected_scan_gap()'s docstring promises "`install_interval` is read when
