@@ -161,7 +161,13 @@ because conflating them is what makes tuning impossible. A sensor the operator
 keeps dismissing is automatically **down-weighted** in risk accumulation (never
 to zero, and reopening an incident retracts the dismissal). Each incident card
 lists the **known benign causes** for the sensors that fired, so triage is a
-lookup rather than an investigation. And corroboration is scored, not just
+lookup rather than an investigation. It also answers *was this me?* from what the
+finding already recorded — whether anyone was at the keyboard when it fired,
+how idle they were, and whether the screen was locked. That is the whole
+verdict for the sensors that store a command's SHA-256 and never its text:
+once the process exits, presence is the only evidence left, and an incident
+nobody can close on evidence stays open forever. It stays evidence and never
+a verdict — same-uid code can forge idle time. And corroboration is scored, not just
 counted: two *different* sensors implicating one entity outranks the same number
 of hits from one sensor.
 

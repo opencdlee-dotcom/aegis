@@ -10191,6 +10191,55 @@ _BTM_PRIVILEGED_MARKERS = ("system.privilege.admin", "authorization failed",
 # truncates only slow refusals, which produce the identical verdict anyway.
 _BTM_WALLED_TIMEOUT = 10
 
+# Re-probing a PROVEN wall is not free. On macOS 26 every `sfltool dumpbtm`
+# raises a SecurityAgent password dialog, so under a change-driven watch a
+# permanent OS policy becomes a prompt every time anything on disk moves --
+# 29 dialogs in 45 minutes, measured on this Mac 2026-09-06.
+#
+# Those cancelled prompts are also why the wall stayed invisible: cancelling
+# one leaves sfltool to be killed by the timeout with EMPTY stderr, so no
+# marker matched, `_wall_record` never ran, and surface_walls.json sat at {}
+# forever. The sensor could not learn the single fact that would have quieted
+# it, so it asked again, and the asking is what the operator experienced.
+#
+# Two changes close that loop. A RUN of consecutive markerless non-answers is
+# itself evidence of the wall -- a genuine flake does not repeat identically --
+# and a wall once proven is re-probed at most daily rather than every scan.
+# The daily re-probe is what still notices a wall Apple later lifts, so the
+# documented "a success clears the wall" contract survives intact.
+#
+# The trade is stated plainly: three consecutive slow-but-real failures are now
+# classified as a permanent wall (PRIVILEGED) rather than a transient one
+# (DEGRADED). The daily re-probe self-corrects that within a day, and a
+# mislabelled gap the operator can see beats an accurate one delivered as a
+# password dialog every ninety seconds.
+_WALL_MISS_THRESHOLD = 3
+_WALL_REPROBE_SECS = 86400
+
+# Reserved key inside the walls file -- surface names are identifiers, so none
+# can collide with a leading '#'. Kept there rather than in a new state
+# constant so that every test sandbox already redirecting SURFACE_WALLS
+# isolates this bookkeeping too, with no change to the sandboxes.
+_PROBE_KEY = "#probe"
+
+
+def _probe_state(name):
+    """{'misses': int, 'last': epoch} for a surface's own probe bookkeeping."""
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        return dict((walls.get(_PROBE_KEY) or {}).get(name) or {})
+    except Exception:
+        return {}
+
+
+def _probe_record(name, **fields):
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        walls.setdefault(_PROBE_KEY, {}).setdefault(name, {}).update(fields)
+        save_json(SURFACE_WALLS, walls)
+    except Exception:
+        pass
+
 
 def _parse_btm(text):
     """{identifier: {name, team, type, url}} from `sfltool dumpbtm`. A top-level
@@ -10258,13 +10307,26 @@ def snapshot_btm():
     admin authorization. That is not a flake — it will fail identically on
     every scan this OS ever runs — so it returns SURFACE_PRIVILEGED and is
     recorded as a permanent, named coverage gap rather than a degraded sensor."""
-    # A wall this machine already proved gets a short probe, not a long wait.
+    # A wall this machine has already proven is re-probed at most daily: the
+    # probe's real cost is a password dialog, not the seconds it blocks.
+    if _wall_seen("btm") and (
+            _epoch() - (_probe_state("btm").get("last") or 0)
+            < _WALL_REPROBE_SECS):
+        return SURFACE_PRIVILEGED
+    _probe_record("btm", last=_epoch())
+    # The two guards COMPOSE rather than compete: this backoff decides how
+    # OFTEN a proven wall is asked, and _BTM_WALLED_TIMEOUT decides how long a
+    # single ask may hang. Neither subsumes the other -- a short cap alone
+    # still raises the dialog every scan (SecurityAgent spawns about a second
+    # after the request, so a 10s probe prompts exactly as a 30s one does),
+    # and a backoff alone would let the one daily re-probe block for 30s.
     out, err, rc = run(BTM_DUMP_CMD,
                        timeout=_BTM_WALLED_TIMEOUT if _wall_seen("btm") else 30)
     if rc != 0 or not out:
         blob = ((err or "") + "\n" + (out or "")).lower()
         if any(marker in blob for marker in _BTM_PRIVILEGED_MARKERS):
             _wall_record("btm")
+            _probe_record("btm", misses=0)
             return SURFACE_PRIVILEGED
         if _wall_seen("btm"):
             # This machine has already PROVEN the wall. The authorization
@@ -10273,8 +10335,17 @@ def snapshot_btm():
             # newly broken sensor. Classifying it as DEGRADED opened HIGH
             # incidents about an already-named gap.
             return SURFACE_PRIVILEGED
+        # A cancelled authorization prompt is SILENT -- it carries no marker to
+        # match -- so the wall can only ever be learned from the shape of the
+        # failure: the same markerless non-answer, over and over.
+        misses = int(_probe_state("btm").get("misses") or 0) + 1
+        _probe_record("btm", misses=misses)
+        if misses >= _WALL_MISS_THRESHOLD:
+            _wall_record("btm")
+            return SURFACE_PRIVILEGED
         return None  # timeout/failure — a non-answer, NOT "zero items"
     _wall_clear("btm")   # it answered: any later failure is genuinely new
+    _probe_record("btm", misses=0)
     return _parse_btm(out)
 
 
@@ -18867,6 +18938,59 @@ def _benign_note_for(item):
     return notes
 
 
+# What each human-presence regime MEANS for the only question a verdict answers.
+_PRESENCE_MEANING = {
+    "PRESENT-ACTIVE": "someone was at the keyboard when this fired",
+    "PRESENT-IDLE": "someone was logged in but not typing when this fired",
+    "ABSENT": "NO ONE was at the keyboard when this fired",
+    "LOCKED": "the screen was LOCKED when this fired",
+}
+
+
+def _adjudication_notes(item):
+    """The 'was this me?' evidence for an incident, newest observation first.
+
+    An operator closes an incident by answering exactly one question: was I the
+    one who did this? Every finding already carries the raw material for that
+    answer -- the presence regime at the moment it fired, plus the program and
+    pid -- but the detail view printed only the title, so the evidence was
+    collected and then discarded at the moment it was needed.
+
+    That is fatal for the sensors whose command text is deliberately never
+    stored: `behavior` and `shell-history` keep a command sha256 and never the
+    argv, so once the process exits NO ONE can adjudicate the incident from
+    stored state and it stays open forever. A row that cannot be closed on
+    evidence is the most expensive false-alarm class there is -- it is not a
+    wrong detection, it is a permanent one.
+
+    Presence stays EVIDENCE and never a licence, for the same reason the scan
+    stamps it: same-uid code can forge idle time (`caffeinate -u`), so this
+    informs the operator's judgment and must never substitute for it."""
+    for evidence in reversed(item.get("evidence") or ()):
+        try:
+            data = json.loads(evidence["data_json"])
+        except Exception:
+            continue
+        regime = data.get("presence")
+        if not regime:
+            continue
+        bits = []
+        idle = data.get("idle_secs")
+        if idle is not None:
+            bits.append("idle %ss" % idle)
+        locked = data.get("screen_locked")
+        if locked is not None:
+            bits.append("screen %s" % ("locked" if locked else "unlocked"))
+        who = _PRESENCE_MEANING.get(regime, "presence regime %s" % regime)
+        notes = ["%s (%s)" % (who, ", ".join(bits)) if bits else who]
+        actor = ", ".join("%s %s" % (key, data[key])
+                          for key in ("program", "pid") if data.get(key))
+        if actor:
+            notes.append(actor)
+        return notes
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # MITRE ATT&CK technique attribution — read-time only, never a detection input.
 #
@@ -19158,6 +19282,12 @@ def cmd_incident(incident_id, action=None, reason=None):
             summary = evidence["event_type"]
         print("  - %s · %s · %s" %
               (evidence["observed_at"], evidence["source"], summary))
+    adjudication = _adjudication_notes(item)
+    if adjudication:
+        print("\nWas this you? (evidence, never a verdict — same-uid "
+              "code can forge idle time):")
+        for note in adjudication:
+            print("  · %s" % note)
     notes = _benign_note_for(item)
     if notes:
         print("\nKnown benign causes for these sensors (check before acting):")

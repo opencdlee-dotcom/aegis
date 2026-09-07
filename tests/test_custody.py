@@ -802,13 +802,54 @@ class PrivilegeWallIsRemembered(unittest.TestCase):
                       "a timeout after a proven wall must not read as DEGRADED")
 
     def test_a_success_clears_the_memory_so_later_failures_are_new(self):
-        """If the wall comes down, a later failure is genuinely unexplained."""
+        """If the wall comes down, a later failure is genuinely unexplained.
+
+        The contract is unchanged; only its TIMING is. A proven wall is now
+        re-probed at most daily, because the probe's real cost is not the
+        seconds it blocks but the SecurityAgent password dialog it raises --
+        under a change-driven watch that was 29 dialogs in 45 minutes. So the
+        success that clears the wall is observed at the next DUE re-probe
+        rather than the next scan. `last=0` below IS that due re-probe (a day
+        has passed), not a bypass of the rule.
+        """
         self._run_returns(*self.WALLED)
         self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        aegis._probe_record("btm", last=0)     # a day has passed
         self._run_returns("", "", 0)          # rc 0 but empty -> still a non-answer
         aegis.snapshot_btm()
+        aegis._probe_record("btm", last=0)
         self._run_returns("btm dump\n", "", 0)  # a real success clears it
         aegis.snapshot_btm()
         self._run_returns(*self.TIMEOUT)
         self.assertIsNone(aegis.snapshot_btm(),
                           "memory must be cleared by a success")
+
+    def test_a_proven_wall_is_not_re_probed_every_scan(self):
+        """The fix the operator actually asked for: no probe, no dialog.
+
+        Shortening the probe's timeout does NOT help -- SecurityAgent spawns
+        about a second after the authorization request, so a 5s probe raises
+        the same prompt a 30s one does. Only NOT calling sfltool stops it.
+        """
+        self._run_returns(*self.WALLED)
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        calls = []
+        aegis.run = lambda *a, **k: (calls.append(1), ("", "", 1))[1]
+        for _ in range(5):
+            self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        self.assertEqual(calls, [], "a proven wall must not re-probe each scan")
+        aegis._probe_record("btm", last=0)     # a day has passed
+        aegis.snapshot_btm()
+        self.assertEqual(len(calls), 1, "the daily re-probe must still happen")
+
+    def test_a_silent_refusal_is_eventually_learned_as_a_wall(self):
+        """A cancelled prompt carries NO marker, so the wall can only be
+        learned from the shape of the failure. Without this the memory is
+        never written, surface_walls.json stays {} forever (as it did on the
+        reference Mac), and every fix that keys on a proven wall is dead code.
+        """
+        self._run_returns(*self.TIMEOUT)
+        for _ in range(aegis._WALL_MISS_THRESHOLD - 1):
+            self.assertIsNone(aegis.snapshot_btm(),
+                              "one flake is not yet a wall")
+        self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
