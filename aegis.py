@@ -10102,6 +10102,66 @@ def diff_wallet(prior, cur):
 # instead of the real (slow) sfltool — the same override pattern as LSOF_LISTEN_CMD.
 BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
 
+# OPTIONAL root-maintained dump (see aegis-btm-daemon.plist). macOS 26 walls
+# `sfltool dumpbtm` behind system.privilege.admin, and that right cannot be
+# granted to this agent by clicking Allow: it is `shared: false`, so no
+# credential carries to the fresh sfltool each scan spawns, and `timeout: 300`
+# expires a cached grant before the next scan anyway. But it is
+# `allow-root: true` -- a process ALREADY root is authorized with no prompt --
+# so a root LaunchDaemon can dump the store on a schedule and leave it here for
+# this unprivileged agent to read. Only the dump is privileged; aegis is not.
+#
+# The file is REFUSED unless root owns it and no one else can write it (nor its
+# directory). Without that check this path is not a coverage fix but a blinding
+# tool: anyone able to write the file could hand the monitor a background-item
+# list with their own persistence removed from it.
+#
+# Absent file -> behaviour is exactly what it was before this existed.
+_BTM_DUMP_FILE = "/var/db/aegis/btm.txt"
+# A dump older than this is a DEAD DAEMON, and is reported as a non-answer
+# rather than diffed. Silently diffing a frozen list is how a monitor goes
+# blind while still rendering green. Generous against laptop sleep: launchd
+# fires the missed interval on wake, so the gap is seconds, not hours.
+_BTM_DUMP_MAX_AGE = 6 * 3600
+
+
+def _root_owned(path):
+    """True if root owns `path` and no one else can write it.
+
+    Its own function so tests can substitute it -- a test suite cannot create
+    a root-owned file, and a check that is skipped under test is a check that
+    is not tested."""
+    try:
+        st = os.stat(path)
+    except Exception:
+        return False
+    return st.st_uid == 0 and not (st.st_mode & 0o022)
+
+
+def _btm_from_root_dump():
+    """(handled, value) for the optional root-maintained dump.
+
+    handled False -> no usable dump; probe sfltool exactly as before."""
+    path = _BTM_DUMP_FILE
+    if not os.path.exists(path):
+        return False, None
+    if not (_root_owned(path) and _root_owned(os.path.dirname(path))):
+        # Present but untrusted. Never parse it, and never let its existence
+        # suppress the real probe -- that would be the blinding this guards.
+        return False, None
+    try:
+        age = _epoch() - int(os.stat(path).st_mtime)
+    except Exception:
+        return False, None
+    if age > _BTM_DUMP_MAX_AGE:
+        return True, None      # stale = dead daemon = non-answer, NOT empty
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception:
+        return True, None
+    return (True, _parse_btm(text)) if text.strip() else (True, None)
+
 # Sentinel a snapshot fn returns when its backing command EXISTS but this OS
 # requires interactive admin authorization that a background observer cannot —
 # and must not — synthesize. Distinct from None (a transient non-answer:
@@ -10307,6 +10367,14 @@ def snapshot_btm():
     admin authorization. That is not a flake — it will fail identically on
     every scan this OS ever runs — so it returns SURFACE_PRIVILEGED and is
     recorded as a permanent, named coverage gap rather than a degraded sensor."""
+    # A root-maintained dump, where one exists, answers without any probe at
+    # all -- no authorization request, so no password dialog, ever.
+    handled, supplied = _btm_from_root_dump()
+    if handled:
+        if supplied is not None:
+            _wall_clear("btm")
+            _probe_record("btm", misses=0)
+        return supplied
     # A wall this machine has already proven is re-probed at most daily: the
     # probe's real cost is a password dialog, not the seconds it blocks.
     if _wall_seen("btm") and (

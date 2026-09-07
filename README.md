@@ -221,6 +221,45 @@ python3 aegis.py update-check            # is ~/.aegis/aegis.py stale behind thi
 # same thing; `aegis.py install` is the cross-platform equivalent.
 ```
 
+### Background items on macOS 26 — the `btm-daemon` (optional)
+
+macOS 26 moved `sfltool dumpbtm` behind `system.privilege.admin`, so the
+unprivileged agent can no longer read the SMAppService store — the modern
+persistence path, where a login item is registered through the API and never
+drops a plist in `~/Library/LaunchAgents`. Aegis reports that honestly as a
+PRIVILEGED coverage gap and, since it cannot learn anything by asking, stops
+asking: a proven wall is re-probed once a day, not once a scan.
+
+**Clicking Allow cannot fix it.** The right is `shared: false`, so no approved
+credential carries to the fresh `sfltool` each scan spawns, and `timeout: 300`
+expires a cached grant well before the next 600-second scan. Every scan would
+prompt, forever. Do **not** make the right passwordless either
+(`security authorizationdb write system.privilege.admin allow`): it gates
+`AuthorizationExecuteWithPrivileges`, so weakening it to quiet one monitor
+hands every installer on the machine silent root.
+
+The right is, however, `allow-root: true` — a process already running as root
+is authorized with no prompt at all. So run *only the dump* as root:
+
+```bash
+sudo install -d -o root -g wheel -m 755 /var/db/aegis && \
+sudo install -o root -g wheel -m 644 aegis-btm-daemon.plist \
+  /Library/LaunchDaemons/com.charlie.aegis-btm.plist && \
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.charlie.aegis-btm.plist
+```
+
+Aegis picks the file up with no further configuration, and **refuses it unless
+root owns it and nothing else can write it or its directory** — otherwise the
+file would not be a coverage fix but a blinding tool, since anyone able to
+write it could hand the monitor a list with their own persistence removed. A
+dump older than six hours is treated as a dead daemon and reported as a
+non-answer, never diffed: silently comparing against a frozen list is how a
+monitor goes blind while still rendering green.
+
+Remove it with `sudo launchctl bootout system/com.charlie.aegis-btm && sudo rm
+/Library/LaunchDaemons/com.charlie.aegis-btm.plist`; with the file gone, aegis
+behaves exactly as it did before.
+
 ```bash
 # from the aegis/ directory:
 python3 aegis.py scan          # run once, print report, establish baseline
