@@ -4867,9 +4867,16 @@ def _close_cleared_state_incidents(db, observed, now):
     the distinction, and it is the only one that can.
     """
     closed = []
+    # EVERY active state, not just OPEN. A true posture finding is exactly the
+    # thing an operator acknowledges rather than dismisses -- `ack` is also the
+    # documented way to lift one out of the age-out sweep -- so restricting the
+    # close to OPEN would strand precisely the findings someone took seriously.
+    # A cleared condition is cleared whatever tray it was moved to.
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     for row in db.execute(
-            "SELECT id, correlation_key FROM incidents WHERE status='OPEN' "
-            "AND kind='signal' AND correlation_key LIKE 'signal:%'").fetchall():
+            "SELECT id, correlation_key FROM incidents WHERE status IN (%s) "
+            "AND kind='signal' AND correlation_key LIKE 'signal:%%'" % marks,
+            _ACTIVE_INCIDENT_STATES).fetchall():
         key = row["correlation_key"] or ""
         fp = key[len("signal:"):]
         if not fp.startswith(_STATE_FINGERPRINT_PREFIXES):
@@ -4892,9 +4899,9 @@ def _close_cleared_state_incidents(db, observed, now):
         db.execute(
             "UPDATE incidents SET status='RESOLVED',resolution=?,"
             "updated_at=?,last_seen=?,next_reminder_at=NULL "
-            "WHERE id=? AND status='OPEN'",
+            "WHERE id=? AND status IN (%s)" % marks,
             ("condition cleared: the sensor looked again and it is gone",
-             now, now, incident_id))
+             now, now, incident_id) + _ACTIVE_INCIDENT_STATES)
     return len(closed)
 
 

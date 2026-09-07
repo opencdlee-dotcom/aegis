@@ -314,3 +314,50 @@ class DTheSuiteDoesNotAlarmALiveInstall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AAnAcknowledgedConditionStillCloses(Sandbox):
+    """`ack` is the right verb for a TRUE posture finding, and it is also the
+    documented way to lift one out of the age-out sweep (which selects
+    status='OPEN' only). A closer that also looked only at OPEN would strand
+    exactly the findings someone took seriously -- the operator acknowledges
+    the unpatched Mac, patches it, and the row never goes away."""
+
+    def _ack(self):
+        db = aegis._event_connection()
+        try:
+            with db:
+                db.execute("UPDATE incidents SET status='ACK' WHERE "
+                           "correlation_key=?", ("signal:" + STATE_FP,))
+        finally:
+            db.close()
+
+    def test_an_acked_state_incident_resolves_when_the_condition_clears(self):
+        aegis.record_security_state([_state_finding()], sensor_health=_health(),
+                                    now=T0)
+        self._ack()
+        self.assertEqual("ACK", _row(STATE_FP)["status"])
+        aegis.record_security_state([], sensor_health=_health(), now=T0 + 3600)
+        self.assertEqual("RESOLVED", _row(STATE_FP)["status"],
+                         "acknowledging a true finding stranded it forever")
+
+    def test_an_acked_state_incident_still_survives_the_age_out(self):
+        aegis.record_security_state([_state_finding()], sensor_health=_health(),
+                                    now=T0)
+        self._ack()
+        db = aegis._event_connection()
+        try:
+            with db:
+                aegis._age_out_incidents(db, T0 + 30 * 86400)
+        finally:
+            db.close()
+        self.assertEqual("ACK", _row(STATE_FP)["status"])
+
+    def test_a_still_true_acked_condition_stays_acked(self):
+        aegis.record_security_state([_state_finding()], sensor_health=_health(),
+                                    now=T0)
+        self._ack()
+        aegis.record_security_state([_state_finding()], sensor_health=_health(),
+                                    now=T0 + 3600)
+        self.assertEqual("ACK", _row(STATE_FP)["status"],
+                         "a live exposure was closed while still true")
