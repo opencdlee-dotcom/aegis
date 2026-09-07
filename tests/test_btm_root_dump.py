@@ -119,6 +119,15 @@ class NoPasswordDialogFromTheSuite(unittest.TestCase):
         self.assertIn("password dialog", str(caught.exception))
 
     def test_ordinary_commands_still_run(self):
-        out, _err, rc = aegis.run(["/bin/echo", "ok"], timeout=10)
-        self.assertEqual(rc, 0)
-        self.assertIn("ok", out)
+        """The guard must refuse only the prompting tools, not everything.
+
+        Asserts the command is PASSED THROUGH -- no refusal -- and deliberately
+        not that it exits 0. Whether a given argv can execute is real-kernel
+        behaviour, which simbody does not simulate, so an exit-code assertion
+        here would be a platform assertion wearing a guard's clothes: the first
+        draft used /bin/echo and the simbody win diff caught it.
+        """
+        try:
+            aegis.run([sys.executable, "-c", "print('ok')"], timeout=30)
+        except AssertionError as exc:
+            self.fail("the guard refused a harmless command: %s" % exc)

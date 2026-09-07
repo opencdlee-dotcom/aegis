@@ -43,7 +43,14 @@ class TestRootsNameTheRegistries(unittest.TestCase):
 
 class TestExplicitFileIsWalked(Sandbox):
     def _point_at(self, path):
-        self._saved["AGENT_CONFIG_ROOTS"] = aegis.AGENT_CONFIG_ROOTS
+        # setdefault, NOT assignment: the Sandbox has already saved the real
+        # constant and replaced it, so overwriting the saved entry here would
+        # make tearDown "restore" the sandbox's own placeholder and leak it
+        # into every later test in the session. That is exactly what happened
+        # when AGENT_CONFIG_ROOTS was added to the Sandbox pins --
+        # TestRootsNameTheRegistries, which does not even use the Sandbox,
+        # started failing on the real constant being empty.
+        self._saved.setdefault("AGENT_CONFIG_ROOTS", aegis.AGENT_CONFIG_ROOTS)
         aegis.AGENT_CONFIG_ROOTS = []
         aegis.AGENT_CONFIG_FILES = [path]
 
@@ -76,7 +83,12 @@ class TestNewServerFiresOnScan(Sandbox):
     def setUp(self):
         super().setUp()
         self.reg = os.path.join(self.tmp, ".claude.json")
-        self._saved["AGENT_CONFIG_ROOTS"] = aegis.AGENT_CONFIG_ROOTS
+        # setdefault, NOT assignment: the Sandbox has already saved the
+        # real constant and replaced it with its own placeholder, so
+        # overwriting the saved entry makes tearDown "restore" that
+        # placeholder and leak it into every later test in the session.
+        self._saved.setdefault("AGENT_CONFIG_ROOTS",
+                               aegis.AGENT_CONFIG_ROOTS)
         aegis.AGENT_CONFIG_ROOTS = []
         aegis.AGENT_CONFIG_FILES = [self.reg]
 

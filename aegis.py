@@ -13521,6 +13521,12 @@ AGENT_CONFIG_ROOTS = [os.path.join(HOME, d) for d in (
 # sits in $HOME itself, a root nothing here may walk.
 AGENT_CONFIG_FILES = [os.path.join(HOME, f) for f in (".claude.json",)]
 
+# A module constant purely so the suite can pin it. Hardcoded inline, the
+# clipboard sensor read the DEVELOPER's real clipboard on every scan-level test
+# -- 22 reads in one file -- which is both a privacy leak into a test run and a
+# source of nondeterminism no fixture could control.
+PBPASTE_CMD = ["pbpaste"]
+
 # Instruction files: natural language that an agent treats as standing orders.
 AGENT_INSTRUCTION_NAMES = (
     "CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules",
@@ -24573,7 +24579,7 @@ def _clipboard_read():
     """Current clipboard text, or None if this platform has no unprivileged
     reader available (absent, not degraded)."""
     if IS_MAC:
-        out, _e, rc = run(["pbpaste"], timeout=15)
+        out, _e, rc = run(PBPASTE_CMD, timeout=15)
         return out if rc == 0 else None
     if IS_WIN:
         out, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",
