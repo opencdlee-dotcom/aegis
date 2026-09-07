@@ -63,7 +63,8 @@ class BtmWallProbe(unittest.TestCase):
     def test_a_proven_wall_is_probed_briefly(self):
         self._stub(WALLED)
         aegis.snapshot_btm()                      # proves the wall
-        aegis.snapshot_btm()                      # second scan
+        aegis._probe_record("btm", last=0)        # ...and a day passes
+        aegis.snapshot_btm()                      # the DUE re-probe
         # BEFORE THE FIX: 30 again, and 61% of the time it burned all of it.
         self.assertEqual([30, aegis._BTM_WALLED_TIMEOUT], self.timeouts,
                          "a proven wall was still waited on at full cost")
@@ -73,22 +74,50 @@ class BtmWallProbe(unittest.TestCase):
         self.assertGreaterEqual(aegis._BTM_WALLED_TIMEOUT, 2,
                                 "too tight to let a working dumpbtm answer")
 
-    # --- the contract that the first design broke -------------------------
-    def test_one_success_still_clears_the_wall_immediately(self):
-        """The property test_custody pins: a success is seen on the very next
-        scan, not deferred. This is why the probe is shortened, not skipped."""
+    # --- the contract, and what it costs ----------------------------------
+    #
+    # This file originally shortened the probe rather than skipping it, to keep
+    # "a success is seen on the very NEXT scan". That reasoning was right about
+    # the contract and wrong about the cost it was paying: the expense of a
+    # probe is not the seconds it blocks but the SecurityAgent password dialog
+    # it raises, and SecurityAgent spawns about a second after the
+    # authorization request -- so a 10s probe prompts exactly as a 30s one
+    # does. Measured on the reference Mac: 29 dialogs in 45 minutes under a
+    # change-driven watch, the closest pair 3 seconds apart. Shortening the
+    # timeout cut the scan cost (which is what it was for, and it still does)
+    # but could not have cut the prompting.
+    #
+    # So a proven wall is now re-probed at most daily, and the contract holds
+    # at that cadence on the sfltool path. Where it still holds IMMEDIATELY is
+    # the root-dump path (see test_btm_root_dump.py): the daemon's file is read
+    # every scan with no authorization request at all, so an operator who
+    # installs it gets both the old immediacy and no dialogs.
+    def test_one_success_clears_the_wall_at_the_next_due_reprobe(self):
         self._stub(WALLED)
         aegis.snapshot_btm()
         self.assertTrue(aegis._wall_seen("btm"))
+        aegis._probe_record("btm", last=0)        # a day passes
         self._stub(ANSWERED)
         snap = aegis.snapshot_btm()
         self.assertIn("com.x", snap)
         self.assertFalse(aegis._wall_seen("btm"),
-                         "a lifted wall was not noticed on the next scan")
+                         "a lifted wall was not noticed at the due re-probe")
+
+    def test_a_proven_wall_is_not_re_probed_before_it_is_due(self):
+        """The prompting fix itself: between re-probes sfltool is not called,
+        so no dialog can be raised."""
+        self._stub(WALLED)
+        aegis.snapshot_btm()
+        self.timeouts = []
+        for _ in range(5):
+            self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+        self.assertEqual(self.timeouts, [],
+                         "a proven wall must not be probed on every scan")
 
     def test_a_cleared_wall_returns_to_the_full_timeout(self):
         self._stub(WALLED)
         aegis.snapshot_btm()
+        aegis._probe_record("btm", last=0)
         self._stub(ANSWERED)
         aegis.snapshot_btm()
         self._stub(WALLED)

@@ -982,9 +982,70 @@ _LOGSHOW_PREDICATES = (_PRED_XPROTECT, _PRED_SYSPOLICY, _PRED_AMFID)
 _LOG_SHOW_CACHE = None
 
 
+# The widest default window, and what it used to be unconditionally.
+_LOG_SHOW_DEFAULT_MAX_H = 6
+# Frozen for the duration of one scan by _prewarm_log_show. The prewarm cache
+# is keyed by the exact argv, window string included, so a window that changed
+# between prewarming and reading would miss the cache and re-run `log show`
+# LIVE inside the sensor loop -- the precise cost this prewarm exists to avoid.
+# A scan can straddle an hour boundary, so this must not be recomputed.
+_LOG_SHOW_WINDOW = None
+
+
+def _last_scan_epoch():
+    """Epoch of the last COMPLETED scan, or None if unknown.
+
+    Read from the meta row record_security_state() stamps when a scan finishes,
+    so it is the real completion time and not a schedule's opinion of one."""
+    try:
+        db = _event_connection()
+        try:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='last_scan'").fetchone()
+        finally:
+            db.close()
+        return int(row["value"]) if row and row["value"] else None
+    except Exception:
+        return None
+
+
+def _log_show_default_hours():
+    """How many hours of unified log to re-read when no caller specifies.
+
+    This was a flat 6h on every scan, and it dominated the scan: prep.log-show
+    measured 45.11s mean, 77% of a 58.7s scan, with 170 of 181 samples pinned
+    at the 45s cap -- a cap that returns NOTHING and was then read downstream
+    as "clean". Under `install watch` it is six hours of log re-parsed every
+    eleven minutes, and the launchd agent runs at background QoS
+    (ProcessType=Background, Nice 10) where identical work measured ~1.8x its
+    foreground cost on this arm64 box.
+
+    So the window follows the REAL elapsed time since the last completed scan,
+    doubled for margin. Keyed on elapsed time rather than on the configured
+    cadence deliberately: launchd defers StartInterval on battery -- which has
+    already cost this machine 12 unmonitored hours once -- and a window sized
+    from the schedule would silently skip the deferred stretch it most needs
+    to read.
+
+    Floored at 1h and capped at the previous 6h default, so this can only ever
+    read LESS log than before and never more. A gap longer than 6h is still
+    covered only to 6h, exactly as before: that pre-existing hole is neither
+    widened nor closed here."""
+    last = _last_scan_epoch()
+    if not last:
+        return _LOG_SHOW_DEFAULT_MAX_H
+    gap = _epoch() - last
+    if gap <= 0:
+        return _LOG_SHOW_DEFAULT_MAX_H
+    return max(1, min(_LOG_SHOW_DEFAULT_MAX_H,
+                      int(math.ceil(gap * 2 / 3600.0))))
+
+
 def _log_show_window(window_hours):
     if window_hours is None:
-        window_hours = 6  # default cadence-sized window; capped 1..48h
+        if _LOG_SHOW_WINDOW is not None:
+            return _LOG_SHOW_WINDOW      # frozen for this scan
+        window_hours = _log_show_default_hours()
     return "%dh" % max(1, min(int(window_hours), 48))
 
 
@@ -1011,7 +1072,10 @@ def _prewarm_log_show(window_hours=None):
     run() verbatim — all its path/env/timeout hardening — one thread per command;
     run() is stateless, so this is safe."""
     import threading
+    global _LOG_SHOW_WINDOW
+    _LOG_SHOW_WINDOW = None              # size this scan's window from scratch
     win = _log_show_window(window_hours)
+    _LOG_SHOW_WINDOW = win               # ...then freeze it for the whole scan
     results = {}
     lock = threading.Lock()
 
@@ -1019,6 +1083,15 @@ def _prewarm_log_show(window_hours=None):
         argv = ["log", "show", "--last", win, "--style", "ndjson",
                 "--predicate", pred]
         out, _, rc = run(argv, timeout=45)
+        if rc != 0 or not out:
+            # A harvest that timed out examined NOTHING, and every consumer of
+            # this cache turns an empty result into "found nothing wrong". That
+            # is the byte-identical-to-clean shape the coverage ledger exists
+            # to catch, so the non-answer is recorded as a non-answer.
+            unexamined("log show %s %s" % (win, pred),
+                       "rc=%s, %d bytes -- this predicate was not read, so any "
+                       "verdict drawn from it is about no evidence" % (
+                           rc, len(out or "")))
         with lock:
             results[tuple(argv)] = (out, rc)
 
@@ -10102,6 +10175,66 @@ def diff_wallet(prior, cur):
 # instead of the real (slow) sfltool — the same override pattern as LSOF_LISTEN_CMD.
 BTM_DUMP_CMD = ["sfltool", "dumpbtm"]
 
+# OPTIONAL root-maintained dump (see aegis-btm-daemon.plist). macOS 26 walls
+# `sfltool dumpbtm` behind system.privilege.admin, and that right cannot be
+# granted to this agent by clicking Allow: it is `shared: false`, so no
+# credential carries to the fresh sfltool each scan spawns, and `timeout: 300`
+# expires a cached grant before the next scan anyway. But it is
+# `allow-root: true` -- a process ALREADY root is authorized with no prompt --
+# so a root LaunchDaemon can dump the store on a schedule and leave it here for
+# this unprivileged agent to read. Only the dump is privileged; aegis is not.
+#
+# The file is REFUSED unless root owns it and no one else can write it (nor its
+# directory). Without that check this path is not a coverage fix but a blinding
+# tool: anyone able to write the file could hand the monitor a background-item
+# list with their own persistence removed from it.
+#
+# Absent file -> behaviour is exactly what it was before this existed.
+_BTM_DUMP_FILE = "/var/db/aegis/btm.txt"
+# A dump older than this is a DEAD DAEMON, and is reported as a non-answer
+# rather than diffed. Silently diffing a frozen list is how a monitor goes
+# blind while still rendering green. Generous against laptop sleep: launchd
+# fires the missed interval on wake, so the gap is seconds, not hours.
+_BTM_DUMP_MAX_AGE = 6 * 3600
+
+
+def _root_owned(path):
+    """True if root owns `path` and no one else can write it.
+
+    Its own function so tests can substitute it -- a test suite cannot create
+    a root-owned file, and a check that is skipped under test is a check that
+    is not tested."""
+    try:
+        st = os.stat(path)
+    except Exception:
+        return False
+    return st.st_uid == 0 and not (st.st_mode & 0o022)
+
+
+def _btm_from_root_dump():
+    """(handled, value) for the optional root-maintained dump.
+
+    handled False -> no usable dump; probe sfltool exactly as before."""
+    path = _BTM_DUMP_FILE
+    if not os.path.exists(path):
+        return False, None
+    if not (_root_owned(path) and _root_owned(os.path.dirname(path))):
+        # Present but untrusted. Never parse it, and never let its existence
+        # suppress the real probe -- that would be the blinding this guards.
+        return False, None
+    try:
+        age = _epoch() - int(os.stat(path).st_mtime)
+    except Exception:
+        return False, None
+    if age > _BTM_DUMP_MAX_AGE:
+        return True, None      # stale = dead daemon = non-answer, NOT empty
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception:
+        return True, None
+    return (True, _parse_btm(text)) if text.strip() else (True, None)
+
 # Sentinel a snapshot fn returns when its backing command EXISTS but this OS
 # requires interactive admin authorization that a background observer cannot —
 # and must not — synthesize. Distinct from None (a transient non-answer:
@@ -10191,6 +10324,55 @@ _BTM_PRIVILEGED_MARKERS = ("system.privilege.admin", "authorization failed",
 # truncates only slow refusals, which produce the identical verdict anyway.
 _BTM_WALLED_TIMEOUT = 10
 
+# Re-probing a PROVEN wall is not free. On macOS 26 every `sfltool dumpbtm`
+# raises a SecurityAgent password dialog, so under a change-driven watch a
+# permanent OS policy becomes a prompt every time anything on disk moves --
+# 29 dialogs in 45 minutes, measured on this Mac 2026-09-06.
+#
+# Those cancelled prompts are also why the wall stayed invisible: cancelling
+# one leaves sfltool to be killed by the timeout with EMPTY stderr, so no
+# marker matched, `_wall_record` never ran, and surface_walls.json sat at {}
+# forever. The sensor could not learn the single fact that would have quieted
+# it, so it asked again, and the asking is what the operator experienced.
+#
+# Two changes close that loop. A RUN of consecutive markerless non-answers is
+# itself evidence of the wall -- a genuine flake does not repeat identically --
+# and a wall once proven is re-probed at most daily rather than every scan.
+# The daily re-probe is what still notices a wall Apple later lifts, so the
+# documented "a success clears the wall" contract survives intact.
+#
+# The trade is stated plainly: three consecutive slow-but-real failures are now
+# classified as a permanent wall (PRIVILEGED) rather than a transient one
+# (DEGRADED). The daily re-probe self-corrects that within a day, and a
+# mislabelled gap the operator can see beats an accurate one delivered as a
+# password dialog every ninety seconds.
+_WALL_MISS_THRESHOLD = 3
+_WALL_REPROBE_SECS = 86400
+
+# Reserved key inside the walls file -- surface names are identifiers, so none
+# can collide with a leading '#'. Kept there rather than in a new state
+# constant so that every test sandbox already redirecting SURFACE_WALLS
+# isolates this bookkeeping too, with no change to the sandboxes.
+_PROBE_KEY = "#probe"
+
+
+def _probe_state(name):
+    """{'misses': int, 'last': epoch} for a surface's own probe bookkeeping."""
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        return dict((walls.get(_PROBE_KEY) or {}).get(name) or {})
+    except Exception:
+        return {}
+
+
+def _probe_record(name, **fields):
+    try:
+        walls = load_json(SURFACE_WALLS, {}) or {}
+        walls.setdefault(_PROBE_KEY, {}).setdefault(name, {}).update(fields)
+        save_json(SURFACE_WALLS, walls)
+    except Exception:
+        pass
+
 
 def _parse_btm(text):
     """{identifier: {name, team, type, url}} from `sfltool dumpbtm`. A top-level
@@ -10257,14 +10439,46 @@ def snapshot_btm():
     A third outcome exists since macOS 26: dumpbtm refuses without interactive
     admin authorization. That is not a flake — it will fail identically on
     every scan this OS ever runs — so it returns SURFACE_PRIVILEGED and is
-    recorded as a permanent, named coverage gap rather than a degraded sensor."""
-    # A wall this machine already proved gets a short probe, not a long wait.
+    recorded as a permanent, named coverage gap rather than a degraded sensor.
+
+    Two things follow from that refusal being INTERACTIVE. Its cost is a
+    password dialog, not the seconds it blocks, so a wall this machine has
+    proven is re-probed at most daily rather than every scan; and because a
+    cancelled dialog is silent (sfltool dies on the timeout with empty stderr,
+    matching no marker), the wall is also learned from a RUN of markerless
+    non-answers, or it could never be learned here at all.
+
+    Where a root-maintained dump exists it is preferred over probing entirely:
+    it answers every scan, with no authorization request and so no dialog, and
+    a wall lifted by the operator installing the daemon is noticed at once."""
+    # A root-maintained dump, where one exists, answers without any probe at
+    # all -- no authorization request, so no password dialog, ever.
+    handled, supplied = _btm_from_root_dump()
+    if handled:
+        if supplied is not None:
+            _wall_clear("btm")
+            _probe_record("btm", misses=0)
+        return supplied
+    # A wall this machine has already proven is re-probed at most daily: the
+    # probe's real cost is a password dialog, not the seconds it blocks.
+    if _wall_seen("btm") and (
+            _epoch() - (_probe_state("btm").get("last") or 0)
+            < _WALL_REPROBE_SECS):
+        return SURFACE_PRIVILEGED
+    _probe_record("btm", last=_epoch())
+    # The two guards COMPOSE rather than compete: this backoff decides how
+    # OFTEN a proven wall is asked, and _BTM_WALLED_TIMEOUT decides how long a
+    # single ask may hang. Neither subsumes the other -- a short cap alone
+    # still raises the dialog every scan (SecurityAgent spawns about a second
+    # after the request, so a 10s probe prompts exactly as a 30s one does),
+    # and a backoff alone would let the one daily re-probe block for 30s.
     out, err, rc = run(BTM_DUMP_CMD,
                        timeout=_BTM_WALLED_TIMEOUT if _wall_seen("btm") else 30)
     if rc != 0 or not out:
         blob = ((err or "") + "\n" + (out or "")).lower()
         if any(marker in blob for marker in _BTM_PRIVILEGED_MARKERS):
             _wall_record("btm")
+            _probe_record("btm", misses=0)
             return SURFACE_PRIVILEGED
         if _wall_seen("btm"):
             # This machine has already PROVEN the wall. The authorization
@@ -10273,8 +10487,17 @@ def snapshot_btm():
             # newly broken sensor. Classifying it as DEGRADED opened HIGH
             # incidents about an already-named gap.
             return SURFACE_PRIVILEGED
+        # A cancelled authorization prompt is SILENT -- it carries no marker to
+        # match -- so the wall can only ever be learned from the shape of the
+        # failure: the same markerless non-answer, over and over.
+        misses = int(_probe_state("btm").get("misses") or 0) + 1
+        _probe_record("btm", misses=misses)
+        if misses >= _WALL_MISS_THRESHOLD:
+            _wall_record("btm")
+            return SURFACE_PRIVILEGED
         return None  # timeout/failure — a non-answer, NOT "zero items"
     _wall_clear("btm")   # it answered: any later failure is genuinely new
+    _probe_record("btm", misses=0)
     return _parse_btm(out)
 
 
@@ -13297,6 +13520,12 @@ AGENT_CONFIG_ROOTS = [os.path.join(HOME, d) for d in (
 # `mcpServers` store — the primary MCP registration on this machine — and it
 # sits in $HOME itself, a root nothing here may walk.
 AGENT_CONFIG_FILES = [os.path.join(HOME, f) for f in (".claude.json",)]
+
+# A module constant purely so the suite can pin it. Hardcoded inline, the
+# clipboard sensor read the DEVELOPER's real clipboard on every scan-level test
+# -- 22 reads in one file -- which is both a privacy leak into a test run and a
+# source of nondeterminism no fixture could control.
+PBPASTE_CMD = ["pbpaste"]
 
 # Instruction files: natural language that an agent treats as standing orders.
 AGENT_INSTRUCTION_NAMES = (
@@ -18867,6 +19096,59 @@ def _benign_note_for(item):
     return notes
 
 
+# What each human-presence regime MEANS for the only question a verdict answers.
+_PRESENCE_MEANING = {
+    "PRESENT-ACTIVE": "someone was at the keyboard when this fired",
+    "PRESENT-IDLE": "someone was logged in but not typing when this fired",
+    "ABSENT": "NO ONE was at the keyboard when this fired",
+    "LOCKED": "the screen was LOCKED when this fired",
+}
+
+
+def _adjudication_notes(item):
+    """The 'was this me?' evidence for an incident, newest observation first.
+
+    An operator closes an incident by answering exactly one question: was I the
+    one who did this? Every finding already carries the raw material for that
+    answer -- the presence regime at the moment it fired, plus the program and
+    pid -- but the detail view printed only the title, so the evidence was
+    collected and then discarded at the moment it was needed.
+
+    That is fatal for the sensors whose command text is deliberately never
+    stored: `behavior` and `shell-history` keep a command sha256 and never the
+    argv, so once the process exits NO ONE can adjudicate the incident from
+    stored state and it stays open forever. A row that cannot be closed on
+    evidence is the most expensive false-alarm class there is -- it is not a
+    wrong detection, it is a permanent one.
+
+    Presence stays EVIDENCE and never a licence, for the same reason the scan
+    stamps it: same-uid code can forge idle time (`caffeinate -u`), so this
+    informs the operator's judgment and must never substitute for it."""
+    for evidence in reversed(item.get("evidence") or ()):
+        try:
+            data = json.loads(evidence["data_json"])
+        except Exception:
+            continue
+        regime = data.get("presence")
+        if not regime:
+            continue
+        bits = []
+        idle = data.get("idle_secs")
+        if idle is not None:
+            bits.append("idle %ss" % idle)
+        locked = data.get("screen_locked")
+        if locked is not None:
+            bits.append("screen %s" % ("locked" if locked else "unlocked"))
+        who = _PRESENCE_MEANING.get(regime, "presence regime %s" % regime)
+        notes = ["%s (%s)" % (who, ", ".join(bits)) if bits else who]
+        actor = ", ".join("%s %s" % (key, data[key])
+                          for key in ("program", "pid") if data.get(key))
+        if actor:
+            notes.append(actor)
+        return notes
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # MITRE ATT&CK technique attribution — read-time only, never a detection input.
 #
@@ -19158,6 +19440,12 @@ def cmd_incident(incident_id, action=None, reason=None):
             summary = evidence["event_type"]
         print("  - %s · %s · %s" %
               (evidence["observed_at"], evidence["source"], summary))
+    adjudication = _adjudication_notes(item)
+    if adjudication:
+        print("\nWas this you? (evidence, never a verdict — same-uid "
+              "code can forge idle time):")
+        for note in adjudication:
+            print("  · %s" % note)
     notes = _benign_note_for(item)
     if notes:
         print("\nKnown benign causes for these sensors (check before acting):")
@@ -24106,6 +24394,23 @@ def cmd_assay():
     return 1 if failed else 0
 
 
+def _assay_lane_ids(state=None):
+    """Every lane id that SHOULD be proven: the source registry, unioned with
+    whatever the state file still remembers.
+
+    The union matters in both directions -- a lane added to the source but
+    never run must show up as unproven, and a lane deleted from the source must
+    not keep counting as proven from a stale record."""
+    ids = set()
+    try:
+        ids.update(lane[0] for lane in _assay_lanes())
+    except Exception:
+        pass
+    if isinstance(state, dict):
+        ids.update(state)
+    return sorted(ids)
+
+
 def _assay_coverage_state():
     """How much of the detector coverage is currently PROVEN, not asserted.
 
@@ -24125,7 +24430,18 @@ def _assay_coverage_state():
         return None
     now = _epoch()
     stale, broken, oldest = [], [], 0.0
-    for lane_id, rec in sorted(state.items()):
+    # Enumerate the LANE REGISTRY, not the state file. Taking the denominator
+    # from len(state) meant a lane added to the source but never yet run was
+    # neither proven nor stale -- it was invisible, and the coverage line
+    # reported completeness over a denominator that had quietly shrunk to
+    # whatever happened to have been run before ("19 of 19 proven" against a
+    # 21-lane source). A control nobody has ever exercised is precisely the one
+    # most likely not to work, so it is counted, and counted as unproven.
+    for lane_id in _assay_lane_ids(state):
+        rec = state.get(lane_id)
+        if rec is None:
+            stale.append(lane_id)          # never run at all = never proven
+            continue
         if not rec.get("ok"):
             broken.append(lane_id)
             continue
@@ -24133,7 +24449,8 @@ def _assay_coverage_state():
         oldest = max(oldest, age)
         if age * 86400.0 > ASSAY_HALF_LIFE_SECS:
             stale.append(lane_id)
-    return {"total": len(state), "proven": len(state) - len(stale) - len(broken),
+    total = len(_assay_lane_ids(state))
+    return {"total": total, "proven": total - len(stale) - len(broken),
             "stale": stale, "broken": broken, "oldest_days": oldest}
 
 
@@ -24166,9 +24483,12 @@ def check_assay():
     if not isinstance(state, dict) or not state:
         return []
     now, stale, broken = _epoch(), [], []
-    for lane_id, rec in sorted(state.items()):
-        if not rec.get("ok"):
-            broken.append(lane_id)
+    # Registry, not state file -- see _assay_coverage_state: a lane that has
+    # never been run must not be silently absent from its own coverage report.
+    for lane_id in _assay_lane_ids(state):
+        rec = state.get(lane_id)
+        if rec is None or not rec.get("ok"):
+            (stale if rec is None else broken).append(lane_id)
         elif now - rec.get("last_ok", 0) > ASSAY_HALF_LIFE_SECS:
             stale.append(lane_id)
     findings = []
@@ -24259,7 +24579,7 @@ def _clipboard_read():
     """Current clipboard text, or None if this platform has no unprivileged
     reader available (absent, not degraded)."""
     if IS_MAC:
-        out, _e, rc = run(["pbpaste"], timeout=15)
+        out, _e, rc = run(PBPASTE_CMD, timeout=15)
         return out if rc == 0 else None
     if IS_WIN:
         out, _e, rc = run(["powershell", "-NoProfile", "-NonInteractive",

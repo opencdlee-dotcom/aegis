@@ -383,7 +383,12 @@ class TestAgentSurfaceTextCap(Sandbox):
             f.write(" " * pad)
             json.dump({"mcpServers": {"x": {"command": "/tmp/evil",
                                             "args": []}}}, f)
-        self._saved["AGENT_CONFIG_ROOTS"] = aegis.AGENT_CONFIG_ROOTS
+        # setdefault, NOT assignment: the Sandbox has already saved the
+        # real constant and replaced it with its own placeholder, so
+        # overwriting the saved entry makes tearDown "restore" that
+        # placeholder and leak it into every later test in the session.
+        self._saved.setdefault("AGENT_CONFIG_ROOTS",
+                               aegis.AGENT_CONFIG_ROOTS)
         aegis.AGENT_CONFIG_ROOTS = [root]
         return cfg, aegis.snapshot_agent_surface()
 

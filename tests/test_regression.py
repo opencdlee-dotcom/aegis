@@ -159,6 +159,16 @@ class Sandbox(unittest.TestCase):
             "WATCHDOG_ALERT": os.path.join(self.state, "watchdog_alert"),
             "AGENT_SKILL_ROOTS": [],
             "AGENT_CONFIG_FILES": [],
+            # AGENT_CONFIG_ROOTS was NOT pinned alongside its two siblings, so
+            # every scan-level test walked the developer's real ~/.claude,
+            # ~/.codex and VSCode User directory and codesigned whatever it
+            # found there -- 677 codesign spawns on real paths in this file
+            # alone. Reading a machine the fixture does not control is both
+            # slow and nondeterministic.
+            "AGENT_CONFIG_ROOTS": [],
+            # Likewise the clipboard: unpinned, scan-level tests read the
+            # developer's actual clipboard contents.
+            "PBPASTE_CMD": _ECHO_CMD(""),
             # Protective-tier state. NOTARY_FILE and OBSERVATIONS_DIR are
             # written by cmd_scan itself, so omitting them here does not merely
             # leave a gap — it makes every scan-invoking test in this suite

@@ -161,7 +161,13 @@ because conflating them is what makes tuning impossible. A sensor the operator
 keeps dismissing is automatically **down-weighted** in risk accumulation (never
 to zero, and reopening an incident retracts the dismissal). Each incident card
 lists the **known benign causes** for the sensors that fired, so triage is a
-lookup rather than an investigation. And corroboration is scored, not just
+lookup rather than an investigation. It also answers *was this me?* from what the
+finding already recorded — whether anyone was at the keyboard when it fired,
+how idle they were, and whether the screen was locked. That is the whole
+verdict for the sensors that store a command's SHA-256 and never its text:
+once the process exits, presence is the only evidence left, and an incident
+nobody can close on evidence stays open forever. It stays evidence and never
+a verdict — same-uid code can forge idle time. And corroboration is scored, not just
 counted: two *different* sensors implicating one entity outranks the same number
 of hits from one sensor.
 
@@ -214,6 +220,45 @@ python3 aegis.py update-check            # is ~/.aegis/aegis.py stale behind thi
 # On macOS `bash install.sh [watch] [interval]` remains available and does the
 # same thing; `aegis.py install` is the cross-platform equivalent.
 ```
+
+### Background items on macOS 26 — the `btm-daemon` (optional)
+
+macOS 26 moved `sfltool dumpbtm` behind `system.privilege.admin`, so the
+unprivileged agent can no longer read the SMAppService store — the modern
+persistence path, where a login item is registered through the API and never
+drops a plist in `~/Library/LaunchAgents`. Aegis reports that honestly as a
+PRIVILEGED coverage gap and, since it cannot learn anything by asking, stops
+asking: a proven wall is re-probed once a day, not once a scan.
+
+**Clicking Allow cannot fix it.** The right is `shared: false`, so no approved
+credential carries to the fresh `sfltool` each scan spawns, and `timeout: 300`
+expires a cached grant well before the next 600-second scan. Every scan would
+prompt, forever. Do **not** make the right passwordless either
+(`security authorizationdb write system.privilege.admin allow`): it gates
+`AuthorizationExecuteWithPrivileges`, so weakening it to quiet one monitor
+hands every installer on the machine silent root.
+
+The right is, however, `allow-root: true` — a process already running as root
+is authorized with no prompt at all. So run *only the dump* as root:
+
+```bash
+sudo install -d -o root -g wheel -m 755 /var/db/aegis && \
+sudo install -o root -g wheel -m 644 aegis-btm-daemon.plist \
+  /Library/LaunchDaemons/com.charlie.aegis-btm.plist && \
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.charlie.aegis-btm.plist
+```
+
+Aegis picks the file up with no further configuration, and **refuses it unless
+root owns it and nothing else can write it or its directory** — otherwise the
+file would not be a coverage fix but a blinding tool, since anyone able to
+write it could hand the monitor a list with their own persistence removed. A
+dump older than six hours is treated as a dead daemon and reported as a
+non-answer, never diffed: silently comparing against a frozen list is how a
+monitor goes blind while still rendering green.
+
+Remove it with `sudo launchctl bootout system/com.charlie.aegis-btm && sudo rm
+/Library/LaunchDaemons/com.charlie.aegis-btm.plist`; with the file gone, aegis
+behaves exactly as it did before.
 
 ```bash
 # from the aegis/ directory:

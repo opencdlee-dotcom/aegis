@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  OPTIONAL root helper: restores Background Task Management coverage on macOS 26.
+
+  macOS 26 moved `sfltool dumpbtm` behind system.privilege.admin, so the
+  unprivileged aegis agent can no longer read the SMAppService store (the
+  modern persistence path: a login item registered via the API that never drops
+  a plist in ~/Library/LaunchAgents). aegis reports that honestly as a
+  PRIVILEGED coverage gap rather than pretending the surface is empty.
+
+  The gap cannot be closed by clicking Allow: the authorization right is
+  `shared: false` (no credential transfers to the fresh sfltool aegis spawns)
+  with `timeout: 300` (a cached grant dies before the next 600s scan). But it
+  is `allow-root: true` -- a process already running as root is authorized with
+  no prompt at all. So ONLY the dump runs as root, on a schedule, into a
+  root-owned file; aegis itself stays unprivileged and merely reads it.
+
+  Do NOT instead make system.privilege.admin passwordless: that right gates
+  AuthorizationExecuteWithPrivileges, so weakening it to silence one monitor
+  hands every installer on the machine silent root.
+
+  The dump is written tmp+mv so a scan can never read a half-written file, and
+  aegis refuses any dump not owned by root -- otherwise this file would become
+  a way for an attacker to forge the background-item list and hide persistence.
+
+  Install: see the `btm-daemon` section of README.md.
+-->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.charlie.aegis-btm</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>umask 022; /usr/bin/sfltool dumpbtm &gt; /var/db/aegis/btm.txt.tmp 2&gt;/dev/null &amp;&amp; /bin/mv -f /var/db/aegis/btm.txt.tmp /var/db/aegis/btm.txt</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>1800</integer>
+</dict></plist>
