@@ -10168,6 +10168,28 @@ def _wall_clear(name):
 # signature, never inferred from a bare non-zero exit.
 _BTM_PRIVILEGED_MARKERS = ("system.privilege.admin", "authorization failed",
                            "errauthorization")
+# Timeout for dumpbtm once this machine has PROVEN the wall. The full 30s
+# exists for a surface that might still answer; a walled one will not, and the
+# only reason it ever takes 30s is an authorization prompt no launchd agent can
+# answer, sitting until the timeout kills it. Measured here: 65 of 107 runs hit
+# the cap, making surface.btm 20.5s of an 82.3s scan -- 25% of every scan spent
+# re-learning a permanent OS policy already recorded in surface_walls.json.
+#
+# Shortening the timeout rather than SKIPPING the probe is deliberate. The
+# documented contract is that a single success clears the wall, so a later
+# failure reads as genuinely new (test_custody: PrivilegeWallIsRemembered).
+# Skipping the call would delay noticing a lifted wall by however long the
+# skip lasted; probing briefly keeps that contract exactly and still turns
+# 30s into the cap below. A dumpbtm that CAN answer returns in well under a
+# second, so this is generous headroom for a success and a hard cap on a hang.
+#
+# 10s, from the measured distribution: the non-timeout runs here span 65ms to
+# 24s (p50 3.9s, p90 14.6s), but every one of them is a REFUSAL -- this machine
+# has never had a success to time. The short cap can only ever apply where a
+# wall is already proven, and the success that would clear it is a plist read,
+# not an authorization round-trip. 10s is >2x the median refusal, so it
+# truncates only slow refusals, which produce the identical verdict anyway.
+_BTM_WALLED_TIMEOUT = 10
 
 
 def _parse_btm(text):
@@ -10236,7 +10258,9 @@ def snapshot_btm():
     admin authorization. That is not a flake — it will fail identically on
     every scan this OS ever runs — so it returns SURFACE_PRIVILEGED and is
     recorded as a permanent, named coverage gap rather than a degraded sensor."""
-    out, err, rc = run(BTM_DUMP_CMD, timeout=30)
+    # A wall this machine already proved gets a short probe, not a long wait.
+    out, err, rc = run(BTM_DUMP_CMD,
+                       timeout=_BTM_WALLED_TIMEOUT if _wall_seen("btm") else 30)
     if rc != 0 or not out:
         blob = ((err or "") + "\n" + (out or "")).lower()
         if any(marker in blob for marker in _BTM_PRIVILEGED_MARKERS):
