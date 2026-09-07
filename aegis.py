@@ -3410,7 +3410,25 @@ def _tolerance_identity(fingerprint):
     for part in parts:
         if "/" in part:
             versionless = _TOLERANCE_VERSION_RE.sub("#", part)
-            changed = changed or (versionless != part)
+            # A path that arrives ALREADY normalized counts as generalized.
+            # Sensors build their fingerprints from _program_subject, which
+            # applies this very regex at EMISSION -- so by the time the string
+            # reaches here there is nothing left to mutate, `changed` stays
+            # False, and the identity comes back None. A fix at emission was
+            # disabling the fix at learning: `beacon:.../bin.#/Runner.Worker:
+            # <ip>:443` could never accumulate a verdict, while the same
+            # fingerprint carrying the RAW `bin.2.336.0` generalized fine.
+            # Cleaning the path up was denying it an identity.
+            #
+            # Deliberately not the broader repair (dropping the `changed`
+            # requirement altogether). A beacon fingerprint carries no trust
+            # or content component, so an attacker who replaces a vouched
+            # binary IN PLACE and reuses its endpoint presents a byte-identical
+            # fingerprint; granting tolerance to never-normalized paths would
+            # hand that replacement the operator's verdicts. Widening only to
+            # already-normalized paths keeps the population exactly the one
+            # version churn was always meant to cover.
+            changed = changed or (versionless != part) or ("#" in versionless)
             part = versionless
         normalized.append(part)
     if not changed or len(normalized) < 2:
@@ -3564,13 +3582,32 @@ def _subject_identity(sub):
     kind, path = sub.get("kind"), sub.get("path")
     if not path:
         return None
-    generalizes = bool(sub.get("content")) or path != sub.get("raw_path")
+    # `or "#" in path` mirrors the string side exactly: a path that arrived
+    # ALREADY normalized generalizes just as much as one normalized here, and
+    # the two derivations must agree or the operator's verdicts split across
+    # two memories and neither converges.
+    generalizes = (bool(sub.get("content")) or path != sub.get("raw_path")
+                   or "#" in path)
     if kind == "persistence" and generalizes:
         # A subject written before persistence:new declared one describes a
         # CHANGED item, so an absent `op` must keep rendering exactly that.
         return "persistence:%s:%s" % (sub.get("op") or "changed", path)
     if kind == "process" and generalizes:
         return "process:%s:%s" % (path, sub.get("trust") or "")
+    if kind == "beacon" and generalizes:
+        # net-beacon is named in the comment above as one of the three sensors
+        # that declare a subject, and it was the one kind this function never
+        # handled -- every beacon subject fell through to None. That was
+        # invisible while the string side ALSO returned None for the same
+        # rows (both refused a pre-normalized path), so the two derivations
+        # agreed by shared brokenness. The moment the string side learned to
+        # key on such a path, the agreement broke: a row carrying a subject
+        # rendered None while its subject-less twin rendered an identity, and
+        # verdicts would have accumulated in two separate memories, neither
+        # reaching the floor. Rendered here byte-identically to what
+        # _tolerance_identity derives from the fingerprint.
+        return "beacon:%s:%s:%s" % (path, sub.get("ip") or "",
+                                    sub.get("port") or "")
     return None
 
 
