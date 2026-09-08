@@ -43,7 +43,10 @@ You are a background security monitor for macOS, Linux, and Windows. Your job is
   See `tests/simbody.py` — a macOS run cannot fail on a fixture that hard-codes
   macOS vocabulary, BY CONSTRUCTION, and that has now cost two CI cycles. Read
   its docstring first: the absolute failure count is meaningless, only the diff
-  against your merge base is.
+  against your merge base is. This runs the suite twice per body and CANNOT
+  finish inside a foreground Bash call — start it with run_in_background and let
+  completion notify you. A run killed at the 10m ceiling prints a partial
+  NEW/FIXED list, which reads exactly like a clean result; it is not one.
 
 ## Important Notes
 - You are NOT Norton — you are a detect-only monitor
