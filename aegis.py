@@ -6736,6 +6736,8 @@ def check_persistence(baseline_snap, current_snap):
     base = baseline_snap or {}
     for path, rec in current_snap.items():
         if path not in base:
+            if _is_aegis_btm_daemon(path):
+                continue  # our own documented root helper, proven ours
             sev = _persistence_severity(rec)
             findings.append(finding(
                 sev, "persistence", "New persistence item",
@@ -10211,6 +10213,42 @@ def _root_owned(path):
     return st.st_uid == 0 and not (st.st_mode & 0o022)
 
 
+# Aegis's OWN optional root helper. README documents installing it by hand
+# (`sudo install -o root -g wheel -m 644 aegis-btm-daemon.plist ...`), and
+# nothing in aegis puts it there -- so the monitor had no idea the file was
+# its own. Both sensors watching that surface saw it appear: persistence
+# called it a New persistence item, btm called it a New background item, and
+# `chain:supply-chain` correlates exactly those two categories on one entity.
+# A finding whose own severity is LOW therefore escalated to a CRITICAL
+# "Background-item execution chain" -- never auto-tolerated, never aged out --
+# and re-fired every scan. Measured on the reference Mac: 42 events on one
+# path in five hours, the loudest alarm aegis can raise, about aegis
+# following its own install instructions.
+#
+# Identity is proven, not assumed. The path must be exactly ours, root must
+# own both it and its directory with nobody else able to write either (the
+# same _root_owned test aegis already applies to the dump this daemon
+# writes), and the plist must actually name that dump. A same-uid attacker
+# satisfies none of it -- /Library/LaunchDaemons is root-only -- and a root
+# attacker who could is already past every control this alarm protects.
+# Fails closed: anything unreadable or unexpected alarms exactly as before.
+_BTM_DAEMON_PLIST = "/Library/LaunchDaemons/com.charlie.aegis-btm.plist"
+
+
+def _is_aegis_btm_daemon(path):
+    """True only for aegis's own root BTM helper, installed as documented."""
+    if not path or path != _BTM_DAEMON_PLIST:
+        return False
+    if not (_root_owned(_BTM_DAEMON_PLIST)
+            and _root_owned(os.path.dirname(_BTM_DAEMON_PLIST))):
+        return False
+    try:
+        with open(_BTM_DAEMON_PLIST, "rb") as fh:
+            return _BTM_DUMP_FILE.encode("utf-8") in fh.read()
+    except Exception:
+        return False
+
+
 def _btm_from_root_dump():
     """(handled, value) for the optional root-maintained dump.
 
@@ -10514,6 +10552,11 @@ def diff_btm(prior, cur):
     def new_fn(ident, rec):
         url = rec.get("url")
         path = _btm_path_from_url(url)
+        # APPEARANCE only. A CHANGE to this daemon still alerts below: an edit
+        # to a root plist is worth a look even when the file is ours, and the
+        # same first-sight-vs-changed asymmetry governs agent configs already.
+        if _is_aegis_btm_daemon(path):
+            return None
         no_team = not rec.get("team")
         risky = bool(path and is_risky_location(path))
         sev = "HIGH" if (no_team and risky) else "MEDIUM"
