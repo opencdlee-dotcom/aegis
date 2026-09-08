@@ -1,0 +1,16 @@
+# The bytes of this file are load-bearing, not just its text.
+#
+# aegis pins its sha256 as `_BTM_DAEMON_SHA256` so it can recognise its OWN
+# installed root helper and stop raising a CRITICAL supply-chain chain about
+# following its own README (#42), and tests/test_self_btm_daemon.py asserts the
+# constant still matches the shipped file. A Windows checkout with
+# core.autocrlf=true -- the GitHub Actions default -- rewrites LF to CRLF and
+# changes that hash: both windows-latest legs of #42 failed on exactly this,
+# while macOS, Linux and both simulated bodies passed, because only a real
+# Windows checkout mangles the file.
+#
+# eol=lf rather than -text: it pins the WORKING TREE to LF on every body AND
+# normalises on commit, so a plist committed from a CRLF editor cannot quietly
+# become the shipped artifact. Anything else whose hash gets pinned needs the
+# same line.
+aegis-btm-daemon.plist text eol=lf
