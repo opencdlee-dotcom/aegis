@@ -6736,6 +6736,10 @@ def check_persistence(baseline_snap, current_snap):
     base = baseline_snap or {}
     for path, rec in current_snap.items():
         if path not in base:
+            if _is_aegis_btm_daemon(path):
+                # Our own documented root helper, proven ours by ownership AND
+                # by content -- so an edited copy is NOT ours and lands below.
+                continue
             sev = _persistence_severity(rec)
             findings.append(finding(
                 sev, "persistence", "New persistence item",
@@ -10211,6 +10215,65 @@ def _root_owned(path):
     return st.st_uid == 0 and not (st.st_mode & 0o022)
 
 
+# Aegis's OWN optional root helper. README documents installing it by hand
+# (`sudo install -o root -g wheel -m 644 aegis-btm-daemon.plist ...`), and
+# nothing in aegis puts it there -- so the monitor had no idea the file was
+# its own. Both sensors watching that surface saw it appear: persistence
+# called it a New persistence item, btm called it a New background item, and
+# `chain:supply-chain` correlates exactly those two categories on one entity.
+# A finding whose own severity is LOW therefore escalated to a CRITICAL
+# "Background-item execution chain" -- never auto-tolerated, never aged out --
+# and re-fired every scan. Measured on the reference Mac: 42 events on one
+# path in five hours, the loudest alarm aegis can raise, about aegis
+# following its own install instructions.
+#
+# Identity is proven, not assumed, and it is proven of the FILE rather than of
+# its location. The path must be exactly ours; root must own both it and its
+# directory with nobody else able to write either (the same _root_owned test
+# aegis already applies to the dump this daemon writes); and the bytes must be
+# EXACTLY the ones aegis ships. A same-uid attacker satisfies none of it --
+# /Library/LaunchDaemons is root-only -- and a root attacker who could is
+# already past every control this alarm protects.
+#
+# Why the content hash is load-bearing rather than belt-and-braces. Neither
+# sensor can ever report a CHANGE to this file, so without it the suppression
+# would be PERMANENT for that path:
+#
+#   * `btm` is registered as a 3-tuple in SURFACES, so _surface_row leaves
+#     adopt_new False. A post-baseline identifier is therefore never adopted
+#     into baseline["btm"], and diff_btm's changed_fn only ever runs for an
+#     identifier present in BOTH maps.
+#   * check_persistence's changed branch needs `path in base`, and cmd_scan
+#     writes baseline["persistence"] only on `first_run` -- the same
+#     write-once rule _accept_into_baseline exists to work around.
+#
+# So "an edit still alerts" could not have been delivered by leaving the
+# changed paths alone; it is delivered here. The suppression covers exactly
+# the known-good bytes, and ANY edit -- one byte -- fails this test and alarms
+# exactly as it did before, carrying the mutated file's own hash. Storm-free
+# and known-good become the same state.
+#
+# Fails closed everywhere: unreadable, absent, wrong owner, wrong bytes, or a
+# hash that cannot be computed all return False.
+_BTM_DAEMON_PLIST = "/Library/LaunchDaemons/com.charlie.aegis-btm.plist"
+# sha256 of the repo's aegis-btm-daemon.plist. Pinned as a constant because
+# aegis.py is installed ALONE (`~/.aegis/aegis.py`) -- the shipped plist is not
+# a sibling at runtime, so it cannot be read for comparison. Held in lockstep
+# with the shipped file by tests/test_self_btm_daemon.py, which hashes the real
+# one: editing the plist without editing this line fails that test.
+_BTM_DAEMON_SHA256 = "a57344de21f69ce4e1e14ab02b9cb3678250eca21b23c16735d3b6d983b8fd52"
+
+
+def _is_aegis_btm_daemon(path):
+    """True only for aegis's own root BTM helper, installed as documented."""
+    if not path or path != _BTM_DAEMON_PLIST:
+        return False
+    if not (_root_owned(_BTM_DAEMON_PLIST)
+            and _root_owned(os.path.dirname(_BTM_DAEMON_PLIST))):
+        return False
+    return sha256(_BTM_DAEMON_PLIST) == _BTM_DAEMON_SHA256
+
+
 def _btm_from_root_dump():
     """(handled, value) for the optional root-maintained dump.
 
@@ -10514,6 +10577,12 @@ def diff_btm(prior, cur):
     def new_fn(ident, rec):
         url = rec.get("url")
         path = _btm_path_from_url(url)
+        # Silent ONLY while the file is byte-for-byte the one aegis ships --
+        # changed_fn below cannot cover this path (btm never adopts a
+        # post-baseline identifier), so the edit case is carried by the
+        # identity test itself: one changed byte and this alarms again.
+        if _is_aegis_btm_daemon(path):
+            return None
         no_team = not rec.get("team")
         risky = bool(path and is_risky_location(path))
         sev = "HIGH" if (no_team and risky) else "MEDIUM"
