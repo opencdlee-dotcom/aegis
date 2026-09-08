@@ -103,9 +103,14 @@ def _ps_calls():
 
 class PowerShellTimeoutFloor(unittest.TestCase):
     def test_the_ceiling_clears_the_measured_cold_start(self):
-        # 21.4s is the measurement the whole rule rests on; a ceiling that does
-        # not clear it with real margin is not a ceiling.
-        self.assertGreaterEqual(aegis.WIN_PS_COLD_START_CEILING, 60)
+        # A ceiling that does not clear the measured cold start with real
+        # margin is not a ceiling. The floor here is 120 and not 60 because
+        # 60 was chosen against the 21.4s start-only datum, and a windows
+        # runner has since been measured at 91.15s for start PLUS one probe
+        # (2026-09-08) -- a ceiling anywhere under that is known-short, so the
+        # guard has to sit above the worst number the world has produced,
+        # not above the friendliest one.
+        self.assertGreaterEqual(aegis.WIN_PS_COLD_START_CEILING, 120)
 
     def test_the_audit_actually_finds_the_call_sites(self):
         calls = _ps_calls()
