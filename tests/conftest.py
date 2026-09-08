@@ -195,6 +195,28 @@ IS_MAC = sys.platform == "darwin"
 _PROMPTING_TOOLS = ("sfltool",)
 
 
+# --------------------------------------------------------------------------- #
+# No test may read the operator's REAL background-item dump.
+#
+# _BTM_DUMP_FILE points at /var/db/aegis/btm.txt, a root-maintained file that
+# snapshot_btm() prefers over probing sfltool. It is absent on most machines, so
+# nothing failed while it was unpinned -- and then the operator installed the
+# daemon and 19 tests started reading 121 live background items off their real
+# Mac, including one that stubs `run` to simulate a timeout and asserts None.
+# A fixture whose result depends on whether the host happens to have a daemon
+# installed is not a fixture. Pinned suite-wide rather than per-Sandbox because
+# several files roll their own sandbox and would each have to remember.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _no_real_btm_dump(tmp_path):
+    real = aegis._BTM_DUMP_FILE
+    aegis._BTM_DUMP_FILE = str(tmp_path / "absent-btm-dump.txt")
+    try:
+        yield
+    finally:
+        aegis._BTM_DUMP_FILE = real
+
+
 @pytest.fixture(autouse=True)
 def _no_authorization_prompts():
     real_run = aegis.run

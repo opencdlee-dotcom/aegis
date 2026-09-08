@@ -23064,6 +23064,20 @@ def _notary_read_anchors(hours=24):
                            "ForEach-Object { $_.Message }" % _NOTARY_TAG],
                           timeout=120)
     if rc != 0 or not out:
+        if rc == 124:
+            # A TIMEOUT is not "this platform has no anchor channel", and the
+            # two need OPPOSITE handling. An absent channel fails instantly and
+            # costs nothing to retry; a timeout costs the full 90s and, retried
+            # next scan, re-reads the SAME window for the same answer. Four
+            # consecutive ones (2026-09-07 01:43-02:23) each recorded status
+            # OK, detail "", item_count 0 -- byte-identical to "I checked and
+            # the chain is intact" -- while the only root-corroborated half of
+            # the tamper-evidence check did not run. The ledger already exists
+            # for this shape; _prewarm_log_show uses it for its own harvests.
+            unexamined("notary anchors (%dh of the OS log store)" % hours,
+                       "rc=%s, %d bytes -- the root-corroborated half of the "
+                       "tamper-evidence check did not run" % (rc, len(out or "")))
+            return _NOTARY_READ_TIMEOUT
         return None  # channel unavailable — distinct from "no anchors found"
     for m in re.finditer(r"%s seq=(\d+) head=([0-9a-f]{16,64})" % _NOTARY_MARK,
                          out):
@@ -23140,6 +23154,8 @@ def _notary_verify(with_anchors=True):
     if not with_anchors:
         return problems, len(chain), "not-checked"
     res = _notary_read_anchors()
+    if res is _NOTARY_READ_TIMEOUT:
+        return problems, len(chain), "timeout"
     if res is None:
         return problems, len(chain), "unavailable"
     # Tolerate both the real (anchors, conflicts) tuple and a bare {seq: head}
@@ -23190,8 +23206,16 @@ def _notary_verify(with_anchors=True):
     return problems, len(chain), "ok:%d-anchors-matched" % matched
 
 
+# Returned by _notary_read_anchors when the read was ATTEMPTED and timed out,
+# as opposed to None for a platform whose channel cannot be read at all.
+_NOTARY_READ_TIMEOUT = object()
 _NOTARY_ANCHOR_INTERVAL = 3600
 _NOTARY_ANCHOR_LAST = 0
+# Consecutive failed anchor reads, for the backoff below. A FAILED read used to
+# leave the gate open, so the next scan paid the full cost again -- see
+# check_notary.
+_NOTARY_ANCHOR_FAILS = 0
+_NOTARY_ANCHOR_BACKOFF_BASE = 300
 
 
 def check_notary():
@@ -23221,7 +23245,7 @@ def check_notary():
     and an anchor channel this platform cannot read back. Absence of history is
     not evidence of tampering, and neither is a log store that ages anchors out.
     """
-    global _NOTARY_ANCHOR_LAST
+    global _NOTARY_ANCHOR_LAST, _NOTARY_ANCHOR_FAILS
     if not os.path.exists(NOTARY_FILE):
         return []
     now = _epoch()
@@ -23233,7 +23257,23 @@ def check_notary():
     with_anchors = (now - _NOTARY_ANCHOR_LAST) >= _NOTARY_ANCHOR_INTERVAL
     problems, checked, status = _notary_verify(with_anchors=with_anchors)
     if with_anchors and status not in ("unavailable", "not-checked", "empty"):
-        _NOTARY_ANCHOR_LAST = now
+        if status == "timeout":
+            # An attempt that shelled out and came back empty-handed is still
+            # an attempt. Leaving the gate open on failure meant a 90s timeout
+            # was retried on the very NEXT scan, and again, and again: four
+            # consecutive 90s reads inside 40 minutes on a 10-minute cadence
+            # (2026-09-07 01:43, 01:59, 02:18, 02:22), 6.1 of those 40 minutes
+            # spent on calls that returned nothing. It ended only when one call
+            # happened to succeed. An immediate retry reads the SAME 24h window
+            # and would find the same anchors, so it buys no coverage either --
+            # it is pure cost. Back off instead, capped at the normal interval.
+            _NOTARY_ANCHOR_FAILS += 1
+            _NOTARY_ANCHOR_LAST = now - _NOTARY_ANCHOR_INTERVAL + min(
+                _NOTARY_ANCHOR_INTERVAL,
+                _NOTARY_ANCHOR_BACKOFF_BASE * (2 ** (_NOTARY_ANCHOR_FAILS - 1)))
+        else:
+            _NOTARY_ANCHOR_FAILS = 0
+            _NOTARY_ANCHOR_LAST = now
     if not problems:
         return []
     corroborated = [p for p in problems if _NOTARY_EXTERNAL_MARK in p]
@@ -23271,7 +23311,12 @@ def cmd_notary(action="verify"):
     problems, checked, anchors = _notary_verify()
     print("# Aegis notary — %d local link(s), OS-log anchors: %s\n"
           % (checked, anchors))
-    if anchors == "unavailable":
+    if anchors == "timeout":
+        print("NOTE: reading this platform's log store TIMED OUT, so the "
+              "external half of the check did not run. That is a coverage "
+              "gap, not a clean result. The local chain was still "
+              "verified.\n")
+    elif anchors == "unavailable":
         print("NOTE: this platform's log store could not be read back, so the "
               "external half of the check did not run. The local chain was "
               "still verified.\n")
