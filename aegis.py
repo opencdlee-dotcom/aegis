@@ -2203,14 +2203,37 @@ def _classify_linux(path):
 # a DEGRADED sensor rather than letting the silence read as "everything signed".
 _SIG_PROBE_FAILURES = 0
 
-# Every PowerShell-backed probe in this file is sized against ONE measurement: a
-# COLD powershell.exe on a real machine took 21.4s JUST TO START. A cap at or
-# near that is not a timeout, it is a coin flip on whether the interpreter
-# finished booting -- and this file's rule is that a probe which cannot answer
-# must return a non-answer, so a too-tight cap does not degrade gracefully. It
-# converts a working sensor into a permanent coverage gap on exactly the
-# machines that are slowest, and it does it silently.
-WIN_PS_COLD_START_CEILING = 90
+# Every PowerShell-backed probe in this file is sized against MEASUREMENTS of a
+# cold powershell.exe, never a guess. A cap at or near the boot cost is not a
+# timeout, it is a coin flip on whether the interpreter finished booting -- and
+# this file's rule is that a probe which cannot answer must return a non-answer,
+# so a too-tight cap does not degrade gracefully. It converts a working sensor
+# into a permanent coverage gap on exactly the machines that are slowest.
+#
+#   21.4s   a cold powershell.exe JUST TO START. The ceiling was 90 on the
+#           strength of this one number -- about 4x margin over it.
+#   91.15s  ONE uncached Get-AuthenticodeSignature on a cold GitHub windows
+#           runner (2026-09-08, tests/win_live_harness.py section 1, the first
+#           PowerShell of the whole job). Start PLUS probe. It overran the 90s
+#           cap by 1.3% and returned probe_failed, and the batch prefetch a
+#           moment later resolved SIX paths in 16.8s against the now-warm
+#           interpreter -- so that 91s is interpreter boot, not signature work.
+#
+# The second number is why this is 180 and not 90: the old ceiling carried 4x
+# margin over the datum it was picked from and 0.99x over the one the world
+# actually produced. This is the third failure in the family (see also
+# _snapshot_auth_sessions_win and _process_start_token, both raised TO the
+# ceiling after the same mechanism bit them), which is what moves it from
+# runner noise to a number that is simply wrong.
+#
+# The cost of raising it, stated plainly: a genuinely HUNG interpreter now
+# stalls each uncached per-path probe for 180s instead of 90s, and the batch
+# prefetch falls back to exactly those per-path probes when its own chunk
+# times out. That is the accepted trade -- a hang is rare and loud, while a
+# cap below the real cold start is common and costs coverage on every slow
+# machine. Do NOT answer a cold-start overrun by retrying inside the harness:
+# a retry hides the very coverage gap probe_failed exists to surface.
+WIN_PS_COLD_START_CEILING = 180
 
 # Three call sites deliberately stay TIGHTER than the ceiling, because there a
 # hang costs more than a miss. They are the allowlist in
@@ -8613,8 +8636,13 @@ def _parse_win_posture(text):
 
 def _check_hardening_windows():
     findings = []
+    # The ceiling by name, not the number 90 it used to happen to equal. This
+    # probe is as exposed to a cold interpreter as the signature probe is, and
+    # a literal that silently stops tracking the ceiling is how the 2026-09-08
+    # overrun would come back through a different door.
     out, err, rc = run(["powershell", "-NoProfile", "-NonInteractive",
-                        "-Command", _WIN_POSTURE_PS], timeout=90)
+                        "-Command", _WIN_POSTURE_PS],
+                       timeout=WIN_PS_COLD_START_CEILING)
     if rc != 0 or not out.strip():
         _hardening_unknown(findings, "posture", "Windows security posture",
                            err or out)
