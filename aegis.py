@@ -984,6 +984,12 @@ _LOG_SHOW_CACHE = None
 
 # The widest default window, and what it used to be unconditionally.
 _LOG_SHOW_DEFAULT_MAX_H = 6
+# The narrowest. Measured on the reference machine (syspolicy predicate,
+# foreground): 10m = 0.5s CPU, 15m = 1.2s, 30m = 2.0s, 1h = 2.6s. The cost is
+# per-record, so a window sized to the cadence is the whole saving, and the
+# floor exists only to cover logd's ingest latency plus the previous scan's
+# own duration (see _log_show_default_minutes).
+_LOG_SHOW_FLOOR_MIN = 10
 # Frozen for the duration of one scan by _prewarm_log_show. The prewarm cache
 # is keyed by the exact argv, window string included, so a window that changed
 # between prewarming and reading would miss the cache and re-run `log show`
@@ -1009,8 +1015,28 @@ def _last_scan_epoch():
         return None
 
 
-def _log_show_default_hours():
-    """How many hours of unified log to re-read when no caller specifies.
+def _last_scan_started_epoch():
+    """Epoch at which the last completed scan STARTED, or None if unknown.
+
+    The log-show window must reach back past the previous harvest, and that
+    harvest ran near the previous scan's start, not its end. Stamped by
+    record_security_state() from the scan's own cost row; a store written by
+    an older build has only the completion stamp, which _log_show_default_
+    minutes handles by adding the scan's recorded duration back."""
+    try:
+        db = _event_connection()
+        try:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='last_scan_started'").fetchone()
+        finally:
+            db.close()
+        return int(row["value"]) if row and row["value"] else None
+    except Exception:
+        return None
+
+
+def _log_show_default_minutes():
+    """How many minutes of unified log to re-read when no caller specifies.
 
     This was a flat 6h on every scan, and it dominated the scan: prep.log-show
     measured 45.11s mean, 77% of a 58.7s scan, with 170 of 181 samples pinned
@@ -1020,32 +1046,62 @@ def _log_show_default_hours():
     (ProcessType=Background, Nice 10) where identical work measured ~1.8x its
     foreground cost on this arm64 box.
 
-    So the window follows the REAL elapsed time since the last completed scan,
-    doubled for margin. Keyed on elapsed time rather than on the configured
-    cadence deliberately: launchd defers StartInterval on battery -- which has
-    already cost this machine 12 unmonitored hours once -- and a window sized
-    from the schedule would silently skip the deferred stretch it most needs
-    to read.
+    So the window follows the REAL elapsed time since the last scan, doubled
+    for margin. Keyed on elapsed time rather than on the configured cadence
+    deliberately: launchd defers StartInterval on battery -- which has already
+    cost this machine 12 unmonitored hours once -- and a window sized from the
+    schedule would silently skip the deferred stretch it most needs to read.
 
-    Floored at 1h and capped at the previous 6h default, so this can only ever
-    read LESS log than before and never more. A gap longer than 6h is still
-    covered only to 6h, exactly as before: that pre-existing hole is neither
-    widened nor closed here."""
-    last = _last_scan_epoch()
+    The first version of this floored the window at ONE HOUR, and on a
+    ten-minute cadence the floor was therefore the window: every scan
+    re-parsed six times the log it could possibly need, and prep.log-show was
+    still the single most expensive step (17.5s of a 32s scan under the
+    agent's background QoS, 2026-09-08). The elapsed time is now measured
+    from the previous scan's START -- the previous harvest ran near it, so
+    the doubled gap always reaches past that harvest by construction -- and
+    the floor is _LOG_SHOW_FLOOR_MIN, which exists only to cover logd's ingest
+    latency. Capped at the previous 6h default, so a gap longer than that is
+    still covered only to 6h, exactly as before: that pre-existing hole is
+    neither widened nor closed here."""
+    last = _last_scan_started_epoch()
     if not last:
-        return _LOG_SHOW_DEFAULT_MAX_H
+        # A store from before the start stamp existed: reach back past the
+        # completion stamp by the scan's own recorded duration, so the first
+        # scan after an upgrade does not read a window that starts after the
+        # previous harvest ran.
+        done = _last_scan_epoch()
+        if not done:
+            return _LOG_SHOW_DEFAULT_MAX_H * 60
+        last = done - _last_scan_wall_secs()
     gap = _epoch() - last
     if gap <= 0:
-        return _LOG_SHOW_DEFAULT_MAX_H
-    return max(1, min(_LOG_SHOW_DEFAULT_MAX_H,
-                      int(math.ceil(gap * 2 / 3600.0))))
+        return _LOG_SHOW_DEFAULT_MAX_H * 60
+    return max(_LOG_SHOW_FLOOR_MIN, min(_LOG_SHOW_DEFAULT_MAX_H * 60,
+                                        int(math.ceil(gap * 2 / 60.0))))
+
+
+def _last_scan_wall_secs():
+    """Wall seconds of the last completed scan per its own cost row, or 0."""
+    try:
+        for row in get_sensor_health():
+            if row.get("sensor_id") == "scan.cost":
+                return max(0, int(row.get("duration_ms") or 0) // 1000)
+    except Exception:
+        pass
+    return 0
 
 
 def _log_show_window(window_hours):
+    """The `--last` argument: an explicit caller's hours verbatim, else the
+    default window in minutes -- rendered in hours when it is a whole number
+    of them, so the no-history default is the same "6h" argv as before."""
     if window_hours is None:
         if _LOG_SHOW_WINDOW is not None:
             return _LOG_SHOW_WINDOW      # frozen for this scan
-        window_hours = _log_show_default_hours()
+        minutes = _log_show_default_minutes()
+        if minutes % 60 == 0:
+            return "%dh" % (minutes // 60)
+        return "%dm" % minutes
     return "%dh" % max(1, min(int(window_hours), 48))
 
 
@@ -5420,6 +5476,17 @@ def record_security_state(findings, sensor_health=(), now=None,
                 log_run("age-out skipped: %s" % e)
             db.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON "
                        "CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+            # When this scan STARTED, from its own cost row: the next scan's
+            # log-show window is sized from here, because the harvest it must
+            # reach back past ran near the start of this one, not its end.
+            for row in sensor_health or ():
+                if isinstance(row, dict) and row.get("sensor_id") == "scan.cost":
+                    wall = max(0, int(row.get("duration_ms") or 0) // 1000)
+                    db.execute(
+                        "INSERT INTO meta(key,value) VALUES('last_scan_started',?)"
+                        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(now - wall),))
+                    break
         # Bound raw observations while retaining materialized signals/incidents.
         # Evidence attached to an incident IS materialized state: the FK is
         # ON DELETE CASCADE with foreign_keys=ON, so pruning a referenced row
@@ -20745,6 +20812,20 @@ def cmd_allow(path):
 
 WATCH_DEBOUNCE_SECS = 3   # let a write burst settle so it costs one scan
 WATCH_MIN_GAP_SECS = 60   # floor between event-triggered scans (battery bound)
+# A change event no longer buys a full scan by itself. It buys a QUICK LOOK:
+# only the sensors that read the changed path run, nothing is written, and a
+# full scan follows only when one of their findings is something emit() would
+# record. Measured before this existed (2026-09-08, reference machine): an
+# agent session's IPC sockets churned /tmp every few seconds, the loop
+# rescanned as fast as WATCH_MIN_GAP_SECS allowed, and 1577 event scans over
+# five days -- 33 in one hour, 25% of that hour's CPU -- found nothing the
+# ten-minute floor scan would not have. A look at /tmp costs ~0.1s under the
+# agent's QoS against ~32s for the scan it replaces.
+WATCH_LOOK_GAP_SECS = 15  # floor between looks: a churning dir cannot spin it
+WATCH_STREAM_WAKE = "<xprotect-stream>"   # the live log tail woke the loop
+WATCH_UNKNOWN = "<unknown-path>"           # a wake this platform cannot name
+# Indirected so the loop can be driven by a test without wall-clock waits.
+_watch_sleep = time.sleep
 
 # Watch-loop survivability. The loop caught KeyboardInterrupt and nothing else,
 # so ANY other exception ended the process — and under launchd that is not a
@@ -20858,15 +20939,19 @@ def _watch_fingerprint():
 
 
 def _poll_for_change(timeout):
-    """Block up to `timeout` seconds, returning True as soon as any watched path
-    changes. The portable counterpart to _wait_for_change()."""
+    """Block up to `timeout` seconds, returning the set of watched paths that
+    changed as soon as any does (empty on timeout). The portable counterpart
+    to _wait_for_change(); the polled snapshot already knows WHICH path moved,
+    so the quick look gets the same answer here as from a kqueue."""
     deadline = time.time() + timeout
     before = _watch_fingerprint()
     while time.time() < deadline:
         time.sleep(min(WATCH_POLL_SECS, max(0.1, deadline - time.time())))
-        if _watch_fingerprint() != before:
-            return True
-    return False
+        after = _watch_fingerprint()
+        if after != before:
+            return frozenset(p for p in set(before) | set(after)
+                             if before.get(p) != after.get(p))
+    return frozenset()
 
 
 # --- Linux: real event-driven change detection, via inotify through ctypes -- #
@@ -20973,10 +21058,11 @@ def _build_watch(extra_read_fds=()):
     """A kqueue armed over _watch_paths() (EVFILT_VNODE: write/extend/delete/
     rename), plus EVFILT_READ on any `extra_read_fds` (the live log-stream tail
     — data arriving there wakes the loop exactly like a file change). Returns
-    (kq, fds); caller must _close_watch(kq, fds) — extra fds are NOT closed
-    here, they belong to their subprocess."""
+    (kq, fds) with fds a {fd: path} map of the vnode fds this call opened;
+    caller must _close_watch(kq, fds) — extra fds are NOT in the map and NOT
+    closed here, they belong to their subprocess."""
     kq = select.kqueue()
-    fds, evs = [], []
+    fds, evs = {}, []
     fflags = (select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND |
               select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)
     for p in _watch_paths():
@@ -20984,7 +21070,7 @@ def _build_watch(extra_read_fds=()):
             fd = os.open(p, O_EVTONLY)  # macOS: watch without blocking unmount
         except OSError:
             continue
-        fds.append(fd)
+        fds[fd] = p
         evs.append(select.kevent(
             fd, filter=select.KQ_FILTER_VNODE,
             flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=fflags))
@@ -20998,12 +21084,25 @@ def _build_watch(extra_read_fds=()):
     return kq, fds
 
 
-def _wait_for_change(kq, timeout):
-    """True if any watched path changed within `timeout` seconds."""
+def _wait_for_change(kq, timeout, fds=None):
+    """The set of watched paths that changed within `timeout` seconds (empty
+    on timeout, so it is still False-y exactly where the old bool was).
+
+    `fds` is _build_watch's {fd: path} map. An ident outside it is one of the
+    extra read fds — the live XProtect tail — and is reported as
+    WATCH_STREAM_WAKE; with no map at all every wake is WATCH_UNKNOWN, which
+    the quick look treats as "run everything"."""
     try:
-        return bool(kq.control(None, 64, timeout))
+        events = kq.control(None, 64, timeout)
     except OSError:
-        return False
+        return frozenset()
+    changed = set()
+    for ev in events:
+        if fds is None:
+            changed.add(WATCH_UNKNOWN)
+        else:
+            changed.add(fds.get(ev.ident, WATCH_STREAM_WAKE))
+    return frozenset(changed)
 
 
 def _close_watch(kq, fds):
@@ -21079,13 +21178,139 @@ def _stop_stream(proc):
                     pass
 
 
+def _path_under(path, roots):
+    return any(path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def _sensors_for_change(changed):
+    """Which sensor classes read the paths in `changed`, or None when the
+    answer is "all of them, run the full scan": a wake from the live XProtect
+    tail (its harvest needs `log show`, which no quick look runs), a wake a
+    platform could not attribute to a path, or a path this map does not know.
+    Every path _watch_paths() arms is one of the classes below; an unknown
+    one means the watched set grew and this map did not, and the safe
+    reading of that is the old behaviour, not silence."""
+    classes = set()
+    for p in changed:
+        if p in (WATCH_STREAM_WAKE, WATCH_UNKNOWN):
+            return None
+        known = False
+        if p in STAGING_DIRS:
+            classes.add("staging")
+            known = True
+        if p in HOT_DIRS or _path_under(p, HOT_DIRS):
+            classes.add("hot-dir")     # the dir, or an armed .app under it
+            known = True
+        if p in PERSISTENCE_DIRS or os.path.dirname(p) in PERSISTENCE_DIRS:
+            classes.add("persistence")  # the dir, or an armed plist in it
+            known = True
+        if p in SHELL_HISTORY_FILES:
+            classes.add("shell-history")
+            known = True
+        if p in SHELL_RC_FILES:
+            classes.add("shellrc")
+            known = True
+        if p in WALLET_CONFIG_FILES:
+            classes.add("wallet")
+            known = True
+        if p in EXTRA_PERSIST_DIRS or p in EXTRA_PERSIST_FILES:
+            classes.add("extra_persist")
+            known = True
+        if not known:
+            return None
+    return classes
+
+
+def _quick_look_findings(classes):
+    """Findings from just the sensors in `classes`, computed the way the scan
+    computes them and written nowhere. None means a sensor gave a non-answer
+    (no snapshot, a privilege wall, no baseline to diff against, a surface
+    not yet adopted) — a full scan must judge that, a look must not."""
+    _reset_unexamined()
+    findings = []
+    plain = (("hot-dir", check_hot_dirs), ("staging", check_staging),
+             ("shell-history", check_shell_history))
+    for label, fn in plain:
+        if label in classes:
+            out = _run_as_sensor(label, fn)
+            if out is None:
+                return None
+            findings += out
+    surface_keys = classes & {"shellrc", "wallet", "extra_persist"}
+    if "persistence" in classes or surface_keys:
+        baseline, corrupt = load_baseline()
+        if baseline is None or corrupt:
+            return None
+        if "persistence" in classes:
+            current = _run_as_sensor("persistence.snapshot",
+                                     snapshot_persistence)
+            if current is None:
+                return None
+            findings += _apply_writ(
+                _run_as_sensor("persistence.diff", check_persistence,
+                               baseline.get("persistence"), current),
+                "persistence")
+        for row in SURFACES:
+            key, snap_fn, diff_fn, scope, _never, _adopt = _surface_row(row)
+            if key not in surface_keys:
+                continue
+            cur = _run_as_sensor("surface." + key, snap_fn)
+            if cur is None or cur is SURFACE_PRIVILEGED:
+                return None
+            prior = baseline.get(key)
+            if prior is None:
+                return None
+            findings += _apply_writ(diff_fn(prior, cur), scope)
+    return findings
+
+
+def _change_warrants_rescan(changed):
+    """(warranted, why) for a set of changed watch paths — the quick look.
+
+    Runs only the sensors that read those paths, writes nothing, and asks the
+    one question a full scan's emit() would ask of their findings: would any
+    of them be RECORDED — routed to the interrupt or digest tier rather than
+    already in the seen ledger or allowlisted? If yes, the full scan runs now
+    and reports it through the one normal pipeline, exactly as before. If no,
+    the change was churn and the interval floor scan reconciles everything.
+
+    Doubt answers True. A sensor that raises, a snapshot it cannot take, a
+    baseline it cannot read, a surface not yet adopted, a path the map does
+    not know and the live XProtect tail all fall through to the full scan,
+    which is the pre-existing behaviour — this gate can only ever REMOVE
+    scans whose findings were provably already on record."""
+    classes = _sensors_for_change(changed)
+    if classes is None:
+        return True, "not a file event this look can judge"
+    try:
+        findings = _quick_look_findings(classes)
+    except Exception as e:
+        return True, "quick look failed: %s: %s" % (type(e).__name__, e)
+    where = ", ".join(sorted(classes))
+    if findings is None:
+        return True, "a %s sensor gave no answer" % where
+    if not findings:
+        return False, "nothing found under %s" % where
+    routing = _route_for_scan(findings, False, frozenset())
+    unrecorded = [f for f in findings
+                  if (routing.get(f.get("fingerprint")) or {}).get("route")
+                  in (ROUTE_INTERRUPT, ROUTE_DIGEST)]
+    if unrecorded:
+        return True, "%d unrecorded finding(s) under %s" % (len(unrecorded),
+                                                            where)
+    return False, ("%d finding(s) under %s, every one already on record"
+                   % (len(findings), where))
+
+
 def cmd_watch(interval=600):
     """Foreground watch loop. Event-driven where kqueue exists (macOS: always):
-    a change to a watched path rescans within ~WATCH_DEBOUNCE_SECS (rate-limited
-    to one event scan per WATCH_MIN_GAP_SECS), and a full scan runs every
-    `interval` seconds as a floor. Production: `bash install.sh watch` runs this
-    under launchd KeepAlive. Falls back to plain interval polling if kqueue is
-    somehow unavailable.
+    a change to a watched path gets a quick look within ~WATCH_DEBOUNCE_SECS
+    (see _change_warrants_rescan), a full scan follows when the look finds
+    something unrecorded (rate-limited to one event scan per
+    WATCH_MIN_GAP_SECS), and a full scan runs every `interval` seconds as a
+    floor — measured from the last FULL scan, so churn cannot postpone it.
+    Production: `bash install.sh watch` runs this under launchd KeepAlive.
+    Falls back to plain interval polling if kqueue is somehow unavailable.
 
     An iteration that raises is logged and backed off, never fatal: under
     KeepAlive an exit is an ACCELERATOR, not a stop (see WATCH_FAIL_CAP above
@@ -21104,45 +21329,54 @@ def cmd_watch(interval=600):
     print("Aegis watch: %s. Ctrl-C to stop." % mode)
     stream = _spawn_xprotect_stream() if has_kq else None
     consecutive = 0
+    due = True          # a full scan is owed right now
+    last_full = 0.0     # when the last full scan started
+    looked = skipped = 0
     try:
         while True:
             try:
                 # This process holds run.out/run.err open for its whole life,
                 # so nothing else will ever bound them for it.
                 _trim_stdio_logs()
-                started = time.time()
-                cmd_scan(quiet=True)
+                if due:
+                    if looked:
+                        log_run("watch: %d change event(s) looked at since "
+                                "the last full scan; %d warranted no rescan"
+                                % (looked, skipped))
+                    looked = skipped = 0
+                    last_full = time.time()
+                    cmd_scan(quiet=True)
+                    due = False
+                # The floor is owed `interval` after the last full scan
+                # STARTED, whatever woke the loop in between. Waiting a fresh
+                # `interval` after every wake — which is what this did — let
+                # a churning watched dir postpone the reconciliation scan
+                # indefinitely.
+                remaining = max(0.0, last_full + interval - time.time())
                 if not has_kq:
                     # Event-driven where the kernel offers it (inotify on
                     # Linux), polled where it does not — then the SAME
-                    # debounce and rate limit the kqueue path uses, so the
-                    # three platforms differ in latency only, never in what
-                    # they conclude. Re-armed each pass because the watched
-                    # set itself changes as persistence items come and go.
+                    # debounce, look and rate limit the kqueue path uses, so
+                    # the three platforms differ in latency only, never in
+                    # what they conclude. Re-armed each pass because the
+                    # watched set itself changes as persistence items come
+                    # and go. inotify cannot yet name the path that woke it,
+                    # so its look runs every file-shaped sensor.
                     ino_fd = (_build_watch_inotify()[0] if has_inotify
                               else None)
                     if ino_fd is not None:
                         try:
-                            changed = _wait_for_change_inotify(ino_fd,
-                                                               interval)
+                            woke = _wait_for_change_inotify(ino_fd, remaining)
                         finally:
                             try:
                                 os.close(ino_fd)
                             except OSError:
                                 pass
+                        changed = (frozenset([WATCH_UNKNOWN]) if woke
+                                   else frozenset())
                     else:
-                        changed = _poll_for_change(interval)
-                    if changed:
-                        time.sleep(WATCH_DEBOUNCE_SECS)
-                        remain = WATCH_MIN_GAP_SECS - (time.time() - started)
-                        if remain > 0:
-                            time.sleep(remain)
-                        log_run("watch: change event -> rescan")
+                        changed = _poll_for_change(remaining)
                 else:
-                    # Was a bare `continue`. It is an `else` now so that the
-                    # success reset at the bottom is reachable from BOTH arms:
-                    # a `continue` here would have skipped it, and the backoff
-                    # would then never clear on the polled/inotify platforms.
                     if stream is not None and stream.poll() is not None:
                         stream = _spawn_xprotect_stream()  # tail died → respawn
                     extra = (stream.stdout.fileno(),) if stream else ()
@@ -21151,17 +21385,27 @@ def cmd_watch(interval=600):
                     # ms-wide gap.
                     kq, fds = _build_watch(extra)
                     try:
-                        if _wait_for_change(kq, interval):
-                            time.sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
-                            if stream is not None:
-                                # level-triggered read fd: MUST drain or spin
-                                _drain_fd(stream.stdout.fileno())
-                            remain = WATCH_MIN_GAP_SECS - (time.time() - started)
-                            if remain > 0:
-                                time.sleep(remain)  # rate-limit event scans
-                            log_run("watch: change event -> rescan")
+                        changed = _wait_for_change(kq, remaining, fds)
                     finally:
                         _close_watch(kq, fds)
+                if changed:
+                    _watch_sleep(WATCH_DEBOUNCE_SECS)  # settle the burst
+                    if stream is not None:
+                        # level-triggered read fd: MUST drain or spin
+                        _drain_fd(stream.stdout.fileno())
+                    looked += 1
+                    warranted, why = _change_warrants_rescan(changed)
+                    if warranted:
+                        remain = WATCH_MIN_GAP_SECS - (time.time() - last_full)
+                        if remain > 0:
+                            _watch_sleep(remain)  # rate-limit event scans
+                        log_run("watch: change event -> rescan (%s)" % why)
+                        due = True
+                    else:
+                        skipped += 1
+                        _watch_sleep(WATCH_LOOK_GAP_SECS)  # rate-limit looks
+                else:
+                    due = True  # the floor came due
                 # A completed iteration — scan AND arm — is the only evidence
                 # this loop is healthy, so the counter clears here and nowhere
                 # earlier. Resetting right after cmd_scan would have made the
