@@ -50,7 +50,13 @@ class TestLogShowWindow(_Patched):
         super().setUp()
         aegis.init_event_store()
         self.patch("_LOG_SHOW_WINDOW", None)
+        # Pinned: the window is ceil(2 * gap / 60), so a second ticking
+        # between this read and the function's own moved a 300s gap from
+        # "10m" to "11m" on a slow CI runner.
         self.now = int(time.time())
+        real_epoch = self.patch("_epoch", None)
+        aegis._epoch = lambda value=None: (self.now if value is None
+                                           else real_epoch(value))
 
     def _meta(self, key, value):
         db = aegis._event_connection()
@@ -305,8 +311,10 @@ class TestChangeWarrantsRescan(_Patched):
         self.assertEqual(before, after, "a look must not create scan state")
 
 
-@unittest.skipUnless(aegis.IS_MAC and shutil.which("clang"),
-                     "a real hot-dir verdict needs codesign and clang")
+@unittest.skipUnless(sys.platform == "darwin" and aegis.IS_MAC
+                     and shutil.which("clang"),
+                     "a real hot-dir verdict needs a real Mach-O, codesign and "
+                     "clang -- the kernel, not just the flag simbody flips")
 class TestChangeWarrantsRescanLive(_Patched):
     """The gate against the real hot-dir sensor, not a stub of it."""
 
