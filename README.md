@@ -356,9 +356,10 @@ python3 aegis.py neutralize TARGET   # persistence kill-chain: unregister → ki
 bash install.sh              # background it via launchd (hourly); one baseline first
 bash install.sh 1800         # ...or every 30 min (re-run keeps your baseline)
 bash install.sh watch        # ...or EVENT-DRIVEN (recommended): a stdlib kqueue over
-                             #    the persistence/hot/staging/rc/history paths rescans
-                             #    within SECONDS of a change (debounced, ≤1 event-scan
-                             #    per minute), full scan every 10 min as a floor
+                             #    the persistence/hot/staging/rc/history paths takes a
+                             #    quick look within SECONDS of a change and rescans when
+                             #    the look finds something unrecorded (≤1 event-scan per
+                             #    minute), full scan every 10 min as a floor
 bash uninstall.sh            # remove the launchd agent
 python3 selftest.py                    # quick detection-logic smoke (stdlib only)
 python3 -m unittest discover -s tests  # full regression suite (stdlib only)
@@ -668,9 +669,11 @@ targets exactly this residue. Two boundaries stated plainly:
   XProtect log entry, a keychain copy) — not one that ran and vanished in the gap.
   **`install.sh watch` narrows this gap to seconds** for watched file-touch surfaces
   (a persistence write, a `/tmp` staging drop, an rc edit, a pasted ClickFix line
-  hitting history — each triggers a kqueue rescan within ~3s, rate-limited to one
-  event-scan/min), while argv/XProtect/listener sampling still runs at the
-  full-scan floor. A periodic reconciliation remains mandatory because vnode
+  hitting history — each triggers a kqueue *quick look* within ~3s: only the
+  sensors that read the changed path run, and a full rescan follows when one of
+  their findings is not already on record, rate-limited to one event-scan/min;
+  churn that the ledger already knows costs a look, not a scan), while
+  argv/XProtect/listener sampling still runs at the full-scan floor. A periodic reconciliation remains mandatory because vnode
   events can coalesce or be missed. Even so it is detection *after* the write — Aegis **detects
   residue; it does not block.**
 - **Same-user only.** An unprivileged agent can read the command line of *your*
@@ -733,8 +736,11 @@ A security tool sees everything, so it must be trustworthy *by construction*:
 
 - ✅ **Event-assisted observation — SHIPPED** as `install.sh watch`: a stdlib
   `select.kqueue` over the persistence/hot/staging/rc/history/wallet paths
-  rescans within seconds of a change (debounced; ≤1 event-scan/min), full scan
-  every 10 min as the floor. **Both halves now shipped:** a persistent
+  takes a quick look within seconds of a change — the sensors for that path
+  only, written nowhere — and rescans when the look finds something the seen
+  ledger does not already hold (debounced; ≤1 event-scan/min), full scan every
+  10 min as the floor, measured from the last full scan so churn cannot defer
+  it. **Both halves now shipped:** a persistent
   `log stream` tail of Apple's XProtect subsystem is armed as an `EVFILT_READ`
   source on the same kqueue, so a live XProtect detection wakes a rescan the
   moment Apple's engine writes it — the rescan's windowed harvest then reports

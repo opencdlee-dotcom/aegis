@@ -1085,6 +1085,9 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
 - Logs rotate to bound storage. Sensitive values are redacted before persistence.
 - Watch mode is event-assisted, debounced, rate-limited, and always reconciles
   on a periodic full scan; vnode notification is not treated as a complete log.
+  A change event buys a quick look (the sensors for that path, nothing written)
+  and a full scan only when the look finds something not already on record;
+  every non-answer in the look falls through to the full scan.
 - `doctor` exposes permission and sensor degradation. Three consecutive sensor
   failures open one health incident; recovery resolves it and resets the count.
 - Capability-dependent inventories such as Background Task Management report
