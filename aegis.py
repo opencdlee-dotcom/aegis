@@ -4704,6 +4704,32 @@ def _apply_path_lineage(db, new_events, now, initially_notified=False,
     return attached
 
 
+def _correlation_pairs(observations, left_pred, right_pred, window):
+    """Yield (left_id, right_id, left, right) for every ordered pair of
+    observations that passes both predicates, lands inside `window` seconds
+    and shares an entity -- the pairs a chain rule promotes.
+
+    Each predicate runs ONCE per observation. The first version re-ran
+    right_pred for every left that passed, and with 3153 observations in the
+    live 30-minute window that was ~230 x 3153 predicate calls for one chain
+    rule alone; the correlator was the largest pure-Python cost in a scan
+    (2026-09-08 profile), and pure Python pays the agent's background-QoS
+    multiplier in full. Same pairs, same order, same predicates."""
+    lefts = [(i, at, f) for i, at, f in observations if left_pred(f)]
+    if not lefts:
+        return
+    rights = [(i, at, f) for i, at, f in observations if right_pred(f)]
+    for left_id, left_at, left in lefts:
+        for right_id, right_at, right in rights:
+            if left_id == right_id:
+                continue
+            if abs(left_at - right_at) > window:
+                continue
+            if not _same_entity(left, right):
+                continue
+            yield left_id, right_id, left, right
+
+
 def _apply_correlations(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
@@ -4748,22 +4774,14 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
 
     def correlate(base_key, title, left_pred, right_pred, window=900):
         matches_by_entity = {}
-        for left_id, left_at, left in observations:
-            if not left_pred(left):
-                continue
-            for right_id, right_at, right in observations:
-                if left_id == right_id or not right_pred(right):
-                    continue
-                if abs(left_at - right_at) > window:
-                    continue
-                if not _same_entity(left, right):
-                    continue
-                if left_id in new_ids or right_id in new_ids:
-                    entity = _canon_entity_path(_shared_entity(left, right))
-                    entity_key = hashlib.sha256(
-                        entity.encode("utf-8", "replace")).hexdigest()[:16]
-                    matches_by_entity.setdefault(entity_key, set()).update(
-                        (left_id, right_id))
+        for left_id, right_id, left, right in _correlation_pairs(
+                observations, left_pred, right_pred, window):
+            if left_id in new_ids or right_id in new_ids:
+                entity = _canon_entity_path(_shared_entity(left, right))
+                entity_key = hashlib.sha256(
+                    entity.encode("utf-8", "replace")).hexdigest()[:16]
+                matches_by_entity.setdefault(entity_key, set()).update(
+                    (left_id, right_id))
         for entity_key, matches in matches_by_entity.items():
             key = "%s:%s" % (base_key, entity_key)
             incident_id = _upsert_incident(
@@ -15483,23 +15501,29 @@ def _agent_config_files():
                            if d not in ("node_modules", ".git", "__pycache__",
                                         "venv", ".venv", "dist", "build")]
             for fn in filenames:
-                p = os.path.join(dirpath, fn)
-                if os.path.islink(p):
-                    continue
                 if repo_scoped:
                     take = fn in AGENT_REPO_CONFIG_NAMES
                 else:
                     take = (fn.endswith((".json", ".toml")) or
                             fn in AGENT_INSTRUCTION_NAMES)
-                if take:
-                    seen.append(p)
-                    # Checked AFTER the append, as the single-budget version
-                    # was: a cap of 1 must truncate on the first candidate.
-                    if (len(seen) - root_start >= _AGENT_SCAN_ROOT_CAP or
-                            len(seen) >= _AGENT_SCAN_FILE_CAP):
-                        _starved(root)
-                        stop = True
-                        break
+                if not take:
+                    continue
+                p = os.path.join(dirpath, fn)
+                # The symlink check is an lstat, and it ran on every file the
+                # walk listed -- ~30,000 on the reference machine, for the
+                # few hundred whose NAME even qualified. Name first, stat
+                # only the candidates: a symlink that was never a candidate
+                # was skipped either way.
+                if os.path.islink(p):
+                    continue
+                seen.append(p)
+                # Checked AFTER the append, as the single-budget version
+                # was: a cap of 1 must truncate on the first candidate.
+                if (len(seen) - root_start >= _AGENT_SCAN_ROOT_CAP or
+                        len(seen) >= _AGENT_SCAN_FILE_CAP):
+                    _starved(root)
+                    stop = True
+                    break
     return seen
 
 
@@ -23381,18 +23405,39 @@ def _notary_read_anchors(hours=24):
     clean (siege finding). The conflict set is the physical evidence — two anchors
     for one seq — that the collapse discarded. Returns None when the channel is
     unavailable (distinct from an empty result), preserved for the caller."""
+    global _NOTARY_ANCHOR_MEMORY
     seen = {}
     conflicts = set()
+    incremental = False
     if IS_MAC:
         # `process == "logger"` is an INDEXED predicate; the obvious
         # `eventMessage CONTAINS "AEGIS-ANCHOR"` is a full-text scan of the
         # whole archive and was measured at >120s (vs ~4s) against a 1.7GB
         # store on the author's machine. Same result set, two orders of
         # magnitude apart — the marker is then matched in-process below.
-        out, _e, rc = run(["log", "show", "--style", "syslog",
-                           "--last", "%dh" % hours,
-                           "--predicate", 'process == "logger"'],
-                          timeout=90)
+        #
+        # Read the whole window once per process, then only what the store
+        # has appended since. The hourly re-read of a full 24h window cost
+        # 13.2s CPU under the agent's background QoS (2026-09-08) for 115
+        # anchors it had already seen; the same hour read from `--start`
+        # costs 3.3s. The window's MEANING is unchanged: anchors are aged out
+        # of memory at `hours`, exactly as the store's own window would have
+        # dropped them, and every conflict check runs over the retained set.
+        now = _epoch()
+        mem = _NOTARY_ANCHOR_MEMORY
+        incremental = (mem is not None
+                       and 0 <= now - mem["until"] < hours * 3600)
+        if incremental:
+            start = mem["until"] - _NOTARY_ANCHOR_OVERLAP
+            argv = ["log", "show", "--style", "syslog", "--start",
+                    datetime.fromtimestamp(start).astimezone().strftime(
+                        "%Y-%m-%d %H:%M:%S%z"),
+                    "--predicate", 'process == "logger"']
+        else:
+            argv = ["log", "show", "--style", "syslog",
+                    "--last", "%dh" % hours,
+                    "--predicate", 'process == "logger"']
+        out, _e, rc = run(argv, timeout=90)
     elif IS_LINUX:
         out, _e, rc = run(["journalctl", "-t", _NOTARY_TAG,
                            "--since", "-%dh" % hours, "--no-pager"],
@@ -23404,7 +23449,10 @@ def _notary_read_anchors(hours=24):
                            "ProviderName='%s'} -ErrorAction SilentlyContinue | "
                            "ForEach-Object { $_.Message }" % _NOTARY_TAG],
                           timeout=120)
-    if rc != 0 or not out:
+    # An incremental read that found nothing is an EMPTY hour, not an absent
+    # channel: `log show` still prints its header, and rc says whether the
+    # store was read. Only a full read judges the channel by its output.
+    if rc != 0 or (not out and not incremental):
         if rc == 124:
             # A TIMEOUT is not "this platform has no anchor channel", and the
             # two need OPPOSITE handling. An absent channel fails instantly and
@@ -23415,11 +23463,29 @@ def _notary_read_anchors(hours=24):
             # the chain is intact" -- while the only root-corroborated half of
             # the tamper-evidence check did not run. The ledger already exists
             # for this shape; _prewarm_log_show uses it for its own harvests.
-            unexamined("notary anchors (%dh of the OS log store)" % hours,
+            # Memory is left as it was: the next read resumes from the same
+            # point rather than starting the window over.
+            unexamined("notary anchors (%s of the OS log store)"
+                       % ("the part appended since the last read"
+                          if incremental else "%dh" % hours),
                        "rc=%s, %d bytes -- the root-corroborated half of the "
                        "tamper-evidence check did not run" % (rc, len(out or "")))
             return _NOTARY_READ_TIMEOUT
         return None  # channel unavailable — distinct from "no anchors found"
+    if IS_MAC:
+        rows = dict(mem["rows"]) if incremental else {}
+        for ts, seq, head in _notary_anchor_rows(out, now):
+            rows[(seq, head)] = max(ts, rows.get((seq, head), 0))
+        cutoff = now - hours * 3600
+        rows = {k: ts for k, ts in rows.items() if ts >= cutoff}
+        _NOTARY_ANCHOR_MEMORY = {"until": now, "rows": rows}
+        # Chronological, last wins -- the order the store would have handed
+        # a single read -- so a conflict is judged over everything retained.
+        for (seq, head), _ts in sorted(rows.items(), key=lambda kv: kv[1]):
+            if seq in seen and seen[seq] != head:
+                conflicts.add(seq)   # a shadow anchor was appended for this seq
+            seen[seq] = head
+        return seen, conflicts
     for m in re.finditer(r"%s seq=(\d+) head=([0-9a-f]{16,64})" % _NOTARY_MARK,
                          out):
         seq, head = int(m.group(1)), m.group(2)
@@ -23427,6 +23493,43 @@ def _notary_read_anchors(hours=24):
             conflicts.add(seq)   # a shadow anchor was appended for this seq
         seen[seq] = head
     return seen, conflicts
+
+
+# What the process has already read back from the macOS log store:
+# {"until": epoch of the read, "rows": {(seq, head): epoch of the anchor}}.
+# In-process only, never a file -- a same-uid attacker who could edit a file
+# of remembered anchors could equally edit the local chain it corroborates,
+# and the point of the anchors is that the store holding them is root-owned.
+# A by-hand `aegis.py notary` is a fresh process and always reads the whole
+# window; only the long-lived watch loop accumulates.
+_NOTARY_ANCHOR_MEMORY = None
+_NOTARY_ANCHOR_OVERLAP = 120    # seconds re-read past `until`: logd ingest lag
+_NOTARY_STAMP_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.\d+)?([+-]\d{4})")
+_NOTARY_ANCHOR_RE = re.compile(
+    r"%s seq=(\d+) head=([0-9a-f]{16,64})" % _NOTARY_MARK)
+
+
+def _notary_anchor_rows(out, now):
+    """[(epoch, seq, head)] for every anchor line in syslog-style `log show`
+    output. A line whose leading timestamp does not parse is dated `now`:
+    kept, and aged out of memory `hours` later like any other."""
+    rows = []
+    for line in out.splitlines():
+        m = _NOTARY_ANCHOR_RE.search(line)
+        if not m:
+            continue
+        ts = now
+        stamp = _NOTARY_STAMP_RE.match(line)
+        if stamp:
+            try:
+                ts = int(datetime.strptime(
+                    stamp.group(1) + stamp.group(2),
+                    "%Y-%m-%d %H:%M:%S%z").timestamp())
+            except ValueError:
+                pass
+        rows.append((ts, int(m.group(1)), m.group(2)))
+    return rows
 
 
 def notary_append():
