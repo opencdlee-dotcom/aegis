@@ -4303,7 +4303,17 @@ class TestPersistenceChangeDetail(Sandbox):
         self.assertIn("program /usr/bin/python3 -> /tmp/evil", detail)
 
     def test_program_bytes_change_shows_hash_delta_when_path_same(self):
-        detail = self._changed(self._base(), self._base(sha256="beef1234feed99"))
+        # A bytes-only change to an APPLE platform binary under SIP is now a
+        # separate, collapsed finding (_os_program_update): one per updated
+        # program instead of one per launchd job referencing it, because the
+        # macOS 27.0 update moved /bin/bash once and minted 29 incidents.
+        # This test is about the DETAIL message for a program-bytes change, so
+        # it names an interpreter that is not on the sealed system volume --
+        # /opt/homebrew is operator-writable and in RISKY_PREFIXES.
+        brew = "/opt/homebrew/bin/python3"
+        detail = self._changed(self._base(program=brew),
+                               self._base(program=brew,
+                                          sha256="beef1234feed99"))
         self.assertIn("program bytes", detail)
         self.assertIn("0f534e4b", detail)
         self.assertIn("beef1234feed", detail)

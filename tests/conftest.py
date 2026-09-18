@@ -336,6 +336,9 @@ _MAC_ONLY_CLASSES = frozenset((
     # macOS response-tier + system-tool path/environment assertions
     "TestResponseTier", "TestSensorHealthCore",
     "TestDurabilityAndCommandBoundary",
+    # SIP + the sealed system volume: an OS platform-binary update is a
+    # macOS-shaped fact, and _os_program_update refuses off macOS by design.
+    "OneOsUpdateIsOneFinding", "TheGuardRefusesEverythingItShould",
 ))
 
 

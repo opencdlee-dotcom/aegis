@@ -2153,6 +2153,33 @@ def _sig_stat(path):
         return None
 
 
+# Bump when the MEANING of a cached verdict changes, so a logic fix actually
+# reaches a running install.
+#
+# The cache is keyed on (path, stat-signature) and stores the VERDICT. That is
+# correct for its purpose -- a rebuilt binary changes its stat and re-probes --
+# and it quietly defeats every fix to the classifier itself, because a fix
+# changes no file on disk. When the Apple leaf-authority match was repaired,
+# the live install had /bin/bash cached as
+#
+#     {"authority": "macOS Software Signing", "trust": "signed-other"}
+#
+# with a stat that will never change again, so the corrected code would have
+# gone on reading the wrong answer out of the cache indefinitely. A fix that
+# cannot reach a running install is not a fix, and nothing in the file said so.
+#
+# Versioned per ENTRY rather than once per file: a mismatched entry is simply
+# a miss, so the cache self-heals lazily as paths are touched, no reserved key
+# competes with the LRU trim in flush_sigcache(), and a half-written cache
+# from an interrupted scan cannot leave stale verdicts behind a fresh stamp.
+#
+#   1  (implicit) pre-2026-09-17 entries; Apple OS-signing matched by an exact
+#      leaf string, so every platform binary on macOS >= 26 read signed-other.
+#   2  `_is_apple_os_signing`: leaf matched as a family, conjunctive with
+#      Apple's OS-signing CA.
+_SIGCACHE_LOGIC_VERSION = 2
+
+
 def classify_signature(path):
     """
     Return {trust, team, authority} — the platform's answer to "who vouches for
@@ -2177,7 +2204,8 @@ def classify_signature(path):
 
     stat_sig = _sig_stat(path)
     cached = _sigcache.get(path)
-    if cached and stat_sig is not None and cached.get("stat") == stat_sig:
+    if (cached and stat_sig is not None and cached.get("stat") == stat_sig
+            and cached.get("v") == _SIGCACHE_LOGIC_VERSION):
         # LRU touch: move to newest so the insertion-order trim in
         # flush_sigcache() evicts genuinely least-recently-USED entries, not just
         # first-inserted ones (an hourly-hit path must outlive a dead one-off).
@@ -2194,7 +2222,8 @@ def classify_signature(path):
 
     if stat_sig is not None and not result.pop("probe_failed", False):
         _sigcache.pop(path, None)  # overwrite any prior entry for this path
-        _sigcache[path] = {"stat": stat_sig, "result": result}
+        _sigcache[path] = {"stat": stat_sig, "result": result,
+                           "v": _SIGCACHE_LOGIC_VERSION}
     return result
 
 
@@ -2434,8 +2463,14 @@ def warm_signature_cache(paths):
                 # non-answer, and non-answers are never cached.
                 continue
             _sigcache.pop(path, None)
+            # Stamped like every other writer. Unstamped entries are a MISS,
+            # so omitting this here did not produce a wrong verdict -- it
+            # silently turned the batch into one probe per path and threw the
+            # prefetch away, which is why the cost tests caught it and no
+            # correctness test did.
             _sigcache[path] = {"stat": stat_sig,
-                               "result": _win_verdict(status, signer)}
+                               "result": _win_verdict(status, signer),
+                               "v": _SIGCACHE_LOGIC_VERSION}
             resolved += 1
     return resolved
 
@@ -2468,6 +2503,47 @@ def _sig_batch_chunks(paths):
         yield chunk
 
 
+# Apple renames the leaf authority on its own OS-signing certificate between
+# major releases: "Software Signing" through macOS 15, "macOS Software Signing"
+# from macOS 26. The equality test that predated this helper therefore stopped
+# matching on upgrade day and, because nothing else in the chain of branches
+# claims an Apple binary, EVERY platform binary on the machine silently
+# reclassified from `apple` to `signed-other` -- "signed, but by nobody I
+# recognize". Measured on the reference Mac at macOS 27.0 (build 26A428): 109
+# of 123 binaries under /usr/bin carried the new string and NOT ONE classified
+# `apple`, so the whole tier was dead. Five call sites read it; the loudest,
+# `_apple_label_masquerade`, alarms on a `com.apple.*` launchd job whose
+# program is not Apple-signed, which had become a description of every genuine
+# Apple job on the host. The 2026-09-15 batch of 37 `Persistence item CHANGED`
+# incidents was the same root cause reaching the report through a different
+# sensor.
+#
+# So this matches the FAMILY, not a literal: an optional platform word in front
+# of "Software Signing". The generalization is safe only because it is
+# conjunctive with the chain -- the leaf must be issued by Apple's OS-signing
+# intermediate, which is a DIFFERENT CA from the Developer ID one and cannot be
+# minted by anyone but Apple. A renamed leaf under the right CA is still Apple;
+# a same-named leaf under any other CA is not. `Platform identifier=` in the
+# code directory corroborates but is deliberately NOT the gate: that field is
+# attacker-settable in a self-signed binary, whereas the issuing CA is not.
+#
+# test_signature_corpus.py is the ratchet. It classifies REAL binaries on a
+# REAL Mac, so the next rename fails a test instead of silently deleting a
+# trust tier for months. The two tests that existed when this was written both
+# injected {"trust": ..., "authority": "Software Signing"} as a fixture and so
+# could never have caught it -- a mocked classifier proves the callers read the
+# verdict, never that the parser produces it.
+_APPLE_OS_SIGNING_LEAF_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]* )?Software Signing$")
+_APPLE_OS_SIGNING_CA = "Apple Code Signing Certification Authority"
+
+
+def _is_apple_os_signing(leaf, authorities):
+    """Is this leaf authority Apple's own OS-signing identity?"""
+    if not leaf or not _APPLE_OS_SIGNING_LEAF_RE.match(leaf):
+        return False
+    return _APPLE_OS_SIGNING_CA in (authorities or ())
+
+
 def _classify_mac(path):
     out, err, _ = run(["codesign", "-dv", "--verbose=4", path], timeout=12)
     text = (out or "") + (err or "")  # codesign writes detail to stderr
@@ -2493,7 +2569,7 @@ def _classify_mac(path):
             trust = "adhoc"
         elif leaf and leaf.startswith("Developer ID Application"):
             trust = "developer-id"
-        elif leaf == "Software Signing":
+        elif _is_apple_os_signing(leaf, authorities):
             trust = "apple"
         elif leaf == "Apple Mac OS Application Signing":
             trust = "app-store"
@@ -5357,6 +5433,206 @@ def _merge_legacy_persistence_cases(db, now):
     return merged
 
 
+# FROZEN recognizers for the 2026-09 case-identity migration. Copies, never
+# the live keys, per the _STORE_MIGRATIONS rules: a migration's meaning must
+# not drift after it ships.
+_MIG_PROCESS_CASE_RE = re.compile(r"^signal:process:(?!sha:)(.+)$")
+_MIG_BEACON_CASE_RE = re.compile(
+    r"^signal:beacon:(?!rotating:)(.+):([^:]+):(\d+)$")
+_MIG_PERSIST_CHANGED_CASE_RE = re.compile(
+    r"^signal:persistence:changed:(.+)$")
+_MIG_BEACON_DISPERSION_MIN = 4
+# Frozen copy of the mac sealed-system prefixes, per the _STORE_MIGRATIONS
+# rule that a migration's recognizers may not drift after it ships.
+_MIG_SYSTEM_PREFIXES = ("/System/", "/usr/bin/", "/usr/lib/", "/usr/sbin/",
+                        "/usr/libexec/", "/usr/share/", "/bin/", "/sbin/",
+                        "/Library/Apple/")
+
+
+def _mig_latest_event(db, incident_id):
+    """The newest stored evidence for an incident, as a dict. {} when none."""
+    row = db.execute(
+        "SELECT e.data_json FROM incident_events ie JOIN events e "
+        "ON e.id=ie.event_id WHERE ie.incident_id=? ORDER BY e.id DESC "
+        "LIMIT 1", (incident_id,)).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["data_json"])
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _fold_incidents(db, now, key, ids, reason):
+    """Re-key the newest incident in `ids` to `key` and fold the rest into it.
+
+    The same shape as _merge_legacy_persistence_cases: nothing is orphaned, so
+    nothing is closed empty -- the survivor inherits every sibling's evidence
+    and keeps alerting under the new case, and the siblings are marked
+    superseded with `reason`. Deliberately a separate helper rather than a
+    refactor of that function: its recognizers are frozen and shipped, and
+    rewriting a migration that has already run on real stores buys nothing.
+    """
+    keep, dupes = ids[-1], list(ids[:-1])
+    existing = db.execute(
+        "SELECT id FROM incidents WHERE correlation_key=? AND id!=? "
+        "ORDER BY id LIMIT 1", (key, keep)).fetchone()
+    if existing:
+        dupes.append(keep)
+        keep = existing["id"]
+    else:
+        db.execute("UPDATE incidents SET correlation_key=?,updated_at=? "
+                   "WHERE id=?", (key, now, keep))
+    for dupe in dupes:
+        db.execute("UPDATE incident_events SET incident_id=? WHERE "
+                   "incident_id=?", (keep, dupe))
+        db.execute("UPDATE events SET incident_id=? WHERE incident_id=?",
+                   (keep, dupe))
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=?",
+            (reason, now, dupe))
+    return len(dupes)
+
+
+def _merge_2026_09_case_identities(db, now):
+    """One-time: fold the incidents the 2026-09-17 identity fixes de-duplicate.
+
+    The forward fix changes which key a NEW incident is minted under. It does
+    nothing for the rows already in the store, and on the machine this was
+    written for that was the entire complaint: 110 open incidents, about
+    fifteen facts. A fix the operator cannot see is indistinguishable from no
+    fix, so the store is brought to the new identities here.
+
+    Three re-keyings, each folding rather than closing, because the sensors
+    behind them re-observe every scan and the survivor should inherit the
+    history:
+
+      process   keyed on the PATH -> keyed on the content sha. One build of
+                the operator's own app was running byte-identical from
+                /Applications, ~/Downloads and four worktree staging trees:
+                seven incidents, one program. The sha comes from the stored
+                evidence, so no file is re-hashed and a deleted binary still
+                migrates.
+      beacon    keyed per ADDRESS -> one case per (program, port) once four or
+                more addresses are in play. 13 incidents were one binary
+                against 13 EC2 addresses.
+
+    And one retirement, because folding would be a claim this cannot check:
+
+      persistence  `changed:<plist>` is orphaned outright. The case is now
+                keyed on the PROGRAM whose bytes changed, and which plist
+                referenced it is no longer an identity -- there is no
+                surviving row to fold 29 into. Retired the way every previous
+                identity redesign retired its orphans: closed as superseded,
+                re-alerting under the new key if the condition still holds.
+                Note what that does and does not promise -- the persistence
+                baseline already absorbed the change on 2026-09-15, so these
+                would not have re-alerted under the OLD key either. This
+                migration does not create that gap, and does not close it.
+    """
+    folded = 0
+
+    # --- process: path -> content sha ------------------------------------
+    groups = {}
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:process:%' "
+            "AND created_at < ? ORDER BY id", (now,)):
+        if not _MIG_PROCESS_CASE_RE.match(row["correlation_key"] or ""):
+            continue
+        ev = db.execute(
+            "SELECT e.data_json FROM incident_events ie JOIN events e "
+            "ON e.id=ie.event_id WHERE ie.incident_id=? ORDER BY e.id DESC "
+            "LIMIT 1", (row["id"],)).fetchone()
+        sha = None
+        if ev:
+            try:
+                data = json.loads(ev["data_json"])
+                sha = data.get("sha256") or (data.get("subject") or {}).get(
+                    "content")
+            except (ValueError, TypeError, AttributeError):
+                sha = None
+        if sha:
+            groups.setdefault("signal:process:sha:%s" % sha, []).append(
+                row["id"])
+    for key, ids in sorted(groups.items()):
+        # Called even for a lone incident: re-keying it to the sha is what
+        # stops the next scan minting a SECOND case for the same binary
+        # alongside the old path-keyed one. _fold_incidents then folds nothing
+        # and reports nothing folded, which is the honest count.
+        folded += _fold_incidents(
+            db, now, key, ids,
+            "superseded: a running process is now one case per BINARY "
+            "(content sha256), not one per path the same bytes are "
+            "copied to")
+
+    # --- beacon: per-address -> one rotating relationship ----------------
+    disp, rows = {}, []
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
+            "AND created_at < ? ORDER BY id", (now,)):
+        m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
+        if not m:
+            continue
+        prog, rip, rport = m.group(1), m.group(2), m.group(3)
+        key = (_program_subject(prog), rport)
+        disp.setdefault(key, set()).add(rip)
+        rows.append((row["id"], key))
+    groups = {}
+    for inc_id, key in rows:
+        if len(disp.get(key, ())) >= _MIG_BEACON_DISPERSION_MIN:
+            groups.setdefault(
+                "signal:beacon:rotating:%s:%s" % key, []).append(inc_id)
+    for key, ids in sorted(groups.items()):
+        folded += _fold_incidents(
+            db, now, key, ids,
+            "superseded: many addresses on one port from one program is one "
+            "rotating endpoint relationship, not one beacon per address")
+
+    # --- persistence: orphaned by the program-keyed case -----------------
+    orphaned = []
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE "
+            "'signal:persistence:changed:%' AND created_at < ?", (now,)):
+        if not _MIG_PERSIST_CHANGED_CASE_RE.match(row["correlation_key"] or ""):
+            continue
+        # `changed:<plist>` is STILL the live key for every persistence change
+        # that is not an OS program update, which is what separates this
+        # migration from the three before it: theirs recognized key shapes the
+        # code had stopped minting, so matching the shape was enough. Matching
+        # it here would retire live, correct, operator-facing incidents about
+        # rewritten payloads and repointed jobs. So the population is named by
+        # its EVIDENCE instead -- a change confined to a program's bytes, on a
+        # program under the sealed-system prefixes -- which is exactly the set
+        # the forward fix re-keys and nothing else.
+        ev = _mig_latest_event(db, row["id"])
+        detail = str(ev.get("detail") or "")
+        program = str(ev.get("program") or "")
+        if "program bytes" not in detail:
+            continue
+        if "env" in detail or "args" in detail or "payload" in detail:
+            continue
+        if not program.startswith(_MIG_SYSTEM_PREFIXES):
+            continue
+        orphaned.append(row["id"])
+    if orphaned:
+        marks = ",".join("?" for _ in orphaned)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: a change to a program's BYTES is now one case per "
+             "program, not one per persistence item referencing it — an OS "
+             "update moved /bin/bash once and minted 29 incidents. Re-alerts "
+             "under the new identity if the condition still holds", now)
+            + tuple(orphaned))
+        folded += len(orphaned)
+    return folded
+
+
 # One-time event-store migrations, in ship order. Every incident-identity
 # redesign orphans the keys minted under the old scheme, and the first three
 # each shipped their own hand-rolled shim — recognizer regex, retire/merge
@@ -5377,6 +5653,9 @@ _STORE_MIGRATIONS = (
      "retired %d incident(s) keyed on the old positional exec identity"),
     ("persistence_case_merged", _merge_legacy_persistence_cases,
      "folded %d duplicate persistence incident(s) into one case per file"),
+    ("case_identity_2026_09_merged", _merge_2026_09_case_identities,
+     "re-keyed %d incident(s) onto the 2026-09 case identities (content sha "
+     "for processes, rotating endpoints for beacons, program for persistence)"),
     ("program_case_migrated", _retire_orphaned_program_incidents,
      "retired %d incident(s) keyed on the old versioned-path program identity"),
 )
@@ -6839,8 +7118,95 @@ def _persistence_change_detail(label, old, rec,
     return "%s: %s" % (label, "; ".join(parts))
 
 
+_SIP_STATE = None
+
+
+def _sip_enabled():
+    """Is System Integrity Protection on? Cached; UNKNOWN reads as OFF.
+
+    Fails closed on purpose. The one caller uses this to conclude that a
+    system-volume binary CANNOT have been rewritten by anything running as the
+    operator, and that conclusion is only true while SIP holds. An unreadable
+    or unrecognized `csrutil` answer must therefore land on the side that keeps
+    alerting, not the side that quiets.
+    """
+    global _SIP_STATE
+    if _SIP_STATE is None:
+        if not IS_MAC:
+            _SIP_STATE = False
+        else:
+            out, _, rc = run(["csrutil", "status"], timeout=10)
+            low = (out or "").lower()
+            _SIP_STATE = bool(rc == 0 and "enabled" in low
+                              and "disabled" not in low)
+    return _SIP_STATE
+
+
+def _os_program_update(old, rec, prog_changed,
+                       env_changed, args_changed, target_changed):
+    """The program path when this persistence change is just an OS update.
+
+    On 2026-09-15 this sensor emitted 37 HIGH `Persistence item CHANGED`
+    incidents in a single scan, at one timestamp. They were FIVE facts:
+    /bin/bash, /usr/bin/open, /usr/bin/python3, /bin/date and /usr/bin/ssh had
+    all been replaced by the macOS 27.0 update (identical mtime, Sep 3
+    03:34). Twenty-nine launchd jobs run `/bin/bash <script>`, so one OS
+    binary changing bytes minted twenty-nine incidents -- each keyed on the
+    referring PLIST, each demanding its own adjudication, none of them about
+    the plist, which was untouched.
+
+    The rule that produced them is right about third-party programs and its
+    comment says why: "a swapped program binary is inherently serious even if
+    the replacement is validly signed (supply-chain / stolen-cert swap)". That
+    reasoning inverts for a platform binary on the sealed system volume.
+    Nothing running as the operator can write /bin/bash; replacing it takes
+    defeating SIP and the signed system snapshot, which aegis watches
+    separately and reports on its own line. So for THIS narrow shape the
+    routine cause is not a supply-chain swap, it is Tuesday's software update.
+
+    Every conjunct below is load-bearing:
+
+      confined to program bytes   an env, argv or payload mutation alongside
+                                  the swap is a different event and keeps its
+                                  full severity -- this never masks one.
+      same program PATH           a job repointed from /bin/bash to something
+                                  else is a config edit, the attack this
+                                  sensor exists for. Only the BYTES may move.
+      under TRUSTED_PREFIXES      the sealed system volume, which excludes
+                                  /usr/local and /opt/homebrew (both operator-
+                                  writable and both in RISKY_PREFIXES).
+      trust == "apple"            Apple's own OS-signing chain, verified by
+                                  `_is_apple_os_signing` against Apple's CA.
+                                  Before the classifier fix that shipped with
+                                  this change, NO binary on the machine could
+                                  satisfy this and the guard would have been
+                                  dead code.
+      SIP enabled                 the premise of the whole argument. Off or
+                                  unknown, and every word above stops holding.
+
+    Returns the program path, so the caller can key ONE case on the thing that
+    actually changed and carry the referring jobs as its evidence.
+    """
+    if not (IS_MAC and prog_changed):
+        return None
+    if env_changed or args_changed or target_changed:
+        return None
+    program = rec.get("program")
+    if not program or program != old.get("program"):
+        return None
+    if not program.startswith(TRUSTED_PREFIXES):
+        return None
+    if rec.get("trust") != "apple":
+        return None
+    if not _sip_enabled():
+        return None
+    return program
+
+
 def check_persistence(baseline_snap, current_snap):
     findings = []
+    # (program, new_sha) -> [labels of the jobs that reference it]
+    os_updates = {}
     base = baseline_snap or {}
     for path, rec in current_snap.items():
         if path not in base:
@@ -6935,6 +7301,17 @@ def check_persistence(baseline_snap, current_snap):
                 note = _PROVENANCE_NOTE.get(prov) if prov else None
                 if note:
                     detail = "%s\n%s" % (detail, note)
+                # One OS binary updating is ONE fact, however many jobs
+                # reference it. Collect the referrers and emit a single
+                # finding after the loop, keyed on the program; see
+                # _os_program_update.
+                os_prog = _os_program_update(
+                    old, rec, prog_changed,
+                    env_changed, args_changed, target_changed)
+                if os_prog:
+                    os_updates.setdefault(
+                        (os_prog, rec.get("sha256")), []).append(rec["label"])
+                    continue
                 findings.append(finding(
                     graded, "persistence",
                     "Persistence item CHANGED",
@@ -6952,6 +7329,27 @@ def check_persistence(baseline_snap, current_snap):
                 "LOW", "persistence", "Persistence item removed",
                 "%s (%s) no longer present" % (old.get("label"), path),
                 "persistence:removed:%s" % path, path=path))
+    # One finding per updated OS program, carrying every job that references
+    # it. This is deliberately not a suppression: the event still reaches the
+    # report at LOW, with a higher referrer count than any of the 29 incidents
+    # it replaces could show, and the operator adjudicates the OS update once
+    # instead of once per launchd job. The signal key includes the new sha, so
+    # the NEXT update is a new finding rather than a silenced recurrence.
+    for (program, sha), labels in sorted(os_updates.items()):
+        findings.append(finding(
+            "LOW", "persistence",
+            "OS program referenced by persistence items was updated",
+            "%s is Apple-platform-signed on the sealed system volume (SIP "
+            "enabled) and its bytes changed -- the shape of a system update, "
+            "not of a config edit. %d persistence item(s) reference it: %s"
+            % (program, len(labels), ", ".join(sorted(labels)[:12])
+               + (" …" if len(labels) > 12 else "")),
+            "persistence:os-program-update:%s:%s" % (program, sha),
+            case_fingerprint="persistence:os-program-update:%s" % program,
+            subject=_subject("persistence", program, content=sha),
+            path=program, program=program, trust="apple",
+            custody="os-vendor",
+            referrer_count=len(labels), referrers=sorted(labels)))
     return findings
 
 
@@ -7406,7 +7804,19 @@ def check_processes():
                 "%s (%s) %s%s" % (comm, sig["trust"], reason,
                                   ("\n" + note) if note else ""),
                 "process:%s:%s:%s" % (comm, sig["trust"], sha),
-                case_fingerprint="process:%s" % _program_subject(comm),
+                # The CASE is the bytes, not the place. One build of the
+                # operator's own app was running from /Applications,
+                # ~/Downloads and four agent worktree staging trees at once --
+                # byte-identical, sha f0dddc74…, and seven separate HIGH
+                # incidents, each asking the same question about the same
+                # program. _program_subject can only collapse paths that differ
+                # by a VERSION segment; it has nothing to say about a copy, and
+                # a build pipeline makes copies. The signal fingerprint above
+                # keeps the path, so per-location detail and per-path
+                # allowlisting are untouched; only the unit of ADJUDICATION
+                # moves to the thing being adjudicated.
+                case_fingerprint=("process:sha:%s" % sha if sha
+                                  else "process:%s" % _program_subject(comm)),
                 subject=_subject("process", comm, trust=sig["trust"],
                                  content=sha),
                 path=comm, trust=sig["trust"], sha256=sha, custody=rung))
@@ -11554,10 +11964,56 @@ def _beacon_add_sighting(sightings, ts, rows):
         sightings.setdefault(pair, set()).add(int(ts))
 
 
+# A beacon's whole detection is that the endpoint does not MOVE. Four or more
+# distinct addresses on one port, from one program, is the opposite of that:
+# it is DNS round-robin in front of a cloud service. Set from the live data it
+# was written for -- one binary held 13 addresses, every one of them resolving
+# to ec2-*.compute-1.amazonaws.com, and the next-widest program held 2. A C2
+# fallback list is characteristically short (2-3), so this sits above it
+# deliberately: a small set of fixed addresses keeps the full alarm.
+BEACON_DISPERSION_MIN = 4
+
+
+def _beacon_dispersion(rows, sightings):
+    """(program_subject, port) -> set of RECURRING remote IPs.
+
+    Built before any finding is emitted, because the decision "is this one
+    service or one beacon" is a property of the program's WHOLE endpoint set
+    and cannot be made while looking at a single row. That is the defect this
+    fixes: the per-row loop below could only ever see one endpoint at a time,
+    so it answered "is this endpoint persistent?" 13 times instead of "is this
+    program's endpoint FIXED?" once -- and the sensor's own discriminator
+    became its fan-out key.
+
+    Counts ONLY endpoints that clear the same recurrence gate the findings do.
+    Counting every current socket instead would let a program holding one real
+    fixed-endpoint beacon plus three ephemeral connections read as
+    "dispersed", and dispersion DEMOTES -- so the loose version of this
+    function weakens exactly the detection the sensor exists for, and does it
+    in the attacker's favour. Ephemeral churn is the noise this sensor already
+    defines itself against; it must not be allowed to vote on identity.
+    """
+    disp = {}
+    for row in rows:
+        if len(row) < 3:
+            continue
+        path, rip, rport = str(row[0]), str(row[1]), str(row[2])
+        stamps = sightings.get((path, rip, rport), ())
+        if len(stamps) < BEACON_MIN_SCANS:
+            continue
+        if max(stamps) - min(stamps) < BEACON_MIN_SPAN_SECS:
+            continue
+        disp.setdefault((_program_subject(path), rport), set()).add(rip)
+    return disp
+
+
 def _beacon_from_sightings(sightings, current_rows):
     """The recurrence DECISION, over an already-built sightings map."""
     findings = []
-    for row in sorted(set(tuple(r) for r in current_rows)):
+    rows = sorted(set(tuple(r) for r in current_rows))
+    dispersion = _beacon_dispersion(rows, sightings)
+    dispersed_done = set()
+    for row in rows:
         # Length-guarded like the history fold above. Live, current_rows always
         # comes from _outbound_rows() and is well-formed — but `rehunt` feeds
         # this the same shape read back from a gzipped file on disk, where a
@@ -11581,6 +12037,41 @@ def _beacon_from_sightings(sightings, current_rows):
         dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
         if dev_note:
             note = (note + "\n" + dev_note) if note else dev_note
+        # One program spread across many addresses on one port is one service
+        # relationship, so it is ONE case and one signal -- not one per
+        # address. Emitting per-address here did not merely multiply the
+        # incidents; it multiplied the risk WEIGHT on a single entity, because
+        # _accumulate_risk sums per signal fingerprint. The addresses all
+        # survive in the detail, so the collapsed finding names more than any
+        # of the 13 it replaces.
+        fleet = dispersion.get((_program_subject(path), rport)) or {rip}
+        if len(fleet) >= BEACON_DISPERSION_MIN:
+            key = (_program_subject(path), rport)
+            if key in dispersed_done:
+                continue
+            dispersed_done.add(key)
+            shown = sorted(fleet)
+            findings.append(finding(
+                _step_down(graded), "net-beacon",
+                "Persistent outbound connection (rotating endpoints)",
+                "%s [%s] has held connections to %d DISTINCT addresses on "
+                "port %s (%s%s). A beacon's signature is an endpoint that "
+                "does not move; this many addresses on one port is the shape "
+                "of DNS round-robin in front of a cloud service, which is why "
+                "this reads one step below a fixed-endpoint beacon. It is not "
+                "dismissed: a rotating C2 pool looks the same, and every "
+                "address is listed here for that reason."
+                % (path, trust, len(fleet), rport, ", ".join(shown[:8]),
+                   " …" if len(shown) > 8 else "")
+                + (("\n" + note) if note else ""),
+                "beacon:rotating:%s:%s" % (_program_subject(path), rport),
+                case_fingerprint=dev_case or (
+                    "beacon:rotating:%s:%s" % (_program_subject(path), rport)),
+                subject=_subject("beacon", path, port=rport),
+                path=path, program=path, port=rport, trust=trust,
+                endpoint_count=len(fleet), endpoints=shown,
+                custody=rung, markers=["outbound-exfil", "beacon"]))
+            continue
         findings.append(finding(
             graded, "net-beacon",
             "Persistent outbound connection (beacon shape)",
@@ -13984,7 +14475,129 @@ def _git_provenance(path):
     return "remote-foreign" if (rc == 0 and (br or "").strip()) else "local-commit"
 
 
+# All three keyed on the DIRECTORY, not the file. Every question this rung
+# asks -- which repo owns this, does this machine commit to it, does its
+# .gitignore cover this -- has the same answer for every file in a directory,
+# and `git check-ignore` already resolves ancestor patterns (a `dist/` rule
+# answers for `dist/A.app/Contents/MacOS/bin` in one call). Keyed per file
+# instead, a scan grading ~40 binaries spent 148 ms each on three subprocesses
+# that had already been run for a sibling -- about 2.3 s against a 1 % scan
+# cost ceiling. Per directory that collapses to two calls per distinct
+# directory and nothing for repeats.
+_REPO_ROOT_CACHE = {}
+_REPO_SELFNESS_CACHE = {}
+_BUILD_OUTPUT_CACHE = {}
+
+
+def _repo_root_of(git, d):
+    """The work-tree root containing `d`, or None. Cached per directory."""
+    if d in _REPO_ROOT_CACHE:
+        return _REPO_ROOT_CACHE[d]
+    out, _e, rc = run([git, "-C", d, "rev-parse", "--show-toplevel"], timeout=10)
+    root = (out or "").strip()
+    _REPO_ROOT_CACHE[d] = root if (rc == 0 and root) else None
+    return _REPO_ROOT_CACHE[d]
+
+
+def _repo_is_self_committed(git, d):
+    """Does this machine commit to the repo containing `d`? Cached per repo.
+
+    Asks about the repo's HEAD rather than about the file, because the file
+    this is asked on behalf of has no history at all -- being generated is the
+    whole point of it.
+    """
+    root = _repo_root_of(git, d)
+    if not root:
+        return None
+    if root in _REPO_SELFNESS_CACHE:
+        return _REPO_SELFNESS_CACHE[root]
+    verdict = False
+    out, _e, rc = run([git, "-C", root, "log", "-1", "--format=%H|%ae"],
+                      timeout=10)
+    out = (out or "").strip()
+    if rc == 0 and "|" in out:
+        sha, author = out.split("|", 1)
+        verdict = bool(_git_created_here(git, root, sha, author)
+                       or _git_fleet_signed(git, root, sha))
+    _REPO_SELFNESS_CACHE[root] = (root, verdict)
+    return _REPO_SELFNESS_CACHE[root]
+
+
+def _build_output_rung(path):
+    """'build-output' when `path` is a generated artifact of the operator's
+    own repo, else None.
+
+    The gap this closes was measured and written down before it was filled:
+    139 `finding()` call sites, 10 passing a rung, and the roster in
+    test_custody_roster.py naming the rest as debt. But the live 2026-09-17
+    batch showed the debt was not only unwired sites -- the LADDER had no rung
+    that could reach the dominant category on a developer's machine. Every
+    rung asks git or a package manager, and a compiled binary is known to
+    neither. `_git_provenance` cannot even return `untracked` for one: an
+    ignored file is invisible to `git status --porcelain`, so it falls through
+    to a `git log` that finds no commits and answers None. All six live paths
+    sampled -- a signed app bundle in /Applications, four staging copies in
+    agent worktrees, a llama-server -- graded (HIGH, None, None) from BOTH
+    `_grade_binary` and `_custody`.
+
+    The evidence used here is the repo's OWN `.gitignore`, committed by the
+    operator: the repo declares "files matching this are things I generate".
+    Pairing that declaration with "and this machine is what commits to this
+    repo" is a real, checkable, non-circular claim about how a file arrived.
+    Measured against the live incident set: 14 of 38 distinct process paths
+    qualify, and NONE qualified spuriously -- no path landed in a repo that was
+    not the operator's, and none that was actually tracked.
+
+    It is deliberately a WEAK rung. An attacker who drops a payload into
+    `dist/` inherits it, which is exactly why it may only move severity one
+    step and may never suppress: `_demote` enforces both, and
+    `_RISK_CUSTODY_WEIGHT` still lets it corroborate at half weight. Being a
+    build artifact is a claim about a file's ORIGIN, and origin is not
+    innocence -- the same sentence `_grade_binary` was already written around.
+    """
+    if not path:
+        return None
+    git = _git_bin()
+    d = os.path.dirname(os.path.abspath(path))
+    if not (git and os.path.isdir(d)):
+        return None
+    if d in _BUILD_OUTPUT_CACHE:
+        return _BUILD_OUTPUT_CACHE[d]
+    result = None
+    selfness = _repo_is_self_committed(git, d)
+    if selfness and selfness[1]:
+        root = selfness[0]
+        # The repo's own declaration that this directory is generated. Asked
+        # of the DIRECTORY, which is how .gitignore declares build output in
+        # practice (`dist/`, `build/`, `app/staging/`) and what makes one
+        # answer serve every file beside it. -q so nothing is printed; rc 0
+        # means ignored, 1 means not, 128 means the question did not apply.
+        _o, _e, rc = run([git, "-C", root, "check-ignore", "-q", d],
+                         timeout=10)
+        if rc == 0:
+            result = "build-output"
+    _BUILD_OUTPUT_CACHE[d] = result
+    return result
+
+
 _PROVENANCE_NOTE = {
+    "os-vendor": ("The bytes that changed belong to the OS vendor's own "
+                  "platform binary, on the sealed system volume, with SIP "
+                  "enabled — signed by a chain no local party can mint and "
+                  "sitting where nothing running as the operator can write. "
+                  "No local author exists to grade, so this names the only "
+                  "party who could have made the change. Floored at LOW and "
+                  "never zero-weighted: if SIP were off, or the signature "
+                  "were anyone else's, the finding would not have reached "
+                  "this rung at all."),
+    "build-output": ("This file sits at a path its own repository's committed "
+                     ".gitignore declares generated, in a repository this "
+                     "machine commits to — the shape of a build artifact, "
+                     "which is why an unsigned binary in a user-writable path "
+                     "is unremarkable here. Demoted one step only: a payload "
+                     "dropped into a build directory would inherit this same "
+                     "rung, so it explains the file's ORIGIN and is not "
+                     "evidence about its behaviour."),
     "operator-vouched": ("The operator signed a vouch for exactly these bytes "
                          "at exactly this path, with a passphrase-protected "
                          "key verified against the pinned vouch roster. This "
@@ -14066,16 +14679,17 @@ _SELF_CUSTODY = ("operator-vouched", "self-attested", "self-committed",
 # AUTHORSHIP, these are claims of ORIGIN. So they demote one step (HIGH ->
 # MEDIUM), never straight to LOW, except `relocated`, which is a proof that
 # the executed content is byte-identical and therefore carries no new code.
-_VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
+_VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed",
+                    "os-vendor")
 
 # Recognised-but-weak: git knows the edit is local and unpushed. The note has
 # always read "routine if you made it" while the finding stayed HIGH anyway —
 # the ladder named the rung and then ignored it. One step down, not to LOW: an
 # uncommitted worktree edit is exactly what a local attacker's change also
 # looks like, so it earns quiet, not silence.
-_WEAK_CUSTODY = ("worktree", "local-commit")
+_WEAK_CUSTODY = ("worktree", "local-commit", "build-output")
 
-_CUSTODY_FLOOR = {"relocated": "LOW"}
+_CUSTODY_FLOOR = {"relocated": "LOW", "os-vendor": "LOW"}
 # How much a custody-graded finding may still CORROBORATE in the risk tier.
 # The demotion ladder already lowered each finding's own severity; this factor
 # answers a different question — whether provenance-explained findings should
@@ -14344,6 +14958,13 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None):
         rung = "operator-vouched"
     elif _package_receipt(path):
         rung = "package-managed"
+    # Last, and weakest: a generated artifact of a repo this machine commits
+    # to. Before this rung existed, the two questions above were the ONLY ones
+    # asked of a binary, and a developer's machine answers no to both for
+    # everything it builds -- which is why this sensor family produced the
+    # volume it did and why each round of tuning could only move the threshold.
+    elif _build_output_rung(path):
+        rung = "build-output"
     else:
         return severity, None, None
     return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
