@@ -304,5 +304,148 @@ class BuildOutputIsARung(unittest.TestCase):
         self.assertIsNone(aegis._build_output_rung(here))
 
 
+class TheStoreIsBroughtToTheNewIdentities(unittest.TestCase):
+    """A fix the operator cannot see is indistinguishable from no fix.
+
+    Changing which key a NEW incident is minted under does nothing for the 110
+    rows already sitting in the store, and those rows were the whole
+    complaint. This is the migration that folds them, in the shape
+    _STORE_MIGRATIONS documents.
+    """
+
+    def setUp(self):
+        import sqlite3
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            CREATE TABLE incidents(id INTEGER PRIMARY KEY, kind TEXT,
+              correlation_key TEXT, title TEXT, severity TEXT, status TEXT,
+              created_at INT, first_seen INT, last_seen INT, updated_at INT,
+              reminder_count INT DEFAULT 0, next_reminder_at INT,
+              last_notified_at INT, resolution TEXT, subject_json TEXT,
+              last_novel_at INT);
+            CREATE TABLE events(id INTEGER PRIMARY KEY, incident_id INT,
+              data_json TEXT);
+            CREATE TABLE incident_events(incident_id INT, event_id INT);
+        """)
+        self.n = 0
+
+    def tearDown(self):
+        self.db.close()
+
+    def _inc(self, key, data=None, title="t", status="OPEN"):
+        self.n += 1
+        i = self.n
+        self.db.execute(
+            "INSERT INTO incidents(id,kind,correlation_key,title,severity,"
+            "status,created_at,first_seen,last_seen,updated_at) "
+            "VALUES(?,'signal',?,?,'HIGH',?,0,0,0,0)", (i, key, title, status))
+        if data is not None:
+            import json as _j
+            self.db.execute("INSERT INTO events(id,incident_id,data_json) "
+                            "VALUES(?,?,?)", (i, i, _j.dumps(data)))
+            self.db.execute("INSERT INTO incident_events(incident_id,event_id)"
+                            " VALUES(?,?)", (i, i))
+        return i
+
+    def _run(self):
+        return aegis._merge_2026_09_case_identities(self.db, 1000)
+
+    def _keys(self, status="OPEN"):
+        return sorted(r["correlation_key"] for r in self.db.execute(
+            "SELECT correlation_key FROM incidents WHERE status=?", (status,)))
+
+    def test_same_bytes_at_seven_paths_become_one_case(self):
+        for i in range(7):
+            self._inc("signal:process:/p%d/app" % i,
+                      {"sha256": "SHA1", "path": "/p%d/app" % i},
+                      title="Suspicious running process")
+        self._run()
+        self.assertEqual(self._keys(), ["signal:process:sha:SHA1"])
+
+    def test_different_bytes_stay_separate(self):
+        self._inc("signal:process:/a/app", {"sha256": "SHA1"})
+        self._inc("signal:process:/b/app", {"sha256": "SHA2"})
+        self._run()
+        self.assertEqual(self._keys(), ["signal:process:sha:SHA1",
+                                        "signal:process:sha:SHA2"])
+
+    def test_the_survivor_inherits_every_sibling_event(self):
+        """Folding must not destroy evidence -- the point of folding rather
+        than closing."""
+        ids = [self._inc("signal:process:/p%d/app" % i, {"sha256": "SHA1"})
+               for i in range(5)]
+        self._run()
+        keep = self.db.execute(
+            "SELECT id FROM incidents WHERE status='OPEN'").fetchone()["id"]
+        self.assertIn(keep, ids)
+        n = self.db.execute("SELECT COUNT(*) c FROM incident_events WHERE "
+                            "incident_id=?", (keep,)).fetchone()["c"]
+        self.assertEqual(n, 5)
+
+    def test_a_lone_process_incident_is_still_rekeyed(self):
+        """Otherwise the next scan mints a SECOND case beside the old one."""
+        self._inc("signal:process:/only/app", {"sha256": "SHA9"})
+        self._run()
+        self.assertEqual(self._keys(), ["signal:process:sha:SHA9"])
+
+    def test_thirteen_addresses_become_one_relationship(self):
+        for i in range(13):
+            self._inc("signal:beacon:/A.app/MacOS/a:203.0.113.%d:443" % i)
+        self._run()
+        self.assertEqual(self._keys(),
+                         ["signal:beacon:rotating:/A.app/MacOS/a:443"])
+
+    def test_a_short_address_list_is_left_alone(self):
+        """The migration must not fold what the forward fix would not."""
+        for i in range(3):
+            self._inc("signal:beacon:/A.app/MacOS/a:203.0.113.%d:443" % i)
+        self._run()
+        self.assertEqual(len(self._keys()), 3)
+
+    def test_persistence_changed_cases_are_retired_not_folded(self):
+        """They are orphaned: the case is the PROGRAM now, and which plist
+        referenced it is no longer an identity."""
+        for i in range(29):
+            self._inc("signal:persistence:changed:/L/com.x.job%d.plist" % i)
+        self._run()
+        self.assertEqual(self._keys(), [])
+        row = self.db.execute("SELECT resolution FROM incidents LIMIT 1"
+                              ).fetchone()
+        self.assertIn("one case per program", row["resolution"])
+
+    def test_already_adjudicated_rows_are_untouched(self):
+        """A migration may not reopen or rewrite a verdict the operator gave."""
+        self._inc("signal:process:/p/app", {"sha256": "SHA1"},
+                  status="FALSE_POSITIVE")
+        self._inc("signal:persistence:changed:/L/x.plist", status="RESOLVED")
+        self._run()
+        self.assertEqual(self._keys("FALSE_POSITIVE"),
+                         ["signal:process:/p/app"])
+        self.assertEqual(self._keys("RESOLVED"),
+                         ["signal:persistence:changed:/L/x.plist"])
+
+    def test_it_never_violates_correlation_key_uniqueness(self):
+        """If a new-scheme case already exists, the old rows fold INTO it."""
+        self._inc("signal:process:sha:SHA1", {"sha256": "SHA1"})
+        self._inc("signal:process:/p1/app", {"sha256": "SHA1"})
+        self._inc("signal:process:/p2/app", {"sha256": "SHA1"})
+        self._run()
+        self.assertEqual(self._keys(), ["signal:process:sha:SHA1"])
+
+    def test_an_incident_with_no_stored_sha_is_left_alone(self):
+        """No evidence to re-key on, so no guess."""
+        self._inc("signal:process:/p/app", {"path": "/p/app"})
+        self._run()
+        self.assertEqual(self._keys(), ["signal:process:/p/app"])
+
+    def test_it_is_registered_to_run_once(self):
+        keys = [row[0] for row in aegis._STORE_MIGRATIONS]
+        self.assertIn("case_identity_2026_09_merged", keys)
+        fns = {row[0]: row[1] for row in aegis._STORE_MIGRATIONS}
+        self.assertIs(fns["case_identity_2026_09_merged"],
+                      aegis._merge_2026_09_case_identities)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -158,5 +158,70 @@ class TierBoundariesHold(unittest.TestCase):
         self.assertFalse(aegis._is_apple_os_signing(None, []))
 
 
+class ACachedVerdictCannotOutliveItsLogic(unittest.TestCase):
+    """A classifier fix must reach a running install.
+
+    The signature cache is keyed on (path, stat-signature) and stores the
+    VERDICT. Correct for its purpose, and it silently defeats every fix to the
+    classifier, because a fix changes no file on disk. When the Apple
+    leaf-authority repair above was written, the live install held
+
+        /bin/bash -> {"authority": "macOS Software Signing",
+                      "trust": "signed-other"}
+
+    behind a stat that will never change again. The corrected code would have
+    read that wrong answer out of the cache forever, on the machine that
+    needed it most, and every test here would still have passed -- they all
+    clear the cache in setUp. This is the assertion that the deployed path
+    works, not just the computed one.
+    """
+
+    def setUp(self):
+        self._saved = aegis._sigcache
+        aegis._sigcache = {}
+
+    def tearDown(self):
+        aegis._sigcache = self._saved
+
+    def test_an_entry_from_older_logic_is_a_miss(self):
+        aegis._sigcache["/dev/null"] = {
+            "stat": aegis._sig_stat("/dev/null"),
+            "result": {"trust": "bogus-from-old-logic", "team": None,
+                       "authority": None},
+            "v": aegis._SIGCACHE_LOGIC_VERSION - 1,
+        }
+        self.assertNotEqual(
+            aegis.classify_signature("/dev/null")["trust"],
+            "bogus-from-old-logic",
+            "a verdict stamped with superseded logic was served from cache")
+
+    def test_an_unstamped_legacy_entry_is_a_miss(self):
+        """Every entry written before the stamp existed carries no `v`."""
+        aegis._sigcache["/dev/null"] = {
+            "stat": aegis._sig_stat("/dev/null"),
+            "result": {"trust": "bogus-legacy", "team": None,
+                       "authority": None},
+        }
+        self.assertNotEqual(
+            aegis.classify_signature("/dev/null")["trust"], "bogus-legacy")
+
+    def test_a_current_entry_is_still_served(self):
+        """The cache must remain a cache; this is the scan-cost ceiling."""
+        aegis._sigcache["/dev/null"] = {
+            "stat": aegis._sig_stat("/dev/null"),
+            "result": {"trust": "sentinel-current", "team": None,
+                       "authority": None},
+            "v": aegis._SIGCACHE_LOGIC_VERSION,
+        }
+        self.assertEqual(
+            aegis.classify_signature("/dev/null")["trust"], "sentinel-current")
+
+    def test_fresh_entries_are_stamped(self):
+        aegis.classify_signature("/dev/null")
+        entry = aegis._sigcache.get("/dev/null")
+        if entry is not None:  # /dev/null may be unstattable on some hosts
+            self.assertEqual(entry.get("v"), aegis._SIGCACHE_LOGIC_VERSION)
+
+
 if __name__ == "__main__":
     unittest.main()

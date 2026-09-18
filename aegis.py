@@ -2153,6 +2153,33 @@ def _sig_stat(path):
         return None
 
 
+# Bump when the MEANING of a cached verdict changes, so a logic fix actually
+# reaches a running install.
+#
+# The cache is keyed on (path, stat-signature) and stores the VERDICT. That is
+# correct for its purpose -- a rebuilt binary changes its stat and re-probes --
+# and it quietly defeats every fix to the classifier itself, because a fix
+# changes no file on disk. When the Apple leaf-authority match was repaired,
+# the live install had /bin/bash cached as
+#
+#     {"authority": "macOS Software Signing", "trust": "signed-other"}
+#
+# with a stat that will never change again, so the corrected code would have
+# gone on reading the wrong answer out of the cache indefinitely. A fix that
+# cannot reach a running install is not a fix, and nothing in the file said so.
+#
+# Versioned per ENTRY rather than once per file: a mismatched entry is simply
+# a miss, so the cache self-heals lazily as paths are touched, no reserved key
+# competes with the LRU trim in flush_sigcache(), and a half-written cache
+# from an interrupted scan cannot leave stale verdicts behind a fresh stamp.
+#
+#   1  (implicit) pre-2026-09-17 entries; Apple OS-signing matched by an exact
+#      leaf string, so every platform binary on macOS >= 26 read signed-other.
+#   2  `_is_apple_os_signing`: leaf matched as a family, conjunctive with
+#      Apple's OS-signing CA.
+_SIGCACHE_LOGIC_VERSION = 2
+
+
 def classify_signature(path):
     """
     Return {trust, team, authority} — the platform's answer to "who vouches for
@@ -2177,7 +2204,8 @@ def classify_signature(path):
 
     stat_sig = _sig_stat(path)
     cached = _sigcache.get(path)
-    if cached and stat_sig is not None and cached.get("stat") == stat_sig:
+    if (cached and stat_sig is not None and cached.get("stat") == stat_sig
+            and cached.get("v") == _SIGCACHE_LOGIC_VERSION):
         # LRU touch: move to newest so the insertion-order trim in
         # flush_sigcache() evicts genuinely least-recently-USED entries, not just
         # first-inserted ones (an hourly-hit path must outlive a dead one-off).
@@ -2194,7 +2222,8 @@ def classify_signature(path):
 
     if stat_sig is not None and not result.pop("probe_failed", False):
         _sigcache.pop(path, None)  # overwrite any prior entry for this path
-        _sigcache[path] = {"stat": stat_sig, "result": result}
+        _sigcache[path] = {"stat": stat_sig, "result": result,
+                           "v": _SIGCACHE_LOGIC_VERSION}
     return result
 
 
@@ -5398,6 +5427,165 @@ def _merge_legacy_persistence_cases(db, now):
     return merged
 
 
+# FROZEN recognizers for the 2026-09 case-identity migration. Copies, never
+# the live keys, per the _STORE_MIGRATIONS rules: a migration's meaning must
+# not drift after it ships.
+_MIG_PROCESS_CASE_RE = re.compile(r"^signal:process:(?!sha:)(.+)$")
+_MIG_BEACON_CASE_RE = re.compile(
+    r"^signal:beacon:(?!rotating:)(.+):([^:]+):(\d+)$")
+_MIG_PERSIST_CHANGED_CASE_RE = re.compile(
+    r"^signal:persistence:changed:(.+)$")
+_MIG_BEACON_DISPERSION_MIN = 4
+
+
+def _fold_incidents(db, now, key, ids, reason):
+    """Re-key the newest incident in `ids` to `key` and fold the rest into it.
+
+    The same shape as _merge_legacy_persistence_cases: nothing is orphaned, so
+    nothing is closed empty -- the survivor inherits every sibling's evidence
+    and keeps alerting under the new case, and the siblings are marked
+    superseded with `reason`. Deliberately a separate helper rather than a
+    refactor of that function: its recognizers are frozen and shipped, and
+    rewriting a migration that has already run on real stores buys nothing.
+    """
+    keep, dupes = ids[-1], list(ids[:-1])
+    existing = db.execute(
+        "SELECT id FROM incidents WHERE correlation_key=? AND id!=? "
+        "ORDER BY id LIMIT 1", (key, keep)).fetchone()
+    if existing:
+        dupes.append(keep)
+        keep = existing["id"]
+    else:
+        db.execute("UPDATE incidents SET correlation_key=?,updated_at=? "
+                   "WHERE id=?", (key, now, keep))
+    for dupe in dupes:
+        db.execute("UPDATE incident_events SET incident_id=? WHERE "
+                   "incident_id=?", (keep, dupe))
+        db.execute("UPDATE events SET incident_id=? WHERE incident_id=?",
+                   (keep, dupe))
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=?",
+            (reason, now, dupe))
+    return len(dupes)
+
+
+def _merge_2026_09_case_identities(db, now):
+    """One-time: fold the incidents the 2026-09-17 identity fixes de-duplicate.
+
+    The forward fix changes which key a NEW incident is minted under. It does
+    nothing for the rows already in the store, and on the machine this was
+    written for that was the entire complaint: 110 open incidents, about
+    fifteen facts. A fix the operator cannot see is indistinguishable from no
+    fix, so the store is brought to the new identities here.
+
+    Three re-keyings, each folding rather than closing, because the sensors
+    behind them re-observe every scan and the survivor should inherit the
+    history:
+
+      process   keyed on the PATH -> keyed on the content sha. One build of
+                the operator's own app was running byte-identical from
+                /Applications, ~/Downloads and four worktree staging trees:
+                seven incidents, one program. The sha comes from the stored
+                evidence, so no file is re-hashed and a deleted binary still
+                migrates.
+      beacon    keyed per ADDRESS -> one case per (program, port) once four or
+                more addresses are in play. 13 incidents were one binary
+                against 13 EC2 addresses.
+
+    And one retirement, because folding would be a claim this cannot check:
+
+      persistence  `changed:<plist>` is orphaned outright. The case is now
+                keyed on the PROGRAM whose bytes changed, and which plist
+                referenced it is no longer an identity -- there is no
+                surviving row to fold 29 into. Retired the way every previous
+                identity redesign retired its orphans: closed as superseded,
+                re-alerting under the new key if the condition still holds.
+                Note what that does and does not promise -- the persistence
+                baseline already absorbed the change on 2026-09-15, so these
+                would not have re-alerted under the OLD key either. This
+                migration does not create that gap, and does not close it.
+    """
+    folded = 0
+
+    # --- process: path -> content sha ------------------------------------
+    groups = {}
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:process:%' "
+            "ORDER BY id"):
+        if not _MIG_PROCESS_CASE_RE.match(row["correlation_key"] or ""):
+            continue
+        ev = db.execute(
+            "SELECT e.data_json FROM incident_events ie JOIN events e "
+            "ON e.id=ie.event_id WHERE ie.incident_id=? ORDER BY e.id DESC "
+            "LIMIT 1", (row["id"],)).fetchone()
+        sha = None
+        if ev:
+            try:
+                data = json.loads(ev["data_json"])
+                sha = data.get("sha256") or (data.get("subject") or {}).get(
+                    "content")
+            except (ValueError, TypeError, AttributeError):
+                sha = None
+        if sha:
+            groups.setdefault("signal:process:sha:%s" % sha, []).append(
+                row["id"])
+    for key, ids in sorted(groups.items()):
+        # Called even for a lone incident: re-keying it to the sha is what
+        # stops the next scan minting a SECOND case for the same binary
+        # alongside the old path-keyed one. _fold_incidents then folds nothing
+        # and reports nothing folded, which is the honest count.
+        folded += _fold_incidents(
+            db, now, key, ids,
+            "superseded: a running process is now one case per BINARY "
+            "(content sha256), not one per path the same bytes are "
+            "copied to")
+
+    # --- beacon: per-address -> one rotating relationship ----------------
+    disp, rows = {}, []
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
+            "ORDER BY id"):
+        m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
+        if not m:
+            continue
+        prog, rip, rport = m.group(1), m.group(2), m.group(3)
+        key = (_program_subject(prog), rport)
+        disp.setdefault(key, set()).add(rip)
+        rows.append((row["id"], key))
+    groups = {}
+    for inc_id, key in rows:
+        if len(disp.get(key, ())) >= _MIG_BEACON_DISPERSION_MIN:
+            groups.setdefault(
+                "signal:beacon:rotating:%s:%s" % key, []).append(inc_id)
+    for key, ids in sorted(groups.items()):
+        folded += _fold_incidents(
+            db, now, key, ids,
+            "superseded: many addresses on one port from one program is one "
+            "rotating endpoint relationship, not one beacon per address")
+
+    # --- persistence: orphaned by the program-keyed case -----------------
+    orphaned = [row["id"] for row in db.execute(
+        "SELECT id,correlation_key FROM incidents WHERE status IN "
+        "('OPEN','ACK') AND correlation_key LIKE "
+        "'signal:persistence:changed:%'")
+        if _MIG_PERSIST_CHANGED_CASE_RE.match(row["correlation_key"] or "")]
+    if orphaned:
+        marks = ",".join("?" for _ in orphaned)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: a change to a program's BYTES is now one case per "
+             "program, not one per persistence item referencing it — an OS "
+             "update moved /bin/bash once and minted 29 incidents. Re-alerts "
+             "under the new identity if the condition still holds", now)
+            + tuple(orphaned))
+        folded += len(orphaned)
+    return folded
+
+
 # One-time event-store migrations, in ship order. Every incident-identity
 # redesign orphans the keys minted under the old scheme, and the first three
 # each shipped their own hand-rolled shim — recognizer regex, retire/merge
@@ -5418,6 +5606,9 @@ _STORE_MIGRATIONS = (
      "retired %d incident(s) keyed on the old positional exec identity"),
     ("persistence_case_merged", _merge_legacy_persistence_cases,
      "folded %d duplicate persistence incident(s) into one case per file"),
+    ("case_identity_2026_09_merged", _merge_2026_09_case_identities,
+     "re-keyed %d incident(s) onto the 2026-09 case identities (content sha "
+     "for processes, rotating endpoints for beacons, program for persistence)"),
     ("program_case_migrated", _retire_orphaned_program_incidents,
      "retired %d incident(s) keyed on the old versioned-path program identity"),
 )
