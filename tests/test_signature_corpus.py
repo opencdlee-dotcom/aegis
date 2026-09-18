@@ -39,8 +39,10 @@ tolerance becomes a forgery tolerance.
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -179,48 +181,60 @@ class ACachedVerdictCannotOutliveItsLogic(unittest.TestCase):
     def setUp(self):
         self._saved = aegis._sigcache
         aegis._sigcache = {}
+        # A REAL file, not /dev/null. The first version of this class used
+        # /dev/null, which does not exist on Windows -- so classify_signature
+        # returned {"trust": "missing"} before ever consulting the cache. One
+        # of these four tests failed there and the other three PASSED
+        # VACUOUSLY, asserting nothing about the thing they are named for.
+        # Nothing here is macOS-shaped: cache staleness is platform-neutral,
+        # so the fix is a portable fixture, not a platform gate.
+        self._dir = tempfile.mkdtemp(prefix="aegis_sigcache_")
+        self.path = os.path.join(self._dir, "subject.bin")
+        with open(self.path, "wb") as fh:
+            fh.write(b"not a real executable")
 
     def tearDown(self):
         aegis._sigcache = self._saved
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _entry(self, trust, **kw):
+        e = {"stat": aegis._sig_stat(self.path),
+             "result": {"trust": trust, "team": None, "authority": None}}
+        e.update(kw)
+        return e
 
     def test_an_entry_from_older_logic_is_a_miss(self):
-        aegis._sigcache["/dev/null"] = {
-            "stat": aegis._sig_stat("/dev/null"),
-            "result": {"trust": "bogus-from-old-logic", "team": None,
-                       "authority": None},
-            "v": aegis._SIGCACHE_LOGIC_VERSION - 1,
-        }
+        aegis._sigcache[self.path] = self._entry(
+            "bogus-from-old-logic", v=aegis._SIGCACHE_LOGIC_VERSION - 1)
         self.assertNotEqual(
-            aegis.classify_signature("/dev/null")["trust"],
+            aegis.classify_signature(self.path)["trust"],
             "bogus-from-old-logic",
             "a verdict stamped with superseded logic was served from cache")
 
     def test_an_unstamped_legacy_entry_is_a_miss(self):
         """Every entry written before the stamp existed carries no `v`."""
-        aegis._sigcache["/dev/null"] = {
-            "stat": aegis._sig_stat("/dev/null"),
-            "result": {"trust": "bogus-legacy", "team": None,
-                       "authority": None},
-        }
+        aegis._sigcache[self.path] = self._entry("bogus-legacy")
         self.assertNotEqual(
-            aegis.classify_signature("/dev/null")["trust"], "bogus-legacy")
+            aegis.classify_signature(self.path)["trust"], "bogus-legacy")
 
     def test_a_current_entry_is_still_served(self):
         """The cache must remain a cache; this is the scan-cost ceiling."""
-        aegis._sigcache["/dev/null"] = {
-            "stat": aegis._sig_stat("/dev/null"),
-            "result": {"trust": "sentinel-current", "team": None,
-                       "authority": None},
-            "v": aegis._SIGCACHE_LOGIC_VERSION,
-        }
+        aegis._sigcache[self.path] = self._entry(
+            "sentinel-current", v=aegis._SIGCACHE_LOGIC_VERSION)
         self.assertEqual(
-            aegis.classify_signature("/dev/null")["trust"], "sentinel-current")
+            aegis.classify_signature(self.path)["trust"], "sentinel-current")
 
     def test_fresh_entries_are_stamped(self):
-        aegis.classify_signature("/dev/null")
-        entry = aegis._sigcache.get("/dev/null")
-        if entry is not None:  # /dev/null may be unstattable on some hosts
-            self.assertEqual(entry.get("v"), aegis._SIGCACHE_LOGIC_VERSION)
+        result = aegis.classify_signature(self.path)
+        entry = aegis._sigcache.get(self.path)
+        if entry is None:
+            # The body's probe could not run here -- simbody forces IS_WIN on
+            # a host with no PowerShell -- and a NON-ANSWER is deliberately
+            # never cached. Assert that contract instead of asserting through
+            # it: a stamp that was never written says nothing either way.
+            self.assertEqual(result["trust"], "unknown")
+            self.skipTest("signature probe unavailable on this host")
+        self.assertEqual(entry.get("v"), aegis._SIGCACHE_LOGIC_VERSION)
 
 
 if __name__ == "__main__":
