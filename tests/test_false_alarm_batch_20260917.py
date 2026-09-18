@@ -42,7 +42,9 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aegis  # noqa: E402
+from conftest import SUSPICIOUS_TRUST  # noqa: E402
 
 
 def plist(label, program, sha, path=None, trust=None):
@@ -228,7 +230,14 @@ class RotatingEndpointsAreOneRelationship(unittest.TestCase):
 
     def _rows(self, n, path="/Users/x/app/staging/A.app/Contents/MacOS/a",
               port="443"):
-        return [(path, "203.0.113.%d" % (i + 1), port, "adhoc")
+        # The sensor's gate is `suspicious_sig(trust) or is_risky_location(path)`,
+        # so naming a per-body suspicious verdict satisfies it everywhere and the
+        # test needs no path shape at all. Hard-coding "adhoc" here made all six
+        # of these pass on macOS and fail on Windows -- a verdict that does not
+        # exist in the Authenticode vocabulary -- which is precisely the defect
+        # class tests/simbody.py was written to catch, and it caught it.
+        # Dispersion is platform-neutral logic, so this is gated to no body.
+        return [(path, "203.0.113.%d" % (i + 1), port, SUSPICIOUS_TRUST)
                 for i in range(n)]
 
     def _run(self, rows):
