@@ -181,11 +181,26 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
         rec = dict(old, program="/tmp/evil", sha256="NEW")
         self.assertIsNone(self._call(old, rec))
 
-    def test_refuses_operator_writable_prefixes(self):
-        """/usr/local and /opt/homebrew are NOT the sealed volume; both are in
-        RISKY_PREFIXES precisely because anyone can write there."""
-        for prog in ("/usr/local/bin/bash", "/opt/homebrew/bin/bash",
-                     "/Users/x/bin/bash"):
+    def test_refuses_anything_off_the_sealed_system_volume(self):
+        """The guard's premise is that nothing running as the operator can
+        write where the program lives, so every operator-writable prefix must
+        be refused.
+
+        Derived from the live tuples rather than named literally, and that is
+        the whole lesson of this test: `/opt/homebrew` is operator-writable on
+        macOS and `/opt/` is a root-owned package root on Linux. simbody flips
+        the IS_* flags but leaves RISKY_PREFIXES and TRUSTED_PREFIXES bound to
+        the REAL host, so a literal here asserts a macOS fact on a Linux
+        runner -- and CI runs the mac simbody leg on ubuntu. The first version
+        of this test hard-coded `/opt/homebrew` and failed there while passing
+        on every local Mac run, including the local `SIM_BODY=mac` one, which
+        on a Mac is close to a no-op.
+        """
+        risky = [p for p in aegis.RISKY_PREFIXES
+                 if not (p.rstrip("/") + "/").startswith(aegis.TRUSTED_PREFIXES)]
+        self.assertTrue(risky, "no operator-writable prefix on this body")
+        for prefix in risky:
+            prog = os.path.join(prefix, "bin", "bash")
             old = self._p("j", prog, "OLD")
             self.assertIsNone(self._call(old, dict(old, sha256="NEW")), prog)
 
