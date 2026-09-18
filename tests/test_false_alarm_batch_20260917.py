@@ -45,10 +45,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
 
 
-def plist(label, program, sha, path=None):
+def plist(label, program, sha, path=None, trust=None):
+    """A launchd record as the snapshot builds it.
+
+    `trust` is a required-in-practice parameter with no default, so this
+    module-level helper never hard-codes a macOS-only verdict -- the callers
+    that need one are inside macOS-gated classes. See tests/conftest.py,
+    NoTestHardCodesOneBodysTrustVocabulary.
+    """
     return {
         "label": label, "program": program, "sha256": sha,
-        "trust": "apple", "env": None, "args": [program, "/tmp/x.sh"],
+        "trust": trust, "env": None, "args": [program, "/tmp/x.sh"],
         "run_at_load": True,
         "path": path or ("/Users/x/Library/LaunchAgents/%s.plist" % label),
     }
@@ -65,11 +72,14 @@ class OneOsUpdateIsOneFinding(unittest.TestCase):
         aegis.IS_MAC, aegis._SIP_STATE = self._mac, self._sip
 
     def _snaps(self, n=29, program="/bin/bash", trust="apple", tag=""):
+        # trust="apple" is the premise: a bytes-only change to an Apple
+        # platform binary under SIP. This class is registered macOS-only.
         base, cur = {}, {}
         for i in range(n):
             p = ("/Users/x/Library/LaunchAgents/com.example%s.job%d.plist"
                  % (tag, i))
-            rec = plist("com.example%s.job%d" % (tag, i), program, "OLD", p)
+            rec = plist("com.example%s.job%d" % (tag, i), program, "OLD", p,
+                        trust=trust)
             rec["trust"] = trust
             base[p] = dict(rec)
             new = dict(rec, sha256="NEW")
@@ -136,6 +146,11 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
     def tearDown(self):
         aegis.IS_MAC, aegis._SIP_STATE = self._mac, self._sip
 
+    @staticmethod
+    def _p(label, program, sha, path=None):
+        """Apple-platform-signed, which is the premise under test here."""
+        return plist(label, program, sha, path, trust="apple")
+
     def _call(self, old, rec, **kw):
         flags = {"prog_changed": True, "env_changed": False,
                  "args_changed": False, "target_changed": False}
@@ -143,16 +158,16 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
         return aegis._os_program_update(old, rec, **flags)
 
     def test_accepts_the_real_case(self):
-        old = plist("j", "/bin/bash", "OLD")
+        old = self._p("j", "/bin/bash", "OLD")
         self.assertEqual(self._call(old, dict(old, sha256="NEW")), "/bin/bash")
 
     def test_refuses_a_dylib_injection_riding_along(self):
-        old = plist("j", "/bin/bash", "OLD")
+        old = self._p("j", "/bin/bash", "OLD")
         rec = dict(old, sha256="NEW", env={"DYLD_INSERT_LIBRARIES": "/tmp/e.dylib"})
         self.assertIsNone(self._call(old, rec, env_changed=True))
 
     def test_refuses_a_rewritten_payload_riding_along(self):
-        old = plist("j", "/bin/bash", "OLD")
+        old = self._p("j", "/bin/bash", "OLD")
         self.assertIsNone(self._call(old, dict(old, sha256="NEW"),
                                      target_changed=True))
         self.assertIsNone(self._call(old, dict(old, sha256="NEW"),
@@ -160,7 +175,7 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
 
     def test_refuses_a_repointed_program(self):
         """The job now runs something else. That is the attack, not an update."""
-        old = plist("j", "/bin/bash", "OLD")
+        old = self._p("j", "/bin/bash", "OLD")
         rec = dict(old, program="/tmp/evil", sha256="NEW")
         self.assertIsNone(self._call(old, rec))
 
@@ -169,7 +184,7 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
         RISKY_PREFIXES precisely because anyone can write there."""
         for prog in ("/usr/local/bin/bash", "/opt/homebrew/bin/bash",
                      "/Users/x/bin/bash"):
-            old = plist("j", prog, "OLD")
+            old = self._p("j", prog, "OLD")
             self.assertIsNone(self._call(old, dict(old, sha256="NEW")), prog)
 
     def test_refuses_a_non_apple_signature(self):
@@ -177,7 +192,7 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
         supply-chain swap the original rule was written for."""
         for trust in ("developer-id", "signed-other", "adhoc", "unsigned",
                       "broken", "app-store", None):
-            old = plist("j", "/usr/bin/open", "OLD")
+            old = self._p("j", "/usr/bin/open", "OLD")
             old["trust"] = trust
             self.assertIsNone(self._call(old, dict(old, sha256="NEW")), trust)
 
@@ -185,7 +200,7 @@ class TheGuardRefusesEverythingItShould(unittest.TestCase):
         """The whole argument is "nothing as the operator can write there".
         With SIP off that is false, so the guard must vanish."""
         aegis._SIP_STATE = False
-        old = plist("j", "/bin/bash", "OLD")
+        old = self._p("j", "/bin/bash", "OLD")
         self.assertIsNone(self._call(old, dict(old, sha256="NEW")))
 
     def test_sip_unknown_reads_as_off(self):
@@ -275,8 +290,21 @@ class BuildOutputIsARung(unittest.TestCase):
     def setUp(self):
         aegis._BUILD_OUTPUT_CACHE.clear()
         aegis._REPO_SELFNESS_CACHE.clear()
+        aegis._REPO_ROOT_CACHE.clear()
 
     tearDown = setUp
+
+    def test_the_os_update_finding_names_a_rung(self):
+        """Every finding declares who authored its subject or says why it
+        cannot (test_custody_roster.py). For an Apple platform binary under
+        SIP the author is the OS vendor -- a real answer, not a gap."""
+        self.assertIn("os-vendor", aegis._VOUCHED_CUSTODY)
+        self.assertEqual(aegis._CUSTODY_FLOOR["os-vendor"], "LOW")
+        self.assertIn("os-vendor", aegis._PROVENANCE_NOTE)
+        self.assertEqual(aegis._RISK_CUSTODY_WEIGHT["os-vendor"], 0.25)
+        # Never zero-weighted: 29 collapsed referrers must not be able to sum
+        # into an interrupt, but an OS update is not proof of innocence.
+        self.assertGreater(aegis._RISK_CUSTODY_WEIGHT["os-vendor"], 0.0)
 
     def test_it_is_weak_by_construction(self):
         """One step, never suppression, still corroborating at half weight."""
@@ -302,6 +330,57 @@ class BuildOutputIsARung(unittest.TestCase):
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "aegis.py")
         self.assertIsNone(aegis._build_output_rung(here))
+
+    def test_the_question_is_asked_once_per_directory(self):
+        """Not once per file. Three subprocesses per binary, re-run for every
+        sibling in the same build tree, cost about 2.3 s on a scan grading ~40
+        of them -- against a 1 % scan cost ceiling. The answer is identical for
+        every file in a directory, so it is cached there.
+
+        This also fixes the semantics rather than only the cost: `.gitignore`
+        declares build output by DIRECTORY (`dist/`, `app/staging/`), and
+        `git check-ignore` resolves ancestor patterns, so one call on the
+        containing directory already answers for everything beside it.
+        """
+        d = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # The first file in a repo pays the fixed cost of identifying it:
+        # rev-parse, then the HEAD-authorship probes, then check-ignore. What
+        # must not scale is the PER-FILE cost, so measure the increment.
+        aegis._build_output_rung(os.path.join(d, "aegis.py"))
+        calls = []
+        real = aegis.run
+
+        def counting(cmd, *a, **k):
+            calls.append(cmd[0] if cmd else "")
+            return real(cmd, *a, **k)
+
+        aegis.run = counting
+        try:
+            for name in ("README.md", "ARCHITECTURE.md", "ROADMAP.md"):
+                aegis._build_output_rung(os.path.join(d, name))
+        finally:
+            aegis.run = real
+        self.assertEqual(
+            calls, [],
+            "three more files in an ALREADY-ANSWERED directory asked git "
+            "%d more times: %r" % (len(calls), calls))
+
+    def test_a_repeat_path_costs_nothing(self):
+        real = aegis.run
+        d = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        aegis._build_output_rung(os.path.join(d, "aegis.py"))
+        calls = []
+
+        def counting(cmd, *a, **k):
+            calls.append(cmd)
+            return real(cmd, *a, **k)
+
+        aegis.run = counting
+        try:
+            aegis._build_output_rung(os.path.join(d, "aegis.py"))
+        finally:
+            aegis.run = real
+        self.assertEqual(calls, [])
 
 
 class TheStoreIsBroughtToTheNewIdentities(unittest.TestCase):
@@ -336,6 +415,8 @@ class TheStoreIsBroughtToTheNewIdentities(unittest.TestCase):
     def _inc(self, key, data=None, title="t", status="OPEN"):
         self.n += 1
         i = self.n
+        # created_at 0 < the migration's `now`: these are rows minted under
+        # the OLD identity, which is the only population it may touch.
         self.db.execute(
             "INSERT INTO incidents(id,kind,correlation_key,title,severity,"
             "status,created_at,first_seen,last_seen,updated_at) "
@@ -407,12 +488,66 @@ class TheStoreIsBroughtToTheNewIdentities(unittest.TestCase):
         """They are orphaned: the case is the PROGRAM now, and which plist
         referenced it is no longer an identity."""
         for i in range(29):
-            self._inc("signal:persistence:changed:/L/com.x.job%d.plist" % i)
+            self._inc("signal:persistence:changed:/L/com.x.job%d.plist" % i,
+                      {"detail": "com.x: program bytes aaaa -> bbbb",
+                       "program": "/bin/bash"})
         self._run()
         self.assertEqual(self._keys(), [])
         row = self.db.execute("SELECT resolution FROM incidents LIMIT 1"
                               ).fetchone()
         self.assertIn("one case per program", row["resolution"])
+
+    def test_a_live_config_change_incident_is_never_retired(self):
+        """The key `changed:<plist>` is STILL what the code mints for a
+        rewritten payload or a repointed job. Matching the shape alone -- the
+        way the three earlier migrations could -- would close live, correct
+        incidents. Each of these must survive.
+        """
+        self._inc("signal:persistence:changed:/L/a.plist",
+                  {"detail": "a: args changed (watch -> scan)",
+                   "program": "/bin/bash"})
+        self._inc("signal:persistence:changed:/L/b.plist",
+                  {"detail": "b: env changed (DYLD_INSERT_LIBRARIES)",
+                   "program": "/bin/bash"})
+        self._inc("signal:persistence:changed:/L/c.plist",
+                  {"detail": "c: program bytes aaaa -> bbbb",
+                   "program": "/Users/x/bin/tool"})  # not the system volume
+        self._inc("signal:persistence:changed:/L/d.plist",
+                  {"detail": "d: program /bin/bash -> /tmp/evil"},)
+        self._run()
+        self.assertEqual(len(self._keys()), 4, self._keys())
+
+    def test_it_never_touches_an_incident_from_the_current_scan(self):
+        """_run_store_migrations runs INSIDE record_security_state, after
+        correlation -- so on its first run the store already contains the
+        incidents this very scan just opened. Retiring or re-keying those
+        would close a brand-new true positive in the same breath as raising
+        it, and the first version of this migration did exactly that.
+        """
+        self.n = 10
+        now = 1000
+        for key, data in (
+                ("signal:process:/fresh/app", {"sha256": "SHAX"}),
+                ("signal:persistence:changed:/L/fresh.plist",
+                 {"detail": "f: program bytes aaaa -> bbbb",
+                  "program": "/bin/bash"})):
+            self.n += 1
+            i = self.n
+            self.db.execute(
+                "INSERT INTO incidents(id,kind,correlation_key,title,"
+                "severity,status,created_at,first_seen,last_seen,updated_at) "
+                "VALUES(?,'signal',?,'t','HIGH','OPEN',?,?,?,?)",
+                (i, key, now, now, now, now))
+            import json as _j
+            self.db.execute("INSERT INTO events(id,incident_id,data_json) "
+                            "VALUES(?,?,?)", (i, i, _j.dumps(data)))
+            self.db.execute("INSERT INTO incident_events(incident_id,event_id)"
+                            " VALUES(?,?)", (i, i))
+        aegis._merge_2026_09_case_identities(self.db, now)
+        self.assertEqual(
+            self._keys(),
+            ["signal:persistence:changed:/L/fresh.plist",
+             "signal:process:/fresh/app"])
 
     def test_already_adjudicated_rows_are_untouched(self):
         """A migration may not reopen or rewrite a verdict the operator gave."""

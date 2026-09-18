@@ -2463,8 +2463,14 @@ def warm_signature_cache(paths):
                 # non-answer, and non-answers are never cached.
                 continue
             _sigcache.pop(path, None)
+            # Stamped like every other writer. Unstamped entries are a MISS,
+            # so omitting this here did not produce a wrong verdict -- it
+            # silently turned the batch into one probe per path and threw the
+            # prefetch away, which is why the cost tests caught it and no
+            # correctness test did.
             _sigcache[path] = {"stat": stat_sig,
-                               "result": _win_verdict(status, signer)}
+                               "result": _win_verdict(status, signer),
+                               "v": _SIGCACHE_LOGIC_VERSION}
             resolved += 1
     return resolved
 
@@ -5436,6 +5442,26 @@ _MIG_BEACON_CASE_RE = re.compile(
 _MIG_PERSIST_CHANGED_CASE_RE = re.compile(
     r"^signal:persistence:changed:(.+)$")
 _MIG_BEACON_DISPERSION_MIN = 4
+# Frozen copy of the mac sealed-system prefixes, per the _STORE_MIGRATIONS
+# rule that a migration's recognizers may not drift after it ships.
+_MIG_SYSTEM_PREFIXES = ("/System/", "/usr/bin/", "/usr/lib/", "/usr/sbin/",
+                        "/usr/libexec/", "/usr/share/", "/bin/", "/sbin/",
+                        "/Library/Apple/")
+
+
+def _mig_latest_event(db, incident_id):
+    """The newest stored evidence for an incident, as a dict. {} when none."""
+    row = db.execute(
+        "SELECT e.data_json FROM incident_events ie JOIN events e "
+        "ON e.id=ie.event_id WHERE ie.incident_id=? ORDER BY e.id DESC "
+        "LIMIT 1", (incident_id,)).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["data_json"])
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
 
 
 def _fold_incidents(db, now, key, ids, reason):
@@ -5513,7 +5539,7 @@ def _merge_2026_09_case_identities(db, now):
     for row in db.execute(
             "SELECT id,correlation_key FROM incidents WHERE status IN "
             "('OPEN','ACK') AND correlation_key LIKE 'signal:process:%' "
-            "ORDER BY id"):
+            "AND created_at < ? ORDER BY id", (now,)):
         if not _MIG_PROCESS_CASE_RE.match(row["correlation_key"] or ""):
             continue
         ev = db.execute(
@@ -5547,7 +5573,7 @@ def _merge_2026_09_case_identities(db, now):
     for row in db.execute(
             "SELECT id,correlation_key FROM incidents WHERE status IN "
             "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
-            "ORDER BY id"):
+            "AND created_at < ? ORDER BY id", (now,)):
         m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
         if not m:
             continue
@@ -5567,11 +5593,32 @@ def _merge_2026_09_case_identities(db, now):
             "rotating endpoint relationship, not one beacon per address")
 
     # --- persistence: orphaned by the program-keyed case -----------------
-    orphaned = [row["id"] for row in db.execute(
-        "SELECT id,correlation_key FROM incidents WHERE status IN "
-        "('OPEN','ACK') AND correlation_key LIKE "
-        "'signal:persistence:changed:%'")
-        if _MIG_PERSIST_CHANGED_CASE_RE.match(row["correlation_key"] or "")]
+    orphaned = []
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE "
+            "'signal:persistence:changed:%' AND created_at < ?", (now,)):
+        if not _MIG_PERSIST_CHANGED_CASE_RE.match(row["correlation_key"] or ""):
+            continue
+        # `changed:<plist>` is STILL the live key for every persistence change
+        # that is not an OS program update, which is what separates this
+        # migration from the three before it: theirs recognized key shapes the
+        # code had stopped minting, so matching the shape was enough. Matching
+        # it here would retire live, correct, operator-facing incidents about
+        # rewritten payloads and repointed jobs. So the population is named by
+        # its EVIDENCE instead -- a change confined to a program's bytes, on a
+        # program under the sealed-system prefixes -- which is exactly the set
+        # the forward fix re-keys and nothing else.
+        ev = _mig_latest_event(db, row["id"])
+        detail = str(ev.get("detail") or "")
+        program = str(ev.get("program") or "")
+        if "program bytes" not in detail:
+            continue
+        if "env" in detail or "args" in detail or "payload" in detail:
+            continue
+        if not program.startswith(_MIG_SYSTEM_PREFIXES):
+            continue
+        orphaned.append(row["id"])
     if orphaned:
         marks = ",".join("?" for _ in orphaned)
         db.execute(
@@ -7301,6 +7348,7 @@ def check_persistence(baseline_snap, current_snap):
             case_fingerprint="persistence:os-program-update:%s" % program,
             subject=_subject("persistence", program, content=sha),
             path=program, program=program, trust="apple",
+            custody="os-vendor",
             referrer_count=len(labels), referrers=sorted(labels)))
     return findings
 
@@ -11926,8 +11974,8 @@ def _beacon_add_sighting(sightings, ts, rows):
 BEACON_DISPERSION_MIN = 4
 
 
-def _beacon_dispersion(rows):
-    """(program_subject, port) -> set of remote IPs, over this scan's rows.
+def _beacon_dispersion(rows, sightings):
+    """(program_subject, port) -> set of RECURRING remote IPs.
 
     Built before any finding is emitted, because the decision "is this one
     service or one beacon" is a property of the program's WHOLE endpoint set
@@ -11936,12 +11984,25 @@ def _beacon_dispersion(rows):
     so it answered "is this endpoint persistent?" 13 times instead of "is this
     program's endpoint FIXED?" once -- and the sensor's own discriminator
     became its fan-out key.
+
+    Counts ONLY endpoints that clear the same recurrence gate the findings do.
+    Counting every current socket instead would let a program holding one real
+    fixed-endpoint beacon plus three ephemeral connections read as
+    "dispersed", and dispersion DEMOTES -- so the loose version of this
+    function weakens exactly the detection the sensor exists for, and does it
+    in the attacker's favour. Ephemeral churn is the noise this sensor already
+    defines itself against; it must not be allowed to vote on identity.
     """
     disp = {}
     for row in rows:
         if len(row) < 3:
             continue
         path, rip, rport = str(row[0]), str(row[1]), str(row[2])
+        stamps = sightings.get((path, rip, rport), ())
+        if len(stamps) < BEACON_MIN_SCANS:
+            continue
+        if max(stamps) - min(stamps) < BEACON_MIN_SPAN_SECS:
+            continue
         disp.setdefault((_program_subject(path), rport), set()).add(rip)
     return disp
 
@@ -11950,7 +12011,7 @@ def _beacon_from_sightings(sightings, current_rows):
     """The recurrence DECISION, over an already-built sightings map."""
     findings = []
     rows = sorted(set(tuple(r) for r in current_rows))
-    dispersion = _beacon_dispersion(rows)
+    dispersion = _beacon_dispersion(rows, sightings)
     dispersed_done = set()
     for row in rows:
         # Length-guarded like the history fold above. Live, current_rows always
@@ -14414,8 +14475,28 @@ def _git_provenance(path):
     return "remote-foreign" if (rc == 0 and (br or "").strip()) else "local-commit"
 
 
+# All three keyed on the DIRECTORY, not the file. Every question this rung
+# asks -- which repo owns this, does this machine commit to it, does its
+# .gitignore cover this -- has the same answer for every file in a directory,
+# and `git check-ignore` already resolves ancestor patterns (a `dist/` rule
+# answers for `dist/A.app/Contents/MacOS/bin` in one call). Keyed per file
+# instead, a scan grading ~40 binaries spent 148 ms each on three subprocesses
+# that had already been run for a sibling -- about 2.3 s against a 1 % scan
+# cost ceiling. Per directory that collapses to two calls per distinct
+# directory and nothing for repeats.
+_REPO_ROOT_CACHE = {}
 _REPO_SELFNESS_CACHE = {}
 _BUILD_OUTPUT_CACHE = {}
+
+
+def _repo_root_of(git, d):
+    """The work-tree root containing `d`, or None. Cached per directory."""
+    if d in _REPO_ROOT_CACHE:
+        return _REPO_ROOT_CACHE[d]
+    out, _e, rc = run([git, "-C", d, "rev-parse", "--show-toplevel"], timeout=10)
+    root = (out or "").strip()
+    _REPO_ROOT_CACHE[d] = root if (rc == 0 and root) else None
+    return _REPO_ROOT_CACHE[d]
 
 
 def _repo_is_self_committed(git, d):
@@ -14425,9 +14506,8 @@ def _repo_is_self_committed(git, d):
     this is asked on behalf of has no history at all -- being generated is the
     whole point of it.
     """
-    out, _e, rc = run([git, "-C", d, "rev-parse", "--show-toplevel"], timeout=10)
-    root = (out or "").strip()
-    if rc != 0 or not root:
+    root = _repo_root_of(git, d)
+    if not root:
         return None
     if root in _REPO_SELFNESS_CACHE:
         return _REPO_SELFNESS_CACHE[root]
@@ -14477,27 +14557,39 @@ def _build_output_rung(path):
     """
     if not path:
         return None
-    if path in _BUILD_OUTPUT_CACHE:
-        return _BUILD_OUTPUT_CACHE[path]
-    result = None
     git = _git_bin()
     d = os.path.dirname(os.path.abspath(path))
-    if git and os.path.isdir(d):
-        selfness = _repo_is_self_committed(git, d)
-        if selfness and selfness[1]:
-            root = selfness[0]
-            # The repo's own declaration that this path is generated. -q so
-            # nothing is printed; rc 0 means ignored, 1 means not, 128 means
-            # the question did not apply.
-            _o, _e, rc = run([git, "-C", root, "check-ignore", "-q", path],
-                             timeout=10)
-            if rc == 0:
-                result = "build-output"
-    _BUILD_OUTPUT_CACHE[path] = result
+    if not (git and os.path.isdir(d)):
+        return None
+    if d in _BUILD_OUTPUT_CACHE:
+        return _BUILD_OUTPUT_CACHE[d]
+    result = None
+    selfness = _repo_is_self_committed(git, d)
+    if selfness and selfness[1]:
+        root = selfness[0]
+        # The repo's own declaration that this directory is generated. Asked
+        # of the DIRECTORY, which is how .gitignore declares build output in
+        # practice (`dist/`, `build/`, `app/staging/`) and what makes one
+        # answer serve every file beside it. -q so nothing is printed; rc 0
+        # means ignored, 1 means not, 128 means the question did not apply.
+        _o, _e, rc = run([git, "-C", root, "check-ignore", "-q", d],
+                         timeout=10)
+        if rc == 0:
+            result = "build-output"
+    _BUILD_OUTPUT_CACHE[d] = result
     return result
 
 
 _PROVENANCE_NOTE = {
+    "os-vendor": ("The bytes that changed belong to the OS vendor's own "
+                  "platform binary, on the sealed system volume, with SIP "
+                  "enabled — signed by a chain no local party can mint and "
+                  "sitting where nothing running as the operator can write. "
+                  "No local author exists to grade, so this names the only "
+                  "party who could have made the change. Floored at LOW and "
+                  "never zero-weighted: if SIP were off, or the signature "
+                  "were anyone else's, the finding would not have reached "
+                  "this rung at all."),
     "build-output": ("This file sits at a path its own repository's committed "
                      ".gitignore declares generated, in a repository this "
                      "machine commits to — the shape of a build artifact, "
@@ -14587,7 +14679,8 @@ _SELF_CUSTODY = ("operator-vouched", "self-attested", "self-committed",
 # AUTHORSHIP, these are claims of ORIGIN. So they demote one step (HIGH ->
 # MEDIUM), never straight to LOW, except `relocated`, which is a proof that
 # the executed content is byte-identical and therefore carries no new code.
-_VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
+_VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed",
+                    "os-vendor")
 
 # Recognised-but-weak: git knows the edit is local and unpushed. The note has
 # always read "routine if you made it" while the finding stayed HIGH anyway —
@@ -14596,7 +14689,7 @@ _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed")
 # looks like, so it earns quiet, not silence.
 _WEAK_CUSTODY = ("worktree", "local-commit", "build-output")
 
-_CUSTODY_FLOOR = {"relocated": "LOW"}
+_CUSTODY_FLOOR = {"relocated": "LOW", "os-vendor": "LOW"}
 # How much a custody-graded finding may still CORROBORATE in the risk tier.
 # The demotion ladder already lowered each finding's own severity; this factor
 # answers a different question — whether provenance-explained findings should
