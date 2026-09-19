@@ -8170,6 +8170,107 @@ def _argv_signals(argv):
     return sorted(best.items())
 
 
+_ARGV_PREVIEW_BUDGET = 240
+_ARGV_PREVIEW_HEAD = 72       # enough to always show WHAT ran
+_ARGV_PREVIEW_PAD = 36        # context either side of a matched span
+
+
+def _argv_match_spans(argv):
+    """(start, end) of every hostile pattern that fires on `argv`.
+
+    Re-runs the same regexes `_argv_signals` ran and keeps the spans it throws
+    away. Deliberately a second pass rather than a changed return contract:
+    this runs only for an argv that ALREADY matched — a rare path — while
+    `_argv_signals` is called for every watched process on the box."""
+    spans = []
+    for rx, _name, _sev in _HOSTILE_ARGV_RES:
+        m = rx.search(argv)
+        if m:
+            spans.append(m.span())
+    head = argv[:_HOSTILE_SCAN_LIMIT]
+    for rx, _name in _HOSTILE_CONTENT_RES:
+        m = rx.search(head)
+        if m:
+            spans.append(m.span())
+    for rx, _name in _ANTIVM_ARGV_RES:
+        m = rx.search(argv)
+        if m:
+            spans.append(m.span())
+    return spans
+
+
+def _argv_evidence_preview(argv, budget=_ARGV_PREVIEW_BUDGET):
+    """A preview centred on WHAT MATCHED, not on the head of the string.
+
+    The gap this closes, measured 2026-09-19. The preview existed — it was
+    added because "sha256=ccf3a161" gave the operator nothing to judge with —
+    but it was the FIRST 240 characters of argv. An agent harness invokes bash
+    as one very long `-c` string whose first 240 characters are entirely
+    boilerplate prologue (`source .../snapshot-bash-….sh`, `shopt -u extglob`,
+    a run of `builtin unalias`), so incident #503 reported
+    `network-fetch|nohup-curl-fileless|raw-ip-fetch` and then showed the
+    operator none of them. The finding named three hostile idioms and
+    displayed only shell throat-clearing, which is not an adjudicable fact —
+    it is a fact plus a reason to distrust the report.
+
+    So the same budget is spent on the evidence instead: a short head, so the
+    operator always sees what ran, then a window around each matched region,
+    elisions marked. Retention is unchanged and arguably better aligned with
+    the rule it already followed — only the hostile verdict and the evidence
+    that earned it are written, and everything still passes through
+    `redact_sensitive` first.
+    """
+    flat = re.sub(r"\s+", " ", argv or "").strip()
+    if not flat:
+        return ""
+    spans = [(a, b) for a, b in _argv_match_spans(argv or "") if b > a]
+    if not spans:
+        return redact_sensitive(flat)[:budget]
+
+    # Map spans from raw argv onto the whitespace-collapsed string by
+    # collapsing each span's own text the same way. Cheap and exact enough for
+    # a preview: a span whose text vanishes under collapsing is dropped.
+    windows = []
+    for a, b in spans:
+        frag = re.sub(r"\s+", " ", (argv or "")[a:b]).strip()
+        if not frag:
+            continue
+        i = flat.find(frag)
+        if i < 0:
+            continue
+        windows.append((max(0, i - _ARGV_PREVIEW_PAD),
+                        min(len(flat), i + len(frag) + _ARGV_PREVIEW_PAD)))
+    if not windows:
+        return redact_sensitive(flat)[:budget]
+
+    head_end = min(_ARGV_PREVIEW_HEAD, len(flat))
+    merged = []
+    for start, end in sorted([(0, head_end)] + windows):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    out, used, last_end = [], 0, 0
+    for start, end in merged:
+        if used >= budget:
+            break
+        if start > last_end:
+            out.append(" … ")
+            used += 3
+        piece = flat[start:min(end, start + max(0, budget - used))]
+        out.append(piece)
+        used += len(piece)
+        last_end = start + len(piece)
+    if last_end < len(flat):
+        out.append(" …")
+    # Redact LAST, then clamp: the budget above is counted on pre-redaction
+    # text, and a replacement can be longer than what it replaces. Clamping
+    # after redaction is what the previous implementation did too, so a
+    # secret can never be half-redacted by the truncation.
+    return redact_sensitive("".join(out))[:budget]
+
+
 def check_behavior():
     """Inspect running processes' full command lines for hostile behavior."""
     findings = []
@@ -8223,7 +8324,7 @@ def check_behavior():
         # through redact_sensitive first -- and the paste guard already stores
         # its command line the same way. The fingerprint stays on the hash so
         # identity does not move when the redaction regexes do.
-        preview = re.sub(r"\s+", " ", redact_sensitive(argv)).strip()[:240]
+        preview = _argv_evidence_preview(argv)
         findings.append(finding(
             top, "behavior", "Suspicious process behavior",
             "%s triggered [%s]; command sha256=%s; command: %s" %
