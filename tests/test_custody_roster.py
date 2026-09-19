@@ -105,6 +105,13 @@ NO_AUTHORED_SUBJECT = {
 
 GRADED = {
     ("_beacon_from_sightings", "net-beacon"),
+    # Both hot-dir emitters graded 2026-09-19. Until then the sensor scored
+    # solely on the quarantine xattr, which a locally-built or
+    # terminally-fetched binary never carries, so every app this machine built
+    # arrived as an ungraded HIGH while check_processes was grading the
+    # identical bytes in the same scan.
+    ("_check_hot_app", "hot-dir"),
+    ("check_hot_dirs", "hot-dir"),
     ("_first_sight_agent_config", "agent-surface"),
     ("_outbound_findings", "net-outbound"),
     ("check_persistence", "persistence"),
@@ -119,7 +126,6 @@ GRADED = {
 
 CUSTODY_DEBT = {
     ("_assay_lanes.lane_writ_enforcement.probe", "shellrc"): 1,
-    ("_check_hot_app", "hot-dir"): 2,
     ("_cmd_scan_locked", "trust"): 1,
     ("_ext_cap_finding", "extension-capability"): 1,
     ("_first_sight_agent_config", "agent-surface"): 1,
@@ -129,7 +135,6 @@ CUSTODY_DEBT = {
     ("check_browser_automation", "session-theft"): 3,
     ("check_clipboard", "clipboard"): 1,
     ("check_cron", "persistence"): 2,
-    ("check_hot_dirs", "hot-dir"): 1,
     ("check_persistence", "persistence"): 2,
     ("check_processes", "process"): 1,
     ("check_shell_history", "shell-history"): 1,

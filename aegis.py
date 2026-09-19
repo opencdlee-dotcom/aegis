@@ -199,6 +199,7 @@ LATEST_JSON = os.path.join(STATE_DIR, "latest.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
 SIGCACHE = os.path.join(STATE_DIR, "sigcache.json")
 INTENT_FILE = os.path.join(STATE_DIR, "intent.jsonl")
+CUSTODY_FILE = os.path.join(STATE_DIR, "custody.jsonl")
 FLEET_SIGNERS = os.path.join(STATE_DIR, "allowed_signers")
 ALLOWLIST = os.path.join(STATE_DIR, "allowlist.json")
 RUN_LOG = os.path.join(STATE_DIR, "run.log")
@@ -4806,6 +4807,71 @@ def _correlation_pairs(observations, left_pred, right_pred, window):
             yield left_id, right_id, left, right
 
 
+def _dedupe_chain_incidents(db, chains_raised, now):
+    """Close any chain incident whose evidence is a STRICT SUBSET of another
+    chain's on the same entity, and return how many were closed.
+
+    The chain rules overlap by design — each is a different reading of the
+    same stream, and `chain:clickfix` and `chain:persistence-execution` both
+    join a behaviour finding to a persistence one. When both read the same
+    events, the operator gets two CRITICALs for one fact. Measured on the live
+    store: incident #511 (11 events) and #517 (3 events) carried the same
+    entity key `b1fd29aea4dad2af`, and #517's evidence was wholly contained in
+    #511's. Two of four open CRITICALs were one event seen twice.
+
+    Strict subset is the whole test, and it is deliberately narrow:
+
+      * it is pure redundancy — every event in the closed incident is still
+        evidence on the surviving one, so nothing is lost from the record and
+        nothing is suppressed;
+      * OVERLAPPING but non-nested chains are left alone. Two rules matching
+        partly-different evidence on one entity are genuinely two readings,
+        and a remote-access chain alongside a credential-capture chain is
+        worse than either — collapsing those would be losing a finding, not
+        deduplicating one;
+      * equal sets are left alone too (neither is strictly smaller), because
+        picking a winner between two identical readings needs a reason this
+        function does not have.
+
+    The closed row names its survivor, so the collapse is auditable and
+    `reopen` remains available.
+    """
+    # Compared on each incident's FULL evidence, read back from the store, not
+    # on the events this scan happened to match. An incident that has been
+    # accruing evidence for days can match a single new event in one scan, and
+    # judging it on that would close a chain whose real evidence is the wider
+    # of the two — the opposite of what this is for.
+    totals = {}
+    for _entity, inc_id, _matched in chains_raised:
+        if inc_id in totals:
+            continue
+        totals[inc_id] = frozenset(
+            row[0] for row in db.execute(
+                "SELECT event_id FROM incident_events WHERE incident_id=?",
+                (inc_id,)))
+    closed = 0
+    for entity_key, inc_id, _matched in chains_raised:
+        evidence = totals.get(inc_id) or frozenset()
+        if not evidence:
+            continue
+        covering = next(
+            (other for o_entity, other, _o_matched in chains_raised
+             if o_entity == entity_key and other != inc_id
+             and evidence < (totals.get(other) or frozenset())), None)
+        if covering is None:
+            continue
+        marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+        cur = db.execute(
+            "UPDATE incidents SET status='RESOLVED',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=? AND status IN (%s)"
+            % marks,
+            ("subsumed by incident %d — same entity, and every event here is "
+             "also evidence there" % covering, now, inc_id)
+            + _ACTIVE_INCIDENT_STATES)
+        closed += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return closed
+
+
 def _apply_correlations(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
@@ -4847,6 +4913,10 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
                if f.get("category") not in suppressed_categories
                and event_id not in quieted}
     attached = set()
+    # (entity_key, incident_id, evidence_ids) for every chain raised this scan,
+    # so overlapping rules can be reconciled once they have all run. See
+    # _dedupe_chain_incidents.
+    chains_raised = []
 
     def correlate(base_key, title, left_pred, right_pred, window=900):
         matches_by_entity = {}
@@ -4876,6 +4946,7 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
                 ("promoted into incident %d" % incident_id, now, incident_id) +
                 _ACTIVE_INCIDENT_STATES + tuple(sorted(matches)))
             attached.update(matches)
+            chains_raised.append((entity_key, incident_id, frozenset(matches)))
 
     def has_marker(f, values):
         markers = set(f.get("markers") or [])
@@ -4913,6 +4984,10 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
             "gui-kill-coercion", "gui-kill-loop-coercion"}),
         lambda f: f.get("category") in ("persistence", "staging", "net-listener")
         or has_marker(f, {"curl-exfil-post", "fileless-fetch-exec"}))
+
+    # Two chain rules can describe one fact. Reconcile them once every rule has
+    # run — never inside correlate(), which cannot see the rules after it.
+    _dedupe_chain_incidents(db, chains_raised, now)
 
     # Durable lineage: a remembered drop that is later executed/persisted, at any
     # distance in time. Runs BEFORE the uncorrelated-signal fallback so a joined
@@ -7798,7 +7873,7 @@ def check_processes():
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
-            graded, rung, note = _grade_binary(sev, comm)
+            graded, rung, note = _grade_binary(sev, comm, sha=sha)
             findings.append(finding(
                 graded, "process", "Suspicious running process",
                 "%s (%s) %s%s" % (comm, sig["trust"], reason,
@@ -8423,29 +8498,47 @@ def _check_hot_app(path, st, cutoff):
                  "NO quarantine flag — side-loaded (bypassed Gatekeeper)"))
         if origin:
             prov += " from %s" % _origin_host(origin)
+        # Custody is graded on the EXECUTABLE, which is what the sha and every
+        # other sensor's subject already are — the bundle directory has no
+        # identity of its own. Before this call the hot-dir sensor consulted no
+        # rung at all: it graded solely on the quarantine xattr, which a
+        # terminal-fetched or locally-built binary never carries (0 of 29
+        # sampled had one), so every app this machine builds arrived as an
+        # ungraded HIGH while the identical bytes running as a process were
+        # being graded by check_processes in the same scan.
+        graded, rung, rung_note = _grade_binary("HIGH", exe, sha=sha)
         return [finding(
-            "HIGH", "hot-dir", "Unsigned app bundle in watched folder",
-            "%s [%s], modified %s, %s" % (path, sig["trust"], when, prov),
+            graded, "hot-dir", "Unsigned app bundle in watched folder",
+            "%s [%s], modified %s, %s%s" % (path, sig["trust"], when, prov,
+                                            ("\n" + rung_note) if rung_note
+                                            else ""),
             "hotdir:app:%s:%s:%s" % (path, sig["trust"], sha),
             path=path, trust=sig["trust"], sha256=sha,
             quarantined=quar, download_agent=agent,
             origin_url=origin, trusted_origin=trusted_origin,
-            confidence=("low" if trusted_origin else "medium"))]
+            provenance=rung,
+            confidence=("low" if (trusted_origin or rung) else "medium"))]
     if sig["trust"] in ("apple", "app-store"):
         return []
     verdict, source = gatekeeper_verdict(path)
     if verdict == "accepted":
         return []  # notarized — the normal shape of downloaded software
     sha = sha256(exe)
+    # "Verify you built/trust it" is a question custody can often answer
+    # outright: an app this machine built, or a copy of one, is the ordinary
+    # reading of signed-but-un-notarized on a developer's Mac.
+    graded, rung, rung_note = _grade_binary("MEDIUM", exe, sha=sha)
     return [finding(
-        "MEDIUM", "hot-dir", "Un-notarized app in watched folder",
+        graded, "hot-dir", "Un-notarized app in watched folder",
         "%s [%s] is signed but NOT notarized (Gatekeeper: %s%s), modified %s — "
         "a normal quarantined launch would be refused, so if it runs it was "
         "side-loaded or force-approved. Verify you built/trust it."
         % (path, sig["trust"], verdict,
-           ", %s" % source if source else "", when),
+           ", %s" % source if source else "", when)
+        + (("\n" + rung_note) if rung_note else ""),
         "hotdir:notary:%s:%s" % (path, sha),
-        path=path, trust=sig["trust"], sha256=sha, gatekeeper=verdict)]
+        path=path, trust=sig["trust"], sha256=sha, gatekeeper=verdict,
+        provenance=rung)]
 
 
 def _hot_elf_finding(path, st, kind):
@@ -8581,17 +8674,28 @@ def check_hot_dirs(max_age_days=14):
                 # never closes the finding — provenance is an attacker-supplyable
                 # hint, not an authority. A timestomped file is never demoted.
                 demote = trusted_origin and not ts_reason
+                # Custody grading, with the timestomp rule carried through the
+                # mechanism that already expresses it: a backdated file is
+                # ATTACK-DEFINED, so `_grade_binary` returns its severity
+                # untouched and awards no rung. Backdating is an act, not a
+                # property of origin — no provenance explains it away, and a
+                # payload dropped into a build directory must not be able to
+                # buy a step down by also lying about its mtime.
+                graded, rung, rung_note = _grade_binary(
+                    "HIGH", path, attack_defined=bool(ts_reason), sha=sha)
                 findings.append(finding(
-                    "HIGH", "hot-dir", "Unsigned executable in watched folder",
-                    "%s [%s], modified %s, %s%s" % (
+                    graded, "hot-dir", "Unsigned executable in watched folder",
+                    "%s [%s], modified %s, %s%s%s" % (
                         path, sig["trust"],
                         datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
-                        prov, ts_note),
+                        prov, ts_note,
+                        ("\n" + rung_note) if rung_note else ""),
                     "hotdir:%s:%s:%s" % (path, sig["trust"], sha),
                     path=path, trust=sig["trust"], sha256=sha,
                     quarantined=quar, download_agent=agent,
                     origin_url=origin, trusted_origin=trusted_origin,
-                    confidence=("low" if demote else "medium"),
+                    provenance=rung,
+                    confidence=("low" if (demote or rung) else "medium"),
                     timestomp=ts_reason,
                     markers=(["timestomp"] if ts_reason else None)))
     return findings
@@ -14580,6 +14684,188 @@ def _build_output_rung(path):
     return result
 
 
+# --- the custody ledger: a rung is earned by BYTES, not by a directory -------
+#
+# Every rung above answers "what is true of this file where it sits now?".
+# `_build_output_rung` asks the repo that owns the directory, `_package_receipt`
+# asks the installer database for the path, `_vouch_covers` matches path and
+# endpoint. On a machine whose own pipeline MOVES what it builds, all three go
+# blind the moment the bytes leave the directory that could explain them.
+#
+# Measured on the reference Mac, one program's build, five stops:
+#
+#   build-output   ~/.ai/worktrees/<wt>/app/staging/App.app/.../mainexe
+#   None           ~/src/<project>/release/App.app/.../mainexe
+#   None           ~/Downloads/App.app/.../mainexe
+#   None           /Applications/App.app/.../mainexe
+#
+# One sha256 (f0dddc74...) at every stop. Aegis had already PROVEN they were
+# the same bytes — that hash is the incident key for all four — graded them
+# once, and then opened three more ungraded HIGH incidents about the file it
+# had just explained. Four of 49 open incidents were that one fact; the same
+# shape accounted for roughly thirty.
+#
+# So this ledger records the grading rather than re-deriving it: when a rung is
+# earned at any path, `sha256 -> rung` is remembered, and any later sighting of
+# those bytes anywhere inherits `copy-of-graded`.
+#
+# What it deliberately is NOT:
+#
+#   * not transitive over CONTENT. One changed byte is a different sha and
+#     carries nothing. This grades copies, never versions.
+#   * not a re-conferral. Carrying always yields `copy-of-graded`, the weakest
+#     rung, so a path-bound or endpoint-bound vouch cannot widen through it.
+#   * not a suppressor. `_demote` still moves one step and never to LOW, so
+#     every carried finding stays in the report and none auto-closes.
+#   * not fleet-shared, and it must never become so. The bodies sync source,
+#     not verdicts: a ledger that crossed machines would let one compromised
+#     body launder bytes into every other body's known-good set, which is
+#     precisely the blast radius this monitor exists to bound.
+#
+# Threat honesty, the same split the intent ledger states: the MAC key is
+# same-uid-readable, so an attacker already executing as the operator can forge
+# records. That does not defeat the purpose, because a forged `copy-of-graded`
+# buys one severity step on the IDENTITY half of a finding and nothing at all
+# on the behaviour half — and an attacker at that point can equally just drop
+# the payload in `dist/` and inherit `build-output` today.
+_CUSTODY_MAX_AGE_DAYS = 180
+_CUSTODY_MAX_BYTES = 2 * 1024 * 1024
+_CUSTODY_CARRY_CACHE = {}
+
+
+def _custody_mac(ts, sha, rung, path):
+    msg = "custody:v1|%s|%s|%s|%s" % (ts, sha, rung, path)
+    return hmac.new(_hmac_key(), msg.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _custody_remember(sha, rung, path):
+    """Record that content `sha` earned `rung` at `path`.
+
+    Never raises: this runs inside a sensor's grading path, and a ledger that
+    cannot be written must cost a rung, never a scan."""
+    if not (sha and rung and path):
+        return False
+    if rung == "copy-of-graded":
+        return False           # carried rungs are not themselves carriable
+    try:
+        if _custody_carried(sha):
+            return False       # already known; keep the ledger one-row-per-sha
+        ts = now_iso()
+        rec = {"ts": ts, "sha256": sha, "rung": rung,
+               "path": os.path.abspath(path),
+               "mac": _custody_mac(ts, sha, rung, os.path.abspath(path))}
+        line = json.dumps(rec, separators=(",", ":"))
+        try:
+            oversized = os.path.getsize(CUSTODY_FILE) > _CUSTODY_MAX_BYTES
+        except OSError:
+            oversized = False
+        if oversized:
+            with open(CUSTODY_FILE, encoding="utf-8", errors="replace") as f:
+                kept = _custody_prune(f.read().splitlines())
+            tmp = CUSTODY_FILE + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(kept) + ("\n" if kept else ""))
+            os.replace(tmp, CUSTODY_FILE)
+        fd = os.open(CUSTODY_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        _CUSTODY_CARRY_CACHE[sha] = (rung, rec["path"], ts)
+        return True
+    except Exception:
+        return False
+
+
+def _custody_prune(lines):
+    """Drop records past the retention window. Validity is checked at LOOKUP,
+    never here, so a tampered line ages out instead of being deleted at the
+    moment it would have become evidence — the same rule the intent ledger
+    keeps, for the same reason."""
+    cutoff = _epoch() - _CUSTODY_MAX_AGE_DAYS * 86400
+    kept = []
+    for ln in lines:
+        try:
+            if _epoch(json.loads(ln).get("ts")) >= cutoff:
+                kept.append(ln)
+        except Exception:
+            continue
+    return kept
+
+
+def _custody_carried(sha):
+    """(rung, path, ts) that content `sha` earned elsewhere, or None.
+
+    Newest record wins; a bad MAC or a stale timestamp is simply a non-match,
+    so the failure direction is toward suspicion."""
+    if not sha:
+        return None
+    if sha in _CUSTODY_CARRY_CACHE:
+        return _CUSTODY_CARRY_CACHE[sha]
+    found = None
+    try:
+        with open(CUSTODY_FILE, "rb") as f:
+            blob = f.read(_CUSTODY_MAX_BYTES).decode("utf-8", "replace")
+    except OSError:
+        _CUSTODY_CARRY_CACHE[sha] = None
+        return None
+    cutoff = _epoch() - _CUSTODY_MAX_AGE_DAYS * 86400
+    for ln in reversed(blob.splitlines()):
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if rec.get("sha256") != sha:
+            continue
+        if _epoch(rec.get("ts")) < cutoff:
+            continue
+        expect = _custody_mac(rec.get("ts"), rec.get("sha256"),
+                              rec.get("rung"), rec.get("path"))
+        if hmac.compare_digest(expect, str(rec.get("mac") or "")):
+            found = (rec.get("rung"), rec.get("path"), rec.get("ts"))
+            break
+    _CUSTODY_CARRY_CACHE[sha] = found
+    return found
+
+
+_GRADED_SHA_CACHE = {}
+
+
+def _graded_sha(path):
+    """sha256 of `path`, memoised for the life of this process.
+
+    Keyed on (path, mtime, size) so a rebuild inside one scan is not served a
+    stale hash. That key would be wrong for DETECTING a change across scans —
+    a content hash is the only honest answer there — but this cache never
+    outlives the scan that built it, and every sensor here already treats a
+    file mutating mid-scan as out of scope. It exists because grading asks for
+    the same binary's hash from several sensors in one run (a process, its
+    listener, its beacon), and the 1 % scan-cost ceiling does not have room to
+    hash it three times."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime, st.st_size)
+    except OSError:
+        return None
+    if key in _GRADED_SHA_CACHE:
+        return _GRADED_SHA_CACHE[key]
+    val = sha256(path)
+    _GRADED_SHA_CACHE[key] = val
+    return val
+
+
+def _custody_carry_note(carried):
+    """The report line for a carried rung: it must name what was graded, where
+    and when, because 'copy-of-graded' alone tells the operator nothing they
+    can check."""
+    rung, path, ts = carried
+    return ("%s These exact bytes graded '%s' at %s on %s."
+            % (_PROVENANCE_NOTE.get("copy-of-graded", ""), rung, path,
+               (ts or "")[:10]))
+
+
 _PROVENANCE_NOTE = {
     "os-vendor": ("The bytes that changed belong to the OS vendor's own "
                   "platform binary, on the sealed system volume, with SIP "
@@ -14598,6 +14884,16 @@ _PROVENANCE_NOTE = {
                      "dropped into a build directory would inherit this same "
                      "rung, so it explains the file's ORIGIN and is not "
                      "evidence about its behaviour."),
+    "copy-of-graded": ("These exact bytes already earned a custody rung "
+                       "somewhere else on this machine, and this path is a "
+                       "copy or a move of them. The claim is only about "
+                       "ORIGIN, and it is the weakest one here: the rung that "
+                       "was earned is NOT re-conferred, only the fact that "
+                       "some rung was. One changed byte is a different "
+                       "sha256 and carries nothing, so this can never launder "
+                       "a modified binary — and because it demotes one step "
+                       "and never suppresses, a copy that starts behaving "
+                       "badly alarms on its behaviour exactly as before."),
     "operator-vouched": ("The operator signed a vouch for exactly these bytes "
                          "at exactly this path, with a passphrase-protected "
                          "key verified against the pinned vouch roster. This "
@@ -14687,7 +14983,14 @@ _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed",
 # the ladder named the rung and then ignored it. One step down, not to LOW: an
 # uncommitted worktree edit is exactly what a local attacker's change also
 # looks like, so it earns quiet, not silence.
-_WEAK_CUSTODY = ("worktree", "local-commit", "build-output")
+# `copy-of-graded` is the carried form of every rung above: these exact bytes
+# earned a rung somewhere else on this machine, and were then moved or copied
+# here. It is deliberately the WEAKEST way a rung can arrive, and it is the
+# only form carrying ever produces — see `_custody_carried`, which never
+# re-confers the rung it found. That is what stops a vouch from widening: a
+# vouch is bound to one path (and, for outbound, one endpoint), so carrying it
+# as itself would silently grant "may live anywhere, may talk to anywhere".
+_WEAK_CUSTODY = ("worktree", "local-commit", "build-output", "copy-of-graded")
 
 _CUSTODY_FLOOR = {"relocated": "LOW", "os-vendor": "LOW"}
 # How much a custody-graded finding may still CORROBORATE in the risk tier.
@@ -14933,7 +15236,8 @@ def _package_receipt(path):
     return None
 
 
-def _grade_binary(severity, path, attack_defined=False, endpoint=None):
+def _grade_binary(severity, path, attack_defined=False, endpoint=None,
+                  sha=None):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
 
     process / net-listener / net-outbound / net-beacon all raise on the same
@@ -14947,6 +15251,11 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None):
     binary can still be the thing beaconing — the update itself can be the
     compromise — so this quiets the identity half of the alarm and leaves the
     behaviour half at a level that still reaches the report.
+
+    `sha` is the content hash when the caller already holds one (check_processes
+    computes it for its own fingerprint). It is only otherwise derived when a
+    rung is actually at stake, so the ledger costs a hash for the binaries
+    being graded and nothing for the rest.
     """
     if attack_defined:
         return severity, None, None
@@ -14966,7 +15275,26 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None):
     elif _build_output_rung(path):
         rung = "build-output"
     else:
-        return severity, None, None
+        # Nothing about WHERE this file sits explains it. Ask the only question
+        # left: were these exact bytes already explained somewhere else? This
+        # is the stage of the operator's own pipeline the three rungs above
+        # cannot see — the copy in ~/Downloads, the one dragged to
+        # /Applications, the one a release script moved out of the build tree.
+        carried = _custody_carried(sha or _graded_sha(path))
+        if not carried:
+            # Nothing grades it. Before handing back a bare severity, say
+            # whether a vouch the operator signed covers a sibling version of
+            # this same program — the case where they believe a control is on
+            # and it has been left behind by the workload. Note only: the
+            # severity and confidence are untouched, because a vouch for a
+            # sibling is not a vouch for these bytes.
+            return severity, None, _vouch_superseded_note(path)
+        return (_demote(severity, "copy-of-graded"), "copy-of-graded",
+                _custody_carry_note(carried))
+    # A rung earned HERE is what a later copy elsewhere will inherit. Recorded
+    # after the grading decision, never before it, so the ledger only ever
+    # holds rungs that were actually awarded.
+    _custody_remember(sha or _graded_sha(path), rung, path)
     return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
 
 
@@ -15211,6 +15539,93 @@ def _vouch_covers(path, endpoint=None, now=None):
     if endpoint is not None:
         return endpoint in (rec.get("endpoints") or [])
     return True
+
+
+def _vouch_health(rec, now=None):
+    """('applies' | 'bytes-changed' | 'path-gone', detail) for one vouch.
+
+    `vouch list` called every signature-verified, unexpired record "active",
+    which is true of the RECORD and says nothing about whether it can still
+    grade anything. A control the operator believes is on, that is silently
+    off, is the failure this monitor exists to surface — so the health of a
+    vouch is reported rather than inferred.
+    """
+    path = rec.get("path") or ""
+    if not path or not os.path.isfile(path):
+        return "path-gone", "the vouched file no longer exists"
+    live = sha256(path)
+    if live != str(rec.get("sha256") or ""):
+        return ("bytes-changed",
+                "the file at this path is no longer the bytes that were "
+                "vouched for (now %s), so the vouch does not apply to it"
+                % (live or "unreadable")[:16])
+    return "applies", ""
+
+
+def _vouch_superseded_by(path):
+    """A vouch covering a SIBLING VERSION of `path`, or None.
+
+    The failure this answers, measured 2026-09-19. Two self-hosted CI runners
+    were vouched at `<runner>/bin.2.336.0/Runner.Listener`. The runner
+    auto-updated, repointing its `bin` symlink at a new `bin.2.337.0`
+    directory, and every sensor began reporting the new binary — which no
+    vouch covered, so it alarmed exactly as an unvouched workload should.
+
+    Nothing was broken, which is why nothing reported it: the old vouch is
+    still signature-valid, still unexpired, and its file still exists with
+    exactly the pinned bytes, so every staleness test that asks about the
+    RECORD passes. `vouch list` printed 'active'. The vouch had simply been
+    left behind by the workload, and the operator had no way to see that
+    except by noticing an alarm they could not explain.
+
+    Deliberately a NOTE and never a rung. A vouch for a sibling is not a vouch
+    for these bytes, and if it demoted anything then dropping a payload beside
+    a vouched binary would inherit quiet — which is the one thing the vouch
+    tier exists to make impossible. So this changes no severity and no
+    confidence; it only tells the operator which vouch their workload outgrew.
+
+    The match is deliberately narrow: identical basename, and the two paths
+    differing in exactly one directory component (the version segment). A
+    looser rule would start explaining unrelated binaries by unrelated vouches.
+    """
+    if not path:
+        return None
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    base = os.path.basename(real)
+    parts = real.split(os.sep)
+    vouches, tamper = load_vouches()
+    if tamper or not vouches:
+        return None
+    for rec in vouches.values():
+        other = rec.get("path") or ""
+        if not other or other == real or os.path.basename(other) != base:
+            continue
+        o_parts = other.split(os.sep)
+        if len(o_parts) != len(parts):
+            continue
+        differing = [i for i in range(len(parts)) if parts[i] != o_parts[i]]
+        # Exactly one component differs, and it is a directory (never the
+        # filename, which is already known equal) -- the shape of a versioned
+        # install directory being rolled forward.
+        if len(differing) == 1 and differing[0] < len(parts) - 1:
+            return rec
+    return None
+
+
+def _vouch_superseded_note(path):
+    """The report line for a workload that has outgrown its vouch, or None."""
+    rec = _vouch_superseded_by(path)
+    if not rec:
+        return None
+    return ("A vouch you signed covers %s — the same program in a sibling "
+            "directory. This binary is not that one, so the vouch does NOT "
+            "apply and is not grading anything here. If this is that workload "
+            "having updated itself, re-vouch the new path; if it is not, the "
+            "vouch is not the explanation for it."
+            % rec.get("path"))
 
 
 def _vouch_chain_head():
@@ -15465,14 +15880,29 @@ def cmd_vouch(argv):
             print("no active vouches.")
             return 0
         print("%d active vouch(es):" % len(vouches))
+        stale = 0
         for subj in sorted(vouches, key=lambda k: vouches[k]["path"]):
             r = vouches[subj]
-            print("  %s" % r["path"])
+            # "active" was only ever a claim about the RECORD -- verified and
+            # unexpired. Whether it still GRADES anything is a separate
+            # question nothing used to ask, so it is answered here per row.
+            health, why = _vouch_health(r)
+            print("  %s%s" % (r["path"],
+                              "" if health == "applies"
+                              else "   [STALE: %s]" % health))
+            if health != "applies":
+                stale += 1
+                print("    %s" % why)
             print("    sha256=%s uid=%s expires=%s"
                   % (r["sha256"][:16], r.get("uid"),
                      datetime.fromtimestamp(int(r["expires_at"])).isoformat()))
             if r.get("endpoints"):
                 print("    endpoints: %s" % ", ".join(r["endpoints"]))
+        if stale:
+            print("\n%d vouch(es) no longer apply to anything on disk. A vouch "
+                  "you believe is\nprotecting a workload, that is silently "
+                  "grading nothing, is worth the same\nattention as an alarm: "
+                  "re-vouch the current path, or revoke the dead one." % stale)
         return 0
 
     if sub in ("add", "revoke"):
@@ -19457,10 +19887,51 @@ def _accept_into_baseline(incident_ids):
     db = _event_connection()
     try:
         marks = ",".join("?" for _ in incident_ids)
-        wanted = {row[0][len("signal:"):] for row in db.execute(
-            "SELECT correlation_key FROM incidents WHERE id IN (%s)" % marks,
-            tuple(incident_ids)).fetchall()
-            if (row[0] or "").startswith("signal:")}
+        # id travels WITH the key: `WHERE id IN (...)` returns rows in the
+        # store's order, not the caller's, so pairing them back up by position
+        # would attach one incident's key to another incident.
+        keyed = {row[0]: (row[1] or "") for row in db.execute(
+            "SELECT id, correlation_key FROM incidents WHERE id IN (%s)"
+            % marks, tuple(incident_ids)).fetchall()}
+        wanted = {k[len("signal:"):] for k in keyed.values()
+                  if k.startswith("signal:")}
+        # A CHAIN incident's key is `chain:<rule>:<entity>`, which names a
+        # correlation rather than a fact, so it never appears in a surface
+        # diff and the set above is empty for one. That made `benign-positive`
+        # on a chain a silent no-op: the verdict closed the row, the
+        # persistence item underneath it never reached the baseline, the next
+        # scan re-emitted it as new, and the chain re-opened. Measured on the
+        # live store: two CRITICAL `chain:supply-chain` incidents had
+        # accumulated 1,065 and 770 evidence events between them — one of them
+        # aegis's OWN menu-bar host, re-asserted every ~10 minutes since the
+        # day it was installed — with no verdict the operator could give that
+        # would end either one.
+        #
+        # So a chain is accepted through its CONSTITUENT facts. Every guard
+        # below is unchanged and still does the work: the live diff must still
+        # reproduce each fingerprint, `_NEVER_TOLERATE_PREFIXES` still refuses
+        # the whole acceptance, and evidence belonging to no baseline surface
+        # (a process, a behaviour) simply matches nothing and is accepted
+        # nowhere. Accepting the correlation is exactly the claim the operator
+        # is making — that the facts it joined are authorized.
+        chain_ids = [i for i, k in keyed.items()
+                     if not k.startswith("signal:")]
+        chain_wanted = set()
+        if chain_ids:
+            cmarks = ",".join("?" for _ in chain_ids)
+            for row in db.execute(
+                    "SELECT e.data_json FROM events e JOIN incident_events ie "
+                    "ON ie.event_id=e.id WHERE ie.incident_id IN (%s) "
+                    "AND e.event_type='observation.finding'" % cmarks,
+                    tuple(chain_ids)):
+                try:
+                    rec = json.loads(row[0])
+                except Exception:
+                    continue
+                for fp in (rec.get("fingerprint"), rec.get("case_fingerprint")):
+                    if fp:
+                        chain_wanted.add(fp)
+        wanted |= chain_wanted
         # A correlation key is the CASE fingerprint — hashless, one per
         # subject — while the diff below emits the exact per-content
         # fingerprint. Matching only the exact form meant acceptance silently
