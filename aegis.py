@@ -4807,6 +4807,19 @@ def _correlation_pairs(observations, left_pred, right_pred, window):
             yield left_id, right_id, left, right
 
 
+def _chain_entity_key(correlation_key):
+    """The entity half of `chain:<rule>:<entity>`, or None.
+
+    The rule name itself contains no colon, but splitting from the RIGHT is
+    still the safe read: it is the entity that must match, and a future rule
+    name with a colon in it would otherwise silently stop pairing."""
+    key = str(correlation_key or "")
+    if not key.startswith("chain:"):
+        return None
+    entity = key.rsplit(":", 1)[-1]
+    return entity or None
+
+
 def _dedupe_chain_incidents(db, chains_raised, now):
     """Close any chain incident whose evidence is a STRICT SUBSET of another
     chain's on the same entity, and return how many were closed.
@@ -4836,30 +4849,62 @@ def _dedupe_chain_incidents(db, chains_raised, now):
     The closed row names its survivor, so the collapse is auditable and
     `reopen` remains available.
     """
+    # Reconciles every ACTIVE chain, not the ones this scan happened to raise.
+    #
+    # Scan-local was the first shape of this, and it was wrong in the way that
+    # matters: it could only collapse a pair whose BOTH halves re-fired in one
+    # scan. A duplicate pair that was already standing in the queue — which is
+    # the only kind an operator actually has — was never reconciled, because a
+    # chain stops matching new events as soon as the behaviour that fed it
+    # stops. Measured after shipping it: #511 and #517 both sat OPEN with
+    # #517's four events wholly inside #511's twelve, last touched together
+    # hours earlier, and the next scan raised no chain at all, so nothing was
+    # compared. Same defect as the one this whole tier was written to fix —
+    # a rule that only ever looks at new events never writes back to the
+    # standing state.
+    #
+    # `chains_raised` is still taken, because a chain raised THIS scan must be
+    # considered even before it is committed, and reconciling the whole active
+    # set costs one indexed query over a handful of rows.
+    active = {}
+    for row in db.execute(
+            "SELECT id, correlation_key FROM incidents WHERE kind='correlation'"
+            " AND status IN (%s)" % ",".join("?" for _ in
+                                             _ACTIVE_INCIDENT_STATES),
+            _ACTIVE_INCIDENT_STATES):
+        entity = _chain_entity_key(row[1])
+        if entity:
+            active[row[0]] = entity
+    for entity_key, inc_id, _matched in chains_raised:
+        active.setdefault(inc_id, entity_key)
+
     # Compared on each incident's FULL evidence, read back from the store, not
     # on the events this scan happened to match. An incident that has been
     # accruing evidence for days can match a single new event in one scan, and
     # judging it on that would close a chain whose real evidence is the wider
     # of the two — the opposite of what this is for.
     totals = {}
-    for _entity, inc_id, _matched in chains_raised:
-        if inc_id in totals:
-            continue
+    for inc_id in active:
         totals[inc_id] = frozenset(
             row[0] for row in db.execute(
                 "SELECT event_id FROM incident_events WHERE incident_id=?",
                 (inc_id,)))
     closed = 0
-    for entity_key, inc_id, _matched in chains_raised:
+    for inc_id, entity_key in sorted(active.items()):
         evidence = totals.get(inc_id) or frozenset()
         if not evidence:
             continue
-        covering = next(
-            (other for o_entity, other, _o_matched in chains_raised
-             if o_entity == entity_key and other != inc_id
-             and evidence < (totals.get(other) or frozenset())), None)
-        if covering is None:
+        # The WIDEST cover, not the first one found. With A ⊂ B ⊂ C, naming B
+        # would close A against a row that closes moments later in this same
+        # pass, leaving the operator a resolution pointing at a resolved
+        # incident. Every subset points at the maximal survivor instead, and
+        # ties break on id so the choice is stable across runs.
+        covers = [other for other, o_entity in active.items()
+                  if o_entity == entity_key and other != inc_id
+                  and evidence < (totals.get(other) or frozenset())]
+        if not covers:
             continue
+        covering = max(covers, key=lambda o: (len(totals.get(o) or ()), -o))
         marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
         cur = db.execute(
             "UPDATE incidents SET status='RESOLVED',resolution=?,"
