@@ -139,6 +139,24 @@ Weak signals that never notify alone accumulate per entity, weighted by severity
   only after a minimum sample, so one dismissal cannot mute a sensor. Reopening
   an incident retracts its dismissal.
 
+**Chains that describe one fact are reconciled.** The rules overlap by design —
+`chain:clickfix` and `chain:persistence-execution` both join a behaviour finding
+to a persistence one — so a single event can raise two CRITICALs. A chain whose
+evidence is a **strict subset** of another's *on the same entity* is closed,
+naming its survivor: pure redundancy, nothing lost from the record. Overlapping
+but non-nested chains are deliberately left alone (a remote-access chain beside
+a credential-capture chain is worse than either), and equal sets are too, since
+picking between two identical readings needs a reason this has not got.
+
+Two properties were learned the hard way and are load-bearing. It compares each
+incident's **full stored evidence**, not the events one scan happened to match,
+or a chain accruing evidence for days would be closed by one it outweighs. And
+it reconciles **every active chain, not just those raised this scan** — the
+first version was scan-local, which meant a duplicate pair already standing in
+the queue was never compared, because a chain stops matching new events the
+moment the behaviour feeding it stops. That is the only kind of duplicate an
+operator actually has.
+
 ## Incident workflow
 
 Allowed states are `OPEN`, `ACK`, `INVESTIGATING`, `CONTAINED`, `RECOVERING`,

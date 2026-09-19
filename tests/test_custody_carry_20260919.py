@@ -311,6 +311,53 @@ class ChainRulesDoNotDoubleCount(unittest.TestCase):
                          "the incident with the wider record survives")
         self.assertEqual(self._status(narrow), "RESOLVED")
 
+    def test_a_pair_already_STANDING_is_reconciled(self):
+        """The defect the scan-local first version shipped with.
+
+        A chain stops matching new events as soon as the behaviour feeding it
+        stops, so a duplicate pair that is already sitting in the queue — the
+        only kind an operator actually has — re-fires in NO scan and was never
+        compared. Measured after shipping: #511 and #517 both OPEN, #517's
+        four events wholly inside #511's twelve, and the next scan raised no
+        chain at all, so nothing reconciled them."""
+        big = self._chain("chain:persistence-execution:e1", self._ids(1, 2, 3))
+        small = self._chain("chain:clickfix:e1", self._ids(1, 2))
+        # Nothing raised this scan at all: exactly the live situation.
+        closed = aegis._dedupe_chain_incidents(self.db, [], self.now)
+        self.assertEqual(closed, 1,
+                         "a standing duplicate must reconcile without either "
+                         "half re-firing")
+        self.assertEqual(self._status(small), "RESOLVED")
+        self.assertEqual(self._status(big), "OPEN")
+
+    def test_a_nested_run_all_points_at_the_widest_survivor(self):
+        """A subset B of C must not be named as A's survivor when B itself
+        closes in the same pass — the operator would be sent to a resolved
+        row."""
+        c = self._chain("chain:remote-access:e1", self._ids(1, 2, 3))
+        b = self._chain("chain:persistence-execution:e1", self._ids(1, 2))
+        a = self._chain("chain:clickfix:e1", self._ids(1))
+        aegis._dedupe_chain_incidents(self.db, [], self.now)
+        self.assertEqual(self._status(c), "OPEN")
+        for closed_id in (a, b):
+            self.assertEqual(self._status(closed_id), "RESOLVED")
+            res = self.db.execute(
+                "SELECT resolution FROM incidents WHERE id=?",
+                (closed_id,)).fetchone()[0]
+            self.assertIn(str(c), res,
+                          "every subset points at the widest survivor, never "
+                          "at a row that closes beside it")
+
+    def test_an_already_resolved_chain_is_never_named_as_survivor(self):
+        big = self._chain("chain:persistence-execution:e1", self._ids(1, 2, 3))
+        small = self._chain("chain:clickfix:e1", self._ids(1, 2))
+        with self.db:
+            self.db.execute(
+                "UPDATE incidents SET status='RESOLVED' WHERE id=?", (big,))
+        self.assertEqual(aegis._dedupe_chain_incidents(self.db, [], self.now),
+                         0, "a closed chain is not an active cover")
+        self.assertEqual(self._status(small), "OPEN")
+
     def test_a_subset_on_a_DIFFERENT_entity_is_untouched(self):
         a = self._chain("chain:persistence-execution:e1", self._ids(1, 2, 3))
         b = self._chain("chain:clickfix:e2", self._ids(1, 2))
