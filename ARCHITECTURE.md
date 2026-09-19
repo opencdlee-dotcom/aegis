@@ -290,6 +290,27 @@ malicious, a publisher can ship a bad build, a stolen certificate signs cleanly.
    the system interpreter. A hand-installed binary (an unpacked CI runner, a
    curled release tarball) has no receipt and correctly keeps its severity.
 
+**A vouch the workload outgrew.** A vouch binds to one path, and a
+self-updating workload moves. Measured 2026-09-19: two CI runners vouched at
+`<runner>/bin.2.336.0/Runner.Listener` auto-updated, the `bin` symlink was
+repointed at `bin.2.337.0`, and the new binary alarmed for ten days as the
+unvouched workload it genuinely was. Nothing reported the cause, because
+nothing was broken — the old vouch was still signature-valid, still unexpired,
+and its file still held exactly the pinned bytes, so every test that asks about
+the *record* passed and `vouch list` printed "active". The obvious fix, a
+bytes-changed check, would have caught nothing here.
+
+Two things close it. `vouch list` now reports each vouch's **health** —
+`applies`, `STALE: bytes-changed`, or `STALE: path-gone` — because "active" was
+only ever a claim about the record, not about whether it still grades anything.
+And a binary that no rung explains is checked for a vouch covering a **sibling
+version** of the same program (identical basename, exactly one differing
+directory component), which is named in the finding's note. That is
+deliberately a note and never a rung: a vouch for a sibling is not a vouch for
+these bytes, and if it demoted anything, dropping a payload beside a vouched
+binary would inherit quiet — the one thing the vouch tier exists to prevent.
+Severity and confidence are untouched.
+
 Two weak git rungs that the ladder previously named and then ignored:
 `worktree` and `local-commit` printed "routine if you made it" while the finding
 stayed HIGH. They now demote **one step**, not to LOW — an uncommitted local

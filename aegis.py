@@ -15282,7 +15282,13 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
         # /Applications, the one a release script moved out of the build tree.
         carried = _custody_carried(sha or _graded_sha(path))
         if not carried:
-            return severity, None, None
+            # Nothing grades it. Before handing back a bare severity, say
+            # whether a vouch the operator signed covers a sibling version of
+            # this same program — the case where they believe a control is on
+            # and it has been left behind by the workload. Note only: the
+            # severity and confidence are untouched, because a vouch for a
+            # sibling is not a vouch for these bytes.
+            return severity, None, _vouch_superseded_note(path)
         return (_demote(severity, "copy-of-graded"), "copy-of-graded",
                 _custody_carry_note(carried))
     # A rung earned HERE is what a later copy elsewhere will inherit. Recorded
@@ -15533,6 +15539,93 @@ def _vouch_covers(path, endpoint=None, now=None):
     if endpoint is not None:
         return endpoint in (rec.get("endpoints") or [])
     return True
+
+
+def _vouch_health(rec, now=None):
+    """('applies' | 'bytes-changed' | 'path-gone', detail) for one vouch.
+
+    `vouch list` called every signature-verified, unexpired record "active",
+    which is true of the RECORD and says nothing about whether it can still
+    grade anything. A control the operator believes is on, that is silently
+    off, is the failure this monitor exists to surface — so the health of a
+    vouch is reported rather than inferred.
+    """
+    path = rec.get("path") or ""
+    if not path or not os.path.isfile(path):
+        return "path-gone", "the vouched file no longer exists"
+    live = sha256(path)
+    if live != str(rec.get("sha256") or ""):
+        return ("bytes-changed",
+                "the file at this path is no longer the bytes that were "
+                "vouched for (now %s), so the vouch does not apply to it"
+                % (live or "unreadable")[:16])
+    return "applies", ""
+
+
+def _vouch_superseded_by(path):
+    """A vouch covering a SIBLING VERSION of `path`, or None.
+
+    The failure this answers, measured 2026-09-19. Two self-hosted CI runners
+    were vouched at `<runner>/bin.2.336.0/Runner.Listener`. The runner
+    auto-updated, repointing its `bin` symlink at a new `bin.2.337.0`
+    directory, and every sensor began reporting the new binary — which no
+    vouch covered, so it alarmed exactly as an unvouched workload should.
+
+    Nothing was broken, which is why nothing reported it: the old vouch is
+    still signature-valid, still unexpired, and its file still exists with
+    exactly the pinned bytes, so every staleness test that asks about the
+    RECORD passes. `vouch list` printed 'active'. The vouch had simply been
+    left behind by the workload, and the operator had no way to see that
+    except by noticing an alarm they could not explain.
+
+    Deliberately a NOTE and never a rung. A vouch for a sibling is not a vouch
+    for these bytes, and if it demoted anything then dropping a payload beside
+    a vouched binary would inherit quiet — which is the one thing the vouch
+    tier exists to make impossible. So this changes no severity and no
+    confidence; it only tells the operator which vouch their workload outgrew.
+
+    The match is deliberately narrow: identical basename, and the two paths
+    differing in exactly one directory component (the version segment). A
+    looser rule would start explaining unrelated binaries by unrelated vouches.
+    """
+    if not path:
+        return None
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    base = os.path.basename(real)
+    parts = real.split(os.sep)
+    vouches, tamper = load_vouches()
+    if tamper or not vouches:
+        return None
+    for rec in vouches.values():
+        other = rec.get("path") or ""
+        if not other or other == real or os.path.basename(other) != base:
+            continue
+        o_parts = other.split(os.sep)
+        if len(o_parts) != len(parts):
+            continue
+        differing = [i for i in range(len(parts)) if parts[i] != o_parts[i]]
+        # Exactly one component differs, and it is a directory (never the
+        # filename, which is already known equal) -- the shape of a versioned
+        # install directory being rolled forward.
+        if len(differing) == 1 and differing[0] < len(parts) - 1:
+            return rec
+    return None
+
+
+def _vouch_superseded_note(path):
+    """The report line for a workload that has outgrown its vouch, or None."""
+    rec = _vouch_superseded_by(path)
+    if not rec:
+        return None
+    return ("A vouch you signed covers %s — the same program in a sibling "
+            "directory. This binary is not that one, so the vouch does NOT "
+            "apply and is not grading anything here. If this is that workload "
+            "having updated itself, re-vouch the new path; if it is not, the "
+            "vouch is not the explanation for it."
+            % rec.get("path"))
 
 
 def _vouch_chain_head():
@@ -15787,14 +15880,29 @@ def cmd_vouch(argv):
             print("no active vouches.")
             return 0
         print("%d active vouch(es):" % len(vouches))
+        stale = 0
         for subj in sorted(vouches, key=lambda k: vouches[k]["path"]):
             r = vouches[subj]
-            print("  %s" % r["path"])
+            # "active" was only ever a claim about the RECORD -- verified and
+            # unexpired. Whether it still GRADES anything is a separate
+            # question nothing used to ask, so it is answered here per row.
+            health, why = _vouch_health(r)
+            print("  %s%s" % (r["path"],
+                              "" if health == "applies"
+                              else "   [STALE: %s]" % health))
+            if health != "applies":
+                stale += 1
+                print("    %s" % why)
             print("    sha256=%s uid=%s expires=%s"
                   % (r["sha256"][:16], r.get("uid"),
                      datetime.fromtimestamp(int(r["expires_at"])).isoformat()))
             if r.get("endpoints"):
                 print("    endpoints: %s" % ", ".join(r["endpoints"]))
+        if stale:
+            print("\n%d vouch(es) no longer apply to anything on disk. A vouch "
+                  "you believe is\nprotecting a workload, that is silently "
+                  "grading nothing, is worth the same\nattention as an alarm: "
+                  "re-vouch the current path, or revoke the dead one." % stale)
         return 0
 
     if sub in ("add", "revoke"):
