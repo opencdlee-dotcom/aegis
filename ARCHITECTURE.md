@@ -296,6 +296,32 @@ stayed HIGH. They now demote **one step**, not to LOW — an uncommitted local
 edit is also exactly what a local attacker's change looks like, so it earns
 quiet rather than silence.
 
+8. **Carried custody** (`~/.aegis/custody.jsonl`) → **one step**, the weakest
+   rung there is. Every rung above asks a question about a *directory*:
+   `_build_output_rung` asks the repo that owns it, `_package_receipt` asks the
+   installer database for the path, `_vouch_covers` matches path and endpoint.
+   On a machine whose own pipeline **moves what it builds**, all three go blind
+   the moment an artifact is copied out of the tree that could explain it.
+   Measured 2026-09-19, one program's build at four stops — a worktree staging
+   dir, the repo's `release/`, `~/Downloads`, `/Applications` — graded
+   `build-output`, `None`, `None`, `None`, on one sha256. Aegis had already
+   *proven* they were the same bytes (that hash is the incident key for all
+   four) and still opened three ungraded HIGHs about the file it had just
+   explained. So a rung earned at any path is recorded as `sha256 → rung` in a
+   MAC'd ledger, and any later sighting of those bytes anywhere grades
+   `copy-of-graded`.
+
+   Four properties make it a grading rather than an allowlist. It is **not
+   transitive over content** — one changed byte is a different sha and carries
+   nothing, so it grades copies and never versions. It is **not a
+   re-conferral**: carrying always yields `copy-of-graded`, never the rung that
+   was found, which is what stops a path-bound or endpoint-bound vouch widening
+   into "may live anywhere, may talk to anywhere". It is **not a suppressor** —
+   `_demote` still moves one step and never to LOW. And it is **machine-local
+   by design, and must never be synced**: the bodies share source, not
+   verdicts, and a ledger that crossed machines would let one compromised body
+   launder bytes into every other body's known-good set.
+
 Guards, because grading is where an attacker would want to stand:
 
 - **Grades, never mutes.** A downgraded finding is still created, still in the
