@@ -151,7 +151,7 @@ def test_framework_links_and_cache(artifact, tmp_path, monkeypatch):
     assert aegis._artifact_receipt(str(copied / 'app'))
     assert aegis._artifact_receipt(str(copied / 'Contents/Frameworks/Demo.framework/Demo'))
     assert aegis._artifact_receipt(str(copied / 'Contents/Frameworks/Demo.framework/Versions/Current/Demo'))
-    assert len(calls) == 1
+    assert len(calls) == (3 if aegis.IS_WIN else 1)
     target = copied / 'Contents/Frameworks/Demo.framework/Versions/A/Demo'
     old = target.stat()
     target.write_bytes(b'changed   code')
@@ -195,4 +195,24 @@ def test_bad_current_receipt_never_falls_back_to_backup(artifact):
     current = next(directory.iterdir())
     (directory / 'old-good.json').write_bytes(current.read_bytes())
     current.write_text('{invalid')
+    assert aegis._artifact_receipt(str(root / 'app')) is None
+
+
+def test_windows_creation_time_cannot_authorize_changed_bytes(artifact, monkeypatch):
+    root, _, _ = artifact
+    assert receive(artifact) == 0
+    # Windows ctime can remain creation time after same-size overwrites.
+    # Freeze the complete identity to reproduce that exact cache collision.
+    identity = aegis._artifact_tree_identity(str(root))
+    monkeypatch.setattr(aegis, '_artifact_tree_identity', lambda path: identity)
+    monkeypatch.setattr(aegis, 'IS_WIN', True)
+    native_run = aegis.run
+    def host_run(*args, **kwargs):
+        with patch.multiple(aegis, IS_WIN=sys.platform == 'win32',
+                            IS_MAC=sys.platform == 'darwin',
+                            IS_LINUX=sys.platform.startswith('linux')):
+            return native_run(*args, **kwargs)
+    monkeypatch.setattr(aegis, 'run', host_run)
+    assert aegis._artifact_receipt(str(root / 'app'))
+    (root / 'app').write_bytes(b'evil! build')
     assert aegis._artifact_receipt(str(root / 'app')) is None

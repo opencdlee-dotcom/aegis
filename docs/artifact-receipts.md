@@ -42,6 +42,9 @@ directories. A changed identity requires signature and complete byte checking.
 Successful checks are cached only in memory and reset when each scan begins;
 no persistent cache is imported. Added helpers and same-size modifications
 with restored mtime invalidate immediately through membership/ctime checks.
+This stat cache is POSIX-only. Windows always rehashes all artifact bytes:
+on supported Python versions its ctime can mean creation time, so it does not
+prove that a same-size file with restored mtime is unchanged.
 This remains a polling observer: concurrent writes after a check are not
 prevented, and an adversary capable of forging filesystem metadata is outside
 the stat-cache boundary.

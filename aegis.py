@@ -16086,7 +16086,10 @@ def _artifact_verify(record, root, world, project):
     if len(roster) > 1024 * 1024:
         raise ValueError("signer roster exceeds budget")
     key = (root, world, project, json.dumps(record, sort_keys=True), roster, identity)
-    if _ARTIFACT_SCAN_CACHE.get(root) == key:
+    # Windows st_ctime is creation time on supported Python releases, not
+    # metadata-change time. A same-size write with restored mtime can collide.
+    # Keep complete byte verification there rather than trust that stat key.
+    if not IS_WIN and _ARTIFACT_SCAN_CACHE.get(root) == key:
         return record
     if not _vouch_verify_sig(_vouch_canonical(record), record.get("sig"),
                              record["principal"], FLEET_SIGNERS, "aegis-artifact"):
@@ -16095,9 +16098,10 @@ def _artifact_verify(record, root, world, project):
         raise ValueError("artifact component bytes changed")
     if _artifact_tree_identity(root)[0] != identity:
         raise ValueError("artifact tree changed during verification")
-    if len(_ARTIFACT_SCAN_CACHE) >= 128:
-        _ARTIFACT_SCAN_CACHE.clear()
-    _ARTIFACT_SCAN_CACHE[root] = key
+    if not IS_WIN:
+        if len(_ARTIFACT_SCAN_CACHE) >= 128:
+            _ARTIFACT_SCAN_CACHE.clear()
+        _ARTIFACT_SCAN_CACHE[root] = key
     return record
 
 
