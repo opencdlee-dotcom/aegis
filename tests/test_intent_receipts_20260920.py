@@ -195,6 +195,12 @@ def test_corrupt_health_and_missing_build_output(sandbox, capsys):
     assert "outputs_unverified" in (sandbox / "intent.jsonl.health").read_text()
 
 
+def test_non_utf8_health_is_a_visible_coverage_failure(sandbox, capsys):
+    (sandbox / "intent.jsonl.health").write_bytes(bytes([255]))
+    assert aegis.cmd_intent(["aegis", "intent", "health"]) == 0
+    assert json.loads(capsys.readouterr().out)["counts"]["health_corrupt"] == 1
+
+
 def test_codex_namespaced_raw_patch_is_observed_unknown(sandbox, monkeypatch):
     path = sandbox / "sample.py"
     path.write_text("ok")

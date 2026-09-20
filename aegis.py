@@ -15782,12 +15782,29 @@ def _distribution_prove(package, release, archive, expected, source, root):
     This is origin evidence in shadow, never permission or malware clearance.
     """
     import tarfile
+    import gzip
+    class BoundedArchive:
+        def __init__(self, stream):
+            self.stream, self.remaining = stream, 1024 * 1024 * 1024
+
+        def read(self, size):
+            if size < 0:
+                raise ValueError("unbounded archive read")
+            block = self.stream.read(min(size, self.remaining + 1))
+            self.remaining -= len(block)
+            if self.remaining < 0:
+                raise ValueError("archive exceeds expanded budget")
+            return block
+
     if os.path.getsize(archive) > 256 * 1024 * 1024 or sha256(archive) != expected:
         raise ValueError("archive does not match official digest or exceeds budget")
     root = os.path.realpath(root)
     components, seen, total, mismatches = {}, set(), 0, 0
-    with tarfile.open(archive, "r:gz") as bundle:
-        for member in bundle:
+    with gzip.open(archive, "rb") as compressed, tarfile.open(
+            fileobj=BoundedArchive(compressed), mode="r|", encoding="utf-8") as bundle:
+        for member_count, member in enumerate(bundle, 1):
+            if member_count > 40000:
+                raise ValueError("archive exceeds member budget")
             parts = member.name.split("/")
             if (member.name.startswith("/") or "\\" in member.name
                     or ":" in member.name or ".." in parts):
@@ -15887,8 +15904,12 @@ def cmd_distribution(argv):
             matches = [line.split()[0] for line in metadata.decode().splitlines()
                        if len(line.split()) == 2 and line.split()[1] == asset]
         else:
-            matches = [item.get("digest", "").removeprefix("sha256:")
-                       for item in json.loads(metadata).get("assets", []) if item.get("name") == asset]
+            release_data = json.loads(metadata)
+            if not isinstance(release_data, dict) or not isinstance(release_data.get("assets"), list):
+                raise ValueError("invalid official release metadata")
+            matches = [str(item.get("digest") or "").removeprefix("sha256:")
+                       for item in release_data["assets"]
+                       if isinstance(item, dict) and item.get("name") == asset]
         if len(matches) != 1 or not re.fullmatch(r"[0-9a-f]{64}", matches[0]):
             raise ValueError("official asset digest unavailable")
         result = _distribution_prove(package, release, archive, matches[0], source, root)
@@ -17368,6 +17389,8 @@ def cmd_intent(argv):
                         latest = record
             except FileNotFoundError:
                 pass
+            except (UnicodeError, OSError):
+                counts["health_corrupt"] = counts.get("health_corrupt", 0) + 1
         print(json.dumps({"counts": counts, "latest": latest, "hosts": hosts,
                           "scope": "retained local hook deliveries; not host coverage proof"}))
         return 0

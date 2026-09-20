@@ -88,6 +88,28 @@ def test_cli_missing_official_digest_does_not_mint_proof(tmp_path, monkeypatch):
     assert aegis._distribution_receipt(str(root / 'uv')) is None
 
 
+@pytest.mark.parametrize('value', [[], {'assets': None}, {'assets': [None]},
+    {'assets': [{'name': 'release.tar.gz', 'digest': None}]}])
+def test_cli_malformed_metadata_returns_failure(tmp_path, monkeypatch, value):
+    import urllib.request
+    root, archive, digest = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(json.dumps(value).encode()))
+    assert aegis.cmd_distribution(['aegis.py', 'distribution', 'verify',
+        'uv', '0.11.6', str(archive), str(root)]) == 1
+
+
+def test_archive_metadata_member_budget(tmp_path, monkeypatch):
+    root, archive, digest = fixture(tmp_path, monkeypatch)
+    with tarfile.open(archive, 'w:gz') as tar:
+        for index in range(40001):
+            info = tarfile.TarInfo('release/d' + str(index))
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match='member budget'):
+        aegis._distribution_prove('uv', '1', str(archive), digest, 'official', str(root))
+
+
 def test_archive_escape_is_never_read_or_extracted(tmp_path, monkeypatch):
     root, archive, digest = fixture(tmp_path, monkeypatch)
     with tarfile.open(archive, 'w:gz') as tar:
