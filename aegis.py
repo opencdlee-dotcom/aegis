@@ -20440,6 +20440,16 @@ def _cmd_scan_locked(quiet=False):
         # but the failure is durable and visible rather than silently "clean".
         log_run("event-store failure: %s" % e)
         incidents, persisted_health = [], health
+    try:
+        if os.path.exists(os.path.join(STATE_DIR, "workflow-shadow.json")):
+            workflow_db = _event_connection()
+            try:
+                _workflow_shadow_capture(workflow_db)
+            finally:
+                workflow_db.close()
+    except Exception as e:
+        log_run("workflow shadow failed: %s" % e)
+        degraded.append("workflow-shadow")
     # The heartbeat is written AFTER the report, so what is on disk now is the
     # PREVIOUS scan's — which is exactly the liveness fact the report needs and
     # costs no new state to obtain.
@@ -21022,6 +21032,137 @@ def _incident_families(db):
     out = [(k, _family_label(k, v), v) for k, v in groups.items()]
     out.sort(key=lambda t: (-len(t[2]), t[0]))
     return out
+
+
+_WORKFLOW_POLICY = "workflow-review-v1"
+_WORKFLOW_ATTENTION = {"expected": 0, "review": 1, "urgent": 2}
+
+
+def _workflow_report(db):
+    """Presentation only: exact content can relate observations, never verdicts.
+
+    Reuse the family inventory and lifecycle's conservative current-grade check.
+    No path/name/session claim conveys identity or authorization here.
+    """
+    rows = sorted((r for _, _, members in _incident_families(db) for r in members),
+                  key=lambda r: r["id"])
+    groups = {}
+    for row in rows:
+        try:
+            sub = json.loads(row.get("subject_json") or "{}")
+        except (ValueError, TypeError):
+            sub = {}
+        if not isinstance(sub, dict):
+            sub = {}
+        content = sub.get("content")
+        key = "incident:%s" % row["id"]
+        if (sub.get("kind") in ("process", "beacon")
+                and isinstance(content, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", content)):
+            key = "content:" + content.lower()
+        fp = (row.get("correlation_key") or "").removeprefix("signal:")
+        latest = _latest_incident_grade(db, row["id"], row.get("last_seen"))
+        attention, reason = "review", "Origin or destination proof missing; review exact observed bytes."
+        if row["severity"] == "CRITICAL" or fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            attention, reason = "urgent", "Strong threat signal; familiar workflow does not authorize it."
+        elif latest and SEV_ORDER[latest[0]] < SEV_ORDER["HIGH"]:
+            attention, reason = "expected", "Fresh attached evidence regraded below HIGH; no benign verdict implied."
+        elif latest is None:
+            reason = "Historical evidence incomplete, stale, or not safely regradable; do not infer benignness."
+        # An attack-defined event cannot be quieted even when its producer used HIGH.
+        for event in db.execute(
+                "SELECT e.data_json FROM events e JOIN incident_events ie ON ie.event_id=e.id "
+                "WHERE ie.incident_id=? AND e.event_type='observation.finding'", (row["id"],)):
+            try:
+                data = json.loads(event["data_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and (data.get("attack_defined") or
+                    bool(set(data.get("markers") or ()) & (_UNAMBIGUOUS_HIGH_IDIOMS |
+                         {"quarantine-strip", "xattr-clear-all"})) or
+                    str(data.get("fingerprint") or "").startswith(_NEVER_TOLERATE_PREFIXES)):
+                attention, reason = "urgent", "Attached harmful behavior requires review regardless of origin."
+                break
+        groups.setdefault(key, []).append({
+            "id": row["id"], "severity": row["severity"], "attention": attention,
+            "current_grade": latest[0] if latest else None, "reason": reason,
+            "last_seen": row.get("last_seen")})
+    cases = [{"identity": key, "members": members,
+              "severity": max((m["severity"] for m in members), key=lambda s: SEV_ORDER[s]),
+              "attention": max((m["attention"] for m in members), key=_WORKFLOW_ATTENTION.get)}
+             for key, members in groups.items()]
+    actual = sorted(m["id"] for c in cases for m in c["members"])
+    valid = actual == [r["id"] for r in rows] and len(actual) == len(set(actual))
+    valid = valid and all(c["severity"] == max(
+        (r["severity"] for r in rows if r["id"] in {m["id"] for m in c["members"]}),
+        key=lambda s: SEV_ORDER[s]) for c in cases)
+    return {"self_check": "PASS" if valid else "FAIL: inventory/severity mismatch",
+            "policy": _WORKFLOW_POLICY, "incident_count": len(rows), "cases": cases}
+
+
+def _workflow_shadow_evaluate(state, now=None):
+    now = _epoch() if now is None else now
+    samples = state.get("samples", [])
+    return {"policy": state.get("policy"), "window_complete":
+            now - state["started_at"] >= 7 * 86400,
+            "distinct_snapshots": len(samples), "enable_ready": False,
+            "samples_truncated": bool(state.get("samples_truncated")),
+            "result": "INSUFFICIENT_EVIDENCE",
+            "missing_gates": ["Comparable prior-week verified-routine repeat interruptions",
+                              "Positive controls, host canaries, sensor coverage and CPU budget"],
+            "note": "Snapshots count decisions, not delivered notifications. Sparse samples cannot prove a 90% reduction."}
+
+
+def _workflow_shadow_capture(db, now=None):
+    path = os.path.join(STATE_DIR, "workflow-shadow.json")
+    state = load_json(path, None)
+    if state is None:
+        return
+    if state.get("policy") != _WORKFLOW_POLICY:
+        raise ValueError("workflow shadow policy changed; explicit new evaluation required")
+    report = _workflow_report(db)
+    save_json(os.path.join(STATE_DIR, "workflow-review.json"), report)
+    if report["self_check"] != "PASS":
+        raise ValueError(report["self_check"])
+    digest = hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest()
+    samples = state.setdefault("samples", [])
+    if not samples or samples[-1]["digest"] != digest:
+        counts = {level: sum(c["attention"] == level for c in report["cases"])
+                  for level in _WORKFLOW_ATTENTION}
+        samples.append({"at": _epoch() if now is None else now, "digest": digest,
+                        "incidents": report["incident_count"], "decisions": counts})
+        state["samples"] = samples[-10000:]
+        state["samples_truncated"] = bool(state.get("samples_truncated") or len(samples) > 10000)
+        save_json(path, state)
+
+
+def cmd_workflows(action="report"):
+    if action not in ("report", "start", "status", "evaluate"):
+        print("usage: aegis.py workflows [report|start|status|evaluate]")
+        return 2
+    ensure_state()
+    init_event_store()
+    path = os.path.join(STATE_DIR, "workflow-shadow.json")
+    db = _event_connection()
+    try:
+        if action == "report":
+            report = _workflow_report(db)
+            save_json(os.path.join(STATE_DIR, "workflow-review.json"), report)
+            print(json.dumps(report, indent=2))
+            return 0 if report["self_check"] == "PASS" else 1
+        if action == "start" and not os.path.exists(path):
+            save_json(path, {"policy": _WORKFLOW_POLICY, "started_at": _epoch(), "samples": []})
+            _workflow_shadow_capture(db)
+        state = load_json(path, None)
+        if state is None:
+            print("Workflow shadow not started. Run: aegis.py workflows start")
+            return 1
+        result = _workflow_shadow_evaluate(state)
+        save_json(os.path.join(STATE_DIR, "workflow-evaluation.json"), result)
+        print(json.dumps(result, indent=2))
+        return 0
+    finally:
+        db.close()
 
 
 def cmd_families():
@@ -30475,6 +30616,8 @@ def main(argv):
         return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
     if cmd == "families":
         return cmd_families()
+    if cmd == "workflows":
+        return cmd_workflows(argv[2] if len(argv) > 2 else "report")
     if cmd == "family" and len(argv) > 2:
         return cmd_family(argv[2], argv[3] if len(argv) > 3 else None,
                           argv[4] if len(argv) > 4 else None)
