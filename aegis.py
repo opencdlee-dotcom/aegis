@@ -15767,6 +15767,159 @@ _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
                      _os_package_receipt)
 
 
+def _distribution_mac(record):
+    body = json.dumps({k: v for k, v in record.items() if k != "mac"},
+                      sort_keys=True, separators=(",", ":"))
+    return hmac.new(_hmac_key(), ("distribution:v1|" + body).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _distribution_prove(package, release, archive, expected, source, root):
+    """Compare installed components to an explicitly verified upstream archive.
+
+    Called only by the foreground CLI, which obtains the digest from the
+    fixed official endpoint. Never extracts or executes downloaded content.
+    This is origin evidence in shadow, never permission or malware clearance.
+    """
+    import tarfile
+    import gzip
+    class BoundedArchive:
+        def __init__(self, stream):
+            self.stream, self.remaining = stream, 1024 * 1024 * 1024
+
+        def read(self, size):
+            if size < 0:
+                raise ValueError("unbounded archive read")
+            block = self.stream.read(min(size, self.remaining + 1))
+            self.remaining -= len(block)
+            if self.remaining < 0:
+                raise ValueError("archive exceeds expanded budget")
+            return block
+
+    if os.path.getsize(archive) > 256 * 1024 * 1024 or sha256(archive) != expected:
+        raise ValueError("archive does not match official digest or exceeds budget")
+    root = os.path.realpath(root)
+    components, seen, total, mismatches = {}, set(), 0, 0
+    with gzip.open(archive, "rb") as compressed, tarfile.open(
+            fileobj=BoundedArchive(compressed), mode="r|", encoding="utf-8") as bundle:
+        for member_count, member in enumerate(bundle, 1):
+            if member_count > 40000:
+                raise ValueError("archive exceeds member budget")
+            parts = member.name.split("/")
+            if (member.name.startswith("/") or "\\" in member.name
+                    or ":" in member.name or ".." in parts):
+                raise ValueError("archive path escape")
+            if not member.isfile():
+                continue
+            relative = "/".join(parts[1:])
+            if not relative or relative in seen or len(seen) >= 20000:
+                raise ValueError("invalid or duplicate component")
+            seen.add(relative)
+            total += member.size
+            if total > 1024 * 1024 * 1024:
+                raise ValueError("archive exceeds expanded budget")
+            path = os.path.join(root, *relative.split("/"))
+            # No symlink-derived origin; aliases can resolve through an
+            # already verified file but never extend the recorded scope.
+            if os.path.realpath(path) != path or not os.path.isfile(path):
+                continue
+            digest = hashlib.sha256()
+            stream = bundle.extractfile(member)
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+            actual = sha256(path)
+            if actual == digest.hexdigest():
+                components[path] = actual
+            else:
+                mismatches += 1
+    record = {"version": 1, "package": package, "release": release,
+              "source": source, "source_id": "%s@%s:%s" % (package, release, expected),
+              "archive_sha256": expected, "platform": sys.platform,
+              "verified_at": _epoch(), "expires": _epoch() + 30 * 86400,
+              "components": components}
+    record["mac"] = _distribution_mac(record)
+    path = os.path.join(STATE_DIR, "distribution-proofs.json")
+    records = load_json(path, [])
+    if not isinstance(records, list):
+        raise ValueError("invalid distribution proof store")
+    records = [r for r in records if r.get("source_id") != record["source_id"]][-127:]
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    if components:
+        save_json(path, records + [record])
+    return {"matched_components": len(components), "mismatched_components": mismatches,
+            "source": source, "shadow": True}
+
+
+def _distribution_receipt(path):
+    """Offline, exact-content lookup; same-UID MAC is not a privilege boundary."""
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    try:
+        proof_path = os.path.join(STATE_DIR, "distribution-proofs.json")
+        if os.path.getsize(proof_path) > 8 * 1024 * 1024:
+            return None
+        records = load_json(proof_path, [])
+        if not isinstance(records, list) or len(records) > 128:
+            return None
+        for record in reversed(records):
+            if (record.get("version") != 1 or record.get("platform") != sys.platform
+                    or not record["verified_at"] <= _epoch() < record["expires"]
+                    or record["expires"] - record["verified_at"] > 30 * 86400):
+                continue
+            expected = record.get("components", {}).get(real)
+            if expected and hmac.compare_digest(str(record.get("mac", "")),
+                                                _distribution_mac(record)):
+                if _graded_sha(real) == expected:
+                    return record
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return None
+
+
+def cmd_distribution(argv):
+    """Explicit network verification; scanning never contacts these services."""
+    import urllib.request
+    import tarfile
+    try:
+        if len(argv) != 7 or argv[2] != "verify":
+            raise ValueError("usage: distribution verify uv|llama.cpp|node VERSION ARCHIVE ROOT")
+        package, release, archive, root = argv[3:7]
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", release):
+            raise ValueError("invalid release")
+        asset = os.path.basename(archive)
+        if package in ("uv", "llama.cpp"):
+            repo = {"uv": "astral-sh/uv", "llama.cpp": "ggml-org/llama.cpp"}[package]
+            source = "https://api.github.com/repos/%s/releases/tags/%s" % (repo, release)
+        elif package == "node" and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", release):
+            source = "https://nodejs.org/dist/%s/SHASUMS256.txt" % release
+        else:
+            raise ValueError("unsupported package or version")
+        request = urllib.request.Request(source, headers={"User-Agent": "Aegis-explicit-origin-verifier"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            metadata = response.read(1024 * 1024 + 1)
+        if len(metadata) > 1024 * 1024:
+            raise ValueError("official metadata exceeds budget")
+        if package == "node":
+            matches = [line.split()[0] for line in metadata.decode().splitlines()
+                       if len(line.split()) == 2 and line.split()[1] == asset]
+        else:
+            release_data = json.loads(metadata)
+            if not isinstance(release_data, dict) or not isinstance(release_data.get("assets"), list):
+                raise ValueError("invalid official release metadata")
+            matches = [str(item.get("digest") or "").removeprefix("sha256:")
+                       for item in release_data["assets"]
+                       if isinstance(item, dict) and item.get("name") == asset]
+        if len(matches) != 1 or not re.fullmatch(r"[0-9a-f]{64}", matches[0]):
+            raise ValueError("official asset digest unavailable")
+        result = _distribution_prove(package, release, archive, matches[0], source, root)
+        print(json.dumps(result))
+        return 0 if result["matched_components"] else 1
+    except (OSError, ValueError, TypeError, KeyError, tarfile.TarError) as exc:
+        print("Distribution verification failed: %s" % exc)
+        return 1
+
+
 def _package_receipt(path):
     """The package-manager transaction that owns `path`, or None.
 
@@ -15796,6 +15949,238 @@ def _package_receipt(path):
             if hit:
                 return hit
     return None
+
+
+_ARTIFACT_SCAN_CACHE = {}
+_ARTIFACT_MAX_FILES = 20000
+_ARTIFACT_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def _artifact_link(root, path):
+    """An internal, relative link; realpath+exists rejects cycles/dangling links."""
+    link = os.readlink(path)
+    target = os.path.realpath(path)
+    if (os.path.isabs(link) or os.path.commonpath((root, target)) != root
+            or not os.path.exists(target)
+            or (os.path.isdir(target)
+                and os.path.commonpath((os.path.dirname(path), target)) == target)):
+        raise ValueError("artifact symlink escapes, cycles or has no target")
+    return link
+
+
+def _artifact_tree_identity(root):
+    """Complete bounded tree identity, including links and empty directories."""
+    identity, names, total, directories_seen = [], set(), 0, 0
+    if os.path.realpath(root) != root or not os.path.isdir(root):
+        raise ValueError("receiver root changed")
+    def observe(path):
+        nonlocal total
+        value = os.lstat(path)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        link = _artifact_link(root, path) if stat.S_ISLNK(value.st_mode) else None
+        if not (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode) or link is not None):
+            raise ValueError("artifact contains a special file")
+        identity.append((relative, value.st_dev, value.st_ino, value.st_mode,
+                         value.st_size, value.st_mtime_ns, value.st_ctime_ns, link))
+        if not stat.S_ISDIR(value.st_mode):
+            names.add(relative)
+            total += value.st_size
+            if len(names) > _ARTIFACT_MAX_FILES or total > _ARTIFACT_MAX_BYTES:
+                raise ValueError("artifact exceeds 20000 components or 1 GiB")
+    observe(root)
+    def fail(error):
+        raise error
+    for base, directories, files in os.walk(root, followlinks=False, onerror=fail):
+        directories.sort()
+        directories_seen += 1
+        if directories_seen > 4096:
+            raise ValueError("artifact tree exceeds directory budget")
+        for name in sorted(directories + files):
+            observe(os.path.join(base, name))
+    return tuple(identity), names
+
+
+def _artifact_components(root, names):
+    """Hash explicit files and bind internal symlinks to their exact link text."""
+    root = os.path.realpath(root)
+    if not isinstance(names, (list, dict)) or not 0 < len(names) <= _ARTIFACT_MAX_FILES:
+        raise ValueError("expected 1..20000 components")
+    result, total = {}, 0
+    for name in names:
+        if (not isinstance(name, str) or not name or "\\" in name
+                or ":" in name or name.startswith("/")
+                or any(p in ("", ".", "..") for p in name.split("/"))):
+            raise ValueError("component must be a relative file path")
+        path = os.path.join(root, *name.split("/"))
+        if os.path.realpath(os.path.dirname(path)) != os.path.dirname(path):
+            raise ValueError("list the real component, not a symlink alias")
+        if os.path.islink(path):
+            result[name] = {"link": _artifact_link(root, path)}
+            continue
+        if os.path.realpath(path) != path or not os.path.isfile(path):
+            raise ValueError("missing component or symlink substitution")
+        before = os.stat(path)
+        total += before.st_size
+        if total > _ARTIFACT_MAX_BYTES:
+            raise ValueError("artifact exceeds 1 GiB verification budget")
+        digest = hashlib.sha256()
+        read_bytes = 0
+        with open(path, "rb") as f:
+            while True:
+                block = f.read(1024 * 1024)
+                if not block:
+                    break
+                read_bytes += len(block)
+                if read_bytes > before.st_size:
+                    raise ValueError("component grew during verification")
+                digest.update(block)
+        after = os.stat(path)
+        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("component changed during verification")
+        result[name] = digest.hexdigest()
+    return result
+
+
+def _artifact_read(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("receipt exceeds 8 MiB")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("receipt must be an object")
+    return value
+
+
+def _artifact_verify(record, root, world, project):
+    """Origin only, using today's separately pinned roster on every check."""
+    if os.path.realpath(root) != root:
+        raise ValueError("receiver root was replaced by a symlink")
+    required = ("world", "project", "recipe", "toolchain", "principal")
+    if any(not isinstance(record.get(k), str) or not record[k] for k in required):
+        raise ValueError("missing artifact identity")
+    if (record.get("version") != 1 or record["world"] != world
+            or record["project"] != project or record.get("platform") != sys.platform):
+        raise ValueError("wrong world, project, platform or version")
+    for name in ("dependency_digest", "dirty_digest"):
+        value = record.get(name)
+        if name == "dirty_digest" and value is None:
+            continue
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("invalid source/dependency digest")
+    revision = record.get("source_revision")
+    if (not record.get("dirty_digest") and
+            (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision))):
+        raise ValueError("missing source revision or dirty-source digest")
+    now = _epoch()
+    issued, expires = record.get("issued"), record.get("expires")
+    if (not isinstance(issued, (int, float)) or not isinstance(expires, (int, float))
+            or not 0 <= issued <= now < expires <= issued + 31 * 86400):
+        raise ValueError("expired, future or overlong artifact receipt")
+    identity, seen = _artifact_tree_identity(root)
+    if not isinstance(record.get("components"), dict) or seen != set(record["components"]):
+        raise ValueError("unlisted artifact component")
+    with open(FLEET_SIGNERS, "rb") as f:
+        roster = f.read(1024 * 1024 + 1)
+    if len(roster) > 1024 * 1024:
+        raise ValueError("signer roster exceeds budget")
+    key = (root, world, project, json.dumps(record, sort_keys=True), roster, identity)
+    # Windows st_ctime is creation time on supported Python releases, not
+    # metadata-change time. A same-size write with restored mtime can collide.
+    # Keep complete byte verification there rather than trust that stat key.
+    if not IS_WIN and _ARTIFACT_SCAN_CACHE.get(root) == key:
+        return record
+    if not _vouch_verify_sig(_vouch_canonical(record), record.get("sig"),
+                             record["principal"], FLEET_SIGNERS, "aegis-artifact"):
+        raise ValueError("unknown/revoked signer or invalid signature")
+    if _artifact_components(root, record.get("components")) != record["components"]:
+        raise ValueError("artifact component bytes changed")
+    if _artifact_tree_identity(root)[0] != identity:
+        raise ValueError("artifact tree changed during verification")
+    if not IS_WIN:
+        if len(_ARTIFACT_SCAN_CACHE) >= 128:
+            _ARTIFACT_SCAN_CACHE.clear()
+        _ARTIFACT_SCAN_CACHE[root] = key
+    return record
+
+
+def _artifact_receipt(path):
+    """Verified receive-local origin; never inherits an endpoint permission."""
+    if not path:
+        return None
+    directory = os.path.join(STATE_DIR, "artifact_receipts")
+    try:
+        entries = os.listdir(directory)
+        if len(entries) > 128:
+            return None
+        for entry in entries:
+            binding_path = os.path.join(directory, entry)
+            try:
+                binding = _artifact_read(binding_path)
+                root = binding["root"]
+                if not isinstance(root, str) or not isinstance(binding.get("receipt"), dict):
+                    raise ValueError("malformed artifact binding")
+                # Only the receiver's current binding is authoritative, never
+                # a copied backup of an older receipt for the same root.
+                if entry != hashlib.sha256(root.encode()).hexdigest() + ".json":
+                    continue
+                relative = os.path.relpath(os.path.abspath(path), root).replace(os.sep, "/")
+                if relative not in binding["receipt"].get("components", {}):
+                    if os.path.commonpath((os.path.abspath(path), root)) != root:
+                        continue
+                    relative = os.path.relpath(os.path.realpath(path), root).replace(os.sep, "/")
+                    if relative not in binding["receipt"].get("components", {}):
+                        continue
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                unexamined(binding_path, "artifact binding could not be read", exc)
+                continue
+            try:
+                return _artifact_verify(binding["receipt"], root,
+                                        binding["world"], binding["project"])
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                unexamined(binding_path, "artifact origin verification failed", exc)
+                return None
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def cmd_artifact(argv):
+    """Explicit create/receive/verify; no key provisioning or trust pinning."""
+    try:
+        action, root = argv[2:4]
+        root = os.path.realpath(root)
+        if action == "create" and len(argv) == 7:
+            record = _artifact_read(argv[4])
+            record.pop("sig", None)
+            record["components"] = _artifact_components(root, record.get("components"))
+            record["sig"] = _vouch_sign(_vouch_canonical(record), argv[5], "aegis-artifact")
+            _artifact_verify(record, root, record.get("world"), record.get("project"))
+            with open(argv[6], "x", encoding="utf-8") as f:
+                json.dump(record, f, sort_keys=True)
+        elif action in ("receive", "verify") and len(argv) == 7:
+            record = _artifact_read(argv[4])
+            _artifact_verify(record, root, argv[5], argv[6])
+            if action == "receive":
+                directory = os.path.join(STATE_DIR, "artifact_receipts")
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                target = os.path.join(directory, hashlib.sha256(root.encode()).hexdigest() + ".json")
+                fd, temporary = tempfile.mkstemp(dir=directory)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(dict(root=root, world=argv[5], project=argv[6], receipt=record), f)
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+        else:
+            raise ValueError("usage: artifact create ROOT SPEC KEY OUTPUT | receive/verify ROOT RECEIPT WORLD PROJECT")
+        print("artifact origin verified; shadow only (no behavioral authorization)")
+        return 0
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print("artifact receipt rejected: %s" % exc)
+        return 1
 
 
 def _grade_binary(severity, path, attack_defined=False, endpoint=None,
@@ -15850,6 +16235,11 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
             # and it has been left behind by the workload. Note only: the
             # severity and confidence are untouched, because a vouch for a
             # sibling is not a vouch for these bytes.
+            artifact = _artifact_receipt(path) if endpoint is None else None
+            if artifact:
+                return severity, None, ("SHADOW: verified artifact origin for %s/%s; "
+                                        "current severity retained." %
+                                        (artifact["world"], artifact["project"]))
             return severity, None, _vouch_superseded_note(path)
         return (_demote(severity, "copy-of-graded"), "copy-of-graded",
                 _custody_carry_note(carried))
@@ -15922,11 +16312,13 @@ def _vouch_link(rec):
         _vouch_canonical(rec).encode("utf-8", "replace")).hexdigest()
 
 
-def _vouch_verify_sig(payload, sig, principal):
+def _vouch_verify_sig(payload, sig, principal, roster=None, namespace=None):
     """True iff `sig` is a good ssh signature over `payload` by a principal in
     the PINNED vouch roster. Any failure — missing roster, missing ssh-keygen,
     bad signature, unknown signer, timeout — is False, never an exception."""
-    if not sig or not os.path.isfile(VOUCH_SIGNERS):
+    roster = roster or VOUCH_SIGNERS
+    namespace = namespace or _VOUCH_NAMESPACE
+    if not sig or not os.path.isfile(roster):
         return False
     sig_path = None
     try:
@@ -15934,8 +16326,8 @@ def _vouch_verify_sig(payload, sig, principal):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(sig if sig.endswith("\n") else sig + "\n")
         _out, _err, rc = run(
-            ["ssh-keygen", "-Y", "verify", "-f", VOUCH_SIGNERS,
-             "-I", principal, "-n", _VOUCH_NAMESPACE, "-s", sig_path],
+            ["ssh-keygen", "-Y", "verify", "-f", roster,
+             "-I", principal, "-n", namespace, "-s", sig_path],
             timeout=15, stdin_data=payload)
         return rc == 0
     except Exception:
@@ -16206,7 +16598,7 @@ def _vouch_chain_head():
     return _vouch_link(last), int(last["seq"])
 
 
-def _vouch_sign(payload, key_path):
+def _vouch_sign(payload, key_path, namespace=None):
     """Armored ssh signature over `payload`, or None.
 
     ssh-keygen prompts for the key's passphrase on the terminal; that prompt is
@@ -16221,8 +16613,8 @@ def _vouch_sign(payload, key_path):
         # Not run() — this one must inherit the real tty to prompt for the
         # passphrase, which capture_output would swallow.
         rc = subprocess.call(
-            ["/usr/bin/ssh-keygen", "-Y", "sign", "-f", key_path,
-             "-n", _VOUCH_NAMESPACE, "-q", data_path])
+            [shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen", "-Y", "sign", "-f", key_path,
+             "-n", namespace or _VOUCH_NAMESPACE, "-q", data_path])
         if rc != 0:
             return None
         with open(data_path + ".sig", "r", encoding="utf-8") as f:
@@ -16657,7 +17049,7 @@ def _intent_prune(lines):
     return kept
 
 
-def intent_record(path, tool="manual"):
+def intent_record(path, tool="manual", expected_sha=None):
     """Append one signed intent record for `path`'s CURRENT content.
 
     Never raises and never prints: the caller is a harness hook whose failure
@@ -16665,7 +17057,7 @@ def intent_record(path, tool="manual"):
     try:
         path = os.path.realpath(os.path.expanduser(path))
         sha = sha256(path)
-        if not sha:
+        if not sha or (expected_sha is not None and sha != expected_sha):
             return False
         tool = str(tool)[:64]
         ts = now_iso()
@@ -16735,6 +17127,190 @@ def _intent_worthy(path):
                for r in AGENT_CONFIG_ROOTS if os.path.isdir(r))
 
 
+def _intent_append(suffix, record):
+    """Bounded local observations, never an authority or a conversation log."""
+    path = INTENT_FILE + suffix
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    if os.path.exists(path) and os.path.getsize(path) > _INTENT_MAX_BYTES:
+        # One retained generation; readers include both. No unbounded history.
+        os.replace(path, path + ".previous")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as stream:
+        stream.write(line)
+
+
+def _intent_health(outcome, host):
+    try:
+        _intent_append(".health", {"ts": now_iso(), "host": host,
+                                   "outcome": outcome})
+    except OSError:
+        # A full/unwritable state volume cannot persist its own failure.
+        print("Aegis intent: coverage health could not be persisted", file=sys.stderr)
+
+
+def _intent_identity(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest() if value else ""
+
+
+def _intent_receipt_mac(record):
+    body = {k: v for k, v in record.items() if k != "mac"}
+    message = "intent-receipt:v1|" + json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return hmac.new(_hmac_key(), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _intent_receipt_valid(record):
+    try:
+        return (record.get("version") == 1 and
+                hmac.compare_digest(_intent_receipt_mac(record), str(record.get("mac") or "")))
+    except (TypeError, ValueError, OSError, AttributeError):
+        return False
+
+
+def _intent_observe(payload, host, build=False):
+    """Normalize supported writes. New batch/build evidence remains shadow-only.
+
+    Same-UID hooks can be forged: even a success is context, not authorization.
+    No shell text, prompts, tool results or raw session identifiers are stored.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload")
+    tool = payload.get("tool_name", "")
+    if host == "codex" and tool == "functions.apply_patch":
+        tool = "apply_patch"
+    ti = payload.get("tool_input") or {}
+    if tool == "apply_patch" and isinstance(ti, str):
+        ti = {"patch": ti}
+    if not isinstance(ti, dict):
+        raise ValueError("tool_input")
+    event = payload.get("hook_event_name")
+    result = payload.get("tool_response") or {}
+    hermes = host == "hermes" and event == "post_tool_call"
+    extra = payload.get("extra") or {}
+    if not isinstance(extra, dict):
+        raise ValueError("extra")
+    if hermes:
+        result = extra.get("result") or {}
+        if isinstance(result, str):
+            result = json.loads(result)
+    if not isinstance(result, dict):
+        raise ValueError("result")
+    failed = (event == "PostToolUseFailure" or payload.get("status") == "failed"
+              or payload.get("is_error") is True or result.get("is_error") is True
+              or bool(result.get("error")) or result.get("exit_code", 0) != 0
+              or result.get("success") is False
+              or (hermes and extra.get("status") in ("error", "blocked")))
+    status = "failed" if failed else "unknown"
+    if host != "unknown" and not failed and (payload.get("status") == "success" or
+                      (host == "claude-code" and event == "PostToolUse") or
+                      (hermes and extra.get("status") == "ok" and
+                       (result.get("success") is True or "bytes_written" in result))):
+        status = "success"
+    cwd = payload.get("cwd")
+    if cwd and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
+        raise ValueError("absolute cwd required")
+    project = os.path.realpath(cwd) if cwd else ""
+    direct = tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write_file", "edit_file")
+    if hermes and tool in ("write_file", "patch"):
+        paths = (result.get("files_modified") or []) + (result.get("files_created") or [])
+        if result.get("resolved_path"):
+            paths.append(result["resolved_path"])
+        if not paths:
+            paths = [ti.get("path")]
+        # Hermes hook cwd is the host process cwd, not necessarily task cwd.
+        if any(not isinstance(p, str) or not os.path.isabs(p) for p in paths):
+            raise ValueError("Hermes resolved absolute outputs required")
+        direct = False  # Newly supported host receipts remain shadow evidence.
+    elif direct:
+        paths = [ti.get("file_path") or ti.get("path") or ti.get("notebook_path")]
+    elif tool == "apply_patch":
+        patch = ti.get("patch") or ti.get("input") or ""
+        if not isinstance(patch, str):
+            raise ValueError("patch")
+        paths = []
+        for line in patch.splitlines():
+            for prefix in ("*** Add File: ", "*** Update File: ", "*** Move to: "):
+                if line.startswith(prefix):
+                    paths.append(line[len(prefix):])
+    elif build:
+        paths = ti.get("outputs")
+    else:
+        _intent_health("unsupported", host)
+        return
+    if not isinstance(paths, list) or not paths or len(paths) > 64:
+        raise ValueError("paths")
+    outputs = []
+    remaining = 64 * 1024 * 1024
+    for path in dict.fromkeys(paths):
+        if not isinstance(path, str) or not path or len(path) > 4096:
+            raise ValueError("path")
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path) and not project:
+            raise ValueError("relative output without cwd")
+        path = os.path.realpath(os.path.join(project, path))
+        row = {"path": path, "sha256": None}
+        try:
+            size = os.path.getsize(path)
+            if not os.path.isfile(path) or size > remaining:
+                row["observation"] = "unreadable_or_oversize"
+            elif build and os.path.commonpath([project, path]) != project:
+                row["observation"] = "outside_project"
+            else:
+                remaining -= size
+                row["sha256"] = sha256(path)
+                row["observation"] = "hashed" if row["sha256"] else "unreadable"
+        except OSError:
+            row["observation"] = "unreadable"
+        outputs.append(row)
+    record = {"version": 1, "ts": now_iso(), "host": host,
+              "session": _intent_identity(payload.get("session_id")),
+              "call": _intent_identity(payload.get("tool_use_id") or payload.get("call_id") or extra.get("tool_call_id")),
+              "project": project, "operation": tool, "status": status,
+              "shadow": not direct, "outputs": outputs}
+    record["mac"] = _intent_receipt_mac(record)
+    _intent_append(".receipts", record)
+    if status == "success" and direct:
+        for row in outputs:
+            if row["sha256"] and _intent_worthy(row["path"]):
+                if not intent_record(row["path"], host, expected_sha=row["sha256"]):
+                    _intent_health("ledger_write_failure", host)
+                    return
+    _intent_health(status, host)
+    return record
+
+
+def _intent_build(argv):
+    """Run an explicit command with <=64 declared project-relative outputs."""
+    try:
+        split = argv.index("--", 4)
+        project = os.path.realpath(os.path.expanduser(argv[3]))
+        outputs, command = argv[4:split], argv[split + 1:]
+        if not command or not outputs or len(outputs) > 64 or not os.path.isdir(project):
+            raise ValueError("arguments")
+        for path in outputs:
+            if os.path.isabs(path) or os.path.commonpath(
+                    [project, os.path.realpath(os.path.join(project, path))]) != project:
+                raise ValueError("output scope")
+    except (ValueError, IndexError):
+        print("usage: intent build <project> <relative-output> [...] -- <command> [args]")
+        return 2
+    try:
+        code = subprocess.run(command, cwd=project, timeout=600).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        code = 1
+    try:
+        receipt = _intent_observe({"tool_name": "declared_build", "cwd": project,
+                         "status": "success" if code == 0 else "failed",
+                         "tool_input": {"outputs": outputs}}, "build-wrapper", build=True)
+        if code == 0 and any(not row["sha256"] for row in receipt["outputs"]):
+            _intent_health("outputs_unverified", "build-wrapper")
+            return 1
+    except (OSError, ValueError, TypeError):
+        _intent_health("ledger_write_failure", "build-wrapper")
+        if code == 0:
+            return 1
+    return code
+
+
 def cmd_learn(argv):
     """CLI: `learn [status|start [days]|extend <days>|done]`.
 
@@ -16784,25 +17360,62 @@ def cmd_learn(argv):
 
 
 def cmd_intent(argv):
-    """CLI: `intent record <path> [tool]` | `intent hook <tool>` |
-    `intent list [n]`. Hook mode reads the harness's tool-call JSON on stdin,
-    extracts the written file's path, and attests it — always exits 0, prints
-    nothing, so a broken ledger can never break the operator's editor."""
+    """CLI for local intent records, shadow receipts and delivery health.
+
+    Hooks fail open for editing but record durable coverage failures. Only
+    explicit successful single-file writes retain the existing custody rung.
+    """
     sub = argv[2] if len(argv) > 2 else "list"
+    if sub == "build":
+        return _intent_build(argv)
+    if sub == "health":
+        counts, latest = {}, None
+        hosts = {name: {"deliveries": 0, "state": "unobserved"} for name in
+                 ("claude-code", "codex", "hermes", "vscode", "chatgpt")}
+        for suffix in (".health.previous", ".health"):
+            try:
+                with open(INTENT_FILE + suffix, encoding="utf-8") as stream:
+                    for line in stream:
+                        try:
+                            record = json.loads(line)
+                            outcome = record["outcome"]
+                            if not isinstance(outcome, str) or not isinstance(record["host"], str):
+                                raise ValueError("health schema")
+                        except (ValueError, TypeError, KeyError):
+                            counts["health_corrupt"] = counts.get("health_corrupt", 0) + 1
+                            continue
+                        counts[outcome] = counts.get(outcome, 0) + 1
+                        host = hosts.setdefault(record["host"],
+                                                {"deliveries": 0, "state": "unobserved"})
+                        host["deliveries"] += 1
+                        host["state"] = "observed_delivery_only"
+                        host["last_outcome"] = outcome
+                        latest = record
+            except FileNotFoundError:
+                pass
+            except (UnicodeError, OSError):
+                counts["health_corrupt"] = counts.get("health_corrupt", 0) + 1
+        print(json.dumps({"counts": counts, "latest": latest, "hosts": hosts,
+                          "scope": "retained local hook deliveries; not host coverage proof"}))
+        return 0
     if sub == "record" and len(argv) > 3:
         ok = intent_record(argv[3], argv[4] if len(argv) > 4 else "manual")
         print("recorded" if ok else "not recorded (unreadable path?)")
         return 0 if ok else 1
     if sub == "hook":
-        tool = argv[3] if len(argv) > 3 else "agent"
+        host = argv[3] if len(argv) > 3 else "unknown"
+        if host not in ("claude-code", "codex", "hermes", "vscode", "chatgpt"):
+            host = "unknown"
         try:
-            payload = json.loads(sys.stdin.read(1 << 20) or "{}")
-            ti = payload.get("tool_input") or {}
-            p = ti.get("file_path") or ti.get("path") or ""
-            if p and _intent_worthy(p):
-                intent_record(p, tool)
-        except Exception:
-            pass
+            raw = sys.stdin.read((1 << 20) + 1)
+            if len(raw) > (1 << 20):
+                _intent_health("oversize", host)
+            else:
+                _intent_observe(json.loads(raw), host)
+        except (ValueError, TypeError):
+            _intent_health("parse_error", host)
+        except OSError:
+            _intent_health("ledger_write_failure", host)
         return 0
     if sub == "list":
         try:
@@ -19935,6 +20548,7 @@ def cmd_scan(quiet=False, wait=False):
 
 def _cmd_scan_locked(quiet=False):
     global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED, _PROC_ARGV_PARTIAL
+    _ARTIFACT_SCAN_CACHE.clear()
     ensure_state()
     # per-scan; a stale count or flag would mislead every later run
     _SIG_PROBE_FAILURES = 0
@@ -20119,6 +20733,16 @@ def _cmd_scan_locked(quiet=False):
         # but the failure is durable and visible rather than silently "clean".
         log_run("event-store failure: %s" % e)
         incidents, persisted_health = [], health
+    try:
+        if os.path.exists(os.path.join(STATE_DIR, "workflow-shadow.json")):
+            workflow_db = _event_connection()
+            try:
+                _workflow_shadow_capture(workflow_db)
+            finally:
+                workflow_db.close()
+    except Exception as e:
+        log_run("workflow shadow failed: %s" % e)
+        degraded.append("workflow-shadow")
     # The heartbeat is written AFTER the report, so what is on disk now is the
     # PREVIOUS scan's — which is exactly the liveness fact the report needs and
     # costs no new state to obtain.
@@ -20701,6 +21325,264 @@ def _incident_families(db):
     out = [(k, _family_label(k, v), v) for k, v in groups.items()]
     out.sort(key=lambda t: (-len(t[2]), t[0]))
     return out
+
+
+_WORKFLOW_POLICY = "workflow-review-v1"
+_WORKFLOW_ATTENTION = {"expected": 0, "review": 1, "urgent": 2}
+
+
+def _workflow_receipts():
+    """Latest output observations, plus explicit expected-host delivery gaps."""
+    latest, hosts, errors = {}, {}, []
+    config = load_json(os.path.join(STATE_DIR, "config.json"), {})
+    for host in config.get("workflow_expected_hosts", []):
+        hosts[str(host)] = {"status": "never_seen"}
+    for kind in ("receipts", "health"):
+        for suffix in (".previous", ""):
+            try:
+                with open(INTENT_FILE + "." + kind + suffix, encoding="utf-8") as stream:
+                    text = stream.read(_INTENT_MAX_BYTES + 1024 * 1024 + 1)
+                if len(text) > _INTENT_MAX_BYTES + 1024 * 1024:
+                    raise ValueError("receipt read budget")
+                for line in text.splitlines():
+                    record = json.loads(line)
+                    host = str(record.get("host") or "unknown")
+                    if kind == "health":
+                        hosts.setdefault(host, {}).update(status=record.get("outcome"),
+                                                         latest_delivery=record.get("ts"))
+                    else:
+                        hosts.setdefault(host, {}).update(status="receipt_observed", latest_receipt=record.get("ts"))
+                        for output in record.get("outputs", []):
+                            latest[output["path"]] = record
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                errors.append(kind + suffix + ": unreadable or malformed")
+    verified = {}
+    for record in {id(r): r for r in latest.values()}.values():
+        try:
+            stamp = datetime.fromisoformat(record["ts"].replace("Z", "+00:00")).timestamp()
+            if (not _intent_receipt_valid(record) or record.get("status") != "success"
+                    or record.get("host") not in ("claude-code", "codex", "hermes", "vscode", "chatgpt", "build-wrapper")
+                    or not 0 <= _epoch() - stamp <= 7 * 86400):
+                continue
+            outputs = record["outputs"]
+            if not 1 <= len(outputs) <= 64:
+                continue
+            budget = 64 * 1024 * 1024
+            for output in outputs:
+                path, digest = output["path"], output["sha256"]
+                budget -= os.path.getsize(path)
+                if (latest.get(path) is not record or budget < 0
+                        or os.path.realpath(path) != path
+                        or os.path.commonpath([record["project"], path]) != record["project"]
+                        or output.get("observation") != "hashed"
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest or "")
+                        or sha256(path) != digest):
+                    raise ValueError("stale output")
+            identity = "receipt:" + hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+            for output in outputs:
+                verified[(output["path"], output["sha256"])] = (identity, stamp)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    # An incomplete ledger cannot prove which output observation was latest.
+    return ({} if errors else verified), {"hosts": hosts, "errors": errors,
+        "scope": "Local delivery observations, not proof of host-wide hook coverage"}
+
+
+def _workflow_origin(path, content, receipts, observed_at):
+    if not path or not isinstance(content, str) or not re.fullmatch(r"[0-9a-f]{64}", content):
+        return None
+    lookup = globals().get("_distribution_receipt")
+    distribution = lookup(path) if lookup else None
+    if distribution and distribution.get("components", {}).get(path) == content:
+        return "distribution:" + distribution["source_id"], "verified official distribution bytes"
+    artifact = _artifact_receipt(path)
+    if artifact and content in artifact["components"].values() and sha256(path) == content:
+        return ("artifact:" + hashlib.sha256(_vouch_canonical(artifact).encode()).hexdigest(),
+                "verified signed artifact origin")
+    if (path, content) in receipts:
+        identity, stamp = receipts[(path, content)]
+        if stamp <= (observed_at or 0):
+            return identity, "successful local output receipt (same-user context)"
+    return None
+
+
+def _workflow_all_process_origins(db, row, receipts):
+    """Every latest constituent must qualify; the incident subject is only one copy."""
+    latest = {}
+    for event in db.execute(
+            "SELECT e.data_json,e.observed_at FROM events e JOIN incident_events ie ON ie.event_id=e.id "
+            "WHERE ie.incident_id=? AND e.event_type='observation.finding' ORDER BY e.id DESC", (row["id"],)):
+        try:
+            data = json.loads(event["data_json"])
+            fp = data["fingerprint"]
+            if fp not in latest:
+                latest[fp] = (data, event["observed_at"])
+        except (ValueError, TypeError, KeyError):
+            return False
+    if not latest:
+        return False
+    for fp, (data, observed_at) in latest.items():
+        subject = data.get("subject") or {}
+        if not isinstance(subject, dict):
+            return False
+        path = data.get("path") or subject.get("raw_path")
+        content = data.get("sha256") or subject.get("content")
+        trust = data.get("trust") or subject.get("trust")
+        if (not fp.startswith("process:") or trust not in (
+                "adhoc", "unsigned", "unmanaged", "developer-id", "apple", "app-store", "signed-valid", "os-signed", "os-managed")
+                or (subject.get("raw_path") and subject["raw_path"] != path)
+                or (subject.get("content") and subject["content"] != content)
+                or (subject.get("trust") and subject["trust"] != trust)
+                or not _workflow_origin(path, content, receipts, observed_at)):
+            return False
+    return True
+
+
+def _workflow_report(db):
+    """Presentation only: exact content can relate observations, never verdicts.
+
+    Reuse the family inventory and lifecycle's conservative current-grade check.
+    No path/name/session claim conveys identity or authorization here.
+    """
+    rows = sorted((r for _, _, members in _incident_families(db) for r in members),
+                  key=lambda r: r["id"])
+    receipts, integration_health = _workflow_receipts()
+    groups = {}
+    for row in rows:
+        try:
+            sub = json.loads(row.get("subject_json") or "{}")
+        except (ValueError, TypeError):
+            sub = {}
+        if not isinstance(sub, dict):
+            sub = {}
+        content = sub.get("content")
+        key = "incident:%s" % row["id"]
+        if (sub.get("kind") in ("process", "beacon")
+                and isinstance(content, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", content)):
+            key = "content:" + content.lower()
+        fp = (row.get("correlation_key") or "").removeprefix("signal:")
+        latest = _latest_incident_grade(db, row["id"], row.get("last_seen"))
+        proposed, origin = None, None
+        attention, reason = "review", "Origin or destination proof missing; review exact observed bytes."
+        if row["severity"] == "CRITICAL" or fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            attention, reason = "urgent", "Strong threat signal; familiar workflow does not authorize it."
+        elif latest and SEV_ORDER[latest[0]] < SEV_ORDER["HIGH"]:
+            attention, reason = "expected", "Fresh attached evidence regraded below HIGH; no benign verdict implied."
+        elif latest is None:
+            reason = "Historical evidence incomplete, stale, or not safely regradable; do not infer benignness."
+        # An attack-defined event cannot be quieted even when its producer used HIGH.
+        for event in db.execute(
+                "SELECT e.data_json FROM events e JOIN incident_events ie ON ie.event_id=e.id "
+                "WHERE ie.incident_id=? AND e.event_type='observation.finding'", (row["id"],)):
+            try:
+                data = json.loads(event["data_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and (data.get("attack_defined") or
+                    bool(set(data.get("markers") or ()) & (_UNAMBIGUOUS_HIGH_IDIOMS |
+                         {"quarantine-strip", "xattr-clear-all"})) or
+                    str(data.get("fingerprint") or "").startswith(_NEVER_TOLERATE_PREFIXES)):
+                attention, reason = "urgent", "Attached harmful behavior requires review regardless of origin."
+                break
+        path = sub.get("raw_path")
+        if (path and isinstance(content, str) and re.fullmatch(r"[0-9a-f]{64}", content)):
+            proof = _workflow_origin(path, content, receipts, row.get("last_seen"))
+            if proof:
+                key, origin = proof
+            if (origin and latest is not None and sub.get("kind") == "process"
+                    and attention != "urgent" and sub.get("trust") != "broken"
+                    and _workflow_all_process_origins(db, row, receipts)):
+                proposed, attention = "MEDIUM", "expected"
+                reason = "SHADOW: %s; origin does not authorize behavior." % origin
+            elif origin and attention != "urgent":
+                if sub.get("kind") == "process":
+                    attention = "review"
+                reason = "Origin evidenced; destination or behavioral authorization still needs review."
+        groups.setdefault(key, []).append({
+            "id": row["id"], "severity": row["severity"], "attention": attention,
+            "current_grade": latest[0] if latest else None, "reason": reason,
+            "proposed_grade": proposed, "origin": origin,
+            "last_seen": row.get("last_seen")})
+    cases = [{"identity": key, "members": members,
+              "severity": max((m["severity"] for m in members), key=lambda s: SEV_ORDER[s]),
+              "attention": max((m["attention"] for m in members), key=_WORKFLOW_ATTENTION.get)}
+             for key, members in groups.items()]
+    actual = sorted(m["id"] for c in cases for m in c["members"])
+    valid = actual == [r["id"] for r in rows] and len(actual) == len(set(actual))
+    valid = valid and all(c["severity"] == max(
+        (r["severity"] for r in rows if r["id"] in {m["id"] for m in c["members"]}),
+        key=lambda s: SEV_ORDER[s]) for c in cases)
+    return {"self_check": "PASS" if valid else "FAIL: inventory/severity mismatch",
+            "policy": _WORKFLOW_POLICY, "incident_count": len(rows), "cases": cases,
+            "integration_health": integration_health}
+
+
+def _workflow_shadow_evaluate(state, now=None):
+    now = _epoch() if now is None else now
+    samples = state.get("samples", [])
+    return {"policy": state.get("policy"), "window_complete":
+            now - state["started_at"] >= 7 * 86400,
+            "distinct_snapshots": len(samples), "enable_ready": False,
+            "samples_truncated": bool(state.get("samples_truncated")),
+            "result": "INSUFFICIENT_EVIDENCE",
+            "missing_gates": ["Comparable prior-week verified-routine repeat interruptions",
+                              "Positive controls, host canaries, sensor coverage and CPU budget"],
+            "note": "Snapshots count decisions, not delivered notifications. Sparse samples cannot prove a 90% reduction."}
+
+
+def _workflow_shadow_capture(db, now=None):
+    path = os.path.join(STATE_DIR, "workflow-shadow.json")
+    state = load_json(path, None)
+    if state is None:
+        return
+    if state.get("policy") != _WORKFLOW_POLICY:
+        raise ValueError("workflow shadow policy changed; explicit new evaluation required")
+    report = _workflow_report(db)
+    save_json(os.path.join(STATE_DIR, "workflow-review.json"), report)
+    if report["self_check"] != "PASS":
+        raise ValueError(report["self_check"])
+    digest = hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest()
+    samples = state.setdefault("samples", [])
+    if not samples or samples[-1]["digest"] != digest:
+        counts = {level: sum(c["attention"] == level for c in report["cases"])
+                  for level in _WORKFLOW_ATTENTION}
+        samples.append({"at": _epoch() if now is None else now, "digest": digest,
+                        "incidents": report["incident_count"], "decisions": counts})
+        state["samples"] = samples[-10000:]
+        state["samples_truncated"] = bool(state.get("samples_truncated") or len(samples) > 10000)
+        save_json(path, state)
+
+
+def cmd_workflows(action="report"):
+    if action not in ("report", "start", "status", "evaluate"):
+        print("usage: aegis.py workflows [report|start|status|evaluate]")
+        return 2
+    ensure_state()
+    init_event_store()
+    path = os.path.join(STATE_DIR, "workflow-shadow.json")
+    db = _event_connection()
+    try:
+        if action == "report":
+            report = _workflow_report(db)
+            save_json(os.path.join(STATE_DIR, "workflow-review.json"), report)
+            print(json.dumps(report, indent=2))
+            return 0 if report["self_check"] == "PASS" else 1
+        if action == "start" and not os.path.exists(path):
+            save_json(path, {"policy": _WORKFLOW_POLICY, "started_at": _epoch(), "samples": []})
+            _workflow_shadow_capture(db)
+        state = load_json(path, None)
+        if state is None:
+            print("Workflow shadow not started. Run: aegis.py workflows start")
+            return 1
+        result = _workflow_shadow_evaluate(state)
+        save_json(os.path.join(STATE_DIR, "workflow-evaluation.json"), result)
+        print(json.dumps(result, indent=2))
+        return 0
+    finally:
+        db.close()
 
 
 def cmd_families():
@@ -30154,6 +31036,8 @@ def main(argv):
         return cmd_incidents(show_all=(len(argv) > 2 and argv[2] == "all"))
     if cmd == "families":
         return cmd_families()
+    if cmd == "workflows":
+        return cmd_workflows(argv[2] if len(argv) > 2 else "report")
     if cmd == "family" and len(argv) > 2:
         return cmd_family(argv[2], argv[3] if len(argv) > 3 else None,
                           argv[4] if len(argv) > 4 else None)
@@ -30199,6 +31083,10 @@ def main(argv):
         return cmd_signers(argv)
     if cmd == "vouch":
         return cmd_vouch(argv)
+    if cmd == "distribution":
+        return cmd_distribution(argv)
+    if cmd == "artifact":
+        return cmd_artifact(argv)
     if cmd == "identity":
         return cmd_identity(argv)
     if cmd == "replay":
