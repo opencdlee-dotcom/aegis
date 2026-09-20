@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 
 import aegis
+from conftest import SUSPICIOUS_TRUST
 
 
 @pytest.fixture(autouse=True)
@@ -110,9 +111,9 @@ def test_verified_artifact_members_group_but_hostile_member_stays_urgent(tmp_pat
     assert report["cases"][1]["members"][0]["origin"] is None
 
 
-@pytest.mark.parametrize("kind,trust,expected", [("process", "adhoc", "expected"),
+@pytest.mark.parametrize("kind,trust,expected", [("process", SUSPICIOUS_TRUST, "expected"),
                                                ("process", "broken", "review"),
-                                               ("beacon", "adhoc", "review")])
+                                               ("beacon", SUSPICIOUS_TRUST, "review")])
 def test_distribution_only_explains_exact_process_origin(monkeypatch, tmp_path, kind, trust, expected):
     db = store()
     path = tmp_path / "app"
@@ -132,8 +133,8 @@ def test_distribution_only_explains_exact_process_origin(monkeypatch, tmp_path, 
 
 def evidence_subject(db, ident, sub):
     data = json.loads(db.execute("SELECT data_json FROM events WHERE id=?", (ident,)).fetchone()[0])
-    data.update(subject=dict(sub, trust=sub.get("trust", "adhoc")), path=sub["raw_path"],
-                sha256=sub.get("content"), trust=sub.get("trust", "adhoc"))
+    data.update(subject=dict(sub, trust=sub.get("trust", SUSPICIOUS_TRUST)), path=sub["raw_path"],
+                sha256=sub.get("content"), trust=sub.get("trust", SUSPICIOUS_TRUST))
     db.execute("UPDATE events SET data_json=? WHERE id=?", (json.dumps(data), ident))
 
 
@@ -145,11 +146,11 @@ def test_all_latest_copies_must_qualify_not_only_incident_subject(tmp_path, monk
     copy.write_text("same")
     digest = aegis.sha256(str(main))
     incident(db, 1, digest, grade="HIGH")
-    sub = {"kind": "process", "raw_path": str(main), "content": digest, "trust": "adhoc"}
+    sub = {"kind": "process", "raw_path": str(main), "content": digest, "trust": SUSPICIOUS_TRUST}
     db.execute("UPDATE incidents SET subject_json=?", (json.dumps(sub),))
     evidence_subject(db, 1, sub)
     second = {"fingerprint": "process:copy", "severity": "HIGH", "path": str(copy),
-              "sha256": digest, "trust": "broken" if other == "broken" else "adhoc"}
+              "sha256": digest, "trust": "broken" if other == "broken" else SUSPICIOUS_TRUST}
     if other == "missing_metadata":
         second.pop("sha256")
     if other == "replaced_bytes":
