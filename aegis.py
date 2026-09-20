@@ -1887,6 +1887,25 @@ def read_crash():
     return load_json(_crash_file(), {})
 
 
+def _display_pipe_closed(crash):
+    """A read-only CLI display lost its reader, not the background monitor.
+
+    Exact argument shapes matter: incident/family also accept state-changing
+    actions, and an absent command runs a real scan. Unknown shapes stay faults.
+    """
+    if crash.get("exc_type") != "BrokenPipeError" or crash.get("context"):
+        return False
+    argv = crash.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        return False
+    args = argv[1:]
+    return (args in (["status"], ["report"], ["report", "--full"],
+                     ["report", "full"], ["incidents"], ["incidents", "all"],
+                     ["incidents", "families"], ["families"])
+            or (len(args) == 2 and args[0] in ("incident", "family")
+                and bool(args[1]) and not args[1].startswith("-")))
+
+
 # --------------------------------------------------------------------------- #
 # The scheduler's stdout/stderr sinks. launchd's StandardOutPath /
 # StandardErrorPath (and a systemd unit's journal-free equivalent) append for
@@ -21669,8 +21688,10 @@ def cmd_doctor():
     crash = read_crash()
     if crash.get("epoch"):
         fresh = (int(time.time()) - int(crash["epoch"])) <= CRASH_FRESH_SECS
+        display_pipe = _display_pipe_closed(crash)
         print("  %s %-27s %s: %s — %s"
-              % ("✗" if fresh else "i", "last unhandled crash",
+              % ("✗" if fresh and not display_pipe else "i",
+                 "display output pipe closed" if display_pipe else "last unhandled crash",
                  _ago(crash.get("epoch")), crash.get("exc_type") or "?",
                  (crash.get("exc") or "")[:110]))
         print("      argv: %s%s" % (" ".join(crash.get("argv") or [])[:100],
@@ -21680,7 +21701,7 @@ def cmd_doctor():
             print("      %s" % line[:120])
         print("      Full record: %s (delete it once you have read it)"
               % _crash_file())
-        if fresh:
+        if fresh and not display_pipe:
             problems.append("unhandled crash")
     _out_path, err_path = _stdio_log_paths()
     err_tail = _tail_lines(err_path, 8)
