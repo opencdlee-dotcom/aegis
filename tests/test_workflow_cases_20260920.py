@@ -5,6 +5,9 @@ import pytest
 import aegis
 from conftest import SUSPICIOUS_TRUST
 
+# Origin-positive fixtures model known nonbroken local outputs. On Linux the
+# suspicious-signature fixture is broken; ordinary local binaries are unmanaged.
+LOCAL_OUTPUT_TRUST = "unmanaged" if aegis.IS_LINUX else SUSPICIOUS_TRUST
 
 @pytest.fixture(autouse=True)
 def isolated_receipts(tmp_path, monkeypatch):
@@ -111,9 +114,9 @@ def test_verified_artifact_members_group_but_hostile_member_stays_urgent(tmp_pat
     assert report["cases"][1]["members"][0]["origin"] is None
 
 
-@pytest.mark.parametrize("kind,trust,expected", [("process", SUSPICIOUS_TRUST, "expected"),
+@pytest.mark.parametrize("kind,trust,expected", [("process", LOCAL_OUTPUT_TRUST, "expected"),
                                                ("process", "broken", "review"),
-                                               ("beacon", SUSPICIOUS_TRUST, "review")])
+                                               ("beacon", LOCAL_OUTPUT_TRUST, "review")])
 def test_distribution_only_explains_exact_process_origin(monkeypatch, tmp_path, kind, trust, expected):
     db = store()
     path = tmp_path / "app"
@@ -133,8 +136,8 @@ def test_distribution_only_explains_exact_process_origin(monkeypatch, tmp_path, 
 
 def evidence_subject(db, ident, sub):
     data = json.loads(db.execute("SELECT data_json FROM events WHERE id=?", (ident,)).fetchone()[0])
-    data.update(subject=dict(sub, trust=sub.get("trust", SUSPICIOUS_TRUST)), path=sub["raw_path"],
-                sha256=sub.get("content"), trust=sub.get("trust", SUSPICIOUS_TRUST))
+    data.update(subject=dict(sub, trust=sub.get("trust", LOCAL_OUTPUT_TRUST)), path=sub["raw_path"],
+                sha256=sub.get("content"), trust=sub.get("trust", LOCAL_OUTPUT_TRUST))
     db.execute("UPDATE events SET data_json=? WHERE id=?", (json.dumps(data), ident))
 
 
@@ -146,11 +149,11 @@ def test_all_latest_copies_must_qualify_not_only_incident_subject(tmp_path, monk
     copy.write_text("same")
     digest = aegis.sha256(str(main))
     incident(db, 1, digest, grade="HIGH")
-    sub = {"kind": "process", "raw_path": str(main), "content": digest, "trust": SUSPICIOUS_TRUST}
+    sub = {"kind": "process", "raw_path": str(main), "content": digest, "trust": LOCAL_OUTPUT_TRUST}
     db.execute("UPDATE incidents SET subject_json=?", (json.dumps(sub),))
     evidence_subject(db, 1, sub)
     second = {"fingerprint": "process:copy", "severity": "HIGH", "path": str(copy),
-              "sha256": digest, "trust": "broken" if other == "broken" else SUSPICIOUS_TRUST}
+              "sha256": digest, "trust": "broken" if other == "broken" else LOCAL_OUTPUT_TRUST}
     if other == "missing_metadata":
         second.pop("sha256")
     if other == "replaced_bytes":
