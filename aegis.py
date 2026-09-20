@@ -17093,6 +17093,8 @@ def cmd_intent(argv):
         return _intent_build(argv)
     if sub == "health":
         counts, latest = {}, None
+        hosts = {name: {"deliveries": 0, "state": "unobserved"} for name in
+                 ("claude-code", "codex", "hermes", "vscode", "chatgpt")}
         for suffix in (".health.previous", ".health"):
             try:
                 with open(INTENT_FILE + suffix, encoding="utf-8") as stream:
@@ -17100,10 +17102,15 @@ def cmd_intent(argv):
                         record = json.loads(line)
                         outcome = record["outcome"]
                         counts[outcome] = counts.get(outcome, 0) + 1
+                        host = hosts.setdefault(record["host"],
+                                                {"deliveries": 0, "state": "unobserved"})
+                        host["deliveries"] += 1
+                        host["state"] = "observed_delivery_only"
+                        host["last_outcome"] = outcome
                         latest = record
             except FileNotFoundError:
                 pass
-        print(json.dumps({"counts": counts, "latest": latest,
+        print(json.dumps({"counts": counts, "latest": latest, "hosts": hosts,
                           "scope": "retained local hook deliveries; not host coverage proof"}))
         return 0
     if sub == "record" and len(argv) > 3:

@@ -72,6 +72,8 @@ def test_health_tracks_invalid_unsupported_oversized(sandbox, monkeypatch, capsy
     assert aegis.cmd_intent(["aegis", "intent", "health"]) == 0
     health = json.loads(capsys.readouterr().out)
     assert health["counts"] == {"parse_error": 1, "oversize": 1, "unsupported": 1}
+    assert health["hosts"]["codex"]["state"] == "unobserved"
+    assert health["hosts"]["hermes"]["last_outcome"] == "unsupported"
 
 
 def test_build_declared_output_and_failed_partial(sandbox):
