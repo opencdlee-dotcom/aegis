@@ -21358,7 +21358,7 @@ def _workflow_receipts():
     for record in {id(r): r for r in latest.values()}.values():
         try:
             stamp = datetime.fromisoformat(record["ts"].replace("Z", "+00:00")).timestamp()
-            if (record.get("version") != 1 or record.get("status") != "success"
+            if (not _intent_receipt_valid(record) or record.get("status") != "success"
                     or record.get("host") not in ("claude-code", "codex", "hermes", "vscode", "chatgpt", "build-wrapper")
                     or not 0 <= _epoch() - stamp <= 7 * 86400):
                 continue
@@ -21384,6 +21384,56 @@ def _workflow_receipts():
     # An incomplete ledger cannot prove which output observation was latest.
     return ({} if errors else verified), {"hosts": hosts, "errors": errors,
         "scope": "Local delivery observations, not proof of host-wide hook coverage"}
+
+
+def _workflow_origin(path, content, receipts, observed_at):
+    if not path or not isinstance(content, str) or not re.fullmatch(r"[0-9a-f]{64}", content):
+        return None
+    lookup = globals().get("_distribution_receipt")
+    distribution = lookup(path) if lookup else None
+    if distribution and distribution.get("components", {}).get(path) == content:
+        return "distribution:" + distribution["source_id"], "verified official distribution bytes"
+    artifact = _artifact_receipt(path)
+    if artifact and content in artifact["components"].values() and sha256(path) == content:
+        return ("artifact:" + hashlib.sha256(_vouch_canonical(artifact).encode()).hexdigest(),
+                "verified signed artifact origin")
+    if (path, content) in receipts:
+        identity, stamp = receipts[(path, content)]
+        if stamp <= (observed_at or 0):
+            return identity, "successful local output receipt (same-user context)"
+    return None
+
+
+def _workflow_all_process_origins(db, row, receipts):
+    """Every latest constituent must qualify; the incident subject is only one copy."""
+    latest = {}
+    for event in db.execute(
+            "SELECT e.data_json,e.observed_at FROM events e JOIN incident_events ie ON ie.event_id=e.id "
+            "WHERE ie.incident_id=? AND e.event_type='observation.finding' ORDER BY e.id DESC", (row["id"],)):
+        try:
+            data = json.loads(event["data_json"])
+            fp = data["fingerprint"]
+            if fp not in latest:
+                latest[fp] = (data, event["observed_at"])
+        except (ValueError, TypeError, KeyError):
+            return False
+    if not latest:
+        return False
+    for fp, (data, observed_at) in latest.items():
+        subject = data.get("subject") or {}
+        if not isinstance(subject, dict):
+            return False
+        path = data.get("path") or subject.get("raw_path")
+        content = data.get("sha256") or subject.get("content")
+        trust = data.get("trust") or subject.get("trust")
+        if (not fp.startswith("process:") or trust not in (
+                "adhoc", "unsigned", "unmanaged", "developer-id", "apple", "app-store", "signed-valid", "os-signed", "os-managed")
+                or (subject.get("raw_path") and subject["raw_path"] != path)
+                or (subject.get("content") and subject["content"] != content)
+                or (subject.get("trust") and subject["trust"] != trust)
+                or not _workflow_origin(path, content, receipts, observed_at)):
+            return False
+    return True
 
 
 def _workflow_report(db):
@@ -21435,25 +21485,17 @@ def _workflow_report(db):
                 break
         path = sub.get("raw_path")
         if (path and isinstance(content, str) and re.fullmatch(r"[0-9a-f]{64}", content)):
-            distribution_lookup = globals().get("_distribution_receipt")
-            distribution = distribution_lookup(path) if distribution_lookup else None
-            artifact = _artifact_receipt(path)
-            if distribution and distribution.get("components", {}).get(path) == content:
-                key = "distribution:" + distribution["source_id"]
-                origin = "verified official distribution bytes"
-            elif (artifact and content in artifact["components"].values()
-                    and sha256(path) == content):
-                key = "artifact:" + hashlib.sha256(_vouch_canonical(artifact).encode()).hexdigest()
-                origin = "verified signed artifact origin"
-            elif (path, content) in receipts:
-                identity, stamp = receipts[(path, content)]
-                if stamp <= (row.get("last_seen") or 0):
-                    key, origin = identity, "successful local output receipt (same-user context)"
+            proof = _workflow_origin(path, content, receipts, row.get("last_seen"))
+            if proof:
+                key, origin = proof
             if (origin and latest is not None and sub.get("kind") == "process"
-                    and attention != "urgent" and sub.get("trust") != "broken"):
+                    and attention != "urgent" and sub.get("trust") != "broken"
+                    and _workflow_all_process_origins(db, row, receipts)):
                 proposed, attention = "MEDIUM", "expected"
                 reason = "SHADOW: %s; origin does not authorize behavior." % origin
             elif origin and attention != "urgent":
+                if sub.get("kind") == "process":
+                    attention = "review"
                 reason = "Origin evidenced; destination or behavioral authorization still needs review."
         groups.setdefault(key, []).append({
             "id": row["id"], "severity": row["severity"], "attention": attention,

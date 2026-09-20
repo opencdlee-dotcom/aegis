@@ -13,7 +13,9 @@ separate. Different-content helpers can join a case when a currently verified
 signed artifact enumerates them, or when one successful local output receipt
 enumerates their exact still-present bytes. Local receipts are same-user context,
 not signed authority. All outputs must still match, be inside the project, and
-have no newer superseding output receipt. Failed, unknown, malformed, future or
+have no newer superseding output receipt. The local receipt MAC must validate;
+missing or altered authentication cannot propose a grade or workflow link.
+Failed, unknown, malformed, future or
 older-than-seven-days receipts grant no proposed origin. A receipt dated after
 an incident's last observation cannot retroactively explain it.
 
@@ -21,6 +23,10 @@ Eligible process members show a proposed MEDIUM origin grade in shadow while
 retaining their actual evidence grade and original severity. Broken signatures,
 harmful behavior and destination questions retain review/urgent attention.
 The binary grader and notification routing are unchanged by this presentation.
+Every latest attached process fingerprint must independently retain matching
+path/hash metadata, a non-broken known signature state and verified origin.
+One explained main executable cannot quiet an unproved or broken copied path
+inside the same incident, even when the incident's first stored subject looks safe.
 
 Set `workflow_expected_hosts` in the existing config to the actual host inventory
 (for example `["claude-code", "codex", "hermes"]`). `integration_health` reports

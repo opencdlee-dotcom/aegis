@@ -9,6 +9,7 @@ import aegis
 def isolated_receipts(tmp_path, monkeypatch):
     monkeypatch.setattr(aegis, "STATE_DIR", str(tmp_path))
     monkeypatch.setattr(aegis, "INTENT_FILE", str(tmp_path / "intent.jsonl"))
+    monkeypatch.setattr(aegis, "HMAC_KEY_FILE", str(tmp_path / "hmac.key"))
 
 
 def test_successful_build_receipt_proposes_origin_without_live_grade(tmp_path):
@@ -22,6 +23,7 @@ def test_successful_build_receipt_proposes_origin_without_live_grade(tmp_path):
         db.execute("UPDATE incidents SET subject_json=?,last_seen=? WHERE id=?",
                    (json.dumps(sub), aegis._epoch(), ident))
         db.execute("UPDATE events SET observed_at=? WHERE id=?", (aegis._epoch(), ident))
+        evidence_subject(db, ident, sub)
     aegis._intent_observe({"tool_name": "declared_build", "cwd": str(tmp_path),
                           "status": "success", "tool_input": {"outputs": [str(p) for p in paths[:2]]}},
                          "build-wrapper", build=True)
@@ -30,6 +32,18 @@ def test_successful_build_receipt_proposes_origin_without_live_grade(tmp_path):
     assert shared["attention"] == "expected"
     assert all(m["proposed_grade"] == "MEDIUM" for m in shared["members"])
     assert all(m["current_grade"] == "HIGH" for m in shared["members"])
+    receipt_path = aegis.INTENT_FILE + ".receipts"
+    with open(receipt_path) as stream:
+        original = stream.read()
+    forged = json.loads(original)
+    forged.pop("mac")
+    with open(receipt_path, "w") as stream:
+        stream.write(json.dumps(forged))
+    rejected = aegis._workflow_report(db)
+    assert len(rejected["cases"]) == 3
+    assert all(m["proposed_grade"] is None for c in rejected["cases"] for m in c["members"])
+    with open(receipt_path, "w") as stream:
+        stream.write(original)
     paths[1].write_text("changed")
     assert len(aegis._workflow_report(db)["cases"]) == 3
 
@@ -40,7 +54,7 @@ def test_expected_host_never_seen_is_visible(tmp_path):
     assert report["integration_health"]["hosts"]["hermes"]["status"] == "never_seen"
 
 
-@pytest.mark.parametrize("failure", ["failed", "unknown", "stale", "future", "malformed"])
+@pytest.mark.parametrize("failure", ["failed", "unknown", "stale", "future", "malformed", "missing_mac", "tampered_mac"])
 def test_ineligible_receipt_never_proposes_origin(tmp_path, failure):
     path = tmp_path / "main"
     path.write_text("build")
@@ -48,6 +62,8 @@ def test_ineligible_receipt_never_proposes_origin(tmp_path, failure):
     incident(db, 1, aegis.sha256(str(path)), grade="HIGH")
     db.execute("UPDATE incidents SET subject_json=?,last_seen=?", (json.dumps({
         "kind": "process", "raw_path": str(path), "content": aegis.sha256(str(path))}), aegis._epoch()))
+    db.execute("UPDATE events SET observed_at=?", (aegis._epoch(),))
+    evidence_subject(db, 1, json.loads(db.execute("SELECT subject_json FROM incidents").fetchone()[0]))
     record = {"version": 1, "ts": aegis.now_iso(), "host": "build-wrapper",
               "project": str(tmp_path), "status": "success", "outputs": [
                   {"path": str(path), "sha256": aegis.sha256(str(path)), "observation": "hashed"}]}
@@ -57,6 +73,10 @@ def test_ineligible_receipt_never_proposes_origin(tmp_path, failure):
         record["ts"] = "2000-01-01T00:00:00+00:00"
     elif failure == "future":
         record["ts"] = "2999-01-01T00:00:00+00:00"
+    if failure != "missing_mac":
+        record["mac"] = aegis._intent_receipt_mac(record)
+    if failure == "tampered_mac":
+        record["mac"] = "0" * 64
     aegis._intent_append(".receipts", record)
     if failure == "malformed":
         with open(aegis.INTENT_FILE + ".receipts", "a") as stream:
@@ -77,6 +97,7 @@ def test_verified_artifact_members_group_but_hostile_member_stays_urgent(tmp_pat
         incident(db, ident, digest, grade="HIGH", attack=ident == 2)
         db.execute("UPDATE incidents SET subject_json=? WHERE id=?", (json.dumps({
             "kind": "process", "raw_path": str(path), "content": digest}), ident))
+        evidence_subject(db, ident, {"kind": "process", "raw_path": str(path), "content": digest})
         if ident < 3:
             components[path.name] = digest
     monkeypatch.setattr(aegis, "_artifact_receipt", lambda p: {"components": components}
@@ -92,17 +113,56 @@ def test_verified_artifact_members_group_but_hostile_member_stays_urgent(tmp_pat
 @pytest.mark.parametrize("kind,trust,expected", [("process", "adhoc", "expected"),
                                                ("process", "broken", "review"),
                                                ("beacon", "adhoc", "review")])
-def test_distribution_only_explains_exact_process_origin(monkeypatch, kind, trust, expected):
+def test_distribution_only_explains_exact_process_origin(monkeypatch, tmp_path, kind, trust, expected):
     db = store()
-    incident(db, 1, "a" * 64, grade="HIGH")
-    db.execute("UPDATE incidents SET subject_json=?", (json.dumps({
-        "kind": kind, "raw_path": "/work/app", "content": "a" * 64, "trust": trust}),))
+    path = tmp_path / "app"
+    path.write_text("app")
+    digest = aegis.sha256(str(path))
+    incident(db, 1, digest, grade="HIGH")
+    sub = {"kind": kind, "raw_path": str(path), "content": digest, "trust": trust}
+    db.execute("UPDATE incidents SET subject_json=?", (json.dumps(sub),))
+    evidence_subject(db, 1, sub)
     monkeypatch.setattr(aegis, "_distribution_receipt", lambda p: {
-        "source_id": "app@1:archive", "components": {p: "a" * 64}}, raising=False)
+        "source_id": "app@1:archive", "components": {p: digest}}, raising=False)
     member = aegis._workflow_report(db)["cases"][0]["members"][0]
     assert member["attention"] == expected
     assert member["current_grade"] == "HIGH"
     assert member["proposed_grade"] == ("MEDIUM" if expected == "expected" else None)
+
+
+def evidence_subject(db, ident, sub):
+    data = json.loads(db.execute("SELECT data_json FROM events WHERE id=?", (ident,)).fetchone()[0])
+    data.update(subject=dict(sub, trust=sub.get("trust", "adhoc")), path=sub["raw_path"],
+                sha256=sub.get("content"), trust=sub.get("trust", "adhoc"))
+    db.execute("UPDATE events SET data_json=? WHERE id=?", (json.dumps(data), ident))
+
+
+@pytest.mark.parametrize("other", ["broken", "unproved", "missing_metadata", "replaced_bytes"])
+def test_all_latest_copies_must_qualify_not_only_incident_subject(tmp_path, monkeypatch, other):
+    db = store()
+    main, copy = tmp_path / "main", tmp_path / "copy"
+    main.write_text("same")
+    copy.write_text("same")
+    digest = aegis.sha256(str(main))
+    incident(db, 1, digest, grade="HIGH")
+    sub = {"kind": "process", "raw_path": str(main), "content": digest, "trust": "adhoc"}
+    db.execute("UPDATE incidents SET subject_json=?", (json.dumps(sub),))
+    evidence_subject(db, 1, sub)
+    second = {"fingerprint": "process:copy", "severity": "HIGH", "path": str(copy),
+              "sha256": digest, "trust": "broken" if other == "broken" else "adhoc"}
+    if other == "missing_metadata":
+        second.pop("sha256")
+    if other == "replaced_bytes":
+        main.write_text("replacement")
+    db.execute("INSERT INTO events VALUES (2,100,?,'observation.finding')", (json.dumps(second),))
+    db.execute("INSERT INTO incident_events VALUES (1,2)")
+    monkeypatch.setattr(aegis, "_distribution_receipt", lambda p: {
+        "source_id": "app@1:archive", "components": {str(main): digest}} if p == str(main)
+        and aegis.sha256(p) == digest else None,
+        raising=False)
+    member = aegis._workflow_report(db)["cases"][0]["members"][0]
+    assert member["attention"] == "review"
+    assert member["proposed_grade"] is None
 
 
 def store():
