@@ -15767,6 +15767,138 @@ _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
                      _os_package_receipt)
 
 
+def _distribution_mac(record):
+    body = json.dumps({k: v for k, v in record.items() if k != "mac"},
+                      sort_keys=True, separators=(",", ":"))
+    return hmac.new(_hmac_key(), ("distribution:v1|" + body).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _distribution_prove(package, release, archive, expected, source, root):
+    """Compare installed components to an explicitly verified upstream archive.
+
+    Called only by the foreground CLI, which obtains the digest from the
+    fixed official endpoint. Never extracts or executes downloaded content.
+    This is origin evidence in shadow, never permission or malware clearance.
+    """
+    import tarfile
+    if os.path.getsize(archive) > 256 * 1024 * 1024 or sha256(archive) != expected:
+        raise ValueError("archive does not match official digest or exceeds budget")
+    root = os.path.realpath(root)
+    components, seen, total, mismatches = {}, set(), 0, 0
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle:
+            parts = member.name.split("/")
+            if (member.name.startswith("/") or "\\" in member.name
+                    or ":" in member.name or ".." in parts):
+                raise ValueError("archive path escape")
+            if not member.isfile():
+                continue
+            relative = "/".join(parts[1:])
+            if not relative or relative in seen or len(seen) >= 20000:
+                raise ValueError("invalid or duplicate component")
+            seen.add(relative)
+            total += member.size
+            if total > 1024 * 1024 * 1024:
+                raise ValueError("archive exceeds expanded budget")
+            path = os.path.join(root, *relative.split("/"))
+            # No symlink-derived origin; aliases can resolve through an
+            # already verified file but never extend the recorded scope.
+            if os.path.realpath(path) != path or not os.path.isfile(path):
+                continue
+            digest = hashlib.sha256()
+            stream = bundle.extractfile(member)
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+            actual = sha256(path)
+            if actual == digest.hexdigest():
+                components[path] = actual
+            else:
+                mismatches += 1
+    record = {"version": 1, "package": package, "release": release,
+              "source": source, "source_id": "%s@%s:%s" % (package, release, expected),
+              "archive_sha256": expected, "platform": sys.platform,
+              "verified_at": _epoch(), "expires": _epoch() + 30 * 86400,
+              "components": components}
+    record["mac"] = _distribution_mac(record)
+    path = os.path.join(STATE_DIR, "distribution-proofs.json")
+    records = load_json(path, [])
+    if not isinstance(records, list):
+        raise ValueError("invalid distribution proof store")
+    records = [r for r in records if r.get("source_id") != record["source_id"]][-127:]
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    if components:
+        save_json(path, records + [record])
+    return {"matched_components": len(components), "mismatched_components": mismatches,
+            "source": source, "shadow": True}
+
+
+def _distribution_receipt(path):
+    """Offline, exact-content lookup; same-UID MAC is not a privilege boundary."""
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    try:
+        proof_path = os.path.join(STATE_DIR, "distribution-proofs.json")
+        if os.path.getsize(proof_path) > 8 * 1024 * 1024:
+            return None
+        records = load_json(proof_path, [])
+        if not isinstance(records, list) or len(records) > 128:
+            return None
+        for record in reversed(records):
+            if (record.get("version") != 1 or record.get("platform") != sys.platform
+                    or not record["verified_at"] <= _epoch() < record["expires"]
+                    or record["expires"] - record["verified_at"] > 30 * 86400):
+                continue
+            expected = record.get("components", {}).get(real)
+            if expected and hmac.compare_digest(str(record.get("mac", "")),
+                                                _distribution_mac(record)):
+                if _graded_sha(real) == expected:
+                    return record
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return None
+
+
+def cmd_distribution(argv):
+    """Explicit network verification; scanning never contacts these services."""
+    import urllib.request
+    import tarfile
+    try:
+        if len(argv) != 7 or argv[2] != "verify":
+            raise ValueError("usage: distribution verify uv|llama.cpp|node VERSION ARCHIVE ROOT")
+        package, release, archive, root = argv[3:7]
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", release):
+            raise ValueError("invalid release")
+        asset = os.path.basename(archive)
+        if package in ("uv", "llama.cpp"):
+            repo = {"uv": "astral-sh/uv", "llama.cpp": "ggml-org/llama.cpp"}[package]
+            source = "https://api.github.com/repos/%s/releases/tags/%s" % (repo, release)
+        elif package == "node" and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", release):
+            source = "https://nodejs.org/dist/%s/SHASUMS256.txt" % release
+        else:
+            raise ValueError("unsupported package or version")
+        request = urllib.request.Request(source, headers={"User-Agent": "Aegis-explicit-origin-verifier"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            metadata = response.read(1024 * 1024 + 1)
+        if len(metadata) > 1024 * 1024:
+            raise ValueError("official metadata exceeds budget")
+        if package == "node":
+            matches = [line.split()[0] for line in metadata.decode().splitlines()
+                       if len(line.split()) == 2 and line.split()[1] == asset]
+        else:
+            matches = [item.get("digest", "").removeprefix("sha256:")
+                       for item in json.loads(metadata).get("assets", []) if item.get("name") == asset]
+        if len(matches) != 1 or not re.fullmatch(r"[0-9a-f]{64}", matches[0]):
+            raise ValueError("official asset digest unavailable")
+        result = _distribution_prove(package, release, archive, matches[0], source, root)
+        print(json.dumps(result))
+        return 0 if result["matched_components"] else 1
+    except (OSError, ValueError, TypeError, KeyError, tarfile.TarError) as exc:
+        print("Distribution verification failed: %s" % exc)
+        return 1
+
+
 def _package_receipt(path):
     """The package-manager transaction that owns `path`, or None.
 
@@ -30670,6 +30802,8 @@ def main(argv):
         return cmd_signers(argv)
     if cmd == "vouch":
         return cmd_vouch(argv)
+    if cmd == "distribution":
+        return cmd_distribution(argv)
     if cmd == "artifact":
         return cmd_artifact(argv)
     if cmd == "identity":
