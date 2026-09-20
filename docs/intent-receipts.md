@@ -56,7 +56,7 @@ is explicitly marked. Receipt/health logs retain two bounded generations
 (rotation after two MiB), so health counts cover retained deliveries only.
 They do not prove every expected host event arrived.
 
-New patch and build receipts are **shadow-only observations**, with no grading
+New patch, native Hermes and build receipts are **shadow-only observations**, with no grading
 or incident changes. Successful direct writes preserve the existing
 `self-attested` intent grade. This is same-user evidence, not authorization:
 an attacker already executing as the user can forge it. No receipt is a
@@ -68,3 +68,17 @@ success, unknown completion, failed completion and ledger-write failures.
 If the state volume itself cannot be written, stderr reports that health
 could not be persisted; no local implementation can make a durable record on
 an unwritable volume.
+
+Receipts carry a domain-separated HMAC across all receipt fields. Consumers
+must call `_intent_receipt_valid` and apply freshness/scope checks before
+using them; this rejects tampering but does not change the same-user threat
+limit. Rehashing for legacy intent records must match the original observed
+hash. A changed file cannot acquire attestation from that earlier observation.
+Malformed health rows are counted as `health_corrupt` rather than crashing the
+health command. A successful build command with any unverified declared
+output returns nonzero and records `outputs_unverified`.
+
+See [staged host integration](intent-integration-staged.md) for adapter schema
+evidence, proposed entries and required real host canaries. Relative output
+paths without an explicit absolute cwd are rejected. An absolute output can
+be observed without cwd, but the receipt then has no project identity.

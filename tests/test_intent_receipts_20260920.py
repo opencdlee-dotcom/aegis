@@ -113,7 +113,7 @@ def test_unknown_host_and_no_arbitrary_shell_inference(sandbox, monkeypatch):
 def test_ledger_failure_is_durable(sandbox, monkeypatch):
     path = sandbox / "ok.py"
     path.write_text("ok")
-    monkeypatch.setattr(aegis, "intent_record", lambda *args: False)
+    monkeypatch.setattr(aegis, "intent_record", lambda *args, **kwargs: False)
     hook(monkeypatch, {"tool_name": "Write", "tool_input": {"path": str(path)},
                        "status": "success"})
     assert "ledger_write_failure" in (sandbox / "intent.jsonl.health").read_text()
@@ -121,3 +121,97 @@ def test_ledger_failure_is_durable(sandbox, monkeypatch):
 
 def test_build_scope_refuses_before_execution(sandbox):
     assert aegis.cmd_intent(["aegis", "intent", "build", str(sandbox), "../escape", "--", "not-a-command"]) == 2
+
+
+@pytest.mark.parametrize("tool,result", [
+    ("write_file", {"bytes_written": 2}),
+    ("patch", {"success": True}),
+])
+def test_real_hermes_completion_uses_resolved_output(sandbox, monkeypatch, tool, result):
+    path = sandbox / "actual.py"
+    path.write_text("ok")
+    result.update({"resolved_path": str(path), "files_modified": [str(path)]})
+    hook(monkeypatch, {"hook_event_name": "post_tool_call", "tool_name": tool,
+                       "tool_input": {"path": "wrong-cwd.py"}, "cwd": str(sandbox),
+                       "extra": {"status": "ok", "result": json.dumps(result),
+                                 "tool_call_id": "hermes-call"}}, "hermes")
+    row = receipts(sandbox)[0]
+    assert row["status"] == "success"
+    assert row["outputs"][0]["path"] == str(path.resolve())
+    assert row["outputs"][0]["sha256"] == aegis.sha256(path)
+    assert row["call"]
+    # Newly supported Hermes evidence must stay in the shadow rollout.
+    assert row["shadow"] is True
+    assert not aegis._intent_attested(str(path), aegis.sha256(path))
+
+
+def test_hermes_failed_tool_preserves_observation(sandbox, monkeypatch):
+    path = sandbox / "partial.py"
+    path.write_text("partial")
+    hook(monkeypatch, {"hook_event_name": "post_tool_call", "tool_name": "write_file",
+                       "tool_input": {"path": str(path)}, "cwd": str(sandbox),
+                       "extra": {"status": "error", "result": json.dumps({"error": "secret"})}}, "hermes")
+    row = receipts(sandbox)[0]
+    assert row["status"] == "failed"
+    assert "secret" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("cwd", [None, "", "relative-cwd"])
+def test_missing_absolute_cwd_never_resolves_relative_output(sandbox, monkeypatch, cwd):
+    monkeypatch.chdir(sandbox)
+    (sandbox / "relative.py").write_text("wrong file")
+    hook(monkeypatch, {"tool_name": "Write", "tool_input": {"path": "relative.py"},
+                       "status": "success", "cwd": cwd})
+    assert not aegis._intent_attested(str(sandbox / "relative.py"), aegis.sha256(sandbox / "relative.py"))
+    assert not (sandbox / "intent.jsonl.receipts").exists()
+
+
+def test_notebook_path_is_supported(sandbox, monkeypatch):
+    path = sandbox / "example.ipynb"
+    path.write_text("{}")
+    hook(monkeypatch, {"hook_event_name": "PostToolUse", "tool_name": "NotebookEdit",
+                       "tool_input": {"notebook_path": str(path)}})
+    assert receipts(sandbox)[0]["outputs"][0]["sha256"] == aegis.sha256(path)
+
+
+def test_receipt_tampering_and_observation_race_fail_closed(sandbox, monkeypatch):
+    path = sandbox / "race.py"
+    path.write_text("initial")
+    initial = aegis.sha256(path)
+    path.write_text("changed")
+    assert not aegis.intent_record(str(path), expected_sha=initial)
+    hook(monkeypatch, {"tool_name": "Write", "tool_input": {"path": str(path)}, "status": "success"})
+    row = receipts(sandbox)[0]
+    assert aegis._intent_receipt_valid(row)
+    row["outputs"][0]["sha256"] = "f" * 64
+    assert not aegis._intent_receipt_valid(row)
+
+
+def test_corrupt_health_and_missing_build_output(sandbox, capsys):
+    (sandbox / "intent.jsonl.health").write_text('{broken\n')
+    assert aegis.cmd_intent(["aegis", "intent", "health"]) == 0
+    assert json.loads(capsys.readouterr().out)["counts"]["health_corrupt"] == 1
+    assert aegis.cmd_intent(["aegis", "intent", "build", str(sandbox), "missing", "--", sys.executable, "-c", "pass"]) == 1
+    assert "outputs_unverified" in (sandbox / "intent.jsonl.health").read_text()
+
+
+def test_codex_namespaced_raw_patch_is_observed_unknown(sandbox, monkeypatch):
+    path = sandbox / "sample.py"
+    path.write_text("ok")
+    hook(monkeypatch, {"tool_name": "functions.apply_patch", "cwd": str(sandbox),
+                       "tool_input": "*** Begin Patch\n*** Add File: sample.py\n+ok\n*** End Patch"}, "codex")
+    row = receipts(sandbox)[0]
+    assert row["operation"] == "apply_patch"
+    assert row["status"] == "unknown"
+    assert row["outputs"][0]["sha256"] == aegis.sha256(path)
+    assert aegis._intent_receipt_valid(row)
+
+
+def test_hermes_relative_task_path_is_not_resolved_using_host_cwd(sandbox, monkeypatch):
+    path = sandbox / "same-name.py"
+    path.write_text("host cwd file is not the task output")
+    hook(monkeypatch, {"hook_event_name": "post_tool_call", "tool_name": "write_file",
+                       "tool_input": {"path": path.name}, "cwd": str(sandbox),
+                       "extra": {"status": "ok", "result": '{"bytes_written": 2}'}}, "hermes")
+    assert not (sandbox / "intent.jsonl.receipts").exists()
+    assert "parse_error" in (sandbox / "intent.jsonl.health").read_text()

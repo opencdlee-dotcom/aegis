@@ -17012,7 +17012,7 @@ def _intent_prune(lines):
     return kept
 
 
-def intent_record(path, tool="manual"):
+def intent_record(path, tool="manual", expected_sha=None):
     """Append one signed intent record for `path`'s CURRENT content.
 
     Never raises and never prints: the caller is a harness hook whose failure
@@ -17020,7 +17020,7 @@ def intent_record(path, tool="manual"):
     try:
         path = os.path.realpath(os.path.expanduser(path))
         sha = sha256(path)
-        if not sha:
+        if not sha or (expected_sha is not None and sha != expected_sha):
             return False
         tool = str(tool)[:64]
         ts = now_iso()
@@ -17115,6 +17115,20 @@ def _intent_identity(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest() if value else ""
 
 
+def _intent_receipt_mac(record):
+    body = {k: v for k, v in record.items() if k != "mac"}
+    message = "intent-receipt:v1|" + json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return hmac.new(_hmac_key(), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _intent_receipt_valid(record):
+    try:
+        return (record.get("version") == 1 and
+                hmac.compare_digest(_intent_receipt_mac(record), str(record.get("mac") or "")))
+    except (TypeError, ValueError, OSError, AttributeError):
+        return False
+
+
 def _intent_observe(payload, host, build=False):
     """Normalize supported writes. New batch/build evidence remains shadow-only.
 
@@ -17124,23 +17138,52 @@ def _intent_observe(payload, host, build=False):
     if not isinstance(payload, dict):
         raise ValueError("payload")
     tool = payload.get("tool_name", "")
+    if host == "codex" and tool == "functions.apply_patch":
+        tool = "apply_patch"
     ti = payload.get("tool_input") or {}
+    if tool == "apply_patch" and isinstance(ti, str):
+        ti = {"patch": ti}
     if not isinstance(ti, dict):
         raise ValueError("tool_input")
     event = payload.get("hook_event_name")
     result = payload.get("tool_response") or {}
+    hermes = host == "hermes" and event == "post_tool_call"
+    extra = payload.get("extra") or {}
+    if not isinstance(extra, dict):
+        raise ValueError("extra")
+    if hermes:
+        result = extra.get("result") or {}
+        if isinstance(result, str):
+            result = json.loads(result)
     if not isinstance(result, dict):
-        result = {}
+        raise ValueError("result")
     failed = (event == "PostToolUseFailure" or payload.get("status") == "failed"
               or payload.get("is_error") is True or result.get("is_error") is True
-              or bool(result.get("error")) or result.get("exit_code", 0) != 0)
+              or bool(result.get("error")) or result.get("exit_code", 0) != 0
+              or result.get("success") is False
+              or (hermes and extra.get("status") in ("error", "blocked")))
     status = "failed" if failed else "unknown"
     if host != "unknown" and not failed and (payload.get("status") == "success" or
-                      (host == "claude-code" and event == "PostToolUse")):
+                      (host == "claude-code" and event == "PostToolUse") or
+                      (hermes and extra.get("status") == "ok" and
+                       (result.get("success") is True or "bytes_written" in result))):
         status = "success"
-    project = os.path.realpath(payload.get("cwd") or os.getcwd())
+    cwd = payload.get("cwd")
+    if cwd and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
+        raise ValueError("absolute cwd required")
+    project = os.path.realpath(cwd) if cwd else ""
     direct = tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write_file", "edit_file")
-    if direct:
+    if hermes and tool in ("write_file", "patch"):
+        paths = (result.get("files_modified") or []) + (result.get("files_created") or [])
+        if result.get("resolved_path"):
+            paths.append(result["resolved_path"])
+        if not paths:
+            paths = [ti.get("path")]
+        # Hermes hook cwd is the host process cwd, not necessarily task cwd.
+        if any(not isinstance(p, str) or not os.path.isabs(p) for p in paths):
+            raise ValueError("Hermes resolved absolute outputs required")
+        direct = False  # Newly supported host receipts remain shadow evidence.
+    elif direct:
         paths = [ti.get("file_path") or ti.get("path") or ti.get("notebook_path")]
     elif tool == "apply_patch":
         patch = ti.get("patch") or ti.get("input") or ""
@@ -17163,7 +17206,10 @@ def _intent_observe(payload, host, build=False):
     for path in dict.fromkeys(paths):
         if not isinstance(path, str) or not path or len(path) > 4096:
             raise ValueError("path")
-        path = os.path.realpath(os.path.join(project, os.path.expanduser(path)))
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path) and not project:
+            raise ValueError("relative output without cwd")
+        path = os.path.realpath(os.path.join(project, path))
         row = {"path": path, "sha256": None}
         try:
             size = os.path.getsize(path)
@@ -17180,17 +17226,19 @@ def _intent_observe(payload, host, build=False):
         outputs.append(row)
     record = {"version": 1, "ts": now_iso(), "host": host,
               "session": _intent_identity(payload.get("session_id")),
-              "call": _intent_identity(payload.get("tool_use_id") or payload.get("call_id")),
+              "call": _intent_identity(payload.get("tool_use_id") or payload.get("call_id") or extra.get("tool_call_id")),
               "project": project, "operation": tool, "status": status,
               "shadow": not direct, "outputs": outputs}
+    record["mac"] = _intent_receipt_mac(record)
     _intent_append(".receipts", record)
     if status == "success" and direct:
         for row in outputs:
             if row["sha256"] and _intent_worthy(row["path"]):
-                if not intent_record(row["path"], host):
+                if not intent_record(row["path"], host, expected_sha=row["sha256"]):
                     _intent_health("ledger_write_failure", host)
                     return
     _intent_health(status, host)
+    return record
 
 
 def _intent_build(argv):
@@ -17213,9 +17261,12 @@ def _intent_build(argv):
     except (OSError, subprocess.TimeoutExpired):
         code = 1
     try:
-        _intent_observe({"tool_name": "declared_build", "cwd": project,
+        receipt = _intent_observe({"tool_name": "declared_build", "cwd": project,
                          "status": "success" if code == 0 else "failed",
                          "tool_input": {"outputs": outputs}}, "build-wrapper", build=True)
+        if code == 0 and any(not row["sha256"] for row in receipt["outputs"]):
+            _intent_health("outputs_unverified", "build-wrapper")
+            return 1
     except (OSError, ValueError, TypeError):
         _intent_health("ledger_write_failure", "build-wrapper")
         if code == 0:
@@ -17288,8 +17339,14 @@ def cmd_intent(argv):
             try:
                 with open(INTENT_FILE + suffix, encoding="utf-8") as stream:
                     for line in stream:
-                        record = json.loads(line)
-                        outcome = record["outcome"]
+                        try:
+                            record = json.loads(line)
+                            outcome = record["outcome"]
+                            if not isinstance(outcome, str) or not isinstance(record["host"], str):
+                                raise ValueError("health schema")
+                        except (ValueError, TypeError, KeyError):
+                            counts["health_corrupt"] = counts.get("health_corrupt", 0) + 1
+                            continue
                         counts[outcome] = counts.get(outcome, 0) + 1
                         host = hosts.setdefault(record["host"],
                                                 {"deliveries": 0, "state": "unobserved"})
