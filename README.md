@@ -13,6 +13,9 @@ cert required**.
 The complete logic, workflow, safety invariants, and future power-tier gate are
 in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+For alert tuning, evidence-based learning, and SSH/shared-folder boundaries,
+see [False-alarm prevention](docs/false-alarm-prevention.md).
+
 > It is not "Norton," and it deliberately doesn't pretend to be. The background
 > scan is **detect-only and never destructive**; response is a separate, opt-in,
 > reversible-by-default tier you invoke deliberately (see *Response tier* below).

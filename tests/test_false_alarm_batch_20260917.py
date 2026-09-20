@@ -40,6 +40,7 @@ still reaches the report -- it is making the N places EVIDENCE on one case.
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -287,9 +288,19 @@ class RotatingEndpointsAreOneRelationship(unittest.TestCase):
                     f["title"], "Persistent outbound connection (beacon shape)")
 
     def test_dispersion_demotes_exactly_one_step_and_is_not_dropped(self):
-        out = self._run(self._rows(13))
+        # Linux's generic suspicious fixture is 'broken'. Integrity failure
+        # now deliberately outranks rotation, so exercise ordinary unknown
+        # origin through the sensor's independent risky-location gate.
+        rows = [(p, ip, port, "unknown") for p, ip, port, _ in self._rows(13)]
+        with patch.object(aegis, "is_risky_location", return_value=True):
+            out = self._run(rows)
         self.assertEqual(out[0]["severity"], "MEDIUM")  # one step from HIGH
         self.assertIn("every address is listed here", out[0]["detail"])
+
+    def test_rotation_does_not_demote_a_broken_signature(self):
+        rows = [(p, ip, port, "broken") for p, ip, port, _ in self._rows(13)]
+        out = self._run(rows)
+        self.assertEqual(out[0]["severity"], "HIGH")
 
     def test_different_ports_stay_different_relationships(self):
         rows = self._rows(5, port="443") + self._rows(5, port="8443")

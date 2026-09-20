@@ -658,6 +658,19 @@ _PIPE_LAUNCH = r"(?:(?:/\S*/)?env\s+(?:-\S+\s+|[\w.]+=\S*\s+)*)?(?:/\S*/)?"
 # linear. Python 3.9 has no atomic groups / possessive quantifiers, so a numeric
 # bound is the portable fix — same technique as _SECRET_FLAG_RE. `_hostile_content`
 # additionally caps its input as defence in depth.
+#
+# COMMAND-BOUNDARY DISCIPLINE. A COMPOSITE idiom claims two tokens belong to
+# ONE command ("nohup ... curl" is fileless staging; "curl ... 1.2.3.4" is a
+# bare-IP fetch). The skip-run between them must therefore not cross a shell
+# separator, or the regex fuses two unrelated commands into an idiom neither
+# of them is. That is not hypothetical here: an agent harness passes a whole
+# session as a single `bash -c` string, so `nohup llama-server &` earlier in
+# the line and `curl` later in it reported as `nohup-curl-fileless` at HIGH
+# (incident #503). `network-fetch` above already had the right instinct with
+# `[^\n|]`; this is that instinct named, widened to the other separators, and
+# applied to every composite that needs it. Single-token idioms (/dev/tcp/,
+# base64-decode) take no run and are unaffected.
+_ARGV_SAME_CMD = r"[^\n;&|]"
 _HOSTILE_CONTENT_RES = [
     (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]{0,512}\bhttps?://", re.I), "network-fetch"),
     (re.compile(r"\|\s*" + _PIPE_LAUNCH + r"(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
@@ -702,7 +715,22 @@ _HOSTILE_CONTENT_RES = [
     (re.compile(r"\bn(?:c|cat)\b[^\n]{0,512}\s-[a-z]*e\b", re.I), "netcat-exec"),
     (re.compile(r"\bosascript\b[^\n]{0,512}do\s+shell\s+script", re.I), "osascript-shell"),
     (re.compile(r"\bpython[0-9.]*\b[^\n]{0,120}-c[^\n]{0,120}\bimport\s+(?:os|socket|pty|subprocess)", re.I), "python-oneliner"),
-    (re.compile(r"\b(?:curl|wget)\b[^\n]{0,512}\bhttps?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
+    # A bare ROUTABLE address. The threat this names is a C2 reached without
+    # DNS (AMOS ships bare-IP endpoints), and a loopback or RFC1918 address is
+    # not one: `curl http://127.0.0.1:8080/health` against a local dev server
+    # is the single most common command on a developer's box. Aegis already
+    # knows this — the listener sensor drops loopback binds for exactly this
+    # reason ("dev servers churn on 127.0.0.1 constantly") — the knowledge
+    # just never reached the argv scanner, so a llama-server health check read
+    # as a raw-IP C2 fetch, at HIGH, and fed a CRITICAL chain (incident #503).
+    # Excluded: 127/8 loopback, 0/8, 10/8, 172.16/12, 192.168/16, 169.254/16
+    # link-local, and 100.64/10 CGNAT (Tailscale and every carrier NAT).
+    # Anything else — including 100.60.x, which is public — still matches.
+    (re.compile(r"\b(?:curl|wget)\b[^\n]{0,512}\bhttps?://"
+                r"(?!(?:127|10|0)\.|169\.254\.|192\.168\."
+                r"|172\.(?:1[6-9]|2[0-9]|3[01])\."
+                r"|100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)"
+                r"\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
     (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]{0,512}/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
     (re.compile(r"display\s+dialog.{0,512}hidden\s+answer", re.I | re.S), "osascript-password-phish"),
     (re.compile(r"\bsecurity\b[^\n]{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I), "keychain-dump"),
@@ -841,7 +869,10 @@ _HOSTILE_ARGV_RES = [
     (re.compile(r"\bxattr\b[^\n]{0,120}\s-[a-z]*(?:c|d|dr)\b[^\n]{0,120}com\.apple\.quarantine", re.I), "quarantine-strip", "HIGH"),
     (re.compile(r"\bxattr\b\s+-c\b", re.I), "xattr-clear-all", "HIGH"),
     # Invisible DMG mount (new ClickFix DMG variant, Unit42 2026).
-    (re.compile(r"\bhdiutil\b\s+attach\b[^\n]{0,512}-nobrowse\b", re.I), "hdiutil-nobrowse", "HIGH"),
+    # Also used by ordinary installers: retain as a corroborator, not an
+    # interrupt by itself. Stronger companion behaviors keep their severity.
+    (re.compile(r"\bhdiutil\b\s+attach\b" + _ARGV_SAME_CMD + r"{0,512}-nobrowse\b", re.I),
+     "hdiutil-nobrowse", "MEDIUM"),
     # Wipes the TCC privacy DB — resets Aegis's own grants; a tamper signal.
     (re.compile(r"\btccutil\b\s+reset\b", re.I), "tccutil-reset", "HIGH"),
     # Keychain theft residue: copy login.keychain-db out, or dump it.
@@ -853,8 +884,12 @@ _HOSTILE_ARGV_RES = [
     # TLS-verification-disabled streaming download (curl -k | base64 -d | …).
     (re.compile(r"\bcurl\b[^\n]{0,120}\s-[a-z]*k\b[^\n]{0,120}\|\s*(?:base64|gunzip|(?:ba|z)?sh|osascript)", re.I),
      "curl-insecure-pipe", "HIGH"),
-    # Fileless staging: nohup curl pulling a payload run in memory.
-    (re.compile(r"\bnohup\b[^\n]{0,512}\bcurl\b", re.I), "nohup-curl-fileless", "HIGH"),
+    # Fileless staging: nohup curl pulling a payload run in memory. The run is
+    # separator-bounded (see _ARGV_SAME_CMD): `nohup` detaching one process
+    # and a `curl` in a LATER command of the same line are two facts, not one
+    # idiom, and an agent harness puts a whole session on one line.
+    (re.compile(r"\bnohup\b" + _ARGV_SAME_CMD + r"{0,512}\bcurl\b", re.I),
+     "nohup-curl-fileless", "HIGH"),
     # ClickLock (2026) password-coercion / anti-analysis: killing Activity
     # Monitor / SystemUIServer / NotificationCenter / Console. HIGH alone; the
     # tight-loop variant escalates to CRITICAL in _argv_signals (below).
@@ -1854,6 +1889,25 @@ def read_crash():
     return load_json(_crash_file(), {})
 
 
+def _display_pipe_closed(crash):
+    """A read-only CLI display lost its reader, not the background monitor.
+
+    Exact argument shapes matter: incident/family also accept state-changing
+    actions, and an absent command runs a real scan. Unknown shapes stay faults.
+    """
+    if crash.get("exc_type") != "BrokenPipeError" or crash.get("context"):
+        return False
+    argv = crash.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        return False
+    args = argv[1:]
+    return (args in (["status"], ["report"], ["report", "--full"],
+                     ["report", "full"], ["incidents"], ["incidents", "all"],
+                     ["incidents", "families"], ["families"])
+            or (len(args) == 2 and args[0] in ("incident", "family")
+                and bool(args[1]) and not args[1].startswith("-")))
+
+
 # --------------------------------------------------------------------------- #
 # The scheduler's stdout/stderr sinks. launchd's StandardOutPath /
 # StandardErrorPath (and a systemd unit's journal-free equivalent) append for
@@ -2118,6 +2172,19 @@ def download_provenance(path):
 _HOSTILE_SCAN_LIMIT = 65536  # cap untrusted text before regex scanning (below)
 
 
+def _command_pattern_search(rx, text):
+    # Process tables discard argument boundaries and shell quoting. Do not
+    # weaken credential/exfiltration/reverse-shell detection on the strength
+    # of punctuation: an ampersand may belong to a URL argument. Only the two
+    # observed command-coincidence heuristics use the separator restriction;
+    # even those retain conservative matching on quoted/escaped shell text.
+    coincidence = rx.pattern.startswith((r"\bnohup\b", r"\bhdiutil\b"))
+    if _ARGV_SAME_CMD in rx.pattern and (
+            not coincidence or any(c in text for c in "'\"\\")):
+        rx = re.compile(rx.pattern.replace(_ARGV_SAME_CMD, r"[^\n]"), rx.flags)
+    return rx.search(text)
+
+
 def _hostile_content(text):
     """Return the list of hostile-pattern names present in a blob of shell/command
     text (empty list = clean). Shared by shell-rc scanning and could back any
@@ -2132,7 +2199,8 @@ def _hostile_content(text):
         return []
     if len(text) > _HOSTILE_SCAN_LIMIT:
         text = text[:_HOSTILE_SCAN_LIMIT]
-    return sorted({name for rx, name in _HOSTILE_CONTENT_RES if rx.search(text)})
+    return sorted({name for rx, name in _HOSTILE_CONTENT_RES
+                   if _command_pattern_search(rx, text)})
 
 
 # --------------------------------------------------------------------------- #
@@ -4917,6 +4985,72 @@ def _dedupe_chain_incidents(db, chains_raised, now):
     return closed
 
 
+def _chain_severity(leg_pairs, attack_defined=False):
+    """A chain ESCALATES its legs; it does not manufacture a severity.
+
+    This asserted a flat "CRITICAL" for every chain, whatever the two
+    findings it was built from actually said. On the live store that
+    produced incident #511 — `Persistence followed by execution`,
+    CRITICAL, for 24 days — out of a LOW leg and a MEDIUM one:
+
+      left   /bin/bash's bytes changed. The persistence sensor had ALREADY
+             graded it `custody=os-vendor` -> LOW and written the sentence
+             "Apple-platform-signed on the sealed system volume (SIP
+             enabled) ... the shape of a system update, not of a config
+             edit" into its own detail.
+      right  `bash -c` from the operator's agent harness -> MEDIUM.
+
+    Two findings the graders had already explained were fused into the
+    single highest severity the system can emit. The chain rules are
+    right that co-occurrence is worth more than the parts — the
+    credential-capture rule says so explicitly — but "worth more than the
+    parts" is an escalation FROM the parts, and a pair of explained
+    events has nothing to escalate.
+
+    So: one step above the WEAKER leg, floored at the STRONGER leg so folding
+    a standalone incident cannot hide its severity. CRITICAL is retained for
+    an already-critical leg or a pair that has earned
+    it — both legs at HIGH or above, either leg attack-defined, or a rule
+    that is attack-defined BY CONSTRUCTION. An attack-defined leg is never
+    demoted anywhere else in this file and is not demoted here: a payload
+    stays a payload whoever owns the other half of the pair.
+
+    `attack_defined` is the discriminator that separates the five chain
+    rules into the two kinds they have always been, which is visible in
+    their own predicates:
+
+      by construction   `chain:clickfix` and `chain:credential-capture`
+                        select their left leg on hostile MARKERS — a
+                        password phish, a keychain dump, a quarantine
+                        strip. The rule cannot fire without a payload
+                        idiom, so the pair is a kill chain and the
+                        credential-capture rule's own comment is right
+                        that it is worth more than two HIGHs. CRITICAL.
+      by co-occurrence  `chain:persistence-execution`, `:supply-chain`
+                        and `:remote-access` select on CATEGORY alone, so
+                        ANY two ordinary findings on one entity match.
+                        These are the rules that turned explained facts
+                        into CRITICALs, and these are the ones that now
+                        have to earn it from their legs.
+    """
+    best = "LOW"
+    for left, right in leg_pairs or ():
+        if attack_defined or left.get("attack_defined") \
+                or right.get("attack_defined"):
+            return "CRITICAL"
+        left_sev = left.get("severity") if left.get("severity") in SEV_ORDER \
+            else "LOW"
+        right_sev = right.get("severity") if right.get("severity") in SEV_ORDER \
+            else "LOW"
+        weaker = left_sev if SEV_ORDER[left_sev] <= SEV_ORDER[right_sev] \
+            else right_sev
+        if SEV_ORDER[weaker] >= SEV_ORDER["HIGH"]:
+            return "CRITICAL"
+        best = _severity_max(best, _severity_max(
+            _severity_max(left_sev, right_sev), _step_up(weaker)))
+    return best
+
+
 def _apply_correlations(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
@@ -4963,20 +5097,40 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # _dedupe_chain_incidents.
     chains_raised = []
 
-    def correlate(base_key, title, left_pred, right_pred, window=900):
+    def correlate(base_key, title, left_pred, right_pred, window=900,
+                  attack_defined=False):
         matches_by_entity = {}
+        legs_by_entity = {}
         for left_id, right_id, left, right in _correlation_pairs(
                 observations, left_pred, right_pred, window):
+            # An OS binary update is not a new persistence mechanism. Many
+            # unrelated jobs share /bin/bash; that path cannot link the update
+            # to an arbitrary shell command as one intrusion.
+            if left.get("category") == "persistence" and \
+                    left.get("custody") == "os-vendor" and \
+                    not left.get("attack_defined"):
+                continue
+            # BTM and launchd can report the same registration. Seeing the
+            # same plist twice is not independent evidence of execution.
+            if base_key == "chain:supply-chain" and \
+                    right.get("category") == "persistence" and \
+                    left.get("path") and right.get("path") and \
+                    _canon_entity_path(left["path"]) == \
+                    _canon_entity_path(right["path"]):
+                continue
             if left_id in new_ids or right_id in new_ids:
                 entity = _canon_entity_path(_shared_entity(left, right))
                 entity_key = hashlib.sha256(
                     entity.encode("utf-8", "replace")).hexdigest()[:16]
                 matches_by_entity.setdefault(entity_key, set()).update(
                     (left_id, right_id))
+                legs_by_entity.setdefault(entity_key, []).append((left, right))
         for entity_key, matches in matches_by_entity.items():
             key = "%s:%s" % (base_key, entity_key)
+            severity = _chain_severity(legs_by_entity.get(entity_key, ()),
+                                       attack_defined=attack_defined)
             incident_id = _upsert_incident(
-                db, key, title, "CRITICAL", "correlation", now,
+                db, key, title, severity, "correlation", now,
                 sorted(matches), initially_notified)
             # A signal may have opened a standalone incident in an earlier scan.
             # Once independent evidence promotes it into a chain, close those
@@ -5004,7 +5158,10 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         lambda f: f.get("category") in ("behavior", "shell-history") and
         has_marker(f, {"fileless-fetch-exec", "password-phish",
                        "quarantine-strip", "invisible-dmg"}),
-        lambda f: f.get("category") in ("persistence", "staging", "hot-dir"))
+        lambda f: f.get("category") in ("persistence", "staging", "hot-dir"),
+        # Attack-defined: the left predicate is a payload idiom, so this rule
+        # cannot fire on two ordinary findings. See _chain_severity.
+        attack_defined=True)
     correlate(
         "chain:persistence-execution", "Persistence followed by execution",
         lambda f: f.get("category") == "persistence",
@@ -5028,7 +5185,12 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
             "keychain-db-access", "keychain-security-dump", "keychain-dump",
             "gui-kill-coercion", "gui-kill-loop-coercion"}),
         lambda f: f.get("category") in ("persistence", "staging", "net-listener")
-        or has_marker(f, {"curl-exfil-post", "fileless-fetch-exec"}))
+        or has_marker(f, {"curl-exfil-post", "fileless-fetch-exec"}),
+        # Attack-defined: the left predicate is a credential-theft idiom
+        # (password phish, keychain dump, coercion kill). The comment above is
+        # right that this pair is worth more than two HIGHs — that is exactly
+        # what being attack-defined by construction buys it.
+        attack_defined=True)
 
     # Two chain rules can describe one fact. Reconcile them once every rule has
     # run — never inside correlate(), which cannot see the rules after it.
@@ -5220,21 +5382,44 @@ def _close_regraded_incidents(db, now):
     Same discipline as age-out: no dismissals row (a machine verdict must
     never feed backtest precision or acquired tolerance), CRITICAL is never
     closed this way, never-tolerate prefixes are skipped, and the reattach
-    path reopens the case the moment it carries something new."""
+    path reopens the case the moment it carries something new.
+
+    WHY THIS READS THE INCIDENT'S OWN EVIDENCE INSTEAD OF JOINING `signals`.
+    It shipped as `JOIN signals s ON ('signal:' || s.fingerprint) =
+    i.correlation_key` — correct only for an incident keyed on a raw
+    fingerprint. Since the process/beacon identity redesign, the incidents
+    that carry the custody grades are keyed on their CASE
+    (`signal:process:sha:<sha>`) while their signals stay path-keyed
+    (`process:<path>:adhoc:<sha>`), so the string join matched nothing and the
+    exit was structurally unreachable for them. Measured on the live store
+    before this change: 23 of 41 open signal incidents had no joinable signal
+    row at all, including EVERY `process:sha:` one — which is the entire
+    population this function was written for. #509 sat OPEN at HIGH with two
+    LOW `operator-vouched` re-grades attached to it, the strongest rung the
+    ladder has.
+
+    The unit test did not catch it because it builds a finding with no
+    `case_fingerprint` — the one shape the join could handle. So the lookup
+    now goes through the evidence the incident actually holds, which is both
+    key shapes at once and is also the text the operator is shown."""
     rows = db.execute(
-        "SELECT i.id, i.severity AS inc_sev, i.correlation_key, "
-        "s.severity AS sig_sev FROM incidents i "
-        "JOIN signals s ON ('signal:' || s.fingerprint) = i.correlation_key "
-        "WHERE i.status='OPEN' AND i.kind='signal' "
-        "AND i.severity<>'CRITICAL' AND s.last_seen>=i.last_seen").fetchall()
+        "SELECT id, severity AS inc_sev, correlation_key, last_seen "
+        "FROM incidents WHERE status='OPEN' AND kind='signal' "
+        "AND severity<>'CRITICAL'").fetchall()
     closed = []
     for row in rows:
         fp = (row["correlation_key"] or "")[len("signal:"):]
         if fp.startswith(_NEVER_TOLERATE_PREFIXES):
             continue
-        if SEV_ORDER.get(row["sig_sev"], 99) >= SEV_ORDER["HIGH"]:
+        latest = _latest_incident_grade(db, row["id"], row["last_seen"])
+        if latest is None:
             continue
-        closed.append((row["id"], row["sig_sev"]))
+        sig_sev, sig_fp = latest
+        if sig_fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        if SEV_ORDER.get(sig_sev, 99) >= SEV_ORDER["HIGH"]:
+            continue
+        closed.append((row["id"], sig_sev))
     for incident_id, sig_sev in closed:
         db.execute(
             "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
@@ -5242,6 +5427,46 @@ def _close_regraded_incidents(db, now):
             ("re-graded: the signal now reads %s (reopens on new evidence)"
              % sig_sev, now, incident_id))
     return len(closed)
+
+
+def _latest_incident_grade(db, incident_id, incident_last_seen):
+    """Strongest latest per-fingerprint grade attached to `incident_id`.
+
+    Every path's latest word matters, whatever the case is keyed on. Returns None
+    when the incident holds no readable evidence, or when its newest evidence
+    predates its own `last_seen` — the same freshness guard the old
+    `s.last_seen >= i.last_seen` clause enforced, kept because a stale grade
+    must not close an incident something else has refreshed since.
+    """
+    rows = db.execute(
+        "SELECT e.observed_at, e.data_json FROM events e "
+        "JOIN incident_events ie ON ie.event_id=e.id "
+        "WHERE ie.incident_id=? AND e.event_type='observation.finding' "
+        "ORDER BY e.id DESC", (incident_id,)).fetchall()
+    if not rows:
+        return None
+    if (rows[0]["observed_at"] or 0) < (incident_last_seen or 0):
+        return None
+    latest = {}
+    for row in rows:
+        try:
+            data = json.loads(row["data_json"])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        fp = str(data.get("fingerprint") or "")
+        if fp in latest:
+            continue
+        sev = data.get("severity")
+        if not fp or sev not in SEV_ORDER or data.get("attack_defined") \
+                or fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            return None
+        latest[fp] = sev
+    # A content-keyed case can contain several paths. A trusted copy must
+    # never clear an unresolved HIGH observation of the same bytes elsewhere.
+    fp = max(latest, key=lambda key: SEV_ORDER[latest[key]])
+    return latest[fp], fp
 
 
 def _close_cleared_state_incidents(db, observed, now):
@@ -5428,7 +5653,18 @@ _LEGACY_PERSIST_CASE_RE = re.compile(
     r"^(signal:persistence:changed:.*):[0-9a-f]{8,64}$")
 
 
-_LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:.*:[0-9a-f]{64}$")
+# `(?!sha:)` excludes the CURRENT content-keyed case, `signal:process:sha:
+# <sha256>`, which this pattern otherwise matches exactly (`.*` = "sha"). That
+# shape did not exist when this migration shipped, so excluding it changes
+# nothing about how a 2026-08-23-era key migrates — it only stops a retirement
+# sweep from eating the identity that replaced the keys it retires. Without
+# it, on any store where this migration has not already run (a fresh install,
+# a restore from backup, a second machine upgrading late — the exact cases the
+# FROZEN note above exists for) every process incident is closed as
+# "superseded" in the same scan that opened it, and the monitor silently
+# discards its own process findings. Caught by the sandbox, which is by
+# construction a store that has never migrated.
+_LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:(?!sha:).*:[0-9a-f]{64}$")
 # FROZEN copies of _BEACON_FP_RE / _TOLERANCE_VERSION_RE as they stood when this
 # migration shipped (2026-08-23). A migration's meaning must not drift when the
 # live detection patterns evolve: a store restored from backup, or a second
@@ -5616,6 +5852,43 @@ def _fold_incidents(db, now, key, ids, reason):
     return len(dupes)
 
 
+def _fold_rotating_beacon_cases(db, now):
+    """Fold per-ADDRESS beacon incidents onto one (program, port) case.
+
+    Extracted so it can run a second time under its own stamp. Dispersion is
+    counted here from the OPEN INCIDENTS themselves, which is a history and
+    always was -- unlike the live sensor, which until 2026-09-19 counted only
+    the addresses that happened to be live in one scan and therefore kept
+    minting per-address cases a rotating endpoint could never escape. Fixing
+    the sensor leaves the incidents already minted under the old rule behind;
+    this is how every previous identity redesign retired its orphans.
+    """
+    disp, rows = {}, []
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
+            "AND created_at < ? ORDER BY id", (now,)):
+        m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
+        if not m:
+            continue
+        prog, rip, rport = m.group(1), m.group(2), m.group(3)
+        key = (_program_subject(prog), rport)
+        disp.setdefault(key, set()).add(rip)
+        rows.append((row["id"], key))
+    groups = {}
+    for inc_id, key in rows:
+        if len(disp.get(key, ())) >= _MIG_BEACON_DISPERSION_MIN:
+            groups.setdefault(
+                "signal:beacon:rotating:%s:%s" % key, []).append(inc_id)
+    folded = 0
+    for key, ids in sorted(groups.items()):
+        folded += _fold_incidents(
+            db, now, key, ids,
+            "superseded: many addresses on one port from one program is one "
+            "rotating endpoint relationship, not one beacon per address")
+    return folded
+
+
 def _merge_2026_09_case_identities(db, now):
     """One-time: fold the incidents the 2026-09-17 identity fixes de-duplicate.
 
@@ -5689,28 +5962,7 @@ def _merge_2026_09_case_identities(db, now):
             "copied to")
 
     # --- beacon: per-address -> one rotating relationship ----------------
-    disp, rows = {}, []
-    for row in db.execute(
-            "SELECT id,correlation_key FROM incidents WHERE status IN "
-            "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
-            "AND created_at < ? ORDER BY id", (now,)):
-        m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
-        if not m:
-            continue
-        prog, rip, rport = m.group(1), m.group(2), m.group(3)
-        key = (_program_subject(prog), rport)
-        disp.setdefault(key, set()).add(rip)
-        rows.append((row["id"], key))
-    groups = {}
-    for inc_id, key in rows:
-        if len(disp.get(key, ())) >= _MIG_BEACON_DISPERSION_MIN:
-            groups.setdefault(
-                "signal:beacon:rotating:%s:%s" % key, []).append(inc_id)
-    for key, ids in sorted(groups.items()):
-        folded += _fold_incidents(
-            db, now, key, ids,
-            "superseded: many addresses on one port from one program is one "
-            "rotating endpoint relationship, not one beacon per address")
+    folded += _fold_rotating_beacon_cases(db, now)
 
     # --- persistence: orphaned by the program-keyed case -----------------
     orphaned = []
@@ -5778,6 +6030,11 @@ _STORE_MIGRATIONS = (
      "for processes, rotating endpoints for beacons, program for persistence)"),
     ("program_case_migrated", _retire_orphaned_program_incidents,
      "retired %d incident(s) keyed on the old versioned-path program identity"),
+    # The 2026-09-19 dispersion fix changed which beacon cases the SENSOR
+    # mints; the per-address cases minted under the old live-sockets-only rule
+    # are its orphans. Same fold, second stamp.
+    ("beacon_rotation_refold_20260919", _fold_rotating_beacon_cases,
+     "folded %d per-address beacon incident(s) onto their rotating case"),
 )
 
 
@@ -7918,7 +8175,8 @@ def check_processes():
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
-            graded, rung, note = _grade_binary(sev, comm, sha=sha)
+            graded, rung, note = _grade_binary(
+                sev, comm, sha=sha, attack_defined=sig["trust"] == "broken")
             findings.append(finding(
                 graded, "process", "Suspicious running process",
                 "%s (%s) %s%s" % (comm, sig["trust"], reason,
@@ -8136,7 +8394,7 @@ def _argv_signals(argv):
             best[name] = sev
 
     for rx, name, sev in _HOSTILE_ARGV_RES:
-        if rx.search(argv):
+        if _command_pattern_search(rx, argv):
             add(name, sev)
     # Fake-password-prompt phish: ordered token check, padding-proof (see
     # _osascript_phish). Kept out of _HOSTILE_ARGV_RES because its match is not
@@ -8184,12 +8442,12 @@ def _argv_match_spans(argv):
     `_argv_signals` is called for every watched process on the box."""
     spans = []
     for rx, _name, _sev in _HOSTILE_ARGV_RES:
-        m = rx.search(argv)
+        m = _command_pattern_search(rx, argv)
         if m:
             spans.append(m.span())
     head = argv[:_HOSTILE_SCAN_LIMIT]
     for rx, _name in _HOSTILE_CONTENT_RES:
-        m = rx.search(head)
+        m = _command_pattern_search(rx, head)
         if m:
             spans.append(m.span())
     for rx, _name in _ANTIVM_ARGV_RES:
@@ -8197,6 +8455,42 @@ def _argv_match_spans(argv):
         if m:
             spans.append(m.span())
     return spans
+
+
+# Scratch-path nonces: tokens a harness mints fresh every session, which are
+# not part of what the command DOES. Named shapes only, never a general
+# "collapse digits" — over-normalizing here would fold two genuinely different
+# hostile commands onto one identity, and the operator's verdict on the first
+# would silently cover the second.
+_ARGV_NONCE_RES = (
+    # Claude Code / Codex shell snapshots: snapshot-bash-<epoch_ms>-<rand>.sh
+    (re.compile(r"(/\.claude/shell-snapshots/)snapshot-(bash|zsh|sh)-\d+-[A-Za-z0-9]+\.sh"),
+     r"\1snapshot-\2-#.sh"),
+    # macOS per-session temp root: /var/folders/<2>/<hash>/T/...
+    (re.compile(r"/var/folders/[^/\s]{1,4}/[^/\s]+/(?=[CT]/)"), "/var/folders/#/"),
+    # Only uv build-cache components, never arbitrary payload URL suffixes.
+    (re.compile(r"(/\.cache/uv/builds-v[0-9]+/)\.tmp[A-Za-z0-9]{6,}(?=/)"),
+     r"\1.tmp#"),
+)
+
+
+def _argv_case_identity(argv, length=16):
+    """A digest of `argv` with session nonces normalized away — the CASE key.
+
+    The signal fingerprint stays on the EXACT argv sha, so a genuinely new
+    command still alerts exactly once. This answers the different question the
+    rest of the file already separates out: what THING is the operator being
+    asked to judge, and therefore what does a verdict on it cover.
+
+    Harness snapshot paths change across sessions without changing the command.
+    Group those observations into one case while retaining exact fingerprints
+    for re-alerting. This does not change the separate acquired-tolerance
+    identity or manufacture benign verdicts.
+    """
+    flat = argv or ""
+    for rx, repl in _ARGV_NONCE_RES:
+        flat = rx.sub(repl, flat)
+    return hashlib.sha256(flat.encode("utf-8", "replace")).hexdigest()[:length]
 
 
 def _argv_evidence_preview(argv, budget=_ARGV_PREVIEW_BUDGET):
@@ -8329,7 +8623,10 @@ def check_behavior():
             top, "behavior", "Suspicious process behavior",
             "%s triggered [%s]; command sha256=%s; command: %s" %
             (base, names, command_sha[:16], preview),
-            fp, program=argv.split(None, 1)[0] if argv else "",
+            fp, case_fingerprint="behavior:%s:%s:%s" % (
+                base, "|".join(sorted(n for n, _ in signals)),
+                _argv_case_identity(argv)),
+            program=argv.split(None, 1)[0] if argv else "",
             pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha,
             command_preview=preview))
     _annotate_ancestry(findings)
@@ -8672,7 +8969,8 @@ def _check_hot_app(path, st, cutoff):
         # sampled had one), so every app this machine builds arrived as an
         # ungraded HIGH while the identical bytes running as a process were
         # being graded by check_processes in the same scan.
-        graded, rung, rung_note = _grade_binary("HIGH", exe, sha=sha)
+        graded, rung, rung_note = _grade_binary(
+            "HIGH", exe, sha=sha, attack_defined=sig["trust"] == "broken")
         return [finding(
             graded, "hot-dir", "Unsigned app bundle in watched folder",
             "%s [%s], modified %s, %s%s" % (path, sig["trust"], when, prov,
@@ -8848,7 +9146,9 @@ def check_hot_dirs(max_age_days=14):
                 # payload dropped into a build directory must not be able to
                 # buy a step down by also lying about its mtime.
                 graded, rung, rung_note = _grade_binary(
-                    "HIGH", path, attack_defined=bool(ts_reason), sha=sha)
+                    "HIGH", path,
+                    attack_defined=bool(ts_reason) or sig["trust"] == "broken",
+                    sha=sha)
                 findings.append(finding(
                     graded, "hot-dir", "Unsigned executable in watched folder",
                     "%s [%s], modified %s, %s%s%s" % (
@@ -11873,7 +12173,8 @@ def diff_listeners(prior, cur):
                 "needs root)" % uid if uid is not None
                 else "an unattributable process"))
         graded, rung, note = _grade_binary(
-            "HIGH" if hostile else "MEDIUM", path if resolvable else None)
+            "HIGH" if hostile else "MEDIUM", path if resolvable else None,
+            attack_defined=trust == "broken")
         return finding(
             graded,
             "net-listener", "New network listener",
@@ -11994,7 +12295,8 @@ def _outbound_findings(rows):
             endpoint = "%s:%s" % (rip, rport)
             endpoints.append(endpoint)
             graded, rung, note = _grade_binary("MEDIUM", path,
-                                               endpoint=endpoint)
+                                               endpoint=endpoint,
+                                               attack_defined=trust == "broken")
             dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
             # Rank: severity first, then a vouch deviation (the fact the
             # operator must actually adjudicate), then an ungraded rung — all
@@ -12244,7 +12546,7 @@ def _beacon_add_sighting(sightings, ts, rows):
 BEACON_DISPERSION_MIN = 4
 
 
-def _beacon_dispersion(rows, sightings):
+def _beacon_dispersion(sightings):
     """(program_subject, port) -> set of RECURRING remote IPs.
 
     Built before any finding is emitted, because the decision "is this one
@@ -12262,18 +12564,30 @@ def _beacon_dispersion(rows, sightings):
     function weakens exactly the detection the sensor exists for, and does it
     in the attacker's favour. Ephemeral churn is the noise this sensor already
     defines itself against; it must not be allowed to vote on identity.
+
+    And the gate is the ONLY thing allowed to vote: dispersion is read from
+    the sighting HISTORY, not from the current socket table. It shipped
+    iterating `rows` -- this instant's live sockets -- which asks a question
+    about simultaneity that rotation does not answer. A rotating endpoint
+    rotates: the program holds one or two sockets at a time and moves between
+    addresses across hours, so the count only reached four on the rare scan
+    where four happened to overlap. Live cost on this store: eight separate
+    HIGH beacon incidents for ONE program on port 443 (#510, #512-#518) while
+    a rotating case for that same (program, port) -- #506, carrying one of the
+    very same addresses -- was already open beside them. Every address counted
+    here still had to clear BEACON_MIN_SCANS and BEACON_MIN_SPAN_SECS on its
+    own, so a fixed-endpoint C2 still has a dispersion of one and still keeps
+    the full alarm; what changes is only that "how many endpoints does this
+    program use" stops being answered by a stopwatch.
     """
     disp = {}
-    for row in rows:
-        if len(row) < 3:
-            continue
-        path, rip, rport = str(row[0]), str(row[1]), str(row[2])
-        stamps = sightings.get((path, rip, rport), ())
+    for (path, rip, rport), stamps in sightings.items():
         if len(stamps) < BEACON_MIN_SCANS:
             continue
         if max(stamps) - min(stamps) < BEACON_MIN_SPAN_SECS:
             continue
-        disp.setdefault((_program_subject(path), rport), set()).add(rip)
+        disp.setdefault((_program_subject(str(path)), str(rport)),
+                        set()).add(str(rip))
     return disp
 
 
@@ -12281,7 +12595,7 @@ def _beacon_from_sightings(sightings, current_rows):
     """The recurrence DECISION, over an already-built sightings map."""
     findings = []
     rows = sorted(set(tuple(r) for r in current_rows))
-    dispersion = _beacon_dispersion(rows, sightings)
+    dispersion = _beacon_dispersion(sightings)
     dispersed_done = set()
     for row in rows:
         # Length-guarded like the history fold above. Live, current_rows always
@@ -12303,7 +12617,8 @@ def _beacon_from_sightings(sightings, current_rows):
         if not (suspicious_sig(trust) or is_risky_location(path)):
             continue
         endpoint = "%s:%s" % (rip, rport)
-        graded, rung, note = _grade_binary("HIGH", path, endpoint=endpoint)
+        graded, rung, note = _grade_binary(
+            "HIGH", path, endpoint=endpoint, attack_defined=trust == "broken")
         dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
         if dev_note:
             note = (note + "\n" + dev_note) if note else dev_note
@@ -12322,7 +12637,7 @@ def _beacon_from_sightings(sightings, current_rows):
             dispersed_done.add(key)
             shown = sorted(fleet)
             findings.append(finding(
-                _step_down(graded), "net-beacon",
+                graded if trust == "broken" else _step_down(graded), "net-beacon",
                 "Persistent outbound connection (rotating endpoints)",
                 "%s [%s] has held connections to %d DISTINCT addresses on "
                 "port %s (%s%s). A beacon's signature is an endpoint that "
@@ -15220,6 +15535,17 @@ def _step_down(severity):
     return _SEV_LADDER[max(0, i - 1)]
 
 
+def _step_up(severity):
+    """One rung up the ladder, clamped at the top. The escalation half of
+    `_step_down`, used only by the chain correlator: co-occurrence is worth
+    more than either finding alone, and this is how much more."""
+    try:
+        i = _SEV_LADDER.index(severity)
+    except ValueError:
+        return severity
+    return _SEV_LADDER[min(len(_SEV_LADDER) - 1, i + 1)]
+
+
 # --- package-manager receipts -------------------------------------------------
 #
 # Nearly every "untrusted binary in a user-writable path" on a developer's
@@ -15312,6 +15638,75 @@ def _uv_python_receipt(real):
     return None
 
 
+def _playwright_receipt(real):
+    """Completed default-cache install claimed by a linked Playwright package.
+
+    This is origin evidence, not integrity: same-user tampering is possible,
+    just as with the other receipts. Unknown/custom cache layouts fail closed.
+    """
+    if IS_MAC:
+        cache = os.path.join(HOME, "Library", "Caches", "ms-playwright")
+    elif IS_WIN:
+        cache = os.path.join(os.environ.get("LOCALAPPDATA") or
+                             os.path.join(HOME, "AppData", "Local"), "ms-playwright")
+    else:
+        cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or
+                             os.path.join(HOME, ".cache"), "ms-playwright")
+    cache = os.path.abspath(cache)
+    path = os.path.abspath(real)
+    # Check both lexical and resolved containment: _package_receipt also
+    # probes the unresolved name, which must not confer custody on an escape.
+    if not path.startswith(cache + os.sep):
+        return None
+    relative = path[len(cache) + 1:].split(os.sep)
+    if len(relative) < 2:
+        return None
+    match = re.fullmatch(r"(chromium|chromium_headless_shell|firefox|webkit)-([0-9]+)",
+                         relative[0])
+    if not match:
+        return None
+    browser, revision = match.groups()
+    root = os.path.join(cache, relative[0])
+    marker = os.path.join(root, "INSTALLATION_COMPLETE")
+    links = os.path.join(cache, ".links")
+    if (os.path.realpath(root) != root or os.path.realpath(links) != links
+            or not os.path.realpath(path).startswith(root + os.sep)
+            or not os.path.isfile(path) or not os.path.isfile(marker)
+            or os.path.realpath(marker) != marker):
+        return None
+    try:
+        for entry in os.scandir(links):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            package = (_read_text(entry.path, 8192) or "").strip()
+            if not os.path.isabs(package):
+                continue
+            package = os.path.realpath(package)
+            metadata = os.path.join(package, "package.json")
+            manifest = os.path.join(package, "browsers.json")
+            if (os.path.realpath(metadata) != metadata
+                    or os.path.realpath(manifest) != manifest):
+                continue
+            try:
+                identity = json.loads(_read_text(metadata) or "null")
+                data = json.loads(_read_text(manifest) or "null")
+                if not isinstance(identity, dict) or identity.get("name") != "playwright-core":
+                    continue
+                records = data.get("browsers") if isinstance(data, dict) else None
+                if not isinstance(records, list):
+                    continue
+                for record in records:
+                    if (isinstance(record, dict)
+                            and record.get("name") == browser.replace("_", "-")
+                            and record.get("revision") == revision):
+                        return "playwright:%s@%s" % (browser, revision)
+            except (ValueError, TypeError):
+                continue
+    except OSError:
+        pass
+    return None
+
+
 def _winget_receipt(real):
     """A file winget put on disk. Path-shaped, no subprocess — winget installs
     into %LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\<Package.Id>_<hash>\\ and
@@ -15367,7 +15762,8 @@ def _os_package_receipt(real):
 # arithmetic, while it can cost up to three subprocesses on Linux. Cheap
 # questions first, so the expensive one is only asked when no cheap answer won.
 _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
-                     _uv_python_receipt, _winget_receipt, _choco_receipt,
+                     _uv_python_receipt, _playwright_receipt,
+                     _winget_receipt, _choco_receipt,
                      _os_package_receipt)
 
 
@@ -17145,6 +17541,12 @@ def diff_agent_surface(prior, cur):
                         e.get("target_sha") and \
                         oe["target_sha"] != e["target_sha"]:
                     prov, note = _custody(e.get("target"), e.get("target_sha"))
+                    if _os_program_update(
+                            {"program": oe.get("target")},
+                            {"program": e.get("target"),
+                             "trust": e.get("target_trust")},
+                            True, False, False, False):
+                        prov, note = "os-vendor", _PROVENANCE_NOTE["os-vendor"]
                     same_signer = bool(oe.get("target_team")) and \
                         oe.get("target_team") == e.get("target_team")
                     if _demote("HIGH", prov) != "HIGH":
@@ -21288,8 +21690,10 @@ def cmd_doctor():
     crash = read_crash()
     if crash.get("epoch"):
         fresh = (int(time.time()) - int(crash["epoch"])) <= CRASH_FRESH_SECS
+        display_pipe = _display_pipe_closed(crash)
         print("  %s %-27s %s: %s — %s"
-              % ("✗" if fresh else "i", "last unhandled crash",
+              % ("✗" if fresh and not display_pipe else "i",
+                 "display output pipe closed" if display_pipe else "last unhandled crash",
                  _ago(crash.get("epoch")), crash.get("exc_type") or "?",
                  (crash.get("exc") or "")[:110]))
         print("      argv: %s%s" % (" ".join(crash.get("argv") or [])[:100],
@@ -21299,7 +21703,7 @@ def cmd_doctor():
             print("      %s" % line[:120])
         print("      Full record: %s (delete it once you have read it)"
               % _crash_file())
-        if fresh:
+        if fresh and not display_pipe:
             problems.append("unhandled crash")
     _out_path, err_path = _stdio_log_paths()
     err_tail = _tail_lines(err_path, 8)

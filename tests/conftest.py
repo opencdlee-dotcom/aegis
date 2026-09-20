@@ -320,6 +320,7 @@ if not aegis.suspicious_sig(SUSPICIOUS_TRUST):
 
 # Classes whose assertions are inherently macOS-specific.
 _MAC_ONLY_CLASSES = frozenset((
+    "MacOSAgentTargetSafety",  # sealed-system target updates require macOS SIP
     # kqueue / live log-stream watch internals
     "TestWatchKqueue", "TestLiveStreamTail",
     # .app bundles, Gatekeeper/spctl, quarantine xattr provenance
