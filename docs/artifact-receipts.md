@@ -12,8 +12,14 @@ revision) or `dirty_digest` (SHA-256), `recipe`, `toolchain`, `dependency_digest
 (Unix seconds), and `components` (relative file names). A signature attests the
 signer's claims about source and recipe, not reproducibility or malware absence.
 The command hashes the actual components and verifies the resulting signature.
-Use an output receipt outside ROOT. Every file in ROOT must be listed; symlinks
-are rejected, including internal links. Maximum: 1024 files, 256 MiB, 31 days.
+Use an output receipt outside ROOT. Every file and symlink in ROOT must be
+listed, using real component paths rather than paths through directory aliases.
+Relative internal symlinks are stored as exact link text and their real targets
+must remain inside ROOT. Escapes, dangling links, resolution cycles and links
+to ancestor directories fail closed. Framework `Versions/Current` links work.
+Maximum: 20,000 components, 1 GiB, 4096 directories, 31 days; receipt 8 MiB.
+These bounds cover the read-only September 20 measurement of the installed
+bioREADr bundle: 14,536 files, 610,408,543 bytes, 255 directories, 26 file links.
 
 Transfer ROOT and the receipt by any transport. On the receiver,
 `aegis.py artifact verify ROOT RECEIPT WORLD PROJECT` checks the receiving
@@ -30,7 +36,17 @@ No copied trust ledger, HMAC secret, dismissal or network allowlist is imported.
 The local receiver binding shares Aegis's existing same-user observer boundary;
 it is not protection against a principal that can rewrite the monitor itself.
 
-Each lookup rechecks signature and complete bytes with no persistent cache.
-This is bounded correctness-first behavior; large active artifacts need a
-measured scan-cost evaluation before enabling any grading policy. Unsupported
-large or symlink-heavy bundles retain their existing grading.
+Each lookup checks expiry, complete manifest and pinned roster bytes, and the
+entire tree's device/inode/mode/size/mtime/ctime plus link text, including empty
+directories. A changed identity requires signature and complete byte checking.
+Successful checks are cached only in memory and reset when each scan begins;
+no persistent cache is imported. Added helpers and same-size modifications
+with restored mtime invalidate immediately through membership/ctime checks.
+This remains a polling observer: concurrent writes after a check are not
+prevented, and an adversary capable of forging filesystem metadata is outside
+the stat-cache boundary.
+
+Measured on that installed bundle: initial tree stat 0.145 seconds, all hashes
+2.618 seconds, subsequent tree stat 0.081 seconds. These are one local sample,
+not a CPU-budget claim. Multiple findings avoid rehashing the same 610 MB but
+still pay for full-tree stat checks. Measure scan cost before policy activation.

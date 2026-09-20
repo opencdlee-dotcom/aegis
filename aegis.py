@@ -15930,11 +15930,60 @@ def _package_receipt(path):
     return None
 
 
+_ARTIFACT_SCAN_CACHE = {}
+_ARTIFACT_MAX_FILES = 20000
+_ARTIFACT_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def _artifact_link(root, path):
+    """An internal, relative link; realpath+exists rejects cycles/dangling links."""
+    link = os.readlink(path)
+    target = os.path.realpath(path)
+    if (os.path.isabs(link) or os.path.commonpath((root, target)) != root
+            or not os.path.exists(target)
+            or (os.path.isdir(target)
+                and os.path.commonpath((os.path.dirname(path), target)) == target)):
+        raise ValueError("artifact symlink escapes, cycles or has no target")
+    return link
+
+
+def _artifact_tree_identity(root):
+    """Complete bounded tree identity, including links and empty directories."""
+    identity, names, total, directories_seen = [], set(), 0, 0
+    if os.path.realpath(root) != root or not os.path.isdir(root):
+        raise ValueError("receiver root changed")
+    def observe(path):
+        nonlocal total
+        value = os.lstat(path)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        link = _artifact_link(root, path) if stat.S_ISLNK(value.st_mode) else None
+        if not (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode) or link is not None):
+            raise ValueError("artifact contains a special file")
+        identity.append((relative, value.st_dev, value.st_ino, value.st_mode,
+                         value.st_size, value.st_mtime_ns, value.st_ctime_ns, link))
+        if not stat.S_ISDIR(value.st_mode):
+            names.add(relative)
+            total += value.st_size
+            if len(names) > _ARTIFACT_MAX_FILES or total > _ARTIFACT_MAX_BYTES:
+                raise ValueError("artifact exceeds 20000 components or 1 GiB")
+    observe(root)
+    def fail(error):
+        raise error
+    for base, directories, files in os.walk(root, followlinks=False, onerror=fail):
+        directories.sort()
+        directories_seen += 1
+        if directories_seen > 4096:
+            raise ValueError("artifact tree exceeds directory budget")
+        for name in sorted(directories + files):
+            observe(os.path.join(base, name))
+    return tuple(identity), names
+
+
 def _artifact_components(root, names):
-    """Hash a bounded explicit component set; links never establish scope."""
+    """Hash explicit files and bind internal symlinks to their exact link text."""
     root = os.path.realpath(root)
-    if not isinstance(names, (list, dict)) or not 0 < len(names) <= 1024:
-        raise ValueError("expected 1..1024 components")
+    if not isinstance(names, (list, dict)) or not 0 < len(names) <= _ARTIFACT_MAX_FILES:
+        raise ValueError("expected 1..20000 components")
     result, total = {}, 0
     for name in names:
         if (not isinstance(name, str) or not name or "\\" in name
@@ -15942,12 +15991,17 @@ def _artifact_components(root, names):
                 or any(p in ("", ".", "..") for p in name.split("/"))):
             raise ValueError("component must be a relative file path")
         path = os.path.join(root, *name.split("/"))
+        if os.path.realpath(os.path.dirname(path)) != os.path.dirname(path):
+            raise ValueError("list the real component, not a symlink alias")
+        if os.path.islink(path):
+            result[name] = {"link": _artifact_link(root, path)}
+            continue
         if os.path.realpath(path) != path or not os.path.isfile(path):
             raise ValueError("missing component or symlink substitution")
         before = os.stat(path)
         total += before.st_size
-        if total > 256 * 1024 * 1024:
-            raise ValueError("artifact exceeds 256 MiB verification budget")
+        if total > _ARTIFACT_MAX_BYTES:
+            raise ValueError("artifact exceeds 1 GiB verification budget")
         digest = hashlib.sha256()
         read_bytes = 0
         with open(path, "rb") as f:
@@ -15960,8 +16014,8 @@ def _artifact_components(root, names):
                     raise ValueError("component grew during verification")
                 digest.update(block)
         after = os.stat(path)
-        if (before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_ino, after.st_size, after.st_mtime_ns):
+        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError("component changed during verification")
         result[name] = digest.hexdigest()
     return result
@@ -15969,9 +16023,9 @@ def _artifact_components(root, names):
 
 def _artifact_read(path):
     with open(path, "r", encoding="utf-8") as f:
-        raw = f.read(1024 * 1024 + 1)
-    if len(raw) > 1024 * 1024:
-        raise ValueError("receipt exceeds 1 MiB")
+        raw = f.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("receipt exceeds 8 MiB")
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("receipt must be an object")
@@ -16003,27 +16057,26 @@ def _artifact_verify(record, root, world, project):
     if (not isinstance(issued, (int, float)) or not isinstance(expires, (int, float))
             or not 0 <= issued <= now < expires <= issued + 31 * 86400):
         raise ValueError("expired, future or overlong artifact receipt")
+    identity, seen = _artifact_tree_identity(root)
+    if not isinstance(record.get("components"), dict) or seen != set(record["components"]):
+        raise ValueError("unlisted artifact component")
+    with open(FLEET_SIGNERS, "rb") as f:
+        roster = f.read(1024 * 1024 + 1)
+    if len(roster) > 1024 * 1024:
+        raise ValueError("signer roster exceeds budget")
+    key = (root, world, project, json.dumps(record, sort_keys=True), roster, identity)
+    if _ARTIFACT_SCAN_CACHE.get(root) == key:
+        return record
     if not _vouch_verify_sig(_vouch_canonical(record), record.get("sig"),
                              record["principal"], FLEET_SIGNERS, "aegis-artifact"):
         raise ValueError("unknown/revoked signer or invalid signature")
     if _artifact_components(root, record.get("components")) != record["components"]:
         raise ValueError("artifact component bytes changed")
-    # A substituted helper is just as significant as a substituted main file.
-    # Require a dedicated output directory, with every file enumerated.
-    seen, directory_count = set(), 0
-    for base, directories, files in os.walk(root, followlinks=False):
-        directory_count += 1
-        if directory_count > 4096:
-            raise ValueError("artifact tree exceeds directory budget")
-        for name in directories + files:
-            if os.path.islink(os.path.join(base, name)):
-                raise ValueError("artifact tree contains a symlink")
-        for name in files:
-            seen.add(os.path.relpath(os.path.join(base, name), root).replace(os.sep, "/"))
-            if len(seen) > 1024:
-                raise ValueError("artifact tree exceeds component budget")
-    if seen != set(record["components"]):
-        raise ValueError("unlisted artifact component")
+    if _artifact_tree_identity(root)[0] != identity:
+        raise ValueError("artifact tree changed during verification")
+    if len(_ARTIFACT_SCAN_CACHE) >= 128:
+        _ARTIFACT_SCAN_CACHE.clear()
+    _ARTIFACT_SCAN_CACHE[root] = key
     return record
 
 
@@ -16041,7 +16094,11 @@ def _artifact_receipt(path):
             root = binding["root"]
             relative = os.path.relpath(os.path.abspath(path), root).replace(os.sep, "/")
             if relative not in binding["receipt"].get("components", {}):
-                continue
+                if os.path.commonpath((os.path.abspath(path), root)) != root:
+                    continue
+                relative = os.path.relpath(os.path.realpath(path), root).replace(os.sep, "/")
+                if relative not in binding["receipt"].get("components", {}):
+                    continue
             try:
                 return _artifact_verify(binding["receipt"], root,
                                         binding["world"], binding["project"])
@@ -20395,6 +20452,7 @@ def cmd_scan(quiet=False, wait=False):
 
 def _cmd_scan_locked(quiet=False):
     global _SIG_PROBE_FAILURES, _PROC_ENUM_FAILED, _PROC_ARGV_PARTIAL
+    _ARTIFACT_SCAN_CACHE.clear()
     ensure_state()
     # per-scan; a stale count or flag would mislead every later run
     _SIG_PROBE_FAILURES = 0

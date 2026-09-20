@@ -98,3 +98,56 @@ def test_real_cli_verify(artifact, tmp_path):
                             env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'shadow only' in result.stdout
+
+
+def test_framework_links_and_cache(artifact, tmp_path, monkeypatch):
+    root, receipt, _ = artifact
+    framework = root / 'Contents' / 'Frameworks' / 'Demo.framework'
+    version = framework / 'Versions' / 'A'
+    version.mkdir(parents=True)
+    (version / 'Demo').write_bytes(b'framework code')
+    (framework / 'Versions' / 'Current').symlink_to('A', target_is_directory=True)
+    (framework / 'Demo').symlink_to('Versions/Current/Demo')
+    spec = json.loads(receipt.read_text())
+    spec['components'] = ['app', 'Contents/Frameworks/Demo.framework/Versions/A/Demo',
+                          'Contents/Frameworks/Demo.framework/Versions/Current',
+                          'Contents/Frameworks/Demo.framework/Demo']
+    spec_path = tmp_path / 'framework-spec.json'
+    spec_path.write_text(json.dumps(spec))
+    signed = tmp_path / 'framework-receipt.json'
+    assert aegis.cmd_artifact(['aegis', 'artifact', 'create', str(root), str(spec_path),
+                               str(tmp_path / 'key'), str(signed)]) == 0
+    copied = tmp_path / 'Copied.app'
+    shutil.copytree(root, copied, symlinks=True)
+    assert aegis.cmd_artifact(['aegis', 'artifact', 'receive', str(copied), str(signed), 'brain', 'demo']) == 0
+    original = aegis._artifact_components
+    calls = []
+    def counted(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(aegis, '_artifact_components', counted)
+    aegis._ARTIFACT_SCAN_CACHE.clear()
+    assert aegis._artifact_receipt(str(copied / 'app'))
+    assert aegis._artifact_receipt(str(copied / 'Contents/Frameworks/Demo.framework/Demo'))
+    assert aegis._artifact_receipt(str(copied / 'Contents/Frameworks/Demo.framework/Versions/Current/Demo'))
+    assert len(calls) == 1
+    target = copied / 'Contents/Frameworks/Demo.framework/Versions/A/Demo'
+    old = target.stat()
+    target.write_bytes(b'changed   code')
+    os.utime(target, ns=(old.st_atime_ns, old.st_mtime_ns))
+    assert aegis._artifact_receipt(str(copied / 'app')) is None
+    target.write_bytes(b'framework code')
+    assert aegis._artifact_receipt(str(copied / 'app'))
+    (copied / 'new-helper').write_bytes(b'unlisted')
+    assert aegis._artifact_receipt(str(copied / 'app')) is None
+
+
+def test_link_cycles_rejected(artifact):
+    root, _, _ = artifact
+    (root / 'loop').symlink_to('loop')
+    with pytest.raises(ValueError):
+        aegis._artifact_components(str(root), ['app', 'loop'])
+    (root / 'loop').unlink()
+    (root / 'loop').symlink_to('.', target_is_directory=True)
+    with pytest.raises(ValueError):
+        aegis._artifact_components(str(root), ['app', 'loop'])
