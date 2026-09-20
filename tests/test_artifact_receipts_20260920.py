@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -11,10 +12,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import aegis
 
 
+def make_link(link, target, directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        if sys.platform == 'win32' and getattr(exc, 'winerror', None) == 1314:
+            pytest.skip('Windows symlink privilege unavailable for this link-specific test')
+        raise
+
+
 @pytest.fixture
 def artifact(tmp_path, monkeypatch):
     if not shutil.which('ssh-keygen'):
         pytest.skip('ssh-keygen unavailable')
+    # simbody changes grading flags, not the host kernel. Only the real
+    # subprocess adapter needs the actual host's environment/tool mapping.
+    # Native runs retain the unmodified production verifier and trust roster.
+    if aegis.IS_WIN != (sys.platform == 'win32'):
+        native_run = aegis.run
+        def host_run(*args, **kwargs):
+            with patch.multiple(aegis, IS_WIN=sys.platform == 'win32',
+                                IS_MAC=sys.platform == 'darwin',
+                                IS_LINUX=sys.platform.startswith('linux')):
+                return native_run(*args, **kwargs)
+        monkeypatch.setattr(aegis, 'run', host_run)
     key = tmp_path / 'key'
     subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True)
     roster = tmp_path / 'signers'
@@ -71,7 +92,7 @@ def test_rejected_receipts(artifact, failure, tmp_path):
         outside = tmp_path / 'outside'
         outside.write_bytes((root / 'app').read_bytes())
         (root / 'app').unlink()
-        (root / 'app').symlink_to(outside)
+        make_link(root / 'app', outside)
     elif failure == 'scope':
         other = tmp_path / 'other'
         shutil.copytree(root, other)
@@ -106,8 +127,8 @@ def test_framework_links_and_cache(artifact, tmp_path, monkeypatch):
     version = framework / 'Versions' / 'A'
     version.mkdir(parents=True)
     (version / 'Demo').write_bytes(b'framework code')
-    (framework / 'Versions' / 'Current').symlink_to('A', target_is_directory=True)
-    (framework / 'Demo').symlink_to('Versions/Current/Demo')
+    make_link(framework / 'Versions' / 'Current', 'A', directory=True)
+    make_link(framework / 'Demo', 'Versions/Current/Demo')
     spec = json.loads(receipt.read_text())
     spec['components'] = ['app', 'Contents/Frameworks/Demo.framework/Versions/A/Demo',
                           'Contents/Frameworks/Demo.framework/Versions/Current',
@@ -144,11 +165,11 @@ def test_framework_links_and_cache(artifact, tmp_path, monkeypatch):
 
 def test_link_cycles_rejected(artifact):
     root, _, _ = artifact
-    (root / 'loop').symlink_to('loop')
+    make_link(root / 'loop', 'loop')
     with pytest.raises(ValueError):
         aegis._artifact_components(str(root), ['app', 'loop'])
     (root / 'loop').unlink()
-    (root / 'loop').symlink_to('.', target_is_directory=True)
+    make_link(root / 'loop', '.', directory=True)
     with pytest.raises(ValueError):
         aegis._artifact_components(str(root), ['app', 'loop'])
 
