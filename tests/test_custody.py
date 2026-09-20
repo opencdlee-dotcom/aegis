@@ -273,7 +273,7 @@ class IntentLedger(CustodySandbox):
         p = os.path.join(self.tmp, "agentroot", "config.toml")
         with open(p, "w") as f:
             f.write("[mcp_servers]\n")
-        payload = json.dumps({"tool_name": "Write",
+        payload = json.dumps({"tool_name": "Write", "hook_event_name": "PostToolUse",
                               "tool_input": {"file_path": p}})
         import io
         saved = sys.stdin

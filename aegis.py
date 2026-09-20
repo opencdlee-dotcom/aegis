@@ -16735,6 +16735,139 @@ def _intent_worthy(path):
                for r in AGENT_CONFIG_ROOTS if os.path.isdir(r))
 
 
+def _intent_append(suffix, record):
+    """Bounded local observations, never an authority or a conversation log."""
+    path = INTENT_FILE + suffix
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    if os.path.exists(path) and os.path.getsize(path) > _INTENT_MAX_BYTES:
+        # One retained generation; readers include both. No unbounded history.
+        os.replace(path, path + ".previous")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as stream:
+        stream.write(line)
+
+
+def _intent_health(outcome, host):
+    try:
+        _intent_append(".health", {"ts": now_iso(), "host": host,
+                                   "outcome": outcome})
+    except OSError:
+        # A full/unwritable state volume cannot persist its own failure.
+        print("Aegis intent: coverage health could not be persisted", file=sys.stderr)
+
+
+def _intent_identity(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest() if value else ""
+
+
+def _intent_observe(payload, host, build=False):
+    """Normalize supported writes. New batch/build evidence remains shadow-only.
+
+    Same-UID hooks can be forged: even a success is context, not authorization.
+    No shell text, prompts, tool results or raw session identifiers are stored.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload")
+    tool = payload.get("tool_name", "")
+    ti = payload.get("tool_input") or {}
+    if not isinstance(ti, dict):
+        raise ValueError("tool_input")
+    event = payload.get("hook_event_name")
+    result = payload.get("tool_response") or {}
+    if not isinstance(result, dict):
+        result = {}
+    failed = (event == "PostToolUseFailure" or payload.get("status") == "failed"
+              or payload.get("is_error") is True or result.get("is_error") is True
+              or bool(result.get("error")) or result.get("exit_code", 0) != 0)
+    status = "failed" if failed else "unknown"
+    if host != "unknown" and not failed and (payload.get("status") == "success" or
+                      (host == "claude-code" and event == "PostToolUse")):
+        status = "success"
+    project = os.path.realpath(payload.get("cwd") or os.getcwd())
+    direct = tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write_file", "edit_file")
+    if direct:
+        paths = [ti.get("file_path") or ti.get("path") or ti.get("notebook_path")]
+    elif tool == "apply_patch":
+        patch = ti.get("patch") or ti.get("input") or ""
+        if not isinstance(patch, str):
+            raise ValueError("patch")
+        paths = []
+        for line in patch.splitlines():
+            for prefix in ("*** Add File: ", "*** Update File: ", "*** Move to: "):
+                if line.startswith(prefix):
+                    paths.append(line[len(prefix):])
+    elif build:
+        paths = ti.get("outputs")
+    else:
+        _intent_health("unsupported", host)
+        return
+    if not isinstance(paths, list) or not paths or len(paths) > 64:
+        raise ValueError("paths")
+    outputs = []
+    remaining = 64 * 1024 * 1024
+    for path in dict.fromkeys(paths):
+        if not isinstance(path, str) or not path or len(path) > 4096:
+            raise ValueError("path")
+        path = os.path.realpath(os.path.join(project, os.path.expanduser(path)))
+        row = {"path": path, "sha256": None}
+        try:
+            size = os.path.getsize(path)
+            if not os.path.isfile(path) or size > remaining:
+                row["observation"] = "unreadable_or_oversize"
+            elif build and os.path.commonpath([project, path]) != project:
+                row["observation"] = "outside_project"
+            else:
+                remaining -= size
+                row["sha256"] = sha256(path)
+                row["observation"] = "hashed" if row["sha256"] else "unreadable"
+        except OSError:
+            row["observation"] = "unreadable"
+        outputs.append(row)
+    record = {"version": 1, "ts": now_iso(), "host": host,
+              "session": _intent_identity(payload.get("session_id")),
+              "call": _intent_identity(payload.get("tool_use_id") or payload.get("call_id")),
+              "project": project, "operation": tool, "status": status,
+              "shadow": not direct, "outputs": outputs}
+    _intent_append(".receipts", record)
+    if status == "success" and direct:
+        for row in outputs:
+            if row["sha256"] and _intent_worthy(row["path"]):
+                if not intent_record(row["path"], host):
+                    _intent_health("ledger_write_failure", host)
+                    return
+    _intent_health(status, host)
+
+
+def _intent_build(argv):
+    """Run an explicit command with <=64 declared project-relative outputs."""
+    try:
+        split = argv.index("--", 4)
+        project = os.path.realpath(os.path.expanduser(argv[3]))
+        outputs, command = argv[4:split], argv[split + 1:]
+        if not command or not outputs or len(outputs) > 64 or not os.path.isdir(project):
+            raise ValueError("arguments")
+        for path in outputs:
+            if os.path.isabs(path) or os.path.commonpath(
+                    [project, os.path.realpath(os.path.join(project, path))]) != project:
+                raise ValueError("output scope")
+    except (ValueError, IndexError):
+        print("usage: intent build <project> <relative-output> [...] -- <command> [args]")
+        return 2
+    try:
+        code = subprocess.run(command, cwd=project, timeout=600).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        code = 1
+    try:
+        _intent_observe({"tool_name": "declared_build", "cwd": project,
+                         "status": "success" if code == 0 else "failed",
+                         "tool_input": {"outputs": outputs}}, "build-wrapper", build=True)
+    except (OSError, ValueError, TypeError):
+        _intent_health("ledger_write_failure", "build-wrapper")
+        if code == 0:
+            return 1
+    return code
+
+
 def cmd_learn(argv):
     """CLI: `learn [status|start [days]|extend <days>|done]`.
 
@@ -16784,25 +16917,47 @@ def cmd_learn(argv):
 
 
 def cmd_intent(argv):
-    """CLI: `intent record <path> [tool]` | `intent hook <tool>` |
-    `intent list [n]`. Hook mode reads the harness's tool-call JSON on stdin,
-    extracts the written file's path, and attests it — always exits 0, prints
-    nothing, so a broken ledger can never break the operator's editor."""
+    """CLI for local intent records, shadow receipts and delivery health.
+
+    Hooks fail open for editing but record durable coverage failures. Only
+    explicit successful single-file writes retain the existing custody rung.
+    """
     sub = argv[2] if len(argv) > 2 else "list"
+    if sub == "build":
+        return _intent_build(argv)
+    if sub == "health":
+        counts, latest = {}, None
+        for suffix in (".health.previous", ".health"):
+            try:
+                with open(INTENT_FILE + suffix, encoding="utf-8") as stream:
+                    for line in stream:
+                        record = json.loads(line)
+                        outcome = record["outcome"]
+                        counts[outcome] = counts.get(outcome, 0) + 1
+                        latest = record
+            except FileNotFoundError:
+                pass
+        print(json.dumps({"counts": counts, "latest": latest,
+                          "scope": "retained local hook deliveries; not host coverage proof"}))
+        return 0
     if sub == "record" and len(argv) > 3:
         ok = intent_record(argv[3], argv[4] if len(argv) > 4 else "manual")
         print("recorded" if ok else "not recorded (unreadable path?)")
         return 0 if ok else 1
     if sub == "hook":
-        tool = argv[3] if len(argv) > 3 else "agent"
+        host = argv[3] if len(argv) > 3 else "unknown"
+        if host not in ("claude-code", "codex", "hermes", "vscode", "chatgpt"):
+            host = "unknown"
         try:
-            payload = json.loads(sys.stdin.read(1 << 20) or "{}")
-            ti = payload.get("tool_input") or {}
-            p = ti.get("file_path") or ti.get("path") or ""
-            if p and _intent_worthy(p):
-                intent_record(p, tool)
-        except Exception:
-            pass
+            raw = sys.stdin.read((1 << 20) + 1)
+            if len(raw) > (1 << 20):
+                _intent_health("oversize", host)
+            else:
+                _intent_observe(json.loads(raw), host)
+        except (ValueError, TypeError):
+            _intent_health("parse_error", host)
+        except OSError:
+            _intent_health("ledger_write_failure", host)
         return 0
     if sub == "list":
         try:
