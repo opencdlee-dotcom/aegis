@@ -869,8 +869,10 @@ _HOSTILE_ARGV_RES = [
     (re.compile(r"\bxattr\b[^\n]{0,120}\s-[a-z]*(?:c|d|dr)\b[^\n]{0,120}com\.apple\.quarantine", re.I), "quarantine-strip", "HIGH"),
     (re.compile(r"\bxattr\b\s+-c\b", re.I), "xattr-clear-all", "HIGH"),
     # Invisible DMG mount (new ClickFix DMG variant, Unit42 2026).
+    # Also used by ordinary installers: retain as a corroborator, not an
+    # interrupt by itself. Stronger companion behaviors keep their severity.
     (re.compile(r"\bhdiutil\b\s+attach\b" + _ARGV_SAME_CMD + r"{0,512}-nobrowse\b", re.I),
-     "hdiutil-nobrowse", "HIGH"),
+     "hdiutil-nobrowse", "MEDIUM"),
     # Wipes the TCC privacy DB — resets Aegis's own grants; a tamper signal.
     (re.compile(r"\btccutil\b\s+reset\b", re.I), "tccutil-reset", "HIGH"),
     # Keychain theft residue: copy login.keychain-db out, or dump it.

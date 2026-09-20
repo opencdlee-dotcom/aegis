@@ -33,6 +33,12 @@ the benign examples and their malicious counterparts must both pass tests.
 8. Apply the existing OS-update custody checks to unchanged agent configurations
    whose resolved system binary updates: same target, Apple platform signature,
    protected path, and SIP enabled. Unknown or disabled SIP earns no demotion.
+9. Keep a standalone non-browsable disk-image mount at MEDIUM. It is a weak
+   observation also emitted by normal installers, not proof of intrusion.
+   Session-path churn therefore stays in the digest without opening incidents;
+   quarantine stripping, phishing, and other stronger companion signals retain
+   their severity. Case grouping alone does not transfer a reviewed verdict
+   between different commands or grant trust to sourced snapshot contents.
 
 ## SSH and shared folders
 

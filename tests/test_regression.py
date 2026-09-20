@@ -1250,8 +1250,8 @@ class TestArgvSignals(Sandbox):
         self.assertEqual(self._sev('xattr -dr com.apple.quarantine /tmp/update'), "HIGH")
         self.assertEqual(self._sev('xattr -c /tmp/update'), "HIGH")
 
-    def test_hdiutil_nobrowse_is_high(self):
-        self.assertEqual(self._sev('hdiutil attach -nobrowse /tmp/x.dmg'), "HIGH")
+    def test_hdiutil_nobrowse_is_a_medium_corroborator(self):
+        self.assertEqual(self._sev('hdiutil attach -nobrowse /tmp/x.dmg'), "MEDIUM")
 
     def test_tccutil_reset_is_high(self):
         self.assertEqual(self._sev('tccutil reset All'), "HIGH")

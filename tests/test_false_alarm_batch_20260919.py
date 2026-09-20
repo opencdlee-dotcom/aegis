@@ -57,10 +57,10 @@ Counted by distinct fact rather than by row, the 46 were about a dozen things.
 
   D6  The behavior signal's identity was `sha256(argv)`, and the agent harness
       puts a per-session nonce in every command it runs (the shell-snapshot
-      path). So the identity of "bash did X" changed every session, acquired
-      tolerance could never accumulate the three verdicts it needs, and the
-      same command shape opened a fresh HIGH incident forever. #450 and #503
-      are the same finding twice, eight days and two nonces apart.
+      path). Normalize that nonce for case grouping only. Exact fingerprints
+      remain distinct: this does not confer acquired tolerance or carry a
+      reviewed verdict across sessions. Weak standalone behavior must be
+      graded accurately by its producer (see test_mount_signal_precision).
 
 The shape shared by D1, D3 and D6 is the one worth remembering, because it is
 the same one the 2026-09-17 batch named and it has now recurred one level up:
@@ -294,8 +294,7 @@ class D5CompositeIdiomsStayInsideOneCommand(unittest.TestCase):
 
 
 class D6BehaviorIdentityIsNotASessionNonce(unittest.TestCase):
-    """A verdict has to be able to cover the next occurrence of the same
-    thing, or acquired tolerance can never reach its threshold."""
+    """Group equivalent command shapes without granting cross-session trust."""
 
     PROLOGUE = ("/bin/bash -c source /Users/c/.claude/shell-snapshots/"
                 "snapshot-bash-%s-%s.sh 2>/dev/null || true && %s")
@@ -305,7 +304,7 @@ class D6BehaviorIdentityIsNotASessionNonce(unittest.TestCase):
         b = self.PROLOGUE % ("1789508855066", "pb5dpw", "hdiutil attach x -nobrowse")
         self.assertEqual(aegis._argv_case_identity(a),
                          aegis._argv_case_identity(b),
-                         "#450 and #503 are the same finding under two nonces")
+                         "the same command shape differs only in its session nonce")
 
     def test_a_different_command_is_a_different_case(self):
         a = self.PROLOGUE % ("1789621597725", "dtpjwq", "hdiutil attach x -nobrowse")
