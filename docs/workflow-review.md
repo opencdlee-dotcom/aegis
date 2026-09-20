@@ -9,8 +9,24 @@ clean report.
 Exact observed SHA-256 content links process/beacon observations where their
 stored subjects contain that evidence. Directory proximity, agent names and
 shared networks do not link cases. Older beacon records without content stay
-separate. Helpers with different contents also stay separate until verified
-artifact membership is available; this view does not invent those links.
+separate. Different-content helpers can join a case when a currently verified
+signed artifact enumerates them, or when one successful local output receipt
+enumerates their exact still-present bytes. Local receipts are same-user context,
+not signed authority. All outputs must still match, be inside the project, and
+have no newer superseding output receipt. Failed, unknown, malformed, future or
+older-than-seven-days receipts grant no proposed origin. A receipt dated after
+an incident's last observation cannot retroactively explain it.
+
+Eligible process members show a proposed MEDIUM origin grade in shadow while
+retaining their actual evidence grade and original severity. Broken signatures,
+harmful behavior and destination questions retain review/urgent attention.
+The binary grader and notification routing are unchanged by this presentation.
+
+Set `workflow_expected_hosts` in the existing config to the actual host inventory
+(for example `["claude-code", "codex", "hermes"]`). `integration_health` reports
+each expected host as `never_seen` until delivery evidence arrives, with latest
+receipt and delivery timestamps and malformed-ledger errors. This is delivery
+evidence, not a claim of complete host hook coverage or adapter installation.
 
 Each member retains its own attention: expected (fresh sub-HIGH evidence from
 the existing lifecycle grader), review (missing origin/destination proof or

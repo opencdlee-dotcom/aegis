@@ -21292,6 +21292,65 @@ _WORKFLOW_POLICY = "workflow-review-v1"
 _WORKFLOW_ATTENTION = {"expected": 0, "review": 1, "urgent": 2}
 
 
+def _workflow_receipts():
+    """Latest output observations, plus explicit expected-host delivery gaps."""
+    latest, hosts, errors = {}, {}, []
+    config = load_json(os.path.join(STATE_DIR, "config.json"), {})
+    for host in config.get("workflow_expected_hosts", []):
+        hosts[str(host)] = {"status": "never_seen"}
+    for kind in ("receipts", "health"):
+        for suffix in (".previous", ""):
+            try:
+                with open(INTENT_FILE + "." + kind + suffix, encoding="utf-8") as stream:
+                    text = stream.read(_INTENT_MAX_BYTES + 1024 * 1024 + 1)
+                if len(text) > _INTENT_MAX_BYTES + 1024 * 1024:
+                    raise ValueError("receipt read budget")
+                for line in text.splitlines():
+                    record = json.loads(line)
+                    host = str(record.get("host") or "unknown")
+                    if kind == "health":
+                        hosts.setdefault(host, {}).update(status=record.get("outcome"),
+                                                         latest_delivery=record.get("ts"))
+                    else:
+                        hosts.setdefault(host, {}).update(status="receipt_observed", latest_receipt=record.get("ts"))
+                        for output in record.get("outputs", []):
+                            latest[output["path"]] = record
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                errors.append(kind + suffix + ": unreadable or malformed")
+    verified = {}
+    for record in {id(r): r for r in latest.values()}.values():
+        try:
+            stamp = datetime.fromisoformat(record["ts"].replace("Z", "+00:00")).timestamp()
+            if (record.get("version") != 1 or record.get("status") != "success"
+                    or record.get("host") not in ("claude-code", "codex", "hermes", "vscode", "chatgpt", "build-wrapper")
+                    or not 0 <= _epoch() - stamp <= 7 * 86400):
+                continue
+            outputs = record["outputs"]
+            if not 1 <= len(outputs) <= 64:
+                continue
+            budget = 64 * 1024 * 1024
+            for output in outputs:
+                path, digest = output["path"], output["sha256"]
+                budget -= os.path.getsize(path)
+                if (latest.get(path) is not record or budget < 0
+                        or os.path.realpath(path) != path
+                        or os.path.commonpath([record["project"], path]) != record["project"]
+                        or output.get("observation") != "hashed"
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest or "")
+                        or sha256(path) != digest):
+                    raise ValueError("stale output")
+            identity = "receipt:" + hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+            for output in outputs:
+                verified[(output["path"], output["sha256"])] = (identity, stamp)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    # An incomplete ledger cannot prove which output observation was latest.
+    return ({} if errors else verified), {"hosts": hosts, "errors": errors,
+        "scope": "Local delivery observations, not proof of host-wide hook coverage"}
+
+
 def _workflow_report(db):
     """Presentation only: exact content can relate observations, never verdicts.
 
@@ -21300,6 +21359,7 @@ def _workflow_report(db):
     """
     rows = sorted((r for _, _, members in _incident_families(db) for r in members),
                   key=lambda r: r["id"])
+    receipts, integration_health = _workflow_receipts()
     groups = {}
     for row in rows:
         try:
@@ -21316,6 +21376,7 @@ def _workflow_report(db):
             key = "content:" + content.lower()
         fp = (row.get("correlation_key") or "").removeprefix("signal:")
         latest = _latest_incident_grade(db, row["id"], row.get("last_seen"))
+        proposed, origin = None, None
         attention, reason = "review", "Origin or destination proof missing; review exact observed bytes."
         if row["severity"] == "CRITICAL" or fp.startswith(_NEVER_TOLERATE_PREFIXES):
             attention, reason = "urgent", "Strong threat signal; familiar workflow does not authorize it."
@@ -21337,9 +21398,32 @@ def _workflow_report(db):
                     str(data.get("fingerprint") or "").startswith(_NEVER_TOLERATE_PREFIXES)):
                 attention, reason = "urgent", "Attached harmful behavior requires review regardless of origin."
                 break
+        path = sub.get("raw_path")
+        if (path and isinstance(content, str) and re.fullmatch(r"[0-9a-f]{64}", content)):
+            distribution_lookup = globals().get("_distribution_receipt")
+            distribution = distribution_lookup(path) if distribution_lookup else None
+            artifact = _artifact_receipt(path)
+            if distribution and distribution.get("components", {}).get(path) == content:
+                key = "distribution:" + distribution["source_id"]
+                origin = "verified official distribution bytes"
+            elif (artifact and content in artifact["components"].values()
+                    and sha256(path) == content):
+                key = "artifact:" + hashlib.sha256(_vouch_canonical(artifact).encode()).hexdigest()
+                origin = "verified signed artifact origin"
+            elif (path, content) in receipts:
+                identity, stamp = receipts[(path, content)]
+                if stamp <= (row.get("last_seen") or 0):
+                    key, origin = identity, "successful local output receipt (same-user context)"
+            if (origin and latest is not None and sub.get("kind") == "process"
+                    and attention != "urgent" and sub.get("trust") != "broken"):
+                proposed, attention = "MEDIUM", "expected"
+                reason = "SHADOW: %s; origin does not authorize behavior." % origin
+            elif origin and attention != "urgent":
+                reason = "Origin evidenced; destination or behavioral authorization still needs review."
         groups.setdefault(key, []).append({
             "id": row["id"], "severity": row["severity"], "attention": attention,
             "current_grade": latest[0] if latest else None, "reason": reason,
+            "proposed_grade": proposed, "origin": origin,
             "last_seen": row.get("last_seen")})
     cases = [{"identity": key, "members": members,
               "severity": max((m["severity"] for m in members), key=lambda s: SEV_ORDER[s]),
@@ -21351,7 +21435,8 @@ def _workflow_report(db):
         (r["severity"] for r in rows if r["id"] in {m["id"] for m in c["members"]}),
         key=lambda s: SEV_ORDER[s]) for c in cases)
     return {"self_check": "PASS" if valid else "FAIL: inventory/severity mismatch",
-            "policy": _WORKFLOW_POLICY, "incident_count": len(rows), "cases": cases}
+            "policy": _WORKFLOW_POLICY, "incident_count": len(rows), "cases": cases,
+            "integration_health": integration_health}
 
 
 def _workflow_shadow_evaluate(state, now=None):
