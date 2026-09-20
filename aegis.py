@@ -8543,16 +8543,36 @@ def check_shell_history():
             top = max(signals, key=lambda s: SEV_ORDER[s[1]])[1]
             names = sorted(n for n, _ in signals)
             command_sha = hashlib.sha256(cmd.strip().encode()).hexdigest()
+            # The same evidence window the live-process tier uses, for the same
+            # reason: this sensor named its idioms and showed a hash, so a
+            # verdict could never be reached on evidence. Measured on the
+            # reference Mac: 2,024 findings of the shape ".bash_history
+            # triggered [fileless-fetch-exec, network-fetch, pipe-to-shell];
+            # command sha256=250b0c18" — three hostile idioms and not one
+            # character of what matched them.
+            #
+            # Privacy, because this file is the operator's OWN typing and that
+            # is a stronger claim than a running process's argv. Three things
+            # bound it, and they are why a window is safer here than the
+            # head-truncation the process tier used to do: only a line that
+            # ALREADY scored hostile is previewed at all (a clean history line
+            # is never read into a finding); only the matched region plus a
+            # little context is kept, never the whole line; and the result
+            # passes through redact_sensitive. That is the retention rule this
+            # file already states — the hostile verdict and the evidence that
+            # earned it, nothing else.
+            preview = _argv_evidence_preview(cmd)
             findings.append(finding(
                 top, "shell-history",
                 "Hostile command in shell history",
-                "%s triggered [%s]; command sha256=%s" %
-                (os.path.basename(path), ", ".join(names), command_sha[:16]),
+                "%s triggered [%s]; command sha256=%s; command: %s" %
+                (os.path.basename(path), ", ".join(names), command_sha[:16],
+                 preview),
                 "shellhist:%s:%s" % (
                     os.path.basename(path),
                     command_sha[:16]),
                 path=path, markers=names, hostile=names,
-                command_sha256=command_sha))
+                command_sha256=command_sha, command_preview=preview))
     return findings
 
 
