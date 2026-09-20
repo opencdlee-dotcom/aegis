@@ -151,3 +151,27 @@ def test_link_cycles_rejected(artifact):
     (root / 'loop').symlink_to('.', target_is_directory=True)
     with pytest.raises(ValueError):
         aegis._artifact_components(str(root), ['app', 'loop'])
+
+
+def test_malformed_unrelated_binding_does_not_hide_valid_receipt(artifact, monkeypatch):
+    root, _, _ = artifact
+    assert receive(artifact) == 0
+    directory = Path(aegis.STATE_DIR) / 'artifact_receipts'
+    valid = next(directory.iterdir()).name
+    (directory / 'unrelated.json').write_text('{invalid')
+    original = os.listdir
+    monkeypatch.setattr(os, 'listdir', lambda path: ['unrelated.json', valid]
+                        if path == str(directory) else original(path))
+    assert aegis._artifact_receipt(str(root / 'app'))
+    assert any('artifact binding' in row[1]
+               for row in aegis._UNEXAMINED.get('(direct)', []))
+
+
+def test_bad_current_receipt_never_falls_back_to_backup(artifact):
+    root, _, _ = artifact
+    assert receive(artifact) == 0
+    directory = Path(aegis.STATE_DIR) / 'artifact_receipts'
+    current = next(directory.iterdir())
+    (directory / 'old-good.json').write_bytes(current.read_bytes())
+    current.write_text('{invalid')
+    assert aegis._artifact_receipt(str(root / 'app')) is None

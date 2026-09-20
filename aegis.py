@@ -16090,20 +16090,32 @@ def _artifact_receipt(path):
         if len(entries) > 128:
             return None
         for entry in entries:
-            binding = _artifact_read(os.path.join(directory, entry))
-            root = binding["root"]
-            relative = os.path.relpath(os.path.abspath(path), root).replace(os.sep, "/")
-            if relative not in binding["receipt"].get("components", {}):
-                if os.path.commonpath((os.path.abspath(path), root)) != root:
+            binding_path = os.path.join(directory, entry)
+            try:
+                binding = _artifact_read(binding_path)
+                root = binding["root"]
+                if not isinstance(root, str) or not isinstance(binding.get("receipt"), dict):
+                    raise ValueError("malformed artifact binding")
+                # Only the receiver's current binding is authoritative, never
+                # a copied backup of an older receipt for the same root.
+                if entry != hashlib.sha256(root.encode()).hexdigest() + ".json":
                     continue
-                relative = os.path.relpath(os.path.realpath(path), root).replace(os.sep, "/")
+                relative = os.path.relpath(os.path.abspath(path), root).replace(os.sep, "/")
                 if relative not in binding["receipt"].get("components", {}):
-                    continue
+                    if os.path.commonpath((os.path.abspath(path), root)) != root:
+                        continue
+                    relative = os.path.relpath(os.path.realpath(path), root).replace(os.sep, "/")
+                    if relative not in binding["receipt"].get("components", {}):
+                        continue
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                unexamined(binding_path, "artifact binding could not be read", exc)
+                continue
             try:
                 return _artifact_verify(binding["receipt"], root,
                                         binding["world"], binding["project"])
-            except (OSError, ValueError, TypeError, KeyError):
-                continue
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                unexamined(binding_path, "artifact origin verification failed", exc)
+                return None
     except (OSError, ValueError, TypeError, KeyError):
         pass
     return None
