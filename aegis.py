@@ -15798,6 +15798,165 @@ def _package_receipt(path):
     return None
 
 
+def _artifact_components(root, names):
+    """Hash a bounded explicit component set; links never establish scope."""
+    root = os.path.realpath(root)
+    if not isinstance(names, (list, dict)) or not 0 < len(names) <= 1024:
+        raise ValueError("expected 1..1024 components")
+    result, total = {}, 0
+    for name in names:
+        if (not isinstance(name, str) or not name or "\\" in name
+                or ":" in name or name.startswith("/")
+                or any(p in ("", ".", "..") for p in name.split("/"))):
+            raise ValueError("component must be a relative file path")
+        path = os.path.join(root, *name.split("/"))
+        if os.path.realpath(path) != path or not os.path.isfile(path):
+            raise ValueError("missing component or symlink substitution")
+        before = os.stat(path)
+        total += before.st_size
+        if total > 256 * 1024 * 1024:
+            raise ValueError("artifact exceeds 256 MiB verification budget")
+        digest = hashlib.sha256()
+        read_bytes = 0
+        with open(path, "rb") as f:
+            while True:
+                block = f.read(1024 * 1024)
+                if not block:
+                    break
+                read_bytes += len(block)
+                if read_bytes > before.st_size:
+                    raise ValueError("component grew during verification")
+                digest.update(block)
+        after = os.stat(path)
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError("component changed during verification")
+        result[name] = digest.hexdigest()
+    return result
+
+
+def _artifact_read(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("receipt exceeds 1 MiB")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("receipt must be an object")
+    return value
+
+
+def _artifact_verify(record, root, world, project):
+    """Origin only, using today's separately pinned roster on every check."""
+    if os.path.realpath(root) != root:
+        raise ValueError("receiver root was replaced by a symlink")
+    required = ("world", "project", "recipe", "toolchain", "principal")
+    if any(not isinstance(record.get(k), str) or not record[k] for k in required):
+        raise ValueError("missing artifact identity")
+    if (record.get("version") != 1 or record["world"] != world
+            or record["project"] != project or record.get("platform") != sys.platform):
+        raise ValueError("wrong world, project, platform or version")
+    for name in ("dependency_digest", "dirty_digest"):
+        value = record.get(name)
+        if name == "dirty_digest" and value is None:
+            continue
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("invalid source/dependency digest")
+    revision = record.get("source_revision")
+    if (not record.get("dirty_digest") and
+            (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision))):
+        raise ValueError("missing source revision or dirty-source digest")
+    now = _epoch()
+    issued, expires = record.get("issued"), record.get("expires")
+    if (not isinstance(issued, (int, float)) or not isinstance(expires, (int, float))
+            or not 0 <= issued <= now < expires <= issued + 31 * 86400):
+        raise ValueError("expired, future or overlong artifact receipt")
+    if not _vouch_verify_sig(_vouch_canonical(record), record.get("sig"),
+                             record["principal"], FLEET_SIGNERS, "aegis-artifact"):
+        raise ValueError("unknown/revoked signer or invalid signature")
+    if _artifact_components(root, record.get("components")) != record["components"]:
+        raise ValueError("artifact component bytes changed")
+    # A substituted helper is just as significant as a substituted main file.
+    # Require a dedicated output directory, with every file enumerated.
+    seen, directory_count = set(), 0
+    for base, directories, files in os.walk(root, followlinks=False):
+        directory_count += 1
+        if directory_count > 4096:
+            raise ValueError("artifact tree exceeds directory budget")
+        for name in directories + files:
+            if os.path.islink(os.path.join(base, name)):
+                raise ValueError("artifact tree contains a symlink")
+        for name in files:
+            seen.add(os.path.relpath(os.path.join(base, name), root).replace(os.sep, "/"))
+            if len(seen) > 1024:
+                raise ValueError("artifact tree exceeds component budget")
+    if seen != set(record["components"]):
+        raise ValueError("unlisted artifact component")
+    return record
+
+
+def _artifact_receipt(path):
+    """Verified receive-local origin; never inherits an endpoint permission."""
+    if not path:
+        return None
+    directory = os.path.join(STATE_DIR, "artifact_receipts")
+    try:
+        entries = os.listdir(directory)
+        if len(entries) > 128:
+            return None
+        for entry in entries:
+            binding = _artifact_read(os.path.join(directory, entry))
+            root = binding["root"]
+            relative = os.path.relpath(os.path.abspath(path), root).replace(os.sep, "/")
+            if relative not in binding["receipt"].get("components", {}):
+                continue
+            try:
+                return _artifact_verify(binding["receipt"], root,
+                                        binding["world"], binding["project"])
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def cmd_artifact(argv):
+    """Explicit create/receive/verify; no key provisioning or trust pinning."""
+    try:
+        action, root = argv[2:4]
+        root = os.path.realpath(root)
+        if action == "create" and len(argv) == 7:
+            record = _artifact_read(argv[4])
+            record.pop("sig", None)
+            record["components"] = _artifact_components(root, record.get("components"))
+            record["sig"] = _vouch_sign(_vouch_canonical(record), argv[5], "aegis-artifact")
+            _artifact_verify(record, root, record.get("world"), record.get("project"))
+            with open(argv[6], "x", encoding="utf-8") as f:
+                json.dump(record, f, sort_keys=True)
+        elif action in ("receive", "verify") and len(argv) == 7:
+            record = _artifact_read(argv[4])
+            _artifact_verify(record, root, argv[5], argv[6])
+            if action == "receive":
+                directory = os.path.join(STATE_DIR, "artifact_receipts")
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                target = os.path.join(directory, hashlib.sha256(root.encode()).hexdigest() + ".json")
+                fd, temporary = tempfile.mkstemp(dir=directory)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(dict(root=root, world=argv[5], project=argv[6], receipt=record), f)
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+        else:
+            raise ValueError("usage: artifact create ROOT SPEC KEY OUTPUT | receive/verify ROOT RECEIPT WORLD PROJECT")
+        print("artifact origin verified; shadow only (no behavioral authorization)")
+        return 0
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print("artifact receipt rejected: %s" % exc)
+        return 1
+
+
 def _grade_binary(severity, path, attack_defined=False, endpoint=None,
                   sha=None):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
@@ -15850,6 +16009,11 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
             # and it has been left behind by the workload. Note only: the
             # severity and confidence are untouched, because a vouch for a
             # sibling is not a vouch for these bytes.
+            artifact = _artifact_receipt(path) if endpoint is None else None
+            if artifact:
+                return severity, None, ("SHADOW: verified artifact origin for %s/%s; "
+                                        "current severity retained." %
+                                        (artifact["world"], artifact["project"]))
             return severity, None, _vouch_superseded_note(path)
         return (_demote(severity, "copy-of-graded"), "copy-of-graded",
                 _custody_carry_note(carried))
@@ -15922,11 +16086,13 @@ def _vouch_link(rec):
         _vouch_canonical(rec).encode("utf-8", "replace")).hexdigest()
 
 
-def _vouch_verify_sig(payload, sig, principal):
+def _vouch_verify_sig(payload, sig, principal, roster=None, namespace=None):
     """True iff `sig` is a good ssh signature over `payload` by a principal in
     the PINNED vouch roster. Any failure — missing roster, missing ssh-keygen,
     bad signature, unknown signer, timeout — is False, never an exception."""
-    if not sig or not os.path.isfile(VOUCH_SIGNERS):
+    roster = roster or VOUCH_SIGNERS
+    namespace = namespace or _VOUCH_NAMESPACE
+    if not sig or not os.path.isfile(roster):
         return False
     sig_path = None
     try:
@@ -15934,8 +16100,8 @@ def _vouch_verify_sig(payload, sig, principal):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(sig if sig.endswith("\n") else sig + "\n")
         _out, _err, rc = run(
-            ["ssh-keygen", "-Y", "verify", "-f", VOUCH_SIGNERS,
-             "-I", principal, "-n", _VOUCH_NAMESPACE, "-s", sig_path],
+            ["ssh-keygen", "-Y", "verify", "-f", roster,
+             "-I", principal, "-n", namespace, "-s", sig_path],
             timeout=15, stdin_data=payload)
         return rc == 0
     except Exception:
@@ -16206,7 +16372,7 @@ def _vouch_chain_head():
     return _vouch_link(last), int(last["seq"])
 
 
-def _vouch_sign(payload, key_path):
+def _vouch_sign(payload, key_path, namespace=None):
     """Armored ssh signature over `payload`, or None.
 
     ssh-keygen prompts for the key's passphrase on the terminal; that prompt is
@@ -16221,8 +16387,8 @@ def _vouch_sign(payload, key_path):
         # Not run() — this one must inherit the real tty to prompt for the
         # passphrase, which capture_output would swallow.
         rc = subprocess.call(
-            ["/usr/bin/ssh-keygen", "-Y", "sign", "-f", key_path,
-             "-n", _VOUCH_NAMESPACE, "-q", data_path])
+            [shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen", "-Y", "sign", "-f", key_path,
+             "-n", namespace or _VOUCH_NAMESPACE, "-q", data_path])
         if rc != 0:
             return None
         with open(data_path + ".sig", "r", encoding="utf-8") as f:
@@ -30354,6 +30520,8 @@ def main(argv):
         return cmd_signers(argv)
     if cmd == "vouch":
         return cmd_vouch(argv)
+    if cmd == "artifact":
+        return cmd_artifact(argv)
     if cmd == "identity":
         return cmd_identity(argv)
     if cmd == "replay":
