@@ -42,13 +42,49 @@ def test_changed_download_or_installed_bytes_do_not_get_proof(tmp_path, monkeypa
     assert aegis._distribution_receipt(str(root / 'uv')) is None
 
 
-def test_ledger_tamper_and_expiry_are_not_origin(tmp_path, monkeypatch):
+def test_ledger_tamper_is_not_origin(tmp_path, monkeypatch):
     root, archive, digest = fixture(tmp_path, monkeypatch)
     aegis._distribution_prove('uv', '0.11.6', str(archive), digest, 'official', str(root))
     ledger = tmp_path / 'state' / 'distribution-proofs.json'
     records = json.loads(ledger.read_text())
     records[0]['package'] = 'attacker claim'
     ledger.write_text(json.dumps(records))
+    assert aegis._distribution_receipt(str(root / 'uv')) is None
+
+
+def test_expired_proof_is_not_origin(tmp_path, monkeypatch):
+    root, archive, digest = fixture(tmp_path, monkeypatch)
+    now = aegis._epoch()
+    aegis._distribution_prove('uv', '0.11.6', str(archive), digest, 'official', str(root))
+    monkeypatch.setattr(aegis, '_epoch', lambda: now + 31 * 86400)
+    assert aegis._distribution_receipt(str(root / 'uv')) is None
+
+
+def test_cli_uses_official_digest_and_does_not_accept_claimed_source(tmp_path, monkeypatch):
+    import urllib.request
+    root, archive, digest = fixture(tmp_path, monkeypatch)
+    requests = []
+    def metadata(request, timeout):
+        requests.append(request.full_url)
+        return io.BytesIO(json.dumps({'assets': [{'name': archive.name,
+            'digest': 'sha256:' + digest}]}).encode())
+    monkeypatch.setattr(urllib.request, 'urlopen', metadata)
+    assert aegis.main(['aegis.py', 'distribution', 'verify', 'uv', '0.11.6',
+                       str(archive), str(root)]) == 0
+    assert requests == ['https://api.github.com/repos/astral-sh/uv/releases/tags/0.11.6']
+    assert aegis._distribution_receipt(str(root / 'uv')) is not None
+    assert aegis.cmd_distribution(['aegis.py', 'distribution', 'verify',
+        'https://attacker.invalid', '0.11.6', str(archive), str(root)]) == 1
+    assert len(requests) == 1
+
+
+def test_cli_missing_official_digest_does_not_mint_proof(tmp_path, monkeypatch):
+    import urllib.request
+    root, archive, digest = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(
+        json.dumps({'assets': [{'name': archive.name}]}).encode()))
+    assert aegis.cmd_distribution(['aegis.py', 'distribution', 'verify',
+        'uv', '0.11.6', str(archive), str(root)]) == 1
     assert aegis._distribution_receipt(str(root / 'uv')) is None
 
 
