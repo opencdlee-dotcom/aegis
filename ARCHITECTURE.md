@@ -568,6 +568,32 @@ observations re-rendered as though fresh. 118 of 120 dismissals were
 The menu-bar plugin counts OPEN INCIDENTS, so that — not findings-per-scan —
 is the number the operator actually reads, and it is what this tier targets.
 
+### Ground truth: `backtest replay`
+
+Every earlier fix in this tier was measured by silence ("the queue got
+shorter"), which is also what broken detection looks like. `aegis.py backtest
+replay [--days N] [--reobserve]` scores the CURRENT code against the answer key
+the store already holds: it opens the live store read-only (`mode=ro`, one
+snapshot), groups the recorded `observation.finding` events into their scans
+(by `observed_at`: no writer sets `scan_id`), and re-runs each batch through
+`route_findings` with the live tolerance memory and the learning period OFF,
+the scan's own record-and-fold (`_record_finding_events`, shared with
+`record_security_state`) and `_apply_correlations` (chains, lineage, risk,
+incidents) in an in-memory store. It reports per-category interrupts, lists by
+id every incident the operator closed as noise (`FALSE_POSITIVE`, whatever the
+resolution) whose evidence would open an interrupt again — `noise re-opened: N
+of M` — counts open cases with no noise-labelled evidence (`new interrupts
+from corpus`), and routes the findings the 21 assay lanes build through the
+same gate (`assay recall: X/21`; predicate-only lanes and the one lane that
+writes live state are named, not skipped). `--reobserve` first re-asks the
+classifier and the custody ladder about every binary a process, listener,
+beacon or outbound finding names that is still on disk, and re-derives its
+severity from that sensor's own gate, so a classifier or ladder fix is
+scoreable and not only a routing fix. The scan-tail closers are deliberately
+not run: they key on what a scan re-asserted, and the event log holds only
+what the live fold recorded. The command asserts its counts against the store
+before printing them and puts a failed assertion at the top.
+
 ### Identity fixes (what a finding is *about*)
 
 | Sensor | Was identified by | Now identified by | Measured |
