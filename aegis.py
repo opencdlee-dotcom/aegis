@@ -16102,7 +16102,8 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
             # and it has been left behind by the workload. Note only: the
             # severity and confidence are untouched, because a vouch for a
             # sibling is not a vouch for these bytes.
-            return severity, None, _vouch_superseded_note(path)
+            return severity, None, (_vouch_superseded_note(path)
+                                    or _vouch_neighbour_note(path))
         return (_demote(severity, "copy-of-graded"), "copy-of-graded",
                 _custody_carry_note(carried))
     # A rung earned HERE is what a later copy elsewhere will inherit. Recorded
@@ -16440,6 +16441,67 @@ def _vouch_superseded_note(path):
             "having updated itself, re-vouch the new path; if it is not, the "
             "vouch is not the explanation for it."
             % rec.get("path"))
+
+
+def _vouch_beside(path):
+    """A vouch covering a DIFFERENT program in the SAME directory as `path`,
+    or None.
+
+    The sibling _vouch_superseded_by does not reach, measured 2026-09-22. The
+    runner's `Runner.Listener` is vouched at `<runner>/bin.2.337.0/`, and it
+    spawns `Runner.Worker` out of that same directory -- a second binary of
+    the same workload that was never vouched, because the operator vouched
+    the process that beacons, not the install. Incident #534 is that Worker:
+    ad-hoc signed, user-writable path, no rung, and no note either, because
+    the supersession match is on identical basenames by design (same
+    directory is not the test there; same PROGRAM is). So the operator saw a
+    HIGH in a directory they had vouched a file in, with nothing connecting
+    the two, and will see it again after every self-update.
+
+    A note, never a rung, for the reason the supersession note is one: a
+    vouch is for exact bytes, and if a neighbour of a vouched file inherited
+    anything, dropping a payload beside a vouched binary would buy quiet.
+    The note says both readings out loud -- a helper of the vouched workload
+    that needs its own vouch, or a payload that is not that workload at all
+    -- and the operator, who knows which, decides. The match is the resolved
+    directory, exactly equal, and a basename that differs; a parent or child
+    directory does not match, so a vouch in `bin.2.337.0` says nothing about
+    `_work/`.
+    """
+    if not path:
+        return None
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    here, base = os.path.split(real)
+    if not here or not base:
+        return None
+    vouches, tamper = load_vouches()
+    if tamper or not vouches:
+        return None
+    for rec in vouches.values():
+        other = rec.get("path") or ""
+        if not other or other == real:
+            continue
+        o_dir, o_base = os.path.split(other)
+        if o_dir == here and o_base != base:
+            return rec
+    return None
+
+
+def _vouch_neighbour_note(path):
+    """The report line for a binary beside a vouched one, or None."""
+    rec = _vouch_beside(path)
+    if not rec:
+        return None
+    return ("A vouch you signed covers %s — a different program in this same "
+            "directory. This binary was never vouched, so that vouch does NOT "
+            "apply and is not grading anything here. If this is a helper of "
+            "that workload (a runner's Worker beside its Listener), it needs a "
+            "vouch of its own, and will need one again after every "
+            "self-update; if it is not, a vouched neighbour is not the "
+            "explanation for it." % rec.get("path"))
 
 
 def _vouch_chain_head():

@@ -141,6 +141,28 @@ Counted by fact rather than by row, the 14 were six things.
       `Runner.Worker` is spawned by the vouched `Runner.Listener` out of the
       same install directory and has never been vouched itself (#534).
 
+      MEASURED on the live store: #534 is
+      `~/actions-runners/professor-os/bin.2.337.0/Runner.Worker`, ad-hoc
+      signed, user-writable path, sha 7f81f8d6, custody null -- and the
+      same bytes run in `lab-os/bin.2.337.0/` and both `_work/_update/bin/`
+      copies. Four vouches are active, every one of them a `Runner.Listener`
+      (both runners, `bin.2.336.0` and `bin.2.337.0`), because the operator
+      vouched the process that beacons, not the install. `_vouch_covers` is
+      exact bytes and answers no; `_vouch_superseded_by` matches identical
+      basenames by design (same directory is not the test there; same
+      PROGRAM is) and answers None. So the finding carried no rung and no
+      note: a HIGH in a directory the operator had vouched a file in, with
+      nothing connecting the two, due again after every self-update.
+
+      `_vouch_beside` now finds a vouch for a DIFFERENT program in the SAME
+      resolved directory, and `_grade_binary` prints its note when nothing
+      else grades the binary. A note, never a rung: if a neighbour of a
+      vouched file inherited anything, a payload dropped beside a vouched
+      binary would buy quiet. The note says both readings -- a helper that
+      needs its own vouch, or a payload that is not that workload -- and
+      the operator, who knows which, decides. A parent or child directory
+      does not match, and the vouched file is not its own neighbour.
+
   D   A hot-dir finding had no exit when its file is gone. `/tmp/qtest_local`
       (#525) was a throwaway test binary, deleted since; nothing could close
       its incident before age-out.
@@ -156,8 +178,10 @@ are CACHED is the third form, and the one where a single silence lasts
 forever.
 """
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1236,6 +1260,90 @@ class A3EphemeralPortsAreOneListener(Sandbox):
         self.assertEqual(1, len(self._risk()),
                          "three service-port listeners no longer "
                          "accumulate -- the fold reached past the floor")
+
+
+class CAHelperBesideAVouchedBinaryNamesTheVouch(unittest.TestCase):
+    """A vouched workload's second binary, in the vouched directory, was
+    graded with no rung and no note. The lookup is the resolved directory;
+    load_vouches is replaced so every body runs the same store."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="aegis_beside_"))
+        self.install = os.path.join(self.tmp, "bin.2.337.0")
+        self.previous = os.path.join(self.tmp, "bin.2.336.0")
+        os.makedirs(os.path.join(self.install, "_work"))
+        os.makedirs(self.previous)
+        self.listener = self._binary(self.install, "Runner.Listener")
+        self.worker = self._binary(self.install, "Runner.Worker")
+        self.old_listener = self._binary(self.previous, "Runner.Listener")
+        self._saved_load = aegis.load_vouches
+        self.vouched = {}
+        self.tamper = None
+        aegis.load_vouches = lambda now=None: (dict(self.vouched), self.tamper)
+
+    def tearDown(self):
+        aegis.load_vouches = self._saved_load
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _binary(self, d, name):
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\necho %s\n" % name)
+        return path
+
+    def _vouch(self, path):
+        self.vouched[aegis._vouch_subject(path)] = {
+            "path": path, "sha256": aegis.sha256(path), "uid": None,
+            "endpoints": ["20.85.130.105:443"]}
+
+    def test_the_live_shape_gets_a_note(self):
+        """#534: Worker in bin.2.337.0, Listener vouched in bin.2.336.0 AND
+        bin.2.337.0. Supersession sees nothing (different program); the
+        neighbour lookup names the vouch in the same directory."""
+        self._vouch(self.old_listener)
+        self._vouch(self.listener)
+        self.assertIsNone(aegis._vouch_superseded_by(self.worker),
+                          "pinned elsewhere: same directory is not that test")
+        # BEFORE: None -- no rung, no note, nothing connecting the HIGH to
+        # the vouch the operator had signed in this directory.
+        found = aegis._vouch_beside(self.worker)
+        self.assertIsNotNone(found, "the vouch beside it was not findable")
+        self.assertEqual(self.listener, found["path"])
+        note = aegis._vouch_neighbour_note(self.worker)
+        self.assertIn(self.listener, note)
+        self.assertIn("never vouched", note)
+
+    def test_it_is_a_note_and_never_a_rung(self):
+        """The security property: a payload beside a vouched binary must not
+        inherit quiet."""
+        self._vouch(self.listener)
+        sev, rung, note = aegis._grade_binary("HIGH", self.worker)
+        self.assertEqual("HIGH", sev)
+        self.assertIsNone(rung)
+        self.assertTrue(note and self.listener in note)
+
+    def test_the_vouched_file_is_not_its_own_neighbour(self):
+        self._vouch(self.listener)
+        self.assertIsNone(aegis._vouch_beside(self.listener))
+        self.assertTrue(aegis._vouch_covers(self.listener))
+
+    def test_a_child_or_parent_directory_does_not_match(self):
+        self._vouch(self.listener)
+        below = self._binary(os.path.join(self.install, "_work"), "job")
+        above = self._binary(self.tmp, "config.sh")
+        self.assertIsNone(aegis._vouch_beside(below),
+                          "a vouch in bin/ must say nothing about _work/")
+        self.assertIsNone(aegis._vouch_beside(above))
+
+    def test_a_tampered_store_explains_nothing(self):
+        self._vouch(self.listener)
+        self.tamper = "chain broken"
+        self.assertIsNone(aegis._vouch_beside(self.worker))
+        self.assertIsNone(aegis._vouch_neighbour_note(self.worker))
+
+    def test_no_vouches_no_note(self):
+        self.assertIsNone(aegis._vouch_beside(self.worker))
+        self.assertIsNone(aegis._vouch_neighbour_note(""))
 
 
 if __name__ == "__main__":
