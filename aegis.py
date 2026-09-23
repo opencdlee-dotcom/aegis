@@ -4430,6 +4430,243 @@ def _producer_memory(db, now):
     return memory
 
 
+# --- class tolerance: a verdict teaches at the width the ladder can VERIFY ---
+#
+# Measured on the live store, 2026-09-23: 72 hand verdicts across 45 classes,
+# then 109 new incidents opened in a class the operator had already judged.
+# Every identity above names a PLACE or exact BYTES, and the operator's own
+# work mints both on every rebuild, new worktree, runner self-update and
+# translocated copy, so each re-sighting arrived as a stranger. The custody
+# ladder already knows more than that about a binary: who signed it, which
+# package transaction installed it, which repo built it, which vouched program
+# started it. Each is a class a verdict can name, and a class does not move
+# when the path or the bytes do.
+#
+# Width is set by what anchors the class, not by how useful it would be:
+#   anchored  a publisher's team id (a signing chain this uid cannot mint) or
+#             a package receipt (an install transaction the operator ran; the
+#             honest limits written above _homebrew_receipt apply unchanged)
+#             -- ONE verdict;
+#   content   a build repo or a supervisor, derived from things the operator's
+#             own tools move and an attacker at this uid can reach -- the same
+#             floor of three every other tolerance identity keeps.
+# Every other guard is unchanged: never CRITICAL, never attack-defined, never
+# above the severity the operator reviewed, never a disputed class, never a
+# _NEVER_TOLERATE_PREFIXES fingerprint.
+#
+# Two refusals are specific to classes. Only a finding ABOUT A BINARY carries
+# one (process, net-beacon): a persistence job signed by team X can run anything
+# X ships with arguments nobody reviewed. And an interpreter carries none: a
+# signed python, node or pwsh beaconing is whatever script it runs, and its
+# signer, receipt or repo says nothing about that script -- the rule S3 wrote
+# for chain legs, applied to the widest join there is.
+_CLASS_CATEGORIES = frozenset(("process", "net-beacon"))
+_CLASS_MIN_VERDICTS = {"anchored": 1, "content": _TOLERANCE_MIN_VERDICTS}
+# The finding fields a class is read from. _class_facts writes them at
+# emission; _incident_classes pre-filters the store on them, which is sound
+# only because _finding_classes reads nothing else to name a class.
+_CLASS_TRIGGER_KEYS = ("team", "package", "build_repo", "supervisor")
+# Display-only companions: what a lesson prints, never what a key is made of.
+_CLASS_FACT_KEYS = _CLASS_TRIGGER_KEYS + ("authority", "supervisor_path")
+_TEAM_ID_RE = re.compile(r"^[A-Z0-9]{10}$")
+# Script hosts outside _INTERPRETERS that a publisher signs and that run
+# whatever they are handed. Not a detection list; only a refusal to let one
+# binary's signature stand for everything it can be told to do.
+_CLASS_SCRIPT_HOSTS = frozenset(("pwsh", "powershell", "cmd", "wscript",
+                                 "cscript", "mshta", "java", "deno", "bun"))
+
+
+def _class_interpreter(path):
+    """True when `path` is a program that runs what it is handed."""
+    name = os.path.basename(str(path or "").replace("\\", "/")).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return (name in _INTERPRETERS or name in _CLASS_SCRIPT_HOSTS
+            # python3.13, node18: the versioned name of the same host.
+            or name.rstrip("0123456789.") in _INTERPRETERS)
+
+
+def _package_class(receipt):
+    """`<manager>:<name>` a package receipt names, without its version, or
+    None when it names no package (a winget shim is a link, not a package).
+
+    Homebrew receipts read `formula@version` and a formula's own name can
+    carry a version (`python@3.14`), so only the trailing `@version` goes;
+    every other manager spells the version into the name and it is folded
+    with the tolerance layer's own version regex."""
+    manager, sep, name = str(receipt or "").partition(":")
+    if not (sep and manager and name):
+        return None
+    if manager == "homebrew":
+        name = name.rsplit("@", 1)[0]
+    elif manager == "winget" and name == "link":
+        return None
+    else:
+        name = _TOLERANCE_VERSION_RE.sub("#", name)
+    return "%s:%s" % (manager, name) if name else None
+
+
+def _finding_classes(f):
+    """[(class_key, width)] a finding carries, in the order _signal_decision
+    consults them: signer, then package, build repo, supervisor.
+
+    The ONE spelling of a class key. The memory a verdict builds and the
+    lookup a later finding makes both call this, so the two can never
+    disagree on what a class is called -- the drift _subject_identity
+    documents, where a subject and its fingerprint rendered different
+    identities and the verdicts split between two memories. Pure: it reads
+    the facts the emitter attached (_class_facts) and asks the machine
+    nothing."""
+    if not isinstance(f, dict) or f.get("category") not in _CLASS_CATEGORIES:
+        return []
+    if f.get("attack_defined") or str(f.get("fingerprint") or "").startswith(
+            _NEVER_TOLERATE_PREFIXES):
+        return []
+    path = f.get("path") or f.get("program")
+    if not path or _class_interpreter(path):
+        return []
+    out = []
+    team = str(f.get("team") or "")
+    if _TEAM_ID_RE.match(team) and publisher_sig(f.get("trust")):
+        out.append(("signer:%s" % team, "anchored"))
+    custody = f.get("custody")
+    if custody == "package-managed":
+        name = _package_class(f.get("package"))
+        if name:
+            out.append(("package:%s" % name, "anchored"))
+    elif custody == "build-output":
+        repo = str(f.get("build_repo") or "")
+        if repo and os.path.isabs(repo):
+            out.append(("buildrepo:%s" % repo, "content"))
+    elif custody == "supervised":
+        sup = str(f.get("supervisor") or "")
+        if _CONTENT_SHA_RE.match(sup):
+            out.append(("supervisor:%s" % sup.lower(), "content"))
+    return out
+
+
+def _class_facts(path, trust, custody, parents=None):
+    """The class facts a binary sensor attaches to its finding, as fields.
+
+    Asked right after grading, so every answer here is one the ladder has
+    just established: the team only under a publisher verdict the classifier
+    repeats, the receipt only on the package rung, the repo only on the
+    build-output rung (and only when git said yes, never on a non-answer), the
+    supervisor's bytes only on the supervised rung. Each call is a cache hit
+    for the scan that graded it. Never raises: a fact that cannot be read
+    costs that fact, never the scan."""
+    facts = {}
+    if not path:
+        return facts
+    try:
+        if publisher_sig(trust):
+            sig = classify_signature(path) or {}
+            team = str(sig.get("team") or "")
+            if sig.get("trust") == trust and _TEAM_ID_RE.match(team):
+                facts["team"] = team
+                if sig.get("authority"):
+                    facts["authority"] = sig["authority"]
+        if custody == "package-managed":
+            receipt = _package_receipt(path)
+            if receipt:
+                facts["package"] = receipt
+        elif custody == "build-output":
+            git = _git_bin()
+            selfness = _repo_is_self_committed(
+                git, os.path.dirname(os.path.abspath(path))) if git else None
+            if selfness and selfness[0] and selfness[1] is True:
+                facts["build_repo"] = selfness[0]
+        elif custody == "supervised":
+            parent = _supervising_parent(path, parents)
+            sha = _graded_sha(parent) if parent else None
+            if sha:
+                facts["supervisor"] = sha
+                facts["supervisor_path"] = parent
+    except Exception:
+        pass
+    return facts
+
+
+def _incident_classes(db, incident_id):
+    """[(class_key, width, finding)] named by an incident's recorded evidence,
+    one entry per class. `finding` is the newest evidence that names the
+    class, for a lesson to describe it by.
+
+    Read from the NEWEST observation of each signal only -- the latest word
+    on its subject -- and a row is parsed only if it carries one of
+    _CLASS_TRIGGER_KEYS, without which it names no class by construction.
+    This runs every scan over every judged incident, and a judged incident
+    holds up to thousands of re-observations of the same few signals (the
+    live store: ~11,000 evidence rows over ~150 signals); pattern-matching
+    them all in SQL cost ~70 ms of CPU a scan to learn what the newest row
+    per signal already says."""
+    try:
+        newest = sorted((r[0] for r in db.execute(
+            "SELECT MAX(x.id) FROM incident_events ie "
+            "JOIN events x ON x.id=ie.event_id WHERE ie.incident_id=? "
+            "AND x.event_type='observation.finding' "
+            # A row with no signal id is its own signal, never one shared
+            # bucket of every such row.
+            "GROUP BY COALESCE(x.signal_id, -x.id)", (incident_id,))),
+            reverse=True)
+        raws = []
+        for i in range(0, len(newest), 500):
+            chunk = newest[i:i + 500]
+            raws.extend(r[0] for r in db.execute(
+                "SELECT data_json FROM events WHERE id IN (%s) "
+                "ORDER BY id DESC" % ",".join("?" * len(chunk)), chunk))
+    except sqlite3.Error:
+        # A store with no evidence links names no class: the memory built
+        # from it teaches none, so there is none for a dispute to revoke.
+        return []
+    marks = tuple('"%s":' % k for k in _CLASS_TRIGGER_KEYS)
+    out = {}
+    for raw in raws:
+        if not any(m in (raw or "") for m in marks):
+            continue
+        try:
+            f = json.loads(raw)
+        except Exception:
+            continue
+        for klass, width in _finding_classes(f):
+            out.setdefault(klass, (width, f))
+    return [(k, w, f) for k, (w, f) in sorted(out.items())]
+
+
+def _class_verdicts(db, now):
+    """{class_key: {"inc", "sev", "width", "finding"}} over the operator's
+    benign-positive verdicts on signal incidents inside the window, before
+    any floor is applied. Distinct INCIDENTS, as for every tolerance tier:
+    one verdict writes a dismissal row per category."""
+    seen = {}
+    try:
+        rows = db.execute(
+            "SELECT DISTINCT d.incident_id, i.severity "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code='benign-positive' AND d.dismissed_at>=? "
+            "AND d.correlation_key LIKE 'signal:%'",
+            (now - _TOLERANCE_WINDOW,)).fetchall()
+        for row in rows:
+            for klass, width, f in _incident_classes(db, row["incident_id"]):
+                bucket = seen.setdefault(klass, {"inc": set(), "sev": -1,
+                                                 "width": width, "finding": f})
+                bucket["inc"].add(row["incident_id"])
+                bucket["sev"] = max(bucket["sev"],
+                                    SEV_ORDER.get(row["severity"], -1))
+    except Exception:
+        return {}
+    return seen
+
+
+def _class_memory(db, now):
+    """{class_key: (verdicts, max_reviewed_sev)} for classes past the floor
+    their width sets (_CLASS_MIN_VERDICTS)."""
+    return {k: (len(b["inc"]), b["sev"])
+            for k, b in _class_verdicts(db, now).items()
+            if len(b["inc"]) >= _CLASS_MIN_VERDICTS.get(
+                b["width"], _TOLERANCE_MIN_VERDICTS)}
+
+
 def _tolerance_memory(db, now):
     """{identity: (distinct_verdicts, max_reviewed_sev_order)} from the
     operator's own benign-positive dismissals of signal incidents inside the
@@ -4513,6 +4750,11 @@ def _disputed_identities(db):
                     idents.add(klass)
             except Exception:
                 pass
+        # A class is the widest thing a verdict teaches, so a dispute on ANY
+        # incident in it revokes it for all of them -- including the ones it
+        # has already closed.
+        for klass, _width, _f in _incident_classes(db, row["id"]):
+            idents.add(klass)
     return idents
 
 
@@ -4698,13 +4940,15 @@ ROUTE_SILENT = "silent"         # allowlisted by the operator
 
 def _suppression_memory(db, now):
     """Everything the incident tier knows that can quiet a signal, read once
-    per scan: (tolerance, rotating, disputed, learning)."""
+    per scan: (tolerance, rotating, disputed, learning, producer, classes)."""
     tolerance = _tolerance_memory(db, now)
     rotating = _rotating_endpoint_memory(db, now)
     producer = _producer_memory(db, now)
-    disputed = _disputed_identities(db) if (tolerance or rotating or producer) \
-        else frozenset()
-    return tolerance, rotating, disputed, _in_learning_period(now), producer
+    classes = _class_memory(db, now)
+    disputed = _disputed_identities(db) \
+        if (tolerance or rotating or producer or classes) else frozenset()
+    return (tolerance, rotating, disputed, _in_learning_period(now), producer,
+            classes)
 
 
 def _signal_decision(f, memory):
@@ -4717,6 +4961,7 @@ def _signal_decision(f, memory):
         return None, 0
     tolerance, rotating, disputed, learning = memory[:4]
     producer = memory[4] if len(memory) > 4 else {}
+    classes = memory[5] if len(memory) > 5 else {}
     sev = SEV_ORDER.get(f.get("severity"), -1)
     if sev >= SEV_ORDER["CRITICAL"]:
         return None, 0
@@ -4732,6 +4977,11 @@ def _signal_decision(f, memory):
         content_ident = _finding_content_identity(f)
         if content_ident:
             candidates.append((content_ident, tolerance))
+        # Then the classes the ladder verified (signer, package, build repo,
+        # supervisor), each already past the floor its width sets.
+        if classes:
+            for klass, _width in _finding_classes(f):
+                candidates.append((klass, classes))
         if rotating:
             for klass, _observed in _finding_endpoint_classes(f):
                 candidates.append((klass, rotating))
@@ -8869,7 +9119,8 @@ def check_processes():
                                   else "process:%s" % _program_subject(comm)),
                 subject=_subject("process", comm, trust=sig["trust"],
                                  content=sha),
-                path=comm, trust=sig["trust"], sha256=sha, custody=rung)
+                path=comm, trust=sig["trust"], sha256=sha, custody=rung,
+                **_class_facts(comm, sig["trust"], rung, parents))
             if parents:
                 # The programs it ran under, by exe path -- the operator's
                 # answer to "why supervised?", and to why not. Paths rather
@@ -13535,7 +13786,8 @@ def _beacon_from_sightings(sightings, current_rows):
                                  content=_graded_sha(path)),
                 path=path, program=path, port=rport, trust=trust,
                 endpoint_count=len(fleet), endpoints=shown,
-                custody=rung, markers=["outbound-exfil", "beacon"]))
+                custody=rung, markers=["outbound-exfil", "beacon"],
+                **_class_facts(path, trust, rung)))
             continue
         findings.append(finding(
             graded, "net-beacon",
@@ -13560,7 +13812,8 @@ def _beacon_from_sightings(sightings, current_rows):
             path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
-            markers=["outbound-exfil", "beacon"]))
+            markers=["outbound-exfil", "beacon"],
+            **_class_facts(path, trust, rung)))
     return findings
 
 
@@ -16210,6 +16463,13 @@ def _supervised_rung(path, parents):
     is not re-conferred, `_demote` moves one step and never suppresses, and
     `_RISK_CUSTODY_WEIGHT` still lets the finding corroborate at half weight.
     """
+    return "supervised" if _supervising_parent(path, parents) else None
+
+
+def _supervising_parent(path, parents):
+    """The vouched ancestor that earns `path` the `supervised` rung, or None.
+    The walk _supervised_rung describes, returning WHO rather than whether,
+    because the supervisor class (_finding_classes) is keyed on its bytes."""
     if not (path and parents):
         return None
     real = os.path.realpath(path)
@@ -16222,7 +16482,7 @@ def _supervised_rung(path, parents):
         if (real.startswith(home)
                 and all(p.startswith(home) for p in between)
                 and _vouch_covers(parent)):
-            return "supervised"
+            return parent
         between.append(resolved)
     return None
 
@@ -21798,12 +22058,155 @@ def _incident_families(db):
     return out
 
 
+def _authority_org(authority, team):
+    """`Corporation for Digital Scholarship` out of `Developer ID Application:
+    Corporation for Digital Scholarship (8LAYR367YV)`, or '' when there is
+    no authority to read it from."""
+    org = str(authority or "")
+    if ": " in org:
+        org = org.split(": ", 1)[1]
+    suffix = " (%s)" % team
+    if org.endswith(suffix):
+        org = org[:-len(suffix)]
+    return org.strip()
+
+
+def _class_description(klass, f):
+    """A class key in the operator's words, from the evidence that names it."""
+    kind, _sep, rest = str(klass).partition(":")
+    f = f or {}
+    if kind == "signer":
+        org = _authority_org(f.get("authority"), rest)
+        return "anything signed by team %s%s — wherever it runs" % (
+            rest, " (%s)" % org if org else "")
+    if kind == "package":
+        manager, _sep, name = rest.partition(":")
+        return "anything the %s package %s installed, at any version" % (
+            manager, name)
+    if kind == "buildrepo":
+        return "build output of %s" % rest
+    if kind == "supervisor":
+        return "what the vouched %s starts from its own directory" % (
+            f.get("supervisor_path") or "supervisor %s…" % rest[:12])
+    return str(klass)
+
+
+def _class_lessons(db, incident_ids, now, verdicts=None, disputed=None):
+    """One dict per class the evidence of `incident_ids` names: its key and
+    description, the verdicts the store already holds for it, the floor its
+    width sets, whether it is disputed, how many of `incident_ids` name it
+    and how many of those are among its verdicts. Counted by the same
+    _class_verdicts the memory is built from, so a lesson can never claim a
+    count the decision does not see."""
+    if verdicts is None:
+        verdicts = _class_verdicts(db, now)
+    if disputed is None:
+        disputed = _disputed_identities(db)
+    ids = set(incident_ids)
+    named = {}
+    for iid in incident_ids:
+        for klass, width, f in _incident_classes(db, iid):
+            entry = named.setdefault(klass, {"width": width, "finding": f,
+                                             "named": set()})
+            entry["named"].add(iid)
+    out = []
+    for klass in sorted(named):
+        entry = named[klass]
+        bucket = verdicts.get(klass) or {"inc": set()}
+        out.append({
+            "klass": klass,
+            "desc": _class_description(klass, entry["finding"]),
+            "verdicts": len(bucket["inc"]),
+            "floor": _CLASS_MIN_VERDICTS.get(entry["width"],
+                                             _TOLERANCE_MIN_VERDICTS),
+            "disputed": klass in disputed,
+            "named": len(entry["named"]),
+            "counted": len(bucket["inc"] & ids)})
+    return out
+
+
+def _print_class_lessons(incident_ids, now=None):
+    """Print what a benign-positive verdict on `incident_ids` just taught,
+    one line per class, and append each class whose floor THIS verdict
+    crossed to actions.jsonl.
+
+    A class is the widest thing a verdict can buy -- at width one, every
+    binary a publisher ever signs -- so it is never the silent case, exactly
+    as the identity floor is not (_tolerance_escalation). Read-only on the
+    store, and never raises: a reporting extra must not be able to fail an
+    operator's verdict."""
+    try:
+        now = _epoch(now)
+        db = _event_connection()
+        try:
+            lessons = _class_lessons(db, incident_ids, now)
+        finally:
+            db.close()
+    except Exception as e:
+        log_run("class lesson report failed: %s" % e)
+        return
+    for lesson in lessons:
+        n, floor = lesson["verdicts"], lesson["floor"]
+        if lesson["disputed"]:
+            count = ("%d verdict%s, disputed — tolerates nothing until the "
+                     "dispute is closed" % (n, "" if n == 1 else "s"))
+        elif n >= floor:
+            count = "%d verdict%s, tolerates now" % (n, "" if n == 1 else "s")
+        else:
+            count = "%d of %d verdicts" % (n, floor)
+        print("Learned: %s (%s)" % (lesson["desc"], count))
+        if not lesson["disputed"] and n >= floor > n - lesson["counted"]:
+            log_action("class-tolerance-granted", lesson["klass"],
+                       "auto-close-enabled", verdicts=n,
+                       incident_ids=sorted(incident_ids),
+                       window_days=_TOLERANCE_WINDOW // 86400)
+    if any(not lesson["disputed"] and lesson["verdicts"] >= lesson["floor"]
+           for lesson in lessons):
+        print("  Future non-CRITICAL findings in a class that tolerates now "
+              "open PRE-CLOSED.\n  Revoke a class by disputing any one of "
+              "them: aegis.py incident <id> reopen")
+
+
+def _family_teaching(db, families):
+    """{family key: [`would teach:` lines]} -- the classes a benign-positive
+    verdict on each family would teach, counted once for the whole listing.
+    A family whose evidence names no class gets no line: its verdict teaches
+    the identity it is grouped on, which the label already names."""
+    try:
+        now = _epoch()
+        verdicts = _class_verdicts(db, now)
+        disputed = _disputed_identities(db)
+        return {key: _would_teach_lines(_class_lessons(
+                    db, [r["id"] for r in rows], now, verdicts, disputed))
+                for key, _label, rows in families}
+    except Exception as e:
+        log_run("family teaching preview failed: %s" % e)
+        return {}
+
+
+def _would_teach_lines(lessons):
+    """`would teach:` lines for a family not yet judged."""
+    out = []
+    for lesson in lessons:
+        after = lesson["verdicts"] + lesson["named"] - lesson["counted"]
+        if lesson["disputed"]:
+            count = "disputed — would tolerate nothing"
+        elif after >= lesson["floor"]:
+            count = "tolerates after this verdict"
+        else:
+            count = "%d of %d verdicts after this one" % (after,
+                                                          lesson["floor"])
+        out.append("would teach: %s (%s)" % (lesson["desc"], count))
+    return out
+
+
 def cmd_families():
     ensure_state()
     init_event_store()
     db = _event_connection()
     try:
         families = _incident_families(db)
+        teaches = _family_teaching(db, families)
     finally:
         db.close()
     if not families:
@@ -21812,10 +22215,12 @@ def cmd_families():
     total = sum(len(rows) for _k, _l, rows in families)
     print("# Aegis incident families — %d active incident(s), %d decision(s)\n"
           % (total, len(families)))
-    for n, (_key, label, rows) in enumerate(families, 1):
+    for n, (key, label, rows) in enumerate(families, 1):
         worst = max(rows, key=lambda r: SEV_ORDER.get(r["severity"], -1))
         ids = " ".join("#%s" % r["id"] for r in rows)
         print("  [%d] %-8s %s\n      %s" % (n, worst["severity"], label, ids))
+        for line in teaches.get(key, ()):
+            print("      %s" % line)
     print("\nOne verdict per family: aegis.py family <n> "
           "[benign-positive|false-positive]")
     print("A family is grouped ONLY on an identity acquired tolerance already "
@@ -21873,12 +22278,19 @@ def cmd_family(numbers, action=None, reason=None):
             chosen.append((n, families[n - 1]))
 
     if action is None:
+        db = _event_connection()
+        try:
+            teaches = _family_teaching(db, [fam for _n, fam in chosen])
+        finally:
+            db.close()
         for n, (key, label, rows) in chosen:
             print("Family %d — %s\n" % (n, label))
             for row in rows:
                 print("  #%-4s %-8s %-14s %s" % (row["id"], row["severity"],
                                                  row["status"], row["title"]))
             print("\nIdentity: %s" % key)
+            for line in teaches.get(key, ()):
+                print(line[0].upper() + line[1:])
             print("Verdict:  aegis.py family %d benign-positive\n" % n)
         return 0
 
@@ -21913,6 +22325,8 @@ def cmd_family(numbers, action=None, reason=None):
         if verb == "benign-positive" and len(done) >= _TOLERANCE_MIN_VERDICTS:
             print("  this identity now carries %d verdicts — future members "
                   "open pre-closed" % len(done))
+        if verb == "benign-positive" and done:
+            _print_class_lessons(done)
     if accepted:
         print("%d item(s) accepted into the baseline — the sensor stops "
               "reporting them (a CHANGE to any of them still alerts)"
@@ -22420,6 +22834,9 @@ def cmd_incident(incident_id, action=None, reason=None):
                 log_action("tolerance-granted", ident, "auto-close-enabled",
                            verdicts=verdicts, incident_id=incident_id,
                            window_days=_TOLERANCE_WINDOW // 86400)
+            # And the classes it taught, one line each, whether or not a
+            # floor was crossed: the operator should see a verdict widen.
+            _print_class_lessons([incident_id])
     item = incident_detail(incident_id)
     if not item:
         print("no such incident: %s" % incident_id)
@@ -28512,8 +28929,13 @@ def _reobserve(f, memo, stats):
                     graded, rung = sev, got
             if rotating:
                 graded = _step_down(graded)
-        memo[key] = (trust, graded, rung)
-    trust, graded, rung = memo[key]
+        # The class facts the emitting sensor would attach today, from the
+        # same answers (_class_facts), so a class the current code can name
+        # is scoreable exactly as a rung is.
+        facts = _class_facts(path, trust, rung, list(parents) or None) \
+            if graded is not None else {}
+        memo[key] = (trust, graded, rung, facts)
+    trust, graded, rung, facts = memo[key]
     stats["reobserved"] += 1
     trust_moved = trust != f.get("trust")
     stats["trust_changed"] += trust_moved
@@ -28525,7 +28947,8 @@ def _reobserve(f, memo, stats):
     stats["custody_changed"] += custody_moved
     stats["changed"] += trust_moved or custody_moved
     stats["severity_changed"] += graded != f["severity"]
-    g = dict(f, trust=trust, custody=rung, severity=graded)
+    g = {k: v for k, v in f.items() if k not in _CLASS_FACT_KEYS}
+    g.update(facts, trust=trust, custody=rung, severity=graded)
     if isinstance(g.get("subject"), dict) and "trust" in g["subject"]:
         g["subject"] = dict(g["subject"], trust=trust)
     return g
@@ -28808,13 +29231,14 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
                      "(%s) and were not replayed"
                      % (r["unparseable"], ", ".join(_REPLAY_REQUIRED)))
     tolerance, rotating, disputed, _learning, producer = r["memory"][:5]
+    classes = r["memory"][5] if len(r["memory"]) > 5 else {}
     lines.append("  teaching: live store — %d tolerated identit%s, %d "
                  "rotating endpoint class(es), %d producer class(es), %d "
-                 "disputed; %d categor%s down-weighted by dismissals; "
-                 "learning period OFF"
+                 "class(es) taught, %d disputed; %d categor%s down-weighted "
+                 "by dismissals; learning period OFF"
                  % (len(tolerance), "y" if len(tolerance) == 1 else "ies",
-                    len(rotating), len(producer), len(disputed),
-                    len(r["weights"]),
+                    len(rotating), len(producer), len(classes),
+                    len(disputed), len(r["weights"]),
                     "y" if len(r["weights"]) == 1 else "ies"))
     stats = r["reobserve"]
     if stats is not None:
