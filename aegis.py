@@ -6213,6 +6213,96 @@ def _merge_2026_09_case_identities(db, now):
 #     deleted with its row: a store that skipped it falls back to age-out,
 #     which already closes stale OPEN incidents (with a blander resolution).
 # Row shape: (meta_key, fn(db, now) -> count, log template taking that count).
+def _behavior_case_would_move(evidence):
+    """True when the command this evidence shows carries a session nonce, so
+    the case identity the sensor now mints for it differs from the exact-argv
+    hash the incident was keyed on, and no future finding can reach the key.
+
+    Judged on the recorded preview minus its final token, which the preview's
+    budget may have cut mid-word: a `-<16 hex>` that the cut leaves at the
+    end of the string matches the nonce rule's end-of-string alternative
+    there and not in the full command (where a sha256 continues), and a
+    boundary match must never retire a case a future finding could still
+    reach. A single-token preview has no safe head and answers False."""
+    preview = evidence.get("command_preview")
+    if not isinstance(preview, str) or not preview:
+        return False
+    if preview[-1:].isspace():
+        head = preview
+    else:
+        parts = preview.rsplit(None, 1)
+        head = parts[0] if len(parts) == 2 else ""
+    if not head:
+        return False
+    flat = head
+    for rx, repl in _ARGV_NONCE_RES:
+        flat = rx.sub(repl, flat)
+    return _program_subject(flat) != head
+
+
+def _retire_orphaned_behavior_incidents(db, now):
+    """One-time: close behavior incidents keyed on the exact-argv hash of a
+    command that carried a session nonce.
+
+    The 2026-09-19 redesign (D6 of that batch) gave the behavior sensor a
+    CASE identity with session nonces normalized away, so the same command
+    in the next session is the same case and a verdict can accumulate. The
+    signal fingerprint stayed on the exact argv sha, deliberately, so a new
+    command still announces itself once. What the redesign did not do was
+    look back: #503 was minted before it, keyed on
+    `behavior:bash:<signals>:<argv sha16>` with the harness's per-session
+    snapshot nonce inside the hash. No future finding can carry that key --
+    the next occurrence mints a case keyed on the normalized command -- so
+    the incident could only wait out the age-out clock.
+
+    Matched on EVIDENCE, not on key shape: the retired key and the current
+    case key are both `behavior:<base>:<signals>:<16 hex>`, and a nonce-free
+    command's case identity IS its exact-argv hash, so a key alone cannot
+    tell an orphan from a live case. An incident is an orphan when its
+    newest evidence was minted without a case identity, is keyed on its own
+    command hash, and shows a command that nonce normalization would change
+    (_behavior_case_would_move). A preview that shows no nonce leaves its
+    incident standing even if the unrecorded rest of the command held one:
+    an orphan left to the age-out clock costs seven days, and a live case
+    retired costs the finding, because a same-key reattach on a closed
+    incident never carries new evidence. Incidents created in the scan that
+    runs the migration are out of scope by construction.
+
+    Closed as SUPERSEDED with evidence intact, as the program-key migration
+    was: nothing is judged benign, and whatever it described re-alerts under
+    the new identity if it recurs. Run once per store by
+    _run_store_migrations.
+    """
+    aged = []
+    # Never this scan's own incidents: migrations run after correlation, so
+    # a case minted moments ago is in view, and a sweep that can eat what
+    # the same scan opened is the D7 failure of the 2026-09-19 batch.
+    for row in db.execute(
+            "SELECT id, correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:behavior:%' "
+            "AND created_at<?", (now,)).fetchall():
+        key = row["correlation_key"] or ""
+        evidence = _latest_incident_evidence(db, row["id"])
+        if evidence is None or evidence.get("case_fingerprint"):
+            continue          # minted with a case identity: reachable
+        fp = str(evidence.get("fingerprint") or "")
+        sha = str(evidence.get("command_sha256") or "")
+        if key != "signal:" + fp or not sha or not fp.endswith(":" + sha[:16]):
+            continue          # not keyed on the exact command
+        if _behavior_case_would_move(evidence):
+            aged.append(row["id"])
+    if aged:
+        marks = ",".join("?" for _ in aged)
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id IN (%s)" % marks,
+            ("superseded: behavior cases are now keyed on the command with "
+             "session nonces normalized away, and this one was keyed on the "
+             "exact command of one session — re-alerts under the new "
+             "identity if it recurs", now) + tuple(aged))
+    return len(aged)
+
+
 _STORE_MIGRATIONS = (
     ("exec_identity_migrated", _retire_legacy_exec_incidents,
      "retired %d incident(s) keyed on the old positional exec identity"),
@@ -6228,6 +6318,12 @@ _STORE_MIGRATIONS = (
     # are its orphans. Same fold, second stamp.
     ("beacon_rotation_refold_20260919", _fold_rotating_beacon_cases,
      "folded %d per-address beacon incident(s) onto their rotating case"),
+    # The 2026-09-19 behavior case identity (nonces normalized away) left the
+    # cases minted before it keyed on one session's exact command. Same
+    # remedy as the program-key migration: retire what no finding can reach.
+    ("behavior_case_identity_20260922", _retire_orphaned_behavior_incidents,
+     "retired %d behavior incident(s) keyed on the exact command of one "
+     "session"),
 )
 
 

