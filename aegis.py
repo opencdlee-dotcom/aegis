@@ -4552,14 +4552,18 @@ def _signal_decision(f, memory):
     return None, 0
 
 
-def route_findings(findings, first_run=False, adopt=frozenset(), memory=None):
+def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
+                   seen=None):
     """{fingerprint: {"route", "why", "decision", "verdicts"}} for a batch.
 
     `route` is the interrupt-tier outcome. `decision` is the incident-tier
     outcome ("allowlisted", "tolerated", "learning" or None), carried
     separately because a finding the seen-ledger already knows still needs
     its incident decided. `memory` is _suppression_memory(...) or None, in
-    which case only the interrupt-tier checks apply.
+    which case only the interrupt-tier checks apply. `seen` is the seen-ledger
+    to consult, read from SEEN when None; `backtest replay` passes its own,
+    built as it goes, because the live ledger already holds every fingerprint
+    the replay is asking about.
 
     First-run silence is the KnockKnock "trust what's already installed" rule
     — it applies to PERSISTENCE and SHELL-HISTORY only, the two surfaces made
@@ -4571,7 +4575,8 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None):
     sees for the first time. Confidence is the second routing axis: a
     high-impact-but-noisy hit (explicit confidence='low') is logged and
     correlated but routed to the digest instead of interrupting."""
-    seen = load_json(SEEN, {})
+    if seen is None:
+        seen = load_json(SEEN, {})
     allow = set(load_json(ALLOWLIST, []))
     out = {}
     for f in findings:
@@ -6357,6 +6362,76 @@ def _run_store_migrations(db, now):
     return ran
 
 
+def _record_finding_events(db, findings, now, routing=None, folded=None):
+    """Record one scan's findings as signals and finding events in `db`, and
+    return [(event_id, finding)] for the events actually written.
+
+    One function for the scan and for `backtest replay`, which re-records
+    history into a scratch store through this same fold — so the two can never
+    disagree about which re-observation is news. A finding folded into its
+    active case writes no event; when `folded` is a dict it receives
+    {index in findings: incident id folded into}, which is how the replay
+    attributes a folded finding to the case that absorbed it."""
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    new_events = []
+    for index, original in enumerate(findings):
+        f = _redact_value(dict(original))
+        occurred = _epoch(f.get("occurred_at") or f.get("ts") or now)
+        attrs = _event_attributes(f)
+        prev = db.execute(
+            "SELECT severity FROM signals WHERE fingerprint=?",
+            (f["fingerprint"],)).fetchone()
+        db.execute(
+            "INSERT INTO signals(fingerprint,rule_id,rule_version,category,"
+            "severity,title,detail,first_seen,last_seen,occurrence_count,"
+            "attributes_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT("
+            "fingerprint) DO UPDATE SET last_seen=excluded.last_seen,"
+            "severity=excluded.severity,title=excluded.title,detail=excluded.detail,"
+            "occurrence_count=signals.occurrence_count+1,"
+            "attributes_json=excluded.attributes_json",
+            (f["fingerprint"], f.get("rule_id") or "aegis.legacy",
+             int(f.get("rule_version") or 1), f["category"], f["severity"],
+             f["title"], f["detail"], now, now, 1,
+             json.dumps(attrs, sort_keys=True)))
+        signal_id = db.execute("SELECT id FROM signals WHERE fingerprint=?",
+                               (f["fingerprint"],)).fetchone()[0]
+        # A persisting condition is one fact with a count, not an
+        # event per scan. When this signal's OWN case is already an
+        # ACTIVE incident holding its evidence, at the same severity,
+        # the re-observation adds nothing an event row can say —
+        # occurrence_count (incremented above) and last_seen carry it.
+        # Live cost of the old behaviour: 41-64 byte-identical rows
+        # per open signal incident, feeding the 50k retention budget.
+        # Three deliberate bounds: a SEVERITY change still records (a
+        # custody re-grade is exactly the news the incident needs); a
+        # finding with a routing verdict still records (an allowlist
+        # or tolerance decision must reach the loop that closes the
+        # case); and only kind='signal' incidents fold — a risk
+        # incident's corroborating facts must stay visible in the
+        # accumulator's event window.
+        rv = (routing or {}).get(f["fingerprint"])
+        if prev and prev["severity"] == f["severity"] \
+                and not (rv and rv.get("decision")):
+            case = db.execute(
+                "SELECT i.id FROM incidents i JOIN incident_events ie "
+                "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
+                "WHERE i.status IN (%s) AND i.kind='signal' "
+                "AND e.signal_id=? LIMIT 1" % marks,
+                _ACTIVE_INCIDENT_STATES + (signal_id,)).fetchone()
+            if case:
+                if folded is not None:
+                    folded[index] = case[0]
+                continue
+        cur = db.execute(
+            "INSERT INTO events(occurred_at,observed_at,source,event_type,"
+            "signal_id,data_json) VALUES(?,?,?,?,?,?)",
+            (occurred, now, f.get("sensor_id") or f["category"],
+             "observation.finding", signal_id,
+             json.dumps(f, sort_keys=True)))
+        new_events.append((cur.lastrowid, f))
+    return new_events
+
+
 def record_security_state(findings, sensor_health=(), now=None,
                           initially_notified=False,
                           suppressed_categories=frozenset(), routing=None):
@@ -6365,57 +6440,7 @@ def record_security_state(findings, sensor_health=(), now=None,
     new_events = []
     try:
         with db:
-            marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
-            for original in findings:
-                f = _redact_value(dict(original))
-                occurred = _epoch(f.get("occurred_at") or f.get("ts") or now)
-                attrs = _event_attributes(f)
-                prev = db.execute(
-                    "SELECT severity FROM signals WHERE fingerprint=?",
-                    (f["fingerprint"],)).fetchone()
-                db.execute(
-                    "INSERT INTO signals(fingerprint,rule_id,rule_version,category,"
-                    "severity,title,detail,first_seen,last_seen,occurrence_count,"
-                    "attributes_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT("
-                    "fingerprint) DO UPDATE SET last_seen=excluded.last_seen,"
-                    "severity=excluded.severity,title=excluded.title,detail=excluded.detail,"
-                    "occurrence_count=signals.occurrence_count+1,"
-                    "attributes_json=excluded.attributes_json",
-                    (f["fingerprint"], f.get("rule_id") or "aegis.legacy",
-                     int(f.get("rule_version") or 1), f["category"], f["severity"],
-                     f["title"], f["detail"], now, now, 1,
-                     json.dumps(attrs, sort_keys=True)))
-                signal_id = db.execute("SELECT id FROM signals WHERE fingerprint=?",
-                                       (f["fingerprint"],)).fetchone()[0]
-                # A persisting condition is one fact with a count, not an
-                # event per scan. When this signal's OWN case is already an
-                # ACTIVE incident holding its evidence, at the same severity,
-                # the re-observation adds nothing an event row can say —
-                # occurrence_count (incremented above) and last_seen carry it.
-                # Live cost of the old behaviour: 41-64 byte-identical rows
-                # per open signal incident, feeding the 50k retention budget.
-                # Three deliberate bounds: a SEVERITY change still records (a
-                # custody re-grade is exactly the news the incident needs); a
-                # finding with a routing verdict still records (an allowlist
-                # or tolerance decision must reach the loop that closes the
-                # case); and only kind='signal' incidents fold — a risk
-                # incident's corroborating facts must stay visible in the
-                # accumulator's event window.
-                rv = (routing or {}).get(f["fingerprint"])
-                if prev and prev["severity"] == f["severity"]                         and not (rv and rv.get("decision")) and db.execute(
-                        "SELECT 1 FROM incidents i JOIN incident_events ie "
-                        "ON ie.incident_id=i.id JOIN events e ON e.id=ie.event_id "
-                        "WHERE i.status IN (%s) AND i.kind='signal' "
-                        "AND e.signal_id=? LIMIT 1" % marks,
-                        _ACTIVE_INCIDENT_STATES + (signal_id,)).fetchone():
-                    continue
-                cur = db.execute(
-                    "INSERT INTO events(occurred_at,observed_at,source,event_type,"
-                    "signal_id,data_json) VALUES(?,?,?,?,?,?)",
-                    (occurred, now, f.get("sensor_id") or f["category"],
-                     "observation.finding", signal_id,
-                     json.dumps(f, sort_keys=True)))
-                new_events.append((cur.lastrowid, f))
+            new_events = _record_finding_events(db, findings, now, routing)
             _record_health(db, sensor_health, now)
             _apply_correlations(db, new_events, now, initially_notified,
                                 frozenset(suppressed_categories), routing)
@@ -27782,6 +27807,602 @@ def _iso_short(epoch_val):
         return "?"
 
 
+# --------------------------------------------------------------------------- #
+# Ground truth: `backtest replay`.
+#
+# Six false-alarm batches were each judged by the queue getting shorter, which
+# is also exactly what broken detection looks like. The store already holds an
+# answer key nobody read: every finding the sensors recorded, and every
+# incident the operator closed as noise. This re-runs the first through the
+# CURRENT pipeline — route_findings with the live teaching, the scan's own
+# record-and-fold (_record_finding_events), and _apply_correlations (chains,
+# lineage, risk accumulation, incidents) — in a throwaway store, and scores
+# the result against the second. `cmd_replay` re-ran correlation alone and
+# scored nothing.
+#
+# What it deliberately does NOT run: the scan-tail closers (re-grade,
+# cleared-state, re-verified, removed-file, age-out). Each keys on what a scan
+# RE-ASSERTED, and the event log holds only what the live fold chose to
+# record, so "absent from this batch" means "not recorded", never "gone";
+# they would close cases on missing evidence. The question here is whether a
+# case OPENS, and a close that comes later does not un-ring the interrupt.
+# --------------------------------------------------------------------------- #
+
+# The one assay lane a read-only replay refuses to run, and the reason it says.
+_REPLAY_ASSAY_NOT_RUN = {
+    "quarantine-roundtrip": "moves a real file through the live quarantine "
+                            "store and its manifest, a write a read-only "
+                            "replay does not make (`aegis.py assay` runs it)",
+}
+
+# The binary sensors whose severity is their own trust gate graded by
+# _grade_binary: the findings --reobserve can re-derive from today's answers.
+_REOBSERVE_CATEGORIES = ("process", "net-listener", "net-beacon",
+                         "net-outbound")
+
+_REPLAY_ROUTES = (ROUTE_INTERRUPT, ROUTE_DIGEST, ROUTE_SEEN, ROUTE_SILENT,
+                  "dropped")
+_REPLAY_REQUIRED = ("fingerprint", "category", "severity", "title", "detail")
+
+
+@contextmanager
+def _replay_overrides(**names):
+    """Swap module globals for the length of a replay and restore them by
+    value. The move the assay lanes make one name at a time (`g =
+    globals()`), gathered so every substitution a replay makes is listed at
+    the one place it is made."""
+    g = globals()
+    saved = {k: g[k] for k in names}
+    g.update(names)
+    try:
+        yield
+    finally:
+        g.update(saved)
+
+
+def _replay_live_store():
+    """The live event store opened READ-ONLY, or None when there is none.
+
+    Never _event_connection(): that one creates the file, migrates the schema
+    and chmods it — three writes a measurement of the store must not make."""
+    if not os.path.exists(EVENT_DB):
+        return None
+    db = sqlite3.connect("file:%s?mode=ro" % _sqlite_uri_path(EVENT_DB),
+                         uri=True, timeout=10)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def _replay_scratch():
+    """A throwaway in-memory store with the durable schema (as cmd_replay)."""
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.executescript(_EVENT_SCHEMA_SQL)
+    return db
+
+
+def _replay_load_corpus(live, since):
+    """Every recorded finding event since `since`, oldest first."""
+    return live.execute(
+        "SELECT id, scan_id, observed_at, data_json FROM events "
+        "WHERE event_type='observation.finding' AND observed_at>=? "
+        "ORDER BY observed_at, id", (since,)).fetchall()
+
+
+def _replay_batches(rows):
+    """([(batch_now, [(live_event_id, finding)])], unparseable, by_scan_id).
+
+    A batch is one scan. `scan_id` is the column for it, but no writer sets it,
+    so the fallback is the one thing every event of a scan shares:
+    record_security_state stamps them all with the same observed_at."""
+    batches, index, bad, by_scan_id = [], {}, 0, 0
+    for row in rows:
+        try:
+            f = json.loads(row["data_json"])
+        except Exception:
+            f = None
+        if not isinstance(f, dict) or any(k not in f for k in _REPLAY_REQUIRED) \
+                or not f["fingerprint"] or f["severity"] not in SEV_ORDER:
+            bad += 1
+            continue
+        key = ("scan", row["scan_id"]) if row["scan_id"] \
+            else ("at", row["observed_at"])
+        if key not in index:
+            index[key] = len(batches)
+            batches.append((row["observed_at"], []))
+            by_scan_id += 1 if row["scan_id"] else 0
+        batches[index[key]][1].append((row["id"], f))
+    return batches, bad, by_scan_id
+
+
+def _replay_in(live, sql, ids):
+    """Rows of `sql` (one `%s` for the IN list) over `ids`, in chunks under
+    SQLite's bound-parameter ceiling."""
+    ids = list(ids)
+    out = []
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        out.extend(live.execute(sql % ",".join("?" * len(chunk)), chunk))
+    return out
+
+
+def _reobserve_base(f, path, trust):
+    """The UNGRADED severity the sensor that emitted `f` would give `path` at
+    `trust` today, or None when its gate no longer opens and it would not emit
+    the finding at all. Asked of each sensor's own predicates; the four shapes
+    are check_processes, the listener diff, _beacon_from_sightings and
+    _outbound_findings."""
+    category = f.get("category")
+    if category == "process":
+        verdict = _exec_alert(path, trust)
+        return verdict[0] if verdict else None
+    if category == "net-listener":
+        if IS_LINUX:
+            hostile = bool(_exec_alert(path, trust)) or is_risky_location(path)
+        else:
+            hostile = suspicious_sig(trust) and is_risky_location(path)
+        return "HIGH" if hostile else "MEDIUM"
+    if category == "net-beacon":
+        if _is_trusted_prefix(path) or _BEACON_BROWSER_RE.search(path) \
+                or not (suspicious_sig(trust) or is_risky_location(path)):
+            return None
+        return "HIGH"
+    if category == "net-outbound":
+        return "MEDIUM" if _outbound_candidate_trust(path) is not None else None
+    return None
+
+
+def _reobserve_endpoints(f):
+    """The endpoint(s) the emitting sensor graded custody against: a network
+    vouch is endpoint-scoped, so the ladder must be asked the same question."""
+    category, port = f.get("category"), f.get("port")
+    if category == "net-beacon":
+        if f.get("remote"):
+            return ("%s:%s" % (f["remote"], port),)
+        shown = f.get("endpoints") or []
+        return ("%s:%s" % (shown[0], port),) if shown and port else (None,)
+    if category == "net-outbound":
+        return tuple(f.get("endpoints") or ()) or (None,)
+    return (None,)
+
+
+def _reobserve(f, memo, stats):
+    """`f` re-observed with the CURRENT classifier and custody ladder, or None
+    when today's sensor would not emit it; returned as recorded when it is not
+    a binary sensor this can re-derive, or its subject is gone from disk.
+
+    The classifier is asked through classify_signature, logic-versioned cache
+    and all: a classifier change that does not bump _SIGCACHE_LOGIC_VERSION is
+    invisible here exactly as it would be on the live install. Answers are
+    memoized per subject, so a program seen in two hundred scans is asked once."""
+    category = f.get("category")
+    if category not in _REOBSERVE_CATEGORIES:
+        return f
+    path = f.get("path") or f.get("program")
+    if not path or not os.path.exists(path):
+        stats["gone"] += 1
+        return f
+    rotating = str(f["fingerprint"]).startswith("beacon:rotating:")
+    parents = tuple(f.get("ancestry") or ()) if category == "process" else ()
+    endpoints = _reobserve_endpoints(f)
+    key = (category, path, endpoints, parents, rotating)
+    if key not in memo:
+        trust = classify_signature(path)["trust"]
+        base = _reobserve_base(f, path, trust)
+        graded = rung = None
+        if base is not None:
+            sha = memo.get(("sha", path))
+            if sha is None:
+                sha = memo[("sha", path)] = sha256(path)
+            for endpoint in endpoints:
+                sev, got, _note = _grade_binary(
+                    base, path, endpoint=endpoint, sha=sha,
+                    parents=list(parents) or None)
+                if graded is None or SEV_ORDER[sev] > SEV_ORDER[graded]:
+                    graded, rung = sev, got
+            if rotating:
+                graded = _step_down(graded)
+        memo[key] = (trust, graded, rung)
+    trust, graded, rung = memo[key]
+    stats["reobserved"] += 1
+    trust_moved = trust != f.get("trust")
+    stats["trust_changed"] += trust_moved
+    if graded is None:
+        stats["changed"] += trust_moved
+        stats["no_longer_emitted"] += 1
+        return None
+    custody_moved = rung != (f.get("custody") or None)
+    stats["custody_changed"] += custody_moved
+    stats["changed"] += trust_moved or custody_moved
+    stats["severity_changed"] += graded != f["severity"]
+    g = dict(f, trust=trust, custody=rung, severity=graded)
+    if isinstance(g.get("subject"), dict) and "trust" in g["subject"]:
+        g["subject"] = dict(g["subject"], trust=trust)
+    return g
+
+
+def _replay_assay(memory, now):
+    """One row per assay lane. Its findings are captured as the lane's own
+    detectors build them and routed through route_findings and the scratch
+    pipeline exactly like the corpus. A lane that returns a verdict without
+    building a finding is reported as predicate-only, never silently dropped."""
+    import secrets
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+    real_finding = finding
+    rows = []
+    for lane_id, _desc, fn in _assay_lanes():
+        why = _REPLAY_ASSAY_NOT_RUN.get(lane_id)
+        if why:
+            rows.append({"lane": lane_id, "status": "not run", "detail": why})
+            continue
+        built = []
+
+        def capture(*args, _built=built, **kwargs):
+            f = real_finding(*args, **kwargs)
+            _built.append(f)
+            return f
+
+        with _replay_overrides(finding=capture):
+            try:
+                passed = bool(fn(secrets.token_hex(8)))
+            except Exception:
+                passed = False
+        if not passed:
+            rows.append({"lane": lane_id, "status": "FAILED",
+                         "detail": "the control itself failed; run "
+                                   "`aegis.py assay`"})
+            continue
+        if not built:
+            rows.append({"lane": lane_id, "status": "predicate",
+                         "detail": "passes; returns a verdict and builds no "
+                                   "finding, so there is nothing to route"})
+            continue
+        findings = [dict(f) for f in built]
+        routing = route_findings(findings, memory=memory, seen={})
+        told = [f for f in findings
+                if routing[f["fingerprint"]]["route"] == ROUTE_INTERRUPT]
+        scratch = _replay_scratch()
+        try:
+            with scratch:
+                new_events = _record_finding_events(scratch, findings, now,
+                                                    routing)
+                _apply_correlations(scratch, new_events, now,
+                                    initially_notified=bool(told),
+                                    routing=routing)
+            opened = scratch.execute(
+                "SELECT COUNT(*) FROM incidents WHERE status IN (%s)" % marks,
+                _ACTIVE_INCIDENT_STATES).fetchone()[0]
+        finally:
+            scratch.close()
+        top = max(findings, key=lambda f: SEV_ORDER[f["severity"]])
+        detail = "%d finding(s), top %s %s: %s" % (
+            len(findings), top["severity"], top["category"], top["title"])
+        if not (told or opened):
+            detail += " — routed %s" % ", ".join(sorted(
+                {routing[f["fingerprint"]]["why"] for f in findings}))
+        rows.append({"lane": lane_id,
+                     "status": "interrupt" if told or opened else "digest",
+                     "detail": detail})
+    return rows
+
+
+def _backtest_replay(days=30, reobserve=False, now=None):
+    """Everything `backtest replay` reports, as data; cmd_backtest_replay
+    renders it. See the banner above for what is run and what is not."""
+    now = _epoch(now)
+    since = now - int(days) * 86400
+    r = {"days": int(days), "reobserve": None, "problems": []}
+    live = _replay_live_store()
+    if live is None:
+        r["missing"] = EVENT_DB
+        return r
+    try:
+        # One read transaction: every number below, and every assertion made
+        # against the store, comes from the same snapshot while the live
+        # watch keeps writing.
+        live.execute("BEGIN")
+        rows = _replay_load_corpus(live, since)
+        in_store = live.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='observation.finding' "
+            "AND observed_at>=?", (since,)).fetchone()[0]
+        memory = _suppression_memory(live, now)
+        weights = _category_dismissal_weights(live, now)
+        links = {}
+        for row in _replay_in(
+                live, "SELECT event_id, incident_id FROM incident_events "
+                      "WHERE event_id IN (%s)", [row["id"] for row in rows]):
+            links.setdefault(row["event_id"], set()).add(row["incident_id"])
+        incidents = {row["id"]: dict(row) for row in _replay_in(
+            live, "SELECT id, kind, status, resolution, title FROM incidents "
+                  "WHERE id IN (%s)", set().union(*links.values()))}
+        direct_noise = {row[0] for row in live.execute(
+            "SELECT DISTINCT i.id FROM incidents i "
+            "JOIN incident_events ie ON ie.incident_id=i.id "
+            "JOIN events e ON e.id=ie.event_id "
+            "WHERE i.status='FALSE_POSITIVE' "
+            "AND e.event_type='observation.finding' AND e.observed_at>=?",
+            (since,))}
+    finally:
+        live.close()
+    # The learning period is OFF for a replay: inside it every non-attack
+    # signal closes as `learning`, and the baseline would read zero for a
+    # reason that has nothing to do with the code being measured.
+    memory = tuple(memory[:3]) + (False,) + tuple(memory[4:])
+    batches, bad, by_scan_id = _replay_batches(rows)
+    stats = dict.fromkeys(("reobserved", "trust_changed", "custody_changed",
+                           "changed", "severity_changed", "no_longer_emitted",
+                           "gone"), 0)
+    routes, route_of, scratch_of, folded_into, finding_of = {}, {}, {}, {}, {}
+    seen, memo = {}, {}
+    marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
+
+    # The operator's teaching comes from the live store, read once: the
+    # suppression memory rides in on `memory`, the per-category dismissal
+    # weights on this override (the scratch store has no dismissals of its
+    # own). And grading records every rung it awards in the custody ledger,
+    # which a measurement must not do.
+    def live_weights(_db, _now, window=None):
+        return dict(weights)
+
+    def remember_nothing(*_args, **_kwargs):
+        return False
+
+    scratch = _replay_scratch()
+    try:
+        with _replay_overrides(_category_dismissal_weights=live_weights,
+                               _custody_remember=remember_nothing):
+            for batch_now, batch in batches:
+                for live_id, f in batch:
+                    finding_of[live_id] = f
+                if reobserve:
+                    kept = []
+                    for live_id, f in batch:
+                        g = _reobserve(f, memo, stats)
+                        if g is None:
+                            route_of[live_id] = "dropped"
+                            routes.setdefault(f["category"], dict.fromkeys(
+                                _REPLAY_ROUTES, 0))["dropped"] += 1
+                        else:
+                            kept.append((live_id, g))
+                    batch = kept
+                if not batch:
+                    continue
+                findings = [f for _i, f in batch]
+                routing = route_findings(findings, memory=memory, seen=seen)
+                for live_id, f in batch:
+                    fp = f["fingerprint"]
+                    route = routing[fp]["route"]
+                    # emit()'s ledger step: a fingerprint is told once, and a
+                    # repeat inside one batch is already seen.
+                    if route in (ROUTE_DIGEST, ROUTE_INTERRUPT):
+                        if fp in seen:
+                            route = ROUTE_SEEN
+                        else:
+                            seen[fp] = f.get("ts") or batch_now
+                    route_of[live_id] = route
+                    routes.setdefault(f["category"], dict.fromkeys(
+                        _REPLAY_ROUTES, 0))[route] += 1
+                folded = {}
+                with scratch:
+                    new_events = _record_finding_events(
+                        scratch, findings, batch_now, routing, folded=folded)
+                    _apply_correlations(
+                        scratch, new_events, batch_now,
+                        initially_notified=any(
+                            route_of[i] == ROUTE_INTERRUPT for i, _f in batch),
+                        routing=routing)
+                recorded = iter(new_events)
+                for index, (live_id, _f) in enumerate(batch):
+                    if index in folded:
+                        folded_into[live_id] = folded[index]
+                    else:
+                        scratch_of[live_id] = next(recorded)[0]
+            r["assay"] = _replay_assay(memory, now)
+        open_cases = {row["id"]: dict(row) for row in scratch.execute(
+            "SELECT id, kind, severity, title FROM incidents "
+            "WHERE status IN (%s) ORDER BY id" % marks,
+            _ACTIVE_INCIDENT_STATES)}
+        cases_of, events_of = {}, {}
+        for row in scratch.execute(
+                "SELECT incident_id, event_id FROM incident_events"):
+            cases_of.setdefault(row["event_id"], set()).add(row["incident_id"])
+            events_of.setdefault(row["incident_id"], set()).add(row["event_id"])
+    finally:
+        scratch.close()
+
+    def reopens(live_id):
+        """How this finding re-opens under the current code, or None."""
+        if route_of.get(live_id) == ROUTE_INTERRUPT:
+            return "interrupt"
+        cases = set(cases_of.get(scratch_of.get(live_id), ()))
+        if live_id in folded_into:
+            cases.add(folded_into[live_id])
+        for case in sorted(cases):
+            if case in open_cases:
+                return "open %s case" % open_cases[case]["kind"]
+        return None
+
+    noise = {}
+    for live_id in sorted(links):
+        for iid in links[live_id]:
+            info = incidents.get(iid)
+            if info and info["status"] == "FALSE_POSITIVE":
+                noise.setdefault(iid, dict(info, evidence=[]))[
+                    "evidence"].append(live_id)
+    reopened = {}
+    for iid in sorted(noise):
+        for live_id in noise[iid]["evidence"]:
+            how = reopens(live_id)
+            if how:
+                reopened[iid] = {"how": how, "finding": finding_of[live_id]}
+                break
+    noise_events = {ev for info in noise.values() for ev in info["evidence"]}
+    live_of = {s: l for l, s in scratch_of.items()}
+    folded_by_case = {}
+    for live_id, case in folded_into.items():
+        folded_by_case.setdefault(case, set()).add(live_id)
+    new_cases = [case for case in open_cases
+                 if not (({live_of.get(ev) for ev in events_of.get(case, ())}
+                          | folded_by_case.get(case, set())) & noise_events)]
+
+    replayed = sum(len(batch) for _n, batch in batches)
+    routed = sum(n for bucket in routes.values() for n in bucket.values())
+    lanes = len(_assay_lanes())
+    # Rule 17: every number printed is asserted against its source first.
+    problems = r["problems"]
+    if len(rows) != in_store:
+        problems.append("%d finding row(s) loaded but the store holds %d "
+                        "under the same WHERE" % (len(rows), in_store))
+    if replayed + bad != len(rows):
+        problems.append("%d batched + %d unparseable != %d loaded"
+                        % (replayed, bad, len(rows)))
+    if set(noise) != direct_noise:
+        problems.append("the noise set (%d) differs from a direct query of "
+                        "the store (%d): %d missing, %d extra"
+                        % (len(noise), len(direct_noise),
+                           len(direct_noise - set(noise)),
+                           len(set(noise) - direct_noise)))
+    if routed != replayed:
+        problems.append("%d route(s) counted for %d replayed finding(s)"
+                        % (routed, replayed))
+    if not set(reopened) <= set(noise):
+        problems.append("a re-opened incident is not in the noise set")
+    if len(r["assay"]) != lanes:
+        problems.append("%d assay row(s) for %d lane(s)"
+                        % (len(r["assay"]), lanes))
+    r.update(loaded=len(rows), in_store=in_store, unparseable=bad,
+             batches=len(batches), by_scan_id=by_scan_id, memory=memory,
+             weights=weights, routes=routes, open_cases=open_cases,
+             noise=noise, reopened=reopened, new_cases=new_cases,
+             replayed=replayed, lanes=lanes,
+             reobserve=stats if reobserve else None)
+    return r
+
+
+def cmd_backtest_replay(days=30, reobserve=False, now=None):
+    """`backtest replay`: score the CURRENT pipeline against the operator's own
+    noise labels and the assay's positive controls. Read-only."""
+    r = _backtest_replay(days, reobserve, now)
+    if r.get("missing"):
+        print("No event store at %s; nothing to replay." % r["missing"])
+        return 1
+    lines = ["# Aegis backtest replay — last %d days, %d recorded finding "
+             "event%s in %d scan batch%s"
+             % (r["days"], r["loaded"], "" if r["loaded"] == 1 else "s",
+                r["batches"], "" if r["batches"] == 1 else "es"), ""]
+    if r["batches"] and not r["by_scan_id"]:
+        lines.append("  batches: grouped by observed_at (no event carries a "
+                     "scan_id)")
+    if r["unparseable"]:
+        lines.append("  unparseable: %d row(s) lack a field routing needs "
+                     "(%s) and were not replayed"
+                     % (r["unparseable"], ", ".join(_REPLAY_REQUIRED)))
+    tolerance, rotating, disputed, _learning, producer = r["memory"][:5]
+    lines.append("  teaching: live store — %d tolerated identit%s, %d "
+                 "rotating endpoint class(es), %d producer class(es), %d "
+                 "disputed; %d categor%s down-weighted by dismissals; "
+                 "learning period OFF"
+                 % (len(tolerance), "y" if len(tolerance) == 1 else "ies",
+                    len(rotating), len(producer), len(disputed),
+                    len(r["weights"]),
+                    "y" if len(r["weights"]) == 1 else "ies"))
+    stats = r["reobserve"]
+    if stats is not None:
+        lines.append(
+            "  reobserve: %d finding(s) asked again with current code — trust "
+            "changed %d, custody changed %d (trust or custody: %d), severity "
+            "changed %d, no longer emitted %d; %d subject(s) gone from disk, "
+            "replayed as recorded. Re-derivable sensors only (%s)."
+            % (stats["reobserved"], stats["trust_changed"],
+               stats["custody_changed"], stats["changed"],
+               stats["severity_changed"], stats["no_longer_emitted"],
+               stats["gone"], ", ".join(_REOBSERVE_CATEGORIES)))
+    lines.append("")
+    routes = r["routes"]
+    columns = _REPLAY_ROUTES if stats is not None else _REPLAY_ROUTES[:-1]
+    lines.append("Per category — interrupt = the current code would notify:")
+    lines.append("  %-18s %8s " % ("category", "findings")
+                 + " ".join("%9s" % c for c in columns))
+    totals = dict.fromkeys(_REPLAY_ROUTES, 0)
+    for category in sorted(routes, key=lambda c: (-routes[c][ROUTE_INTERRUPT],
+                                                  -sum(routes[c].values()),
+                                                  c)):
+        bucket = routes[category]
+        for c in _REPLAY_ROUTES:
+            totals[c] += bucket[c]
+        lines.append("  %-18s %8d " % (category[:18], sum(bucket.values()))
+                     + " ".join("%9d" % bucket[c] for c in columns))
+    lines.append("  %-18s %8d " % ("total", sum(totals.values()))
+                 + " ".join("%9d" % totals[c] for c in columns))
+    kinds = {}
+    for case in r["open_cases"].values():
+        kinds[case["kind"]] = kinds.get(case["kind"], 0) + 1
+    lines.append("\nCases the replay leaves OPEN: %d%s" % (
+        len(r["open_cases"]), " (%s)" % ", ".join(
+            "%s %d" % (k, kinds[k]) for k in sorted(kinds)) if kinds else ""))
+    lines.append("\nNoise-labelled incidents the current code re-opens "
+                 "(id, closed as, category, title — path, how):")
+    for iid in sorted(r["reopened"]):
+        hit = r["reopened"][iid]
+        f = hit["finding"]
+        label = (r["noise"][iid].get("resolution")
+                 or "false-positive").split(":")[0]
+        lines.append("  #%-5d %-16s %-14s %s — %s · %s" % (
+            iid, label[:16], f["category"][:14], f["title"],
+            f.get("path") or f.get("program") or "-", hit["how"]))
+    if not r["reopened"]:
+        lines.append("  (none)")
+    by_label = {}
+    for iid, info in r["noise"].items():
+        label = (info.get("resolution") or "false-positive").split(":")[0]
+        pair = by_label.setdefault(label, [0, 0])
+        pair[1] += 1
+        pair[0] += iid in r["reopened"]
+    lines.append("")
+    lines.append("noise re-opened: %d of %d" % (len(r["reopened"]),
+                                                len(r["noise"])))
+    if by_label:
+        lines.append("  by label: " + " · ".join(
+            "%s %d/%d" % (label, by_label[label][0], by_label[label][1])
+            for label in sorted(by_label, key=lambda k: -by_label[k][1])))
+    lines.append("new interrupts from corpus: %d  (open cases none of whose "
+                 "evidence carries a noise label)" % len(r["new_cases"]))
+    for case in r["new_cases"]:
+        info = r["open_cases"][case]
+        lines.append("  %-11s %-8s %s" % (info["kind"], info["severity"],
+                                          info["title"]))
+    lines.append("\nAssay recall — %d positive-control lanes, their findings "
+                 "routed through the same gate in a fresh scratch store:"
+                 % r["lanes"])
+    counts = {}
+    for row in r["assay"]:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+        lines.append("  %-22s %-9s %s" % (row["lane"], row["status"],
+                                          row["detail"]))
+    lines.append("assay recall: %d/%d interrupt  (%s)" % (
+        counts.get("interrupt", 0), r["lanes"], ", ".join(
+            "%d %s" % (counts[s], s) for s in sorted(counts)
+            if s != "interrupt") or "every lane interrupts"))
+    lines.append("")
+    if r["problems"]:
+        # At the TOP, not the foot: whoever trusts the first screen must not
+        # have to reach the last line to learn the numbers were wrong.
+        lines.insert(2, "> SELF-CHECK FAILED — do not trust the numbers "
+                        "below: " + "; ".join(r["problems"]))
+        lines.insert(3, "")
+    else:
+        lines.append("_Self-check: %d loaded = %d in the store; %d "
+                     "noise-labelled incident(s) = a direct query; %d "
+                     "replayed finding(s) routed once each; %d/%d assay "
+                     "lanes accounted for._"
+                     % (r["loaded"], r["in_store"], len(r["noise"]),
+                        r["replayed"], len(r["assay"]), r["lanes"]))
+    lines.append("Read-only: the live store was opened mode=ro; nothing was "
+                 "written, notified, or learned.")
+    print("\n".join(lines))
+    return 1 if r["problems"] else 0
+
+
 def cmd_backtest(category=None):
     """Score a detection category against this machine's own dismissal labels.
 
@@ -30597,6 +31218,17 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
   backtest [cat]   score a detection category against this machine's own typed
                    dismissals. REFUSES below 20 labels rather than reporting a
                    precision figure built on noise
+  backtest replay [--days N] [--reobserve]
+                   ground truth: re-run the recorded findings of the last N
+                   days (default 30) through the CURRENT routing, fold,
+                   correlation and incident pipeline in a throwaway store,
+                   with the live tolerance memory and the learning period OFF,
+                   and score it against the incidents you closed as noise
+                   ("noise re-opened: N of M", listed by id) and the assay
+                   lanes ("assay recall: X/21"). --reobserve first re-asks the
+                   signature classifier and custody ladder about every binary
+                   still on disk, so a classifier or ladder fix is scoreable.
+                   Asserts its own counts against the store. Read-only
 """
 
 
@@ -30972,6 +31604,25 @@ def main(argv):
             return 1
         return cmd_rehunt(days)
     if cmd == "backtest":
+        if len(argv) > 2 and argv[2] == "replay":
+            rest, days, reobserve = list(argv[3:]), 30, False
+            try:
+                while rest:
+                    arg = rest.pop(0)
+                    if arg == "--reobserve":
+                        reobserve = True
+                    elif arg == "--days":
+                        days = int(rest.pop(0))
+                    elif arg.startswith("--days="):
+                        days = int(arg.split("=", 1)[1])
+                    else:
+                        raise ValueError(arg)
+                if days < 1:
+                    raise ValueError(days)
+            except (ValueError, IndexError):
+                print("usage: aegis.py backtest replay [--days N] [--reobserve]")
+                return 1
+            return cmd_backtest_replay(days, reobserve)
         return cmd_backtest(argv[2] if len(argv) > 2 else None)
     if cmd == "cauterize":
         return cmd_cauterize(argv[2] if len(argv) > 2 else None,
