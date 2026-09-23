@@ -8881,11 +8881,119 @@ def _obfuscated_payload_signals(argv, idioms):
     return out
 
 
+# The agent harness's own command wrapper. Claude Code runs every command the
+# agent issues as ONE `-c` string (live `ps`, reference Mac, 2026-09-23):
+#
+#   /bin/bash -c source ~/.claude/shell-snapshots/snapshot-bash-<nonce>.sh
+#     2>/dev/null || true && shopt -u extglob 2>/dev/null || true &&
+#     { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; }
+#     >/dev/null 2>&1 || true && eval '<CMD>' < /dev/null &&
+#     pwd -P >| /tmp/claude-<hex>-cwd
+#
+# `eval-subshell` is `eval … $(`, so ANY <CMD> with a command substitution
+# matched on the harness's `eval` (incident #538: a `while … s=$(gh pr checks
+# …)` poll loop), and that same `eval` was the exec half that turned a benign
+# value capture `v=$(curl -s https://…)` into fileless-fetch-exec at HIGH.
+# The sensor was judging the harness, not the command.
+#
+# So the wrapper is unwrapped and <CMD> is judged — with the full ruleset,
+# exactly as the same line typed at a prompt. This is NOT trust of agent
+# hosts: a prompt-injected agent running `curl | bash` is what the sensor
+# exists for, and it still fires. What makes it safe is that the wrapper is
+# matched against a FIXED grammar: every character outside the payload must
+# be one of these clauses, with no shell metacharacter in any free field (a
+# snapshot path or cwd file that could carry `;curl${IFS}…` never matches).
+# Anything the harness does not write means it is not the harness, and the
+# whole argv is judged as before. Only the shapes in the recorded corpus are
+# known: the Claude Code prologue with and without the unalias clause. Codex
+# runs `bash -lc <CMD>` with no eval to unwrap; no Hermes argv is on record.
+_HARNESS_SHELL_RE = re.compile(r"(?:[\w./+-]*/)?(?:bash|zsh|sh) -c ")
+_HARNESS_SNAPSHOT_RE = re.compile(
+    r"source [\w./+-]*/shell-snapshots/snapshot-(?:bash|zsh|sh)-[\w-]+\.sh"
+    r" 2>/dev/null \|\| true && ")
+_HARNESS_OPTIONAL_CLAUSE_RES = (
+    re.compile(r"shopt -u extglob 2>/dev/null \|\| true && "),
+    re.compile(r"\{ \\builtin unalias -- '[\w.:-]+'; \\builtin unset -f -- "
+               r"'[\w.:-]+'; \} >/dev/null(?: 2>&1)?(?: \|\| true)? && "),
+)
+_HARNESS_EPILOGUE_RE = re.compile(
+    r"(?: < /dev/null)?(?: && pwd -P >\| [\w./+-]*/claude-[0-9a-f]+-cwd)?\s*")
+_HARNESS_WRAPPER = "claude-code-snapshot"
+
+
+def _shell_single_quoted(text, i):
+    """(value, end) of the shell word at text[i] built from single-quoted runs
+    joined by the two escapes a quoter emits for an embedded quote — `'"'"'`
+    (Claude Code) and `'\\''` — or None when a run never closes. The word ends
+    at the first character that is neither; the caller decides whether what
+    follows is allowed."""
+    out = []
+    n = len(text)
+    while i < n and text[i] == "'":
+        j = text.find("'", i + 1)
+        if j < 0:
+            return None
+        out.append(text[i + 1:j])
+        i = j + 1
+        if text.startswith("\"'\"", i):
+            out.append("'")
+            i += 3
+        elif text.startswith("\\'", i):
+            out.append("'")
+            i += 2
+    return "".join(out), i
+
+
+def _unwrap_agent_harness(argv):
+    """<CMD> when argv is exactly the Claude Code wrapper around it, else
+    None. One layer; see _agent_harness_payload."""
+    m = _HARNESS_SHELL_RE.match(argv)
+    if not m:
+        return None
+    m = _HARNESS_SNAPSHOT_RE.match(argv, m.end())
+    if not m:
+        return None
+    pos = m.end()
+    for rx in _HARNESS_OPTIONAL_CLAUSE_RES:
+        m = rx.match(argv, pos)
+        while m:
+            pos = m.end()
+            m = rx.match(argv, pos)
+    if not argv.startswith("eval '", pos):
+        return None
+    word = _shell_single_quoted(argv, pos + len("eval "))
+    if word is None or not _HARNESS_EPILOGUE_RE.fullmatch(argv, word[1]):
+        return None
+    return word[0]
+
+
+def _agent_harness_payload(argv):
+    """(text to judge, wrapper name or None).
+
+    Unwrapped to a fixed point, so every helper that judges or displays an
+    argv — _argv_signals, _argv_match_spans, _argv_evidence_preview,
+    _argv_case_identity — sees the same text whichever of them runs first,
+    even for a payload that is itself a harness line. Terminates: each layer
+    is strictly shorter than the one around it."""
+    if not argv or "shell-snapshots/snapshot-" not in argv:
+        return argv, None
+    wrapper = None
+    while True:
+        payload = _unwrap_agent_harness(argv)
+        if payload is None:
+            return argv, wrapper
+        argv, wrapper = payload, _HARNESS_WRAPPER
+
+
 def _argv_signals(argv):
     """Return [(name, severity)] for hostile patterns in a live process's argv
     (empty = clean). Structural signals keep their assigned severity; the shared
     shell idioms notify (HIGH) only as a fetch+exec COMBINATION, else stay MEDIUM;
-    anti-VM gates are MEDIUM corroborators below the notify floor."""
+    anti-VM gates are MEDIUM corroborators below the notify floor.
+
+    An agent-harness wrapper is unwrapped first and the command inside it is
+    what gets judged (_agent_harness_payload)."""
+    argv = _agent_harness_payload(argv)[0]
     if not argv:
         return []
     best = {}
@@ -8940,7 +9048,11 @@ def _argv_match_spans(argv):
     Re-runs the same regexes `_argv_signals` ran and keeps the spans it throws
     away. Deliberately a second pass rather than a changed return contract:
     this runs only for an argv that ALREADY matched — a rare path — while
-    `_argv_signals` is called for every watched process on the box."""
+    `_argv_signals` is called for every watched process on the box.
+
+    Same text `_argv_signals` judged, so for a harness-wrapped argv the spans
+    index the unwrapped payload (_agent_harness_payload), not the argv."""
+    argv = _agent_harness_payload(argv)[0] or ""
     spans = []
     for rx, _name, _sev in _HOSTILE_ARGV_RES:
         m = rx.search(argv)
@@ -8991,8 +9103,13 @@ def _argv_case_identity(argv, length=16):
     acquired tolerance needs, and the same command shape opened a fresh HIGH
     incident forever — #450 and #503 are the same finding twice, minted eight
     days apart under two nonces.
+
+    A harness-wrapped argv is keyed on the command inside the wrapper
+    (_agent_harness_payload), so a verdict attaches to what ran — the
+    wrapper also carries a per-command cwd-file nonce the rules above do not
+    name, which made every wrapped command its own case.
     """
-    flat = argv or ""
+    flat = _agent_harness_payload(argv)[0] or ""
     for rx, repl in _ARGV_NONCE_RES:
         flat = rx.sub(repl, flat)
     flat = _program_subject(flat)
@@ -9019,7 +9136,11 @@ def _argv_evidence_preview(argv, budget=_ARGV_PREVIEW_BUDGET):
     the rule it already followed — only the hostile verdict and the evidence
     that earned it are written, and everything still passes through
     `redact_sensitive` first.
+
+    A harness-wrapped argv previews the command inside the wrapper — what
+    was judged, and what ran; the finding names the wrapper separately.
     """
+    argv = _agent_harness_payload(argv)[0]
     flat = re.sub(r"\s+", " ", argv or "").strip()
     if not flat:
         return ""
@@ -9125,16 +9246,22 @@ def check_behavior():
         # its command line the same way. The fingerprint stays on the hash so
         # identity does not move when the redaction regexes do.
         preview = _argv_evidence_preview(argv)
+        # A harness-wrapped command is judged, previewed and keyed on the
+        # command inside the wrapper; the wrapper itself is not evidence, but
+        # the fact that it was there is, so the operator is told.
+        wrapper = _agent_harness_payload(argv)[1]
+        extra = {"wrapper": wrapper} if wrapper else {}
         findings.append(finding(
             top, "behavior", "Suspicious process behavior",
-            "%s triggered [%s]; command sha256=%s; command: %s" %
-            (base, names, command_sha[:16], preview),
+            "%s triggered [%s]; command sha256=%s; %scommand: %s" %
+            (base, names, command_sha[:16],
+             "wrapper: %s; " % wrapper if wrapper else "", preview),
             fp, case_fingerprint="behavior:%s:%s:%s" % (
                 base, "|".join(sorted(n for n, _ in signals)),
                 _argv_case_identity(argv)),
             program=argv.split(None, 1)[0] if argv else "",
             pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha,
-            command_preview=preview))
+            command_preview=preview, **extra))
     _annotate_ancestry(findings)
     return findings
 
