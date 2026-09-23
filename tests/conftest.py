@@ -53,6 +53,15 @@ _REAL_STATE = os.path.join(os.path.expanduser("~"), ".aegis")
 # rather than becoming a silently-tolerated leak.
 REAL_RUN_LOG_WRITES = []
 REAL_ANCHOR_WRITES = []
+# The custody ledger (~/.aegis/custody.jsonl) is written by `_custody_remember`
+# with a raw os.open, so none of the wrappers below saw it. Found 2026-09-23:
+# test_provenance_tier's FamiliesAreTheAdjudicationSurface accepts a verdict
+# through `_accept_into_baseline`, which re-diffs the REAL LaunchAgents, and
+# with persistence payloads graded by `_custody_payload` that appended a real
+# `local-commit` row for ~/Ai/Universe/tools/aikit/schedule/run.py to the
+# operator's ledger. TestWritEnforcementIsActuallyWired runs a real
+# `gather_all` and reached the same writer 45 times through `_grade_binary`.
+REAL_CUSTODY_WRITES = []
 
 
 def _targets_real_state(path):
@@ -96,6 +105,7 @@ def _forbid_real_state_writes():
     real_ensure = aegis.ensure_state
     real_log_run = aegis.log_run
     real_emit_anchor = aegis._notary_emit_anchor
+    real_custody_remember = aegis._custody_remember
     leaked = []
 
     def _refuse(what, path):
@@ -137,6 +147,17 @@ def _forbid_real_state_writes():
         REAL_ANCHOR_WRITES.append((seq, head))
         return "absent"
 
+    def guarded_custody_remember(sha, rung, path):
+        # Refused and recorded rather than raised, like the notary anchor:
+        # the callers are grading paths that treat a failed write as "no
+        # rung remembered", and several scan-level tests reach this through
+        # real sensors they cannot sandbox one global at a time. What must
+        # never happen is the append; the session-end line keeps it visible.
+        if _targets_real_state(aegis.CUSTODY_FILE):
+            REAL_CUSTODY_WRITES.append((rung, path))
+            return False
+        return real_custody_remember(sha, rung, path)
+
     def guarded_log_run(msg):
         # Ask where the write would ACTUALLY land, not where the RUN_LOG
         # constant points: aegis.log_run resolves its path against the current
@@ -164,6 +185,7 @@ def _forbid_real_state_writes():
     aegis.ensure_state = guarded_ensure
     aegis.log_run = guarded_log_run
     aegis._notary_emit_anchor = guarded_emit_anchor
+    aegis._custody_remember = guarded_custody_remember
     try:
         yield leaked
     finally:
@@ -172,6 +194,7 @@ def _forbid_real_state_writes():
         aegis.ensure_state = real_ensure
         aegis.log_run = real_log_run
         aegis._notary_emit_anchor = real_emit_anchor
+        aegis._custody_remember = real_custody_remember
 
 IS_MAC = sys.platform == "darwin"
 
@@ -430,6 +453,13 @@ def pytest_sessionfinish(session, exitstatus):
             "\n%d notary OS-log anchor(s) from sandboxed chains were "
             "suppressed. Writing them pollutes the machine's real "
             "tamper-evidence record.\n" % len(REAL_ANCHOR_WRITES))
+    if REAL_CUSTODY_WRITES:
+        sys.stderr.write(
+            "\n%d custody-ledger write(s) aimed at the REAL "
+            "~/.aegis/custody.jsonl were REFUSED by tests/conftest.py. "
+            "Sandbox aegis.CUSTODY_FILE in the offending test's setUp. "
+            "First: %s\n" % (len(REAL_CUSTODY_WRITES),
+                              REAL_CUSTODY_WRITES[0]))
     if REAL_RUN_LOG_WRITES:
         n = len(REAL_RUN_LOG_WRITES)
         sys.stderr.write(

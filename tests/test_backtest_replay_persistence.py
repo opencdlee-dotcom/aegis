@@ -130,16 +130,29 @@ class APayloadWhoseCustodyIsNowProvenIsDemoted(PersistenceReplay):
                 "args_sha256": "b" * 64, "env": None, "run_at_load": True,
                 "script_target": PAYLOAD, "target_sha": target_sha}
 
-    def recorded(self):
+    def recorded(self, per_job):
+        """The finding the sensor records for the rewrite. `per_job` is the
+        shape it recorded before a payload's rewrite became one case per
+        payload (2026-09-23): one CHANGED finding keyed on the plist, whose
+        line names the payload — the shape the live corpus holds. Otherwise
+        the payload case itself, keyed on the payload and naming its jobs."""
         self.stub("_git_provenance", lambda path: None)
-        f = aegis.check_persistence({PLIST: self.job("0" * 64)},
-                                    {PLIST: self.job("1" * 64)})
+        real = aegis._payload_update
+        if per_job:
+            aegis._payload_update = lambda *args: None
+        try:
+            f = aegis.check_persistence({PLIST: self.job("0" * 64)},
+                                        {PLIST: self.job("1" * 64)})
+        finally:
+            aegis._payload_update = real
         self.assertEqual(1, len(f))
         self.assertEqual(("HIGH", None), (f[0]["severity"], f[0]["custody"]))
+        self.assertEqual(not per_job, f[0]["fingerprint"].startswith(
+            "persistence:payload-update:"))
         return f[0]
 
-    def check(self, baseline):
-        inc = self.record(self.recorded())
+    def check(self, baseline, per_job=True):
+        inc = self.record(self.recorded(per_job))
         self.live({PLIST: self.job("1" * 64)}, baseline)
         self.assertEqual([inc], sorted(aegis._backtest_replay(now=NOW)["reopened"]))
         asked = []
@@ -152,6 +165,7 @@ class APayloadWhoseCustodyIsNowProvenIsDemoted(PersistenceReplay):
         r = aegis._backtest_replay(now=NOW, reobserve=True)
         stats = r["reobserve"]
         self.assertIn(PAYLOAD, asked)
+        self.assertEqual({}, stats["not_rederivable"])
         self.assertEqual(1, stats["reobserved"])
         self.assertEqual(1, stats["custody_changed"])
         self.assertEqual(1, stats["severity_changed"])
@@ -160,21 +174,34 @@ class APayloadWhoseCustodyIsNowProvenIsDemoted(PersistenceReplay):
         self.assertIn("HIGH/- -> LOW/self-committed: 1", self.printed())
 
     def test_rebuilt_from_the_record_alone(self):
+        """The current sensor answers a per-job rewrite with the payload
+        case; that case, naming this job and the recorded bytes, IS the
+        record re-derived."""
         self.check(None)
 
     def test_with_the_old_side_still_in_the_baseline(self):
         self.check({PLIST: self.job("0" * 64)})
 
-    def test_a_payload_that_moved_on_is_not_regraded(self):
+    def test_a_recorded_payload_case_is_rebuilt_on_the_jobs_it_names(self):
+        self.check(None, per_job=False)
+
+    def moved_on(self, per_job):
         """The script was rewritten again after the record: its custody now
         describes other bytes, so the record is replayed as it stands."""
-        inc = self.record(self.recorded())
+        inc = self.record(self.recorded(per_job))
         self.live({PLIST: self.job("2" * 64)})
         self.stub("_git_provenance", lambda path: "self-committed")
         r = aegis._backtest_replay(now=NOW, reobserve=True)
         self.assertEqual(0, r["reobserve"]["reobserved"])
-        self.assertEqual(1, sum(r["reobserve"]["not_rederivable"].values()))
+        self.assertEqual({aegis._REPLAY_MOVED_ON: 1},
+                         r["reobserve"]["not_rederivable"])
         self.assertEqual([inc], sorted(r["reopened"]))
+
+    def test_a_payload_that_moved_on_is_not_regraded(self):
+        self.moved_on(per_job=True)
+
+    def test_a_payload_case_whose_payload_moved_on_is_not_regraded(self):
+        self.moved_on(per_job=False)
 
 
 class ARecordThatCannotBeRebuiltIsCountedNotGuessed(PersistenceReplay):
