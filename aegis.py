@@ -2509,8 +2509,17 @@ def warm_signature_cache(paths):
         if stat_sig is None:
             continue  # missing/unreadable — classify_signature reports it
         cached = _sigcache.get(p)
-        if cached and cached.get("stat") == stat_sig:
-            continue  # already known and still current
+        # Both halves, the way classify_signature reads an entry: the stat
+        # says the bytes are unchanged, the version stamp says the verdict
+        # still MEANS what the current logic means. This checked only the
+        # stat, so after a logic bump every still-current v2 entry was
+        # skipped here and then re-probed one PowerShell start-up at a time
+        # by the per-path fallback -- the exact cost this batch exists to
+        # amortize, paid once per stale entry on the first scan after an
+        # upgrade (found while bumping to v3, 2026-09-22).
+        if (cached and cached.get("stat") == stat_sig
+                and cached.get("v") == _SIGCACHE_LOGIC_VERSION):
+            continue  # already known, still current, same logic
         pending[p] = stat_sig
     if not pending:
         return 0

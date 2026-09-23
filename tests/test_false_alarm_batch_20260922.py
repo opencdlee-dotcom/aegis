@@ -486,6 +486,60 @@ def _git_question(cmd):
     raise AssertionError("not a custody question: %r" % (args,))
 
 
+class A1bThePrefetchHonoursTheLogicVersion(unittest.TestCase):
+    """The Windows batch prefetch skipped any entry whose stat still matched,
+    without reading the version stamp. After a logic bump that turned the
+    prefetch into one PowerShell start-up per stale entry -- the per-path
+    fallback re-probed each one -- which is the exact cost the batch exists
+    to amortize. Found while bumping to v3 for Fact A."""
+
+    def setUp(self):
+        self._saved = (aegis.run, aegis._sigcache, aegis.IS_WIN, aegis.IS_MAC,
+                       aegis.IS_LINUX, aegis._sig_stat)
+        aegis.IS_WIN, aegis.IS_MAC, aegis.IS_LINUX = True, False, False
+        aegis._sigcache = {}
+        aegis._sig_stat = lambda p: "stat:" + p
+        self.calls = []
+
+        def _run(cmd, timeout=15, extra_env=None):
+            self.calls.append(extra_env or {})
+            env = extra_env or {}
+            return ("".join("%s\tNotSigned\t\n" % p
+                            for p in env.get("AEGIS_SIG_PATHS", "").split("\n")),
+                    "", 0)
+        aegis.run = _run
+
+    def tearDown(self):
+        (aegis.run, aegis._sigcache, aegis.IS_WIN, aegis.IS_MAC,
+         aegis.IS_LINUX, aegis._sig_stat) = self._saved
+
+    def _entry(self, path, version):
+        return {"stat": "stat:" + path,
+                "result": {"trust": "unsigned", "team": None,
+                           "authority": None},
+                "v": version}
+
+    def test_a_stale_version_is_re_probed_in_the_batch(self):
+        p = "C:\\a\\stale.exe"
+        aegis._sigcache[p] = self._entry(p, aegis._SIGCACHE_LOGIC_VERSION - 1)
+        self.assertEqual(1, aegis.warm_signature_cache([p]))
+        self.assertEqual(1, len(self.calls), "one start-up, in the batch")
+        self.assertEqual(aegis._SIGCACHE_LOGIC_VERSION,
+                         aegis._sigcache[p]["v"])
+
+    def test_a_current_entry_is_still_skipped(self):
+        p = "C:\\a\\current.exe"
+        aegis._sigcache[p] = self._entry(p, aegis._SIGCACHE_LOGIC_VERSION)
+        self.assertEqual(0, aegis.warm_signature_cache([p]))
+        self.assertEqual([], self.calls)
+
+    def test_a_changed_stat_is_still_re_probed(self):
+        p = "C:\\a\\moved.exe"
+        aegis._sigcache[p] = self._entry(p, aegis._SIGCACHE_LOGIC_VERSION)
+        aegis._sigcache[p]["stat"] = "stat:elsewhere"
+        self.assertEqual(1, aegis.warm_signature_cache([p]))
+
+
 class B1AWorktreeIsStillTheRepo(Sandbox):
     """"Does this machine commit here?" is a question about the REPOSITORY,
     and a timed-out git is not an answer to it.
