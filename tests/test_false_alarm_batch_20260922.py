@@ -167,6 +167,19 @@ Counted by fact rather than by row, the 14 were six things.
       (#525) was a throwaway test binary, deleted since; nothing could close
       its incident before age-out.
 
+      The finding is an event keyed on path and bytes. When the file is
+      deleted the sensor simply stops emitting, and that silence reaches
+      none of the evidence-driven exits: no new evidence for the re-grade
+      exit, no signature verdict for the re-verify exit, no state for the
+      cleared-state exit. `_close_removed_drop_incidents` asks the one
+      question a drop has an answer to -- is the file still there? -- and
+      closes RESOLVED (the finding was right; the exposure ended), with no
+      dismissals row. Gone means gone, not unreadable: the path must not
+      exist AND its folder must be listable, so an unmounted or unreadable
+      folder is not read as absence. The sensor-ran guard holds, a case
+      re-asserted this scan is the re-grade exit's, and the reattach path
+      reopens the case if the same bytes land again.
+
   E   The behavior identity redesign of 2026-09-19 (its D6) orphaned its own
       open case: #503 is keyed on a raw-argv hash that no future finding can
       re-emit.
@@ -1344,6 +1357,125 @@ class CAHelperBesideAVouchedBinaryNamesTheVouch(unittest.TestCase):
     def test_no_vouches_no_note(self):
         self.assertIsNone(aegis._vouch_beside(self.worker))
         self.assertIsNone(aegis._vouch_neighbour_note(""))
+
+
+class DAHotDirDropWhoseFileIsGoneCloses(Sandbox):
+    """The exit a deleted drop needs. record_security_state is driven with
+    hand-built hot-dir findings and sensor health, so what is under test is
+    the closer's reading of the filesystem against its own evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.hot, "qtest_local")
+        with open(self.path, "wb") as fh:
+            fh.write(b"\xcf\xfa\xed\xfe fixture bytes")
+        self.sha = aegis.sha256(self.path)
+
+    def _drop(self, path=None, sha=None):
+        path, sha = path or self.path, sha or self.sha
+        return aegis.finding(
+            "HIGH", "hot-dir", "Unsigned executable in watched folder",
+            "%s [adhoc], modified 2026-09-20, NO quarantine flag" % path,
+            "hotdir:%s:adhoc:%s" % (path, sha), path=path, trust="adhoc",
+            sha256=sha, sensor_id="hot-dir")
+
+    def _row(self, f):
+        db = aegis._event_connection()
+        try:
+            r = db.execute("SELECT * FROM incidents WHERE correlation_key=?",
+                           ("signal:" + f["fingerprint"],)).fetchone()
+            return dict(r) if r else None
+        finally:
+            db.close()
+
+    def _dismissals(self):
+        db = aegis._event_connection()
+        try:
+            return db.execute("SELECT COUNT(*) FROM dismissals").fetchone()[0]
+        finally:
+            db.close()
+
+    def _open(self, f):
+        aegis.record_security_state([f], sensor_health=_health("hot-dir"),
+                                    now=T0)
+        self.assertEqual("OPEN", self._row(f)["status"], "fixture did not open")
+
+    def _rescan(self, sensor="hot-dir", status="OK", findings=(), at=T0 + 600):
+        aegis.record_security_state(list(findings),
+                                    sensor_health=_health(sensor, status),
+                                    now=at)
+
+    # ---- the exit ------------------------------------------------------------
+
+    def test_a_deleted_drop_closes_resolved(self):
+        f = self._drop()
+        self._open(f)
+        os.remove(self.path)
+        self._rescan()
+        row = self._row(f)
+        # BEFORE: OPEN, with no exit but the age-out clock. Live: #525.
+        self.assertEqual("RESOLVED", row["status"],
+                         "a drop whose file is gone had no exit")
+        self.assertIn("file gone", row["resolution"] or "")
+        self.assertIn(self.path, row["resolution"] or "")
+        self.assertEqual(0, self._dismissals(),
+                         "a machine exit must never write a verdict")
+
+    def test_the_same_bytes_dropped_again_reopen_it(self):
+        f = self._drop()
+        self._open(f)
+        os.remove(self.path)
+        self._rescan()
+        self.assertEqual("RESOLVED", self._row(f)["status"])
+        with open(self.path, "wb") as fh:
+            fh.write(b"\xcf\xfa\xed\xfe fixture bytes")
+        self._rescan(findings=[self._drop()], at=T0 + 1200)
+        self.assertEqual("OPEN", self._row(f)["status"],
+                         "the exit must be reversible by new evidence")
+
+    # ---- what does not close ---------------------------------------------------
+
+    def test_a_file_still_there_stays_open(self):
+        """The sensor going quiet (the 14-day window closing) is not the
+        file going away."""
+        f = self._drop()
+        self._open(f)
+        self._rescan()
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_failed_sensor_leaves_it_standing(self):
+        f = self._drop()
+        self._open(f)
+        os.remove(self.path)
+        self._rescan(status="FAILED")
+        self.assertEqual("OPEN", self._row(f)["status"],
+                         "a sensor that did not answer was read as absence")
+        self._rescan(sensor="process", at=T0 + 1200)
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_an_unreadable_folder_is_not_absence(self):
+        f = self._drop()
+        self._open(f)
+        shutil.rmtree(self.hot)
+        self._rescan()
+        self.assertEqual("OPEN", self._row(f)["status"],
+                         "a folder that cannot be listed says nothing about "
+                         "the file")
+
+    def test_re_asserted_this_scan_is_left_to_the_regrade_exit(self):
+        f = self._drop()
+        self._open(f)
+        os.remove(self.path)
+        self._rescan(findings=[self._drop()])
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_critical_drop_is_never_machine_closed(self):
+        f = self._drop()
+        f["severity"] = "CRITICAL"
+        self._open(f)
+        os.remove(self.path)
+        self._rescan()
+        self.assertEqual("OPEN", self._row(f)["status"])
 
 
 if __name__ == "__main__":

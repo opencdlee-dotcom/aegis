@@ -5648,6 +5648,84 @@ def _close_reverified_incidents(db, observed, now):
     return len(closed)
 
 
+def _close_removed_drop_incidents(db, observed, now):
+    """Close OPEN hot-dir incidents whose file is gone.
+
+    A hot-dir finding is an event -- an executable appeared in a watched
+    folder -- keyed on the path and the bytes, and it had no exit but the
+    age-out clock. The sensor stops emitting the moment the file is deleted
+    (or fourteen days after it was modified, whichever comes first), and that
+    silence reaches none of the evidence-driven exits: no new evidence, so
+    the re-grade exit never reads it; not a signature verdict, so the
+    re-verify exit never re-asks; not a state, so the cleared-state exit
+    never looks. Live: `/tmp/qtest_local` (#525) was a throwaway test binary,
+    ad-hoc signed and side-loaded, deleted the same day, and its incident sat
+    OPEN at HIGH for a file that no longer existed.
+
+    So this asks the one question a drop has an answer to: is the file still
+    there? RESOLVED, not FALSE_POSITIVE, exactly as the cleared-state exit
+    files a posture that ended: the finding was right when it was made -- an
+    unsigned executable did land there -- and the exposure it described is
+    over. Filing it as a misdetection would teach the precision ledger a lie.
+    No dismissals row, for the same reason every machine exit writes none.
+
+    Gone means gone, not unreadable. The path must not exist AND its folder
+    must be listable by this process: a folder that cannot be read (a
+    permission revoked, a volume unmounted) says nothing about the file, and
+    reading that as absence is how a dead sensor renders green. The
+    sensor-ran guard holds too, for the reason it does everywhere else. A
+    case the sensor re-asserted this scan is the re-grade exit's. A file the
+    operator quarantined is gone by this reading, which is right: quarantine
+    is the exposure ending by hand. The reattach path reopens the case on new
+    evidence, so the same bytes dropped again at the same path are the same
+    case, back.
+    """
+    rows = db.execute(
+        "SELECT id, correlation_key FROM incidents WHERE status='OPEN' "
+        "AND kind='signal' AND severity<>'CRITICAL' "
+        "AND correlation_key LIKE 'signal:hotdir:%'").fetchall()
+    closed = []
+    for row in rows:
+        fp = (row["correlation_key"] or "")[len("signal:"):]
+        if fp in observed:
+            continue          # still there this scan
+        evidence = _latest_incident_evidence(db, row["id"])
+        if evidence is None:
+            continue
+        if (evidence.get("fingerprint") in observed
+                or evidence.get("case_fingerprint") in observed):
+            continue          # re-asserted this scan: the re-grade exit's
+        path = evidence.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        sensor = db.execute(
+            "SELECT e.source FROM events e JOIN incident_events ie "
+            "ON ie.event_id=e.id WHERE ie.incident_id=? "
+            "ORDER BY e.id DESC LIMIT 1", (row["id"],)).fetchone()
+        if not sensor or not sensor["source"]:
+            continue          # cannot prove who owned it -- leave it standing
+        ok = db.execute(
+            "SELECT 1 FROM sensor_status WHERE sensor_id=? AND status='OK' "
+            "AND last_ok_at>=?", (sensor["source"], now)).fetchone()
+        if not ok:
+            continue          # the sensor did not answer this scan
+        if os.path.lexists(path):
+            continue          # still there
+        try:
+            os.listdir(os.path.dirname(path) or os.sep)
+        except OSError:
+            continue          # the folder cannot be read: not absence
+        closed.append((row["id"], path))
+    for incident_id, path in closed:
+        db.execute(
+            "UPDATE incidents SET status='RESOLVED',resolution=?,"
+            "updated_at=?,last_seen=?,next_reminder_at=NULL "
+            "WHERE id=? AND status='OPEN'",
+            ("file gone: %s no longer exists in its watched folder "
+             "(reopens on new evidence)" % path, now, now, incident_id))
+    return len(closed)
+
+
 def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
     """Close OPEN incidents that stopped producing evidence, and say so.
 
@@ -6255,17 +6333,23 @@ def record_security_state(findings, sensor_health=(), now=None,
                     log_run("closed %d cleared state incident(s)" % cleared)
             except Exception as e:
                 log_run("state-clear close skipped: %s" % e)
+            # Both identities: a case the sensor re-asserted this scan may
+            # be keyed on either, and it is the re-grade exit's to judge.
+            asserted = {fp for f in findings
+                        for fp in (f.get("fingerprint"),
+                                   f.get("case_fingerprint")) if fp}
             try:
-                # Both identities: a case the sensor re-asserted this scan may
-                # be keyed on either, and it is the re-grade exit's to judge.
-                reverified = _close_reverified_incidents(
-                    db, {fp for f in findings
-                         for fp in (f.get("fingerprint"),
-                                    f.get("case_fingerprint")) if fp}, now)
+                reverified = _close_reverified_incidents(db, asserted, now)
                 if reverified:
                     log_run("closed %d re-verified incident(s)" % reverified)
             except Exception as e:
                 log_run("re-verify close skipped: %s" % e)
+            try:
+                removed = _close_removed_drop_incidents(db, asserted, now)
+                if removed:
+                    log_run("closed %d removed-file incident(s)" % removed)
+            except Exception as e:
+                log_run("removed-file close skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
