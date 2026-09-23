@@ -1394,11 +1394,14 @@ class DAHotDirDropWhoseFileIsGoneCloses(Sandbox):
 
     def _drop(self, path=None, sha=None):
         path, sha = path or self.path, sha or self.sha
+        # _untrusted(): the verdict that qualifies on the running body, not
+        # macOS's spelling of it (tests/test_cross_platform.py's guard).
         return aegis.finding(
             "HIGH", "hot-dir", "Unsigned executable in watched folder",
-            "%s [adhoc], modified 2026-09-20, NO quarantine flag" % path,
-            "hotdir:%s:adhoc:%s" % (path, sha), path=path, trust="adhoc",
-            sha256=sha, sensor_id="hot-dir")
+            "%s [%s], modified 2026-09-20, NO quarantine flag"
+            % (path, _untrusted()),
+            "hotdir:%s:%s:%s" % (path, _untrusted(), sha), path=path,
+            trust=_untrusted(), sha256=sha, sensor_id="hot-dir")
 
     def _row(self, f):
         db = aegis._event_connection()
