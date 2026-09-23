@@ -6489,6 +6489,64 @@ def _retire_unjoinable_chain_incidents(db, now):
     return retired
 
 
+# FROZEN recognizer for the 2026-09-23 payload-case migration: the first
+# detail line check_persistence wrote for a change confined to a payload's
+# bytes, `<label>: payload <path> bytes <old12> -> <new12>` and nothing else.
+# Any other part of a change (program, args, env) is joined on with "; " and
+# the anchors refuse it.
+_MIG_PAYLOAD_ONLY_DETAIL_RE = re.compile(
+    r"^.*?: payload (.+) bytes [0-9a-f?]{1,12} -> [0-9a-f?]{1,12}$")
+
+
+def _fold_payload_update_cases(db, now):
+    """One-time: fold the per-job incidents about one payload's bytes into
+    the one case per payload that check_persistence now mints.
+
+    Before the 2026-09-23 payload case, a rewrite of a script several jobs
+    run was one incident per referring plist -- #383 and #392-#397 were one
+    edit to aikit's run.py. The forward fix changes which key a NEW incident
+    is minted under and does nothing for the rows already open, so they are
+    folded here: the newest is re-keyed to `persistence:payload-update:<path>`
+    and inherits every sibling's evidence, and the siblings close as
+    superseded. Folding rather than retiring, unlike the OS-program
+    migration, because the new case IS about the same fact -- the payload
+    and its bytes are in the evidence, so nothing is guessed.
+
+    Matched on EVIDENCE, never on key shape: `changed:<plist>` is still the
+    live key for every change that is not payload-only. An incident folds only
+    when its newest evidence is a payload-only detail naming the same path as
+    its recorded script_target, on the plist its key names. Incidents created
+    in the scan that runs the migration are out of scope by construction, and
+    adjudicated rows are never touched.
+    """
+    groups = {}
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE "
+            "'signal:persistence:changed:%' AND created_at < ? ORDER BY id",
+            (now,)).fetchall():
+        key = _MIG_PERSIST_CHANGED_CASE_RE.match(row["correlation_key"] or "")
+        if not key:
+            continue
+        ev = _mig_latest_event(db, row["id"])
+        head = str(ev.get("detail") or "").split("\n", 1)[0]
+        hit = _MIG_PAYLOAD_ONLY_DETAIL_RE.match(head)
+        if not hit or hit.group(1) != ev.get("script_target"):
+            continue
+        if ev.get("path") not in (None, key.group(1)):
+            continue
+        groups.setdefault(hit.group(1), []).append(row["id"])
+    folded = 0
+    for payload, ids in sorted(groups.items()):
+        folded += _fold_incidents(
+            db, now, "signal:persistence:payload-update:%s" % payload, ids,
+            "superseded: a change to a payload script's BYTES is now one case "
+            "per payload, not one per persistence item that runs it — one "
+            "edit to a shared run.py minted seven HIGH incidents. Folded into "
+            "the payload's case with its evidence")
+    return folded
+
+
 _STORE_MIGRATIONS = (
     ("exec_identity_migrated", _retire_legacy_exec_incidents,
      "retired %d incident(s) keyed on the old positional exec identity"),
@@ -6515,6 +6573,12 @@ _STORE_MIGRATIONS = (
     # ones they would not have formed receive nothing that could close them.
     ("chain_legs_20260923", _retire_unjoinable_chain_incidents,
      "retired %d chain incident(s) the current join rules would not form"),
+    # The 2026-09-23 payload case: a change confined to a payload script's
+    # bytes is one case per payload, and the per-job cases minted before it
+    # fold into it, evidence and all.
+    ("persistence_payload_case_20260923", _fold_payload_update_cases,
+     "folded %d per-job persistence incident(s) into one case per rewritten "
+     "payload"),
 )
 
 
@@ -8097,10 +8161,51 @@ def _os_program_update(old, rec, prog_changed,
     return program
 
 
+def _payload_update(old, rec, prog_changed, env_changed, args_changed,
+                    target_changed, attack_defined):
+    """The payload path when this persistence change is confined to the bytes
+    of the script the job runs.
+
+    The payload twin of _os_program_update, for the same reason. On
+    2026-09-10 one edit to ~/Ai/Universe/tools/aikit/schedule/run.py
+    (4a1646366adf -> 25ee9a4593c2) minted seven HIGH incidents, #383 and
+    #392-#397 -- one per `com.aikit.*` plist that runs it, each keyed on the
+    referring PLIST, none of them about the plist, which was untouched. The
+    fact was one script's bytes; the plists were where it was seen.
+
+    Every conjunct is load-bearing:
+
+      confined to payload bytes   a program, argv or env change alongside is
+                                  a repointed or injected job -- the attack
+                                  this sensor exists for -- and keeps its own
+                                  per-job case.
+      same payload PATH           a job told to run a DIFFERENT script is a
+                                  config edit, not a rewrite of this one.
+      not attack-defined          a hostile argv or a loader-injection env on
+                                  the job is never folded, so the payload's
+                                  custody can never be what quiets it.
+
+    Unlike the OS case this makes no severity claim of its own: the payload's
+    custody, asked once for all the jobs, is the only thing that may demote
+    it.
+    """
+    if not target_changed or attack_defined:
+        return None
+    if prog_changed or env_changed or args_changed:
+        return None
+    payload = rec.get("script_target")
+    if not payload or payload != old.get("script_target"):
+        return None
+    return payload
+
+
 def check_persistence(baseline_snap, current_snap):
     findings = []
     # (program, new_sha) -> [labels of the jobs that reference it]
     os_updates = {}
+    # (payload, new_sha) -> [(path, old, rec, severity)] of the jobs whose
+    # only change is that payload's bytes
+    payload_updates = {}
     base = baseline_snap or {}
     for path, rec in current_snap.items():
         if path not in base:
@@ -8118,10 +8223,17 @@ def check_persistence(baseline_snap, current_snap):
                     "persistence", path, op="new", content=rec.get("sha256"),
                     program_sha=rec.get("sha256"), trust=rec.get("trust"),
                     target=_script_target(rec.get("args"),
-                                          rec.get("program"))),
+                                          rec.get("program")),
+                    target_sha=rec.get("target_sha")),
                 path=path, program=rec.get("program"), trust=rec.get("trust"),
                 script_target=_script_target(rec.get("args"),
                                              rec.get("program")),
+                # The bytes of both halves of what the job executes, as the
+                # snapshot hashed them -- the pair a CHANGED diff compares.
+                # The recorded evidence named neither, so a NEW finding read
+                # back from the store could not say which producer it was.
+                program_sha=rec.get("sha256"),
+                target_sha=rec.get("target_sha"),
                 run_at_load=rec.get("run_at_load")))
         else:
             old = base[path]
@@ -8173,6 +8285,17 @@ def check_persistence(baseline_snap, current_snap):
                 # payload can never be quieted by proving who moved it.
                 attack_defined = _env_attack_defined(rec.get("env")) \
                     or _hostile_args(rec.get("args"), rec.get("program"))
+                # One payload rewritten is ONE fact, however many jobs run
+                # it: collected here, graded once after the loop, keyed on
+                # the payload. See _payload_update.
+                payload = _payload_update(
+                    old, rec, prog_changed, env_changed, args_changed,
+                    target_changed, attack_defined)
+                if payload:
+                    payload_updates.setdefault(
+                        (payload, rec.get("target_sha")), []).append(
+                            (path, old, rec, sev))
+                    continue
                 prov = (None if attack_defined
                         else _custody_persistence(old, rec)
                         or (_custody(path, rec.get("sha256"))[0]
@@ -8182,8 +8305,11 @@ def check_persistence(baseline_snap, current_snap):
                 # so grading only `path` can never see who did it and every
                 # payload update reads as a swap. Ask the ledger about the
                 # payload that actually changed. Same rung, same demote-only
-                # ladder, same attack-defined refusal above.
-                if prov is None and target_changed:
+                # ladder, same attack-defined refusal above -- asked here too,
+                # or a DYLD-injected job whose payload is committed would
+                # record custody=self-committed on an attack-defined finding
+                # that the grader downstream cannot tell apart.
+                if prov is None and target_changed and not attack_defined:
                     tgt = rec.get("script_target") or _script_target(
                         rec.get("args"), rec.get("program"))
                     if tgt and rec.get("target_sha") and _intent_worthy(tgt):
@@ -8244,6 +8370,39 @@ def check_persistence(baseline_snap, current_snap):
             path=program, program=program, trust="apple",
             custody="os-vendor",
             referrer_count=len(labels), referrers=sorted(labels)))
+    # One finding per rewritten payload, carrying every job that runs it, so
+    # the operator adjudicates the edit once. Custody is asked ONCE, about
+    # the payload: seven jobs sharing run.py asked git seven times a scan,
+    # and every probe that timed out re-minted a case at HIGH. Severity is
+    # the worst any job scores (each already floored at HIGH, exactly as a
+    # single job's is) before the payload's rung demotes it. The signal key
+    # carries the new sha, so the NEXT edit is a new finding rather than a
+    # silenced recurrence.
+    for (payload, sha), jobs in sorted(payload_updates.items()):
+        jobs.sort(key=lambda job: job[0])
+        worst = max(jobs, key=lambda job: SEV_ORDER[job[3]])
+        prov, note = _custody_payload(payload, sha)
+        labels = sorted(str(rec.get("label") or path)
+                        for path, _old, rec, _sev in jobs)
+        olds = sorted({(old.get("target_sha") or "?")[:12]
+                       for _path, old, _rec, _sev in jobs})
+        detail = ("payload %s bytes %s -> %s; %d persistence item(s) run it: "
+                  "%s" % (payload, ",".join(olds), sha[:12], len(labels),
+                          ", ".join(labels[:12])
+                          + (" …" if len(labels) > 12 else "")))
+        if note:
+            detail = "%s\n%s" % (detail, note)
+        findings.append(finding(
+            _demote(worst[3], prov), "persistence",
+            "Persistence item CHANGED", detail,
+            "persistence:payload-update:%s:%s" % (payload, sha),
+            case_fingerprint="persistence:payload-update:%s" % payload,
+            subject=_subject("persistence", payload, content=sha),
+            path=payload, program=worst[2].get("program"),
+            trust=worst[2].get("trust"), custody=prov,
+            script_target=payload, target_sha=sha,
+            referrer_count=len(jobs), referrers=labels,
+            referrer_paths=[path for path, _old, _rec, _sev in jobs]))
     return findings
 
 
@@ -17343,6 +17502,49 @@ def _custody_persistence(old, rec):
     return None
 
 
+def _custody_payload(path, sha):
+    """(rung, note) for the payload script of a CHANGED persistence item.
+
+    The two questions _custody asks -- a signed intent receipt for these
+    exact bytes at this path, then git -- with two differences the live store
+    showed were needed (2026-09-23):
+
+      * no `_intent_worthy` prefilter. That exists to keep HOOK mode from
+        recording every file an agent touches; a script a persistence item
+        runs is worth grading by definition. #319's payload,
+        ~/.local/bin/improver, has no extension, so it was never asked.
+      * when git gives NO answer -- not in a repo, or a probe timed out --
+        the bytes are asked what _grade_binary asks last: were they already
+        explained somewhere else? By the custody ledger (a rung this payload
+        earned on an earlier scan, which is what stops a git timeout flipping
+        a graded case back to HIGH: 23 of the 217 scans that recorded run.py
+        did exactly that, taking 11-190 s per job against 0-1 s when git
+        answered), or by an intent receipt for the same sha at another path
+        (#319: the agent wrote improver.py, an install step copied the
+        bytes). Either carries as `copy-of-graded` -- the weakest rung, one
+        step, never a re-conferral.
+
+    A carried rung fills a non-answer and never argues with an answer:
+    `untracked` and `remote-foreign` stand as git gave them. A rung earned
+    here is remembered against the bytes, so the next non-answer can carry it.
+    """
+    rung, note = _custody(path, sha)
+    if rung in _SELF_CUSTODY or rung in _VOUCHED_CUSTODY \
+            or rung in _WEAK_CUSTODY:
+        _custody_remember(sha, rung, path)
+        return rung, note
+    if rung is not None:
+        return rung, note
+    carried = _custody_carried(sha)
+    if carried is None:
+        receipt = _intent_receipt(sha)
+        if receipt:
+            carried = ("self-attested",) + receipt
+    if carried:
+        return "copy-of-graded", _custody_carry_note(carried)
+    return None, ""
+
+
 
 
 def cmd_vouch(argv):
@@ -17670,6 +17872,41 @@ def _intent_attested(path, sha):
         if hmac.compare_digest(expect, str(rec.get("mac") or "")):
             return True
     return False
+
+
+def _intent_receipt(sha):
+    """(path, ts) of the newest valid intent record for content `sha` at ANY
+    path, or None.
+
+    _intent_attested binds bytes to the path the agent wrote. This asks about
+    the bytes alone, for the one caller that must recognise a copy: an agent
+    writes a script in its repo and an install step copies it to where a
+    persistence item runs it (#319: improver.py -> ~/.local/bin/improver,
+    same sha a588f96d11b4). What that proves is carried, never re-conferred
+    -- see _custody_payload. Same validity rules: newest first, and a bad MAC
+    or a stale timestamp is a non-match."""
+    if not sha:
+        return None
+    try:
+        with open(INTENT_FILE, "rb") as f:
+            blob = f.read(_INTENT_MAX_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return None
+    cutoff = _epoch() - _INTENT_MAX_AGE_DAYS * 86400
+    for ln in reversed(blob.splitlines()):
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(rec, dict) or rec.get("sha256") != sha:
+            continue
+        if _epoch(rec.get("ts")) < cutoff:
+            continue
+        expect = _intent_mac(rec.get("ts"), rec.get("path"),
+                             rec.get("sha256"), rec.get("tool"))
+        if hmac.compare_digest(expect, str(rec.get("mac") or "")):
+            return rec.get("path"), rec.get("ts")
+    return None
 
 
 def _intent_worthy(path):
@@ -21515,25 +21752,34 @@ def _accept_into_baseline(incident_ids):
             if f["fingerprint"] not in wanted and not (
                     case in wanted and f["fingerprint"] in reviewed):
                 continue
-            entry = _accepted_entry_key(f, prior, live)
-            if entry is None:
+            # A payload case is one fact carried as evidence on every job
+            # that runs the reviewed bytes (check_persistence lists them in
+            # referrer_paths), so one verdict accepts them all. Only jobs
+            # the recomputed diff still names are listed, which keeps the
+            # guard above: a job that moved on is in a different finding.
+            entries = [p for p in (f.get("referrer_paths") or ())
+                       if p in live or p in prior] \
+                or [_accepted_entry_key(f, prior, live)]
+            if entries == [None]:
                 continue
-            if entry in live:
-                # Stored verbatim from the snapshot, which is ALREADY in
-                # baseline shape (persistence emits args_sha256 alongside args,
-                # exactly as the store holds it). Re-deriving the shape here
-                # would make the accepted record differ from every other one,
-                # and the diffs compare those fields like-for-like — so the
-                # item would report CHANGED on every scan from then on, which
-                # is the noise this whole path exists to end.
-                prior[entry] = live[entry]
-            else:
-                prior.pop(entry, None)
+            for entry in entries:
+                if entry in live:
+                    # Stored verbatim from the snapshot, which is ALREADY in
+                    # baseline shape (persistence emits args_sha256 alongside
+                    # args, exactly as the store holds it). Re-deriving the
+                    # shape here would make the accepted record differ from
+                    # every other one, and the diffs compare those fields
+                    # like-for-like — so the item would report CHANGED on
+                    # every scan from then on, which is the noise this whole
+                    # path exists to end.
+                    prior[entry] = live[entry]
+                else:
+                    prior.pop(entry, None)
+                accepted.append(entry)
             baseline[key] = prior
             wanted.discard(f["fingerprint"])
             if case:
                 wanted.discard(case)
-            accepted.append(entry)
             dirty = True
     if not dirty:
         return []
