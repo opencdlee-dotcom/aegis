@@ -3547,12 +3547,37 @@ def _canon_entity_key(value):
         if os.path.isabs(value) else value
 
 
+def _is_shared_interpreter(value):
+    """True when an entity names an interpreter (`/bin/bash`, `python3`, ...):
+    a program half the machine runs, so two findings that both name it share
+    nothing but the shell."""
+    return os.path.basename(str(value)) in _INTERPRETERS
+
+
+def _join_entities(f):
+    """`_entities(f)` minus every interpreter -- what a CHAIN may join on.
+
+    `_entities()` keeps interpreters out of the secondary identities only; its
+    primary is returned unconditionally, because display, dedup and path
+    lineage all read it as the finding's own object. A chain cannot: live
+    incident #538 joined an OS update that replaced /bin/bash (primary
+    `/bin/bash`, custody os-vendor) to a harness command bash ran (primary
+    `/bin/bash`) into "Persistence followed by execution" -- the exact join
+    `_entities()` says must never happen, reached through the one side it did
+    not guard. #517 was the same hash under `chain:clickfix`. Excluded here
+    from BOTH sides, primary or not, so every chain rule inherits it; the
+    payload an interpreter runs is still carried as `script_target` and still
+    joins."""
+    return [v for v in _entities(f) if not _is_shared_interpreter(v)]
+
+
 def _shared_entity(a, b):
     """The identity two findings have in common, or None. Returns the value as
     the finding REPORTED it (not the comparison form) so callers keep deriving
-    correlation keys exactly as they did when only the primary entity joined."""
-    eb = {_canon_entity_key(v) for v in _entities(b)}
-    for v in _entities(a):
+    correlation keys exactly as they did when only the primary entity joined.
+    Never an interpreter, from either side: see `_join_entities`."""
+    eb = {_canon_entity_key(v) for v in _join_entities(b)}
+    for v in _join_entities(a):
         if _canon_entity_key(v) in eb:
             return v
     return None
@@ -5095,6 +5120,24 @@ def _chain_severity(leg_pairs, attack_defined=False):
     return best
 
 
+def _custody_explained(f):
+    """True when custody has already explained where this finding came from:
+    its rung is in the self tier (the operator authored it) or the vouched
+    tier (an OS update, a package receipt, a same-publisher re-sign).
+
+    Such a finding cannot TRIGGER a chain -- see `_apply_correlations`. It may
+    still be the other leg of one an unexplained finding triggers, and
+    attack-defined evidence is never explained, the same refusal `_demote()`
+    makes: knowing who wrote a payload is not a reason to stop calling it one.
+    Weak rungs (`build-output`, `worktree`, ...) explain nothing here; they
+    only ever buy one step of demotion. The sensors carry the rung as
+    `custody`; the agent-surface diff calls it `provenance`."""
+    if f.get("attack_defined"):
+        return False
+    rung = f.get("custody") or f.get("provenance") or ""
+    return rung in _SELF_CUSTODY + _VOUCHED_CUSTODY
+
+
 def _apply_correlations(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
@@ -5135,6 +5178,15 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     new_ids = {event_id for event_id, f in new_events
                if f.get("category") not in suppressed_categories
                and event_id not in quieted}
+    # Provenance, by the same pattern: a finding custody has already explained
+    # leaves the TRIGGER set and stays in `observations`, so it can still be
+    # the other leg of a chain an unexplained finding triggers. #538's left
+    # leg was an OS update custody had graded os-vendor, LOW, in its own
+    # detail. A set of its own rather than a narrower `new_ids`: the risk
+    # tier reads `new_ids` too, and already weights these rungs itself
+    # (_RISK_CUSTODY_WEIGHT).
+    chain_triggers = {event_id for event_id, f in new_events
+                      if event_id in new_ids and not _custody_explained(f)}
     attached = set()
     # (entity_key, incident_id, evidence_ids) for every chain raised this scan,
     # so overlapping rules can be reconciled once they have all run. See
@@ -5147,7 +5199,7 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         legs_by_entity = {}
         for left_id, right_id, left, right in _correlation_pairs(
                 observations, left_pred, right_pred, window):
-            if left_id in new_ids or right_id in new_ids:
+            if left_id in chain_triggers or right_id in chain_triggers:
                 entity = _canon_entity_path(_shared_entity(left, right))
                 entity_key = hashlib.sha256(
                     entity.encode("utf-8", "replace")).hexdigest()[:16]
@@ -6317,6 +6369,86 @@ def _retire_orphaned_behavior_incidents(db, now):
     return len(aged)
 
 
+def _unjoinable_chain_resolution(entity_key, legs):
+    """The superseded resolution for a chain keyed on `entity_key` that the
+    current join rules would not form from `legs`, or None when they still
+    would -- or when this cannot tell which entity the chain joined on."""
+    def keyed(value):
+        return hashlib.sha256(_canon_entity_path(value).encode(
+            "utf-8", "replace")).hexdigest()[:16] == entity_key
+    joined = next((v for f in legs for v in _entities(f) if keyed(v)), None)
+    if joined is None:
+        return None
+    if _is_shared_interpreter(joined):
+        return ("superseded: a chain cannot join on an interpreter (%s) — "
+                "reopens on new evidence" % joined)
+    holders = [f for f in legs if any(keyed(v) for v in _join_entities(f))]
+    if len(holders) < 2 or not all(_custody_explained(f) for f in holders):
+        return None
+    rungs = sorted({str(f.get("custody") or f.get("provenance"))
+                    for f in holders})
+    return ("superseded: every leg of this chain is provenance-explained "
+            "(custody %s), and a chain needs a leg custody cannot explain — "
+            "reopens on new evidence" % ", ".join(rungs))
+
+
+def _retire_unjoinable_chain_incidents(db, now):
+    """One-time: close the chain incidents the 2026-09-23 join rules would not
+    have formed.
+
+    Two rules shipped together in the correlation tier: an interpreter is
+    never the shared entity of a chain (`_join_entities`), and a finding
+    custody has explained cannot trigger one (`_custody_explained`). Both are
+    forward-only, and a chain is an event, not a state: an incident they would
+    have prevented -- #538, an OS update joined to a harness command on
+    /bin/bash -- receives no evidence that could re-grade it, so it could only
+    wait out the age-out clock.
+
+    Judged on the incident's own EVIDENCE, the way the forward rules judge a
+    pair. The entity the chain was keyed on is recovered by hashing each leg's
+    identities as correlate() does; an interpreter there is rule 1. Otherwise
+    the chain stands while two legs hold that entity and at least one of them
+    is unexplained -- the forward code would form it again, the explained leg
+    as its other leg -- and only a chain whose every leg on it is explained is
+    rule 2. An entity no leg reproduces is left alone: a chain this cannot
+    re-derive is not one it may retire.
+
+    Path lineage (`chain:lineage:`) is out of scope: it joins a remembered
+    drop, not a co-occurrence, and neither rule changed it. Incidents created
+    in the scan that runs the migration are out of scope by construction.
+    Closed as SUPERSEDED with evidence intact, as the other identity
+    migrations are, and no dismissals row is written.
+    """
+    retired = 0
+    for row in db.execute(
+            "SELECT id, correlation_key FROM incidents WHERE "
+            "kind='correlation' AND status IN ('OPEN','ACK') AND "
+            "correlation_key LIKE 'chain:%' AND "
+            "correlation_key NOT LIKE 'chain:lineage:%' AND created_at<?",
+            (now,)).fetchall():
+        legs = []
+        for ev in db.execute(
+                "SELECT e.data_json FROM incident_events ie JOIN events e "
+                "ON e.id=ie.event_id WHERE ie.incident_id=? AND "
+                "e.event_type='observation.finding'", (row["id"],)).fetchall():
+            try:
+                f = json.loads(ev["data_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(f, dict):
+                legs.append(f)
+        resolution = _unjoinable_chain_resolution(
+            _chain_entity_key(row["correlation_key"]), legs)
+        if not resolution:
+            continue
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=?",
+            (resolution, now, row["id"]))
+        retired += 1
+    return retired
+
+
 _STORE_MIGRATIONS = (
     ("exec_identity_migrated", _retire_legacy_exec_incidents,
      "retired %d incident(s) keyed on the old positional exec identity"),
@@ -6338,6 +6470,11 @@ _STORE_MIGRATIONS = (
     ("behavior_case_identity_20260922", _retire_orphaned_behavior_incidents,
      "retired %d behavior incident(s) keyed on the exact command of one "
      "session"),
+    # The 2026-09-23 chain-leg rules (an interpreter never joins, an explained
+    # finding never triggers) are forward-only, and a chain is an event: the
+    # ones they would not have formed receive nothing that could close them.
+    ("chain_legs_20260923", _retire_unjoinable_chain_incidents,
+     "retired %d chain incident(s) the current join rules would not form"),
 )
 
 
