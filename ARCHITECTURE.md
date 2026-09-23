@@ -1208,11 +1208,15 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   not answer (a `codesign` that times out or prints nothing, a custody `git`
   that times out) returns a non-answer (`probe_failed`; `None` from the git
   rungs), counts toward its DEGRADED row (`signature.classify`,
-  `custody.grade`), and is never cached (2026-09-20: one silent `codesign`
-  filed a Developer ID app as `unsigned`, and the stat-keyed cache kept it
-  for two days under eight beacon incidents). The custody git caches are
-  per scan for the same reason: `cmd_watch` scans in-process, and an answer
-  given about a fresh worktree stood for the life of the daemon. A
+  `custody.grade`), and is never cached as a verdict (2026-09-20: one silent
+  `codesign` filed a Developer ID app as `unsigned`, and the stat-keyed
+  cache kept it for two days under eight beacon incidents). The custody git
+  caches are per scan for the same reason: `cmd_watch` scans in-process, and
+  an answer given about a fresh worktree stood for the life of the daemon.
+  Within one scan they remember a git non-answer *as* a non-answer, never
+  as "in no repo" or "not build output", so a git that is timing out costs
+  its timeouts once per repo rather than once per file, and is counted
+  once. A
   retired sensor id is declared in `_RETIRED_SENSOR_IDS` so its
   health row cannot haunt `doctor` as "DID NOT RUN". A sensor that concludes from a fact another
   sensor could not take (`_browser_loopback_entries` reading "no debugging

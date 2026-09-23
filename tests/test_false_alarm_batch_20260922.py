@@ -78,9 +78,11 @@ Counted by fact rather than by row, the 14 were six things.
       every commit made in it afterwards. Which of the three minted #537's
       null is not recoverable from the store; offline, the same path grades
       (MEDIUM, build-output). A timed-out custody probe is now a non-answer --
-      no rung, full severity, never cached, counted into a `custody.grade`
-      DEGRADED health row -- and the caches are cleared at the start of every
-      scan, so the incident re-grades the first time git answers.
+      no rung, full severity, counted once into a `custody.grade` DEGRADED
+      health row -- and the caches are cleared at the start of every scan, so
+      the incident re-grades the first time git answers. Within one scan the
+      non-answer IS remembered, as a non-answer, so a git that is timing out
+      costs its timeouts once per repo rather than once per file.
 
   C   A runner workload outgrows its vouch on every self-update.
       `Runner.Worker` is spawned by the vouched `Runner.Listener` out of the
@@ -512,17 +514,30 @@ class B1AWorktreeIsStillTheRepo(Sandbox):
     # ---- a timed-out git is not a no (mocked, every body) --------------------
 
     def test_a_timed_out_git_log_is_not_a_no(self):
-        self._fake_git(head=TIMED_OUT, reflog=TIMED_OUT, signature=TIMED_OUT)
+        asked = self._fake_git(head=TIMED_OUT, reflog=TIMED_OUT,
+                               signature=TIMED_OUT)
         got = aegis._repo_is_self_committed("git", self.dist)
         # BEFORE: (FAKE_ROOT, False), cached for the rest of the scan -- and,
         # in watch mode, for the life of the daemon.
         self.assertEqual((FAKE_ROOT, None), got)
-        self.assertNotIn(FAKE_ROOT, aegis._REPO_SELFNESS_CACHE)
         self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
+        # Remembered for THIS scan, as a non-answer: every later file in the
+        # repo costs a lookup, not another round of timeouts.
+        self.assertEqual((FAKE_ROOT, None),
+                         aegis._REPO_SELFNESS_CACHE.get(FAKE_ROOT))
+        before = len(asked)
         self.assertIsNone(aegis._build_output_rung(self.binary))
+        self.assertIsNone(aegis._build_output_rung(
+            os.path.join(self.dist, "sibling")))
+        self.assertEqual(before, len(asked),
+                         "the same scan asked git again: %r" % asked[before:])
         self.assertNotIn(self.dist, aegis._BUILD_OUTPUT_CACHE)
-        # Asked again, because nothing was remembered -- and counted again.
-        self.assertEqual(2, aegis._CUSTODY_PROBE_FAILURES)
+        self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES,
+                         "one question git did not answer, however many "
+                         "files asked it")
+        # ...and for this scan ONLY.
+        aegis._reset_custody_probes()
+        self.assertNotIn(FAKE_ROOT, aegis._REPO_SELFNESS_CACHE)
 
     def test_every_custody_probe_that_times_out_is_a_non_answer(self):
         self._pin_a_fleet_roster()
@@ -545,22 +560,40 @@ class B1AWorktreeIsStillTheRepo(Sandbox):
                 self.assertIn(question, asked)
                 self.assertIsNotNone(got, "a timeout read as 'no repo'")
                 self.assertIsNone(got[1], "a timeout read as an answer")
-                self.assertEqual({}, aegis._REPO_SELFNESS_CACHE)
                 if question == "rev-parse":
-                    # Not "this directory is in no repo", either.
-                    self.assertNotIn(self.dist, aegis._REPO_ROOT_CACHE)
+                    # Not "this directory is in no repo", either: remembered
+                    # as the sentinel, which is not None.
+                    self.assertIs(aegis._GIT_NO_ANSWER,
+                                  aegis._REPO_ROOT_CACHE.get(self.dist))
+                    self.assertEqual({}, aegis._REPO_SELFNESS_CACHE)
+                else:
+                    self.assertEqual({FAKE_ROOT: (FAKE_ROOT, None)},
+                                     aegis._REPO_SELFNESS_CACHE)
                 self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
+                before = len(asked)
                 self.assertIsNone(aegis._build_output_rung(self.binary))
+                self.assertEqual(before, len(asked), asked[before:])
                 self.assertEqual({}, aegis._BUILD_OUTPUT_CACHE)
+                self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
 
     def test_a_timed_out_check_ignore_is_not_a_no(self):
-        self._fake_git(**{"check-ignore": TIMED_OUT})
+        asked = self._fake_git(**{"check-ignore": TIMED_OUT})
         self.assertIsNone(aegis._build_output_rung(self.binary))
-        self.assertNotIn(self.dist, aegis._BUILD_OUTPUT_CACHE)
+        # Remembered for this scan as the sentinel -- None would be the
+        # ANSWER "not build output".
+        self.assertIs(aegis._GIT_NO_ANSWER,
+                      aegis._BUILD_OUTPUT_CACHE.get(self.dist))
         self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
         # The repo's selfness WAS answered, and stays remembered.
         self.assertEqual((FAKE_ROOT, True),
                          aegis._REPO_SELFNESS_CACHE.get(FAKE_ROOT))
+        # A sibling costs a lookup, and the sentinel never escapes: every
+        # caller reads this rung for truth, and the sentinel is truthy.
+        before = len(asked)
+        self.assertIsNone(aegis._build_output_rung(
+            os.path.join(self.dist, "sibling")))
+        self.assertEqual(before, len(asked), asked[before:])
+        self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
 
     def test_an_answer_from_either_rung_still_stands(self):
         """One rung timing out does not void the other's answer: a verified
@@ -581,18 +614,28 @@ class B1AWorktreeIsStillTheRepo(Sandbox):
         self.assertEqual(0, aegis._CUSTODY_PROBE_FAILURES)
 
     def test_the_first_answer_after_a_timeout_is_the_grade(self):
-        self._fake_git(head=TIMED_OUT)
-        self.assertIsNone(aegis._build_output_rung(self.binary))
-        self._fake_git()
-        self.assertEqual("build-output", aegis._build_output_rung(self.binary))
-        self.assertEqual("build-output", aegis._BUILD_OUTPUT_CACHE[self.dist])
+        for question in ("rev-parse", "head", "check-ignore"):
+            with self.subTest(question=question):
+                self._clear_caches()
+                self._fake_git(**{question: TIMED_OUT})
+                self.assertIsNone(aegis._build_output_rung(self.binary))
+                # The next scan starts clean and asks a git that answers.
+                aegis._reset_custody_probes()
+                self._fake_git()
+                self.assertEqual("build-output",
+                                 aegis._build_output_rung(self.binary))
+                self.assertEqual("build-output",
+                                 aegis._BUILD_OUTPUT_CACHE[self.dist])
 
     # ---- the caches are per scan ---------------------------------------------
 
     def test_the_git_caches_do_not_outlive_a_scan(self):
         aegis._REPO_ROOT_CACHE["/seeded"] = "/seeded"
+        aegis._REPO_ROOT_CACHE["/timed-out"] = aegis._GIT_NO_ANSWER
         aegis._REPO_SELFNESS_CACHE["/seeded"] = ("/seeded", False)
+        aegis._REPO_SELFNESS_CACHE["/timed-out"] = ("/timed-out", None)
         aegis._BUILD_OUTPUT_CACHE["/seeded/dist"] = None
+        aegis._BUILD_OUTPUT_CACHE["/timed-out/dist"] = aegis._GIT_NO_ANSWER
         aegis._CUSTODY_PROBE_FAILURES = 3
         aegis._reset_custody_probes()
         self.assertEqual({}, aegis._REPO_ROOT_CACHE)

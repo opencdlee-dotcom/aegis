@@ -15108,15 +15108,35 @@ def _git_provenance(path):
 # 2026-09-22 these outlived the scan that filled them, and an answer given
 # about a worktree while it was fresh stood for the life of the daemon --
 # through every commit made in that worktree afterwards.
+#
+# A NON-answer is remembered too, for the rest of the scan that got it and no
+# longer: (root, None) in _REPO_SELFNESS_CACHE, _GIT_NO_ANSWER in the other
+# two. That is safe where the old cache was not, because the defect was never
+# "remembered" -- it was a timeout remembered AS AN ANSWER ("not committed
+# here"), and remembered past the scan. A remembered non-answer still reads as
+# no rung and full severity, and the reset above means the next scan asks git
+# again. What it buys is a bound. Unremembered, a git timing out under an
+# agent's build storm cost up to ~50 s of timeouts (10 + 10 + 15 + 15) for
+# EVERY file graded in that repo; remembered, it costs them once per repo per
+# scan, and _CUSTODY_PROBE_FAILURES counts questions git did not answer rather
+# than files that happened to ask.
 _REPO_ROOT_CACHE = {}
 _REPO_SELFNESS_CACHE = {}
 _BUILD_OUTPUT_CACHE = {}
 
+# What _REPO_ROOT_CACHE and _BUILD_OUTPUT_CACHE hold for a question git did not
+# answer this scan. Its own object, never None: None already means "in no repo"
+# in the one and "not build output" in the other, and both of those are
+# answers. It never leaves the function that reads the cache.
+_GIT_NO_ANSWER = object()
+
 # Custody questions this scan asked git and got no answer to, because a probe
-# timed out. Each one is a finding graded at full severity with no rung -- the
-# fail-toward-suspicion outcome, which is correct -- and so is a coverage gap
-# rather than a verdict: cmd_scan reports it as the `custody.grade` DEGRADED
-# row, the same contract `signature.classify` keeps for codesign.
+# timed out: counted once per question, which the memo above makes once per
+# directory or repo per scan. Each is a finding graded at full severity with
+# no rung -- the fail-toward-suspicion outcome, which is correct -- and so is a
+# coverage gap rather than a verdict: cmd_scan reports it as the
+# `custody.grade` DEGRADED row, the contract `signature.classify` keeps for
+# codesign.
 _CUSTODY_PROBE_FAILURES = 0
 
 
@@ -15130,15 +15150,18 @@ def _reset_custody_probes():
 
 def _repo_root_of(git, d):
     """The work-tree root containing `d`, None when `d` is in no repo, or
-    False when git did not answer in time. Cached per directory -- except
-    False: a rev-parse that timed out has not said `d` is outside every repo,
-    so it must not be remembered as if it had."""
+    _GIT_NO_ANSWER when git did not answer in time. Cached per directory for
+    the scan. A rev-parse that timed out has not said `d` is outside every
+    repo, so it is remembered as the sentinel, never as None."""
+    global _CUSTODY_PROBE_FAILURES
     if d in _REPO_ROOT_CACHE:
         return _REPO_ROOT_CACHE[d]
     out, err, rc = run([git, "-C", d, "rev-parse", "--show-toplevel"],
                        timeout=10)
     if _probe_timed_out(err, rc):
-        return False
+        _CUSTODY_PROBE_FAILURES += 1
+        _REPO_ROOT_CACHE[d] = _GIT_NO_ANSWER
+        return _GIT_NO_ANSWER
     root = (out or "").strip()
     _REPO_ROOT_CACHE[d] = root if (rc == 0 and root) else None
     return _REPO_ROOT_CACHE[d]
@@ -15151,20 +15174,22 @@ def _repo_is_self_committed(git, d):
     this is asked on behalf of has no history at all -- being generated is the
     whole point of it.
 
-    (root, True) and (root, False) are answers, and are cached. (root, None)
-    is a NON-answer -- a git probe timed out, so neither rung said yes and
-    they did not both say no -- and is neither cached nor read as "no". Read
-    as False and cached, one slow git under an agent's build storm (10-15 s
-    caps, a scan at background QoS) graded every binary in that repo as a
-    stranger's for the rest of the scan, and in watch mode for the rest of the
-    daemon. (None, None) is the same non-answer from the rev-parse that finds
-    the root. Each is counted into _CUSTODY_PROBE_FAILURES, so the scan says
+    (root, True) and (root, False) are answers. (root, None) is a NON-answer
+    -- a git probe timed out, so neither rung said yes and they did not both
+    say no -- and is never read as "no". Read as False and cached, one slow
+    git under an agent's build storm (10-15 s caps, a scan at background QoS)
+    graded every binary in that repo as a stranger's for the rest of the scan,
+    and in watch mode for the rest of the daemon. All three are cached for
+    this scan only; the non-answer is cached AS a non-answer, so later files
+    in the repo pay a dict lookup instead of the timeouts again (see the
+    comment above _REPO_ROOT_CACHE). (None, None) is the same non-answer from
+    the rev-parse that finds the root. Each is counted into
+    _CUSTODY_PROBE_FAILURES once, when git failed to answer, so the scan says
     what it could not ask.
     """
     global _CUSTODY_PROBE_FAILURES
     root = _repo_root_of(git, d)
-    if root is False:
-        _CUSTODY_PROBE_FAILURES += 1
+    if root is _GIT_NO_ANSWER:
         return (None, None)
     if not root:
         return None
@@ -15173,11 +15198,10 @@ def _repo_is_self_committed(git, d):
     verdict = False
     out, err, rc = run([git, "-C", root, "log", "-1", "--format=%H|%ae"],
                        timeout=10)
-    if _probe_timed_out(err, rc):
-        _CUSTODY_PROBE_FAILURES += 1
-        return (root, None)
     out = (out or "").strip()
-    if rc == 0 and "|" in out:
+    if _probe_timed_out(err, rc):
+        verdict = None
+    elif rc == 0 and "|" in out:
         sha, author = out.split("|", 1)
         created = _git_created_here(git, root, sha, author)
         if created:
@@ -15189,8 +15213,9 @@ def _repo_is_self_committed(git, d):
             if fleet:
                 verdict = True
             elif created is None or fleet is None:
-                _CUSTODY_PROBE_FAILURES += 1
-                return (root, None)
+                verdict = None
+    if verdict is None:
+        _CUSTODY_PROBE_FAILURES += 1
     _REPO_SELFNESS_CACHE[root] = (root, verdict)
     return _REPO_SELFNESS_CACHE[root]
 
@@ -15235,13 +15260,15 @@ def _build_output_rung(path):
     if not (git and os.path.isdir(d)):
         return None
     if d in _BUILD_OUTPUT_CACHE:
-        return _BUILD_OUTPUT_CACHE[d]
+        hit = _BUILD_OUTPUT_CACHE[d]
+        return None if hit is _GIT_NO_ANSWER else hit
     result = None
     selfness = _repo_is_self_committed(git, d)
     if selfness and selfness[1] is None:
-        # git did not answer: no rung, so the finding keeps its full severity,
-        # and nothing remembered, so the next ask -- at the latest the next
-        # scan -- gets the real answer and the incident re-grades on it.
+        # git did not answer: no rung, so the finding keeps its full severity.
+        # Not written here -- the non-answer is already remembered for this
+        # scan one level down, so the next file costs a lookup there -- and
+        # the next scan asks git again and the incident re-grades on it.
         return None
     if selfness and selfness[1]:
         root = selfness[0]
@@ -15253,7 +15280,10 @@ def _build_output_rung(path):
         _o, err, rc = run([git, "-C", root, "check-ignore", "-q", d],
                           timeout=10)
         if _probe_timed_out(err, rc):
+            # Remembered for this scan as the sentinel, never as None, which
+            # would be the answer "not build output".
             _CUSTODY_PROBE_FAILURES += 1
+            _BUILD_OUTPUT_CACHE[d] = _GIT_NO_ANSWER
             return None
         if rc == 0:
             result = "build-output"
