@@ -28139,10 +28139,30 @@ _REPLAY_ASSAY_NOT_RUN = {
                             "replay does not make (`aegis.py assay` runs it)",
 }
 
-# The binary sensors whose severity is their own trust gate graded by
-# _grade_binary: the findings --reobserve can re-derive from today's answers.
+# The findings --reobserve can re-derive from today's answers: the binary
+# sensors whose severity is their own trust gate graded by _grade_binary, and
+# the two change sensors, whose record is a diff and is re-derived by
+# rebuilding the pair it was a diff of (_reobserve_persistence,
+# _reobserve_agent_surface).
 _REOBSERVE_CATEGORIES = ("process", "net-listener", "net-beacon",
-                         "net-outbound")
+                         "net-outbound", "persistence", "agent-surface")
+
+# The persistence findings check_persistence emits from a launchd / unit /
+# Run-key diff. The category's other titles come from other sensors (cron, a
+# .pth hook, a removed item) and are replayed as recorded.
+_REOBSERVE_PERSISTENCE_TITLES = (
+    "Persistence item CHANGED", "New persistence item",
+    "OS program referenced by persistence items was updated")
+
+# What the scan stamps on a finding after its sensor returns it. A re-derived
+# finding that changes shape keeps these from the record it replaces.
+_REPLAY_ENVELOPE = ("ts", "presence", "idle_secs", "screen_locked",
+                    "sensor_id")
+
+# The old-side fields a "program bytes" / "program" / "args" line cannot carry,
+# named the way the not-re-derivable count reports them.
+_REPLAY_UNRECORDED = {"authority": "signer", "sha256": "program bytes",
+                      "script_target": "payload path"}
 
 _REPLAY_ROUTES = (ROUTE_INTERRUPT, ROUTE_DIGEST, ROUTE_SEEN, ROUTE_SILENT,
                   "dropped")
@@ -28270,16 +28290,348 @@ def _reobserve_endpoints(f):
     return (None,)
 
 
+_REPLAY_MOVED_ON = "the item on disk no longer shows the recorded change"
+
+
+def _reobserve_live(memo, part):
+    """Live state a change finding is re-derived against, read once per replay
+    and only when the corpus asks: the baseline FILE (never load_baseline(),
+    which migrates and writes) or the persistence sensor's own snapshot of the
+    items on disk now."""
+    key = ("live", part)
+    if key not in memo:
+        if part == "baseline":
+            base = load_json(BASELINE, {})
+            memo[key] = base if isinstance(base, dict) else {}
+        else:
+            memo[key] = snapshot_persistence() or {}
+    return memo[key]
+
+
+def _reobserve_sha(memo, path):
+    key = ("sha", path)
+    if key not in memo:
+        memo[key] = sha256(path)
+    return memo[key]
+
+
+def _persistence_line(old, rec, flags):
+    """The first line of the detail check_persistence prints for this change
+    (`flags` in _persistence_change_detail's order: program, env, args,
+    payload), as finding() stores it."""
+    return redact_sensitive(_persistence_change_detail(
+        rec.get("label"), old, rec, *flags)).split("\n")[0]
+
+
+def _persistence_recorded_change(line, rec):
+    """(flags, program, {field: old value as printed}) for the change `line`
+    records, read against the item's CURRENT record `rec`; None when no change
+    of `rec` prints `line`.
+
+    Asked of the sensor's renderer rather than of a parser written beside it:
+    every shape _persistence_change_detail can print is rendered with a token
+    in each old-side slot, and the shape that matches the recorded line says
+    which fields changed and what each one was. Every new-side slot prints
+    from `rec`, so a match is also the proof that the item on disk still is
+    what the record says it changed TO. `program` is None, "path" or "bytes",
+    the renderer's two ways of printing a program change. Tokens are seven
+    characters because the renderer cuts a hash to twelve."""
+    import itertools
+    tokens = (("program", "QRPLYP0"), ("sha256", "QRPLYS0"),
+              ("args", "QRPLYA0"), ("target_sha", "QRPLYT0"),
+              ("env", "QRPLYE0"))
+    for program, args, target, env in itertools.product(
+            (None, "path", "bytes"), (False, True), (False, True),
+            (False, True)):
+        if not (program or args or target or env):
+            continue
+        on = {"program": program == "path", "sha256": program == "bytes",
+              "args": args, "target_sha": target, "env": env}
+        flags = (bool(program), env, args, target)
+        probe = dict(rec, **{field: t for field, t in tokens if on[field]})
+        pattern = re.escape(_persistence_line(probe, rec, flags))
+        for field, token in tokens:
+            if on[field]:
+                # env prints as JSON, so its token arrives quoted
+                shown = json.dumps(token) if field == "env" else token
+                pattern = pattern.replace(re.escape(shown),
+                                          "(?P<%s>.*?)" % field, 1)
+        m = re.fullmatch(pattern, line)
+        if m:
+            return flags, program, m.groupdict()
+    return None
+
+
+def _persistence_rebuilt_old(rec, program, shown):
+    """(old, unknown): the old side of a recorded change — `rec` with every
+    slot the record printed put back to what it printed — and, for each field
+    the grade may read that no line carries, the values it could have had."""
+    old, unknown = dict(rec), {}
+    if program == "path":
+        old["program"] = shown.get("program")
+        unknown["sha256"] = (rec.get("sha256"), None)
+    elif program == "bytes":
+        was = shown.get("sha256")
+        old["sha256"] = None if was in (None, "?") else was
+        unknown["authority"] = (rec.get("authority"), None)
+    if "args" in shown:
+        old["args"] = None if shown["args"] == "(none)" else shown["args"]
+        old["args_sha256"] = None
+        # An argv edit may be what moved the payload, and the same script in
+        # another directory is the one shape `relocated` is awarded on.
+        tgt = rec.get("script_target")
+        unknown["script_target"] = (tgt, None) + ((os.path.join(
+            os.sep + "unrecorded", os.path.basename(tgt)),) if tgt else ())
+    if "target_sha" in shown:
+        old["target_sha"] = shown["target_sha"]
+    if "env" in shown:
+        try:
+            old["env"] = (None if shown["env"] == "(none)"
+                          else json.loads(shown["env"]))
+        except ValueError:
+            old["env"] = shown["env"]
+    return old, unknown
+
+
+def _reobserve_persistence_answer(f, path, memo):
+    """("ok", finding) | ("dropped", None) | ("gone", None) | ("not", reason)
+    for one persistence record; see _reobserve_persistence."""
+    import itertools
+    title = f["title"]
+    if title == "OS program referenced by persistence items was updated":
+        program = f.get("program") or path
+        sha = ((f.get("subject") or {}).get("content")
+               or str(f["fingerprint"]).rsplit(":", 1)[-1])
+        now_sha = _reobserve_sha(memo, program)
+        if now_sha is None:
+            return "gone", None
+        if now_sha != sha:
+            return "not", _REPLAY_MOVED_ON
+        trust = classify_signature(program)["trust"]
+        if not _os_program_update(
+                {"program": program},
+                {"program": program, "sha256": sha, "trust": trust},
+                True, False, False, False):
+            return "not", ("no longer an OS update, and the jobs referring "
+                           "to it are not in the record")
+        return "ok", dict(f, trust=trust)
+    rec = _reobserve_live(memo, "persistence").get(path)
+    if rec is None:
+        return "gone", None
+    # The two fields every persistence finding names its item by, as the
+    # sensor fills them in from the record.
+    for field, now in (("program", rec.get("program")),
+                       ("script_target", _script_target(rec.get("args"),
+                                                        rec.get("program")))):
+        if field in f and (f[field] or None) != (now or None):
+            return "not", _REPLAY_MOVED_ON
+    if title == "New persistence item":
+        # check_persistence keys a new item on its program's bytes
+        if f["fingerprint"] != "persistence:new:%s:%s" % (
+                path, rec.get("sha256")):
+            return "not", _REPLAY_MOVED_ON
+        out = check_persistence({}, {path: rec})
+        return ("ok", out[0]) if out else ("dropped", None)
+    line = str(f["detail"]).split("\n")[0]
+    found = _persistence_recorded_change(line, rec)
+    if found is None:
+        return "not", _REPLAY_MOVED_ON
+    flags, program, shown = found
+    old, unknown = _persistence_rebuilt_old(rec, program, shown)
+    base = (_reobserve_live(memo, "baseline").get("persistence") or {}).get(path)
+    if unknown and isinstance(base, dict) \
+            and _persistence_line(base, rec, flags) == line:
+        # The baseline still holds the recorded old side: it knows the rest.
+        old.update((field, base.get(field)) for field in unknown)
+        unknown = {}
+    answers = {}
+    for values in itertools.product(*unknown.values()):
+        out = check_persistence(
+            {path: dict(old, **dict(zip(unknown, values)))}, {path: rec})
+        if len(out) != 1 or (out[0]["title"] == title and
+                             out[0]["detail"].split("\n")[0] != line):
+            return "not", "the rebuilt change does not reproduce the record"
+        g = out[0]
+        answers.setdefault((g["title"], g["severity"], g.get("custody"),
+                            g["fingerprint"]), g)
+    if len(answers) > 1:
+        return "not", "the old %s is not recorded" % " / ".join(
+            _REPLAY_UNRECORDED[field] for field in unknown)
+    return "ok", next(iter(answers.values()))
+
+
+def _reobserve_agent_surface_answer(f, memo):
+    """("ok", finding) | ("gone", None) | ("not", reason) for one
+    delegate-surface record; see _reobserve_agent_surface."""
+    fp, path = str(f["fingerprint"]), f.get("path")
+    parts = fp.split(":", 2)
+    kind = parts[1] if len(parts) == 3 and parts[0] == "agent-surface" else ""
+    if kind == "newexec":
+        # custody grades the CONFIG file's bytes, which no record carries
+        return "not", "the config's content is not recorded"
+    if kind not in ("target", "materialized", "imperative",
+                    "newfile-imperative"):
+        return "not", "shape not modelled: %s" % f.get("title")
+    prefix = "agent-surface:%s:%s:" % (kind, path)
+    if not path or not fp.startswith(prefix) or ":" not in fp[len(prefix):]:
+        return "not", "the fingerprint does not name its subject"
+    head, sha12 = fp[len(prefix):].rsplit(":", 1)
+    subject = f.get("program") if kind in ("target", "materialized") else path
+    if not subject:
+        return "not", "the record names no item"
+    sha = _reobserve_sha(memo, subject)
+    if not sha:
+        return "gone", None
+    if sha[:12] != sha12:
+        return "not", _REPLAY_MOVED_ON
+    if kind in ("imperative", "newfile-imperative"):
+        cur = {path: {"imperatives": head.split(","), "sha256": sha}}
+        runs = [({} if kind == "newfile-imperative"
+                 else {path: {"imperatives": []}}, cur)]
+    else:
+        ent = {"cmd": head.rsplit("|", 1)[0], "args": [], "target": subject,
+               "target_sha": sha}
+        team = classify_signature(subject).get("team")
+        if team:
+            ent["target_team"] = team
+        if kind == "materialized":
+            olds = [dict(ent, target_sha=None)]
+        else:
+            # Neither the old target's bytes nor its signer is recorded. The
+            # sensor diffs against the baseline entry, so while that still
+            # holds other bytes its signer is the one the grade reads;
+            # otherwise both answers to "same signer?" are tried.
+            surface = _reobserve_live(memo, "baseline").get("agent_surface")
+            known = surface.get(path) if isinstance(surface, dict) else None
+            execs = known.get("execs") if isinstance(known, dict) else None
+            was = execs.get(head) if isinstance(execs, dict) else None
+            if isinstance(was, dict) and was.get("target_sha") \
+                    and was["target_sha"] != sha:
+                teams = (was.get("target_team"),)
+            else:
+                teams = (team, None)
+            olds = [dict(ent, target_sha="unrecorded", target_team=t)
+                    for t in teams]
+        runs = [({path: {"execs": {head: old}}}, {path: {"execs": {head: ent}}})
+                for old in olds]
+    answers = {}
+    for prior, cur in runs:
+        hit = [g for g in diff_agent_surface(prior, cur)
+               if g["fingerprint"] == fp]
+        if len(hit) != 1:
+            return "not", "the rebuilt change does not reproduce the record"
+        answers.setdefault((hit[0]["severity"], hit[0].get("provenance")),
+                           hit[0])
+    if len(answers) > 1:
+        return "not", "the old signer is not recorded"
+    return "ok", next(iter(answers.values()))
+
+
+def _reobserve_apply(f, answer, stats, rung):
+    """`f` as the answer re-derives it, counted the way _reobserve counts its
+    own. `rung` is the field the sensor carries custody in."""
+    kind, got = answer
+    if kind == "gone":
+        stats["gone"] += 1
+        return f
+    if kind == "not":
+        reasons = stats["not_rederivable"]
+        reasons[got] = reasons.get(got, 0) + 1
+        return f
+    if got is None:
+        g = None
+    elif got["title"] == f["title"]:
+        # The same fact re-graded: keep the record's identity, take the grade.
+        g = dict(f)
+        for field in ("severity", "trust", "custody", "provenance", "markers",
+                      "confidence"):
+            if field in got:
+                g[field] = got[field]
+        if isinstance(g.get("subject"), dict) and "trust" in g["subject"]:
+            g["subject"] = dict(g["subject"], trust=g.get("trust"))
+    else:
+        # A different shape (a swap that is now an OS update): the current
+        # sensor's finding, stamped with when the record was observed.
+        g = dict(got, **{k: f[k] for k in _REPLAY_ENVELOPE if k in f})
+    stats["reobserved"] += 1
+    trust_moved = g is not None and (g.get("trust") or None) != (
+        f.get("trust") or None)
+    stats["trust_changed"] += trust_moved
+    if g is None:
+        stats["changed"] += trust_moved
+        stats["no_longer_emitted"] += 1
+    else:
+        custody_moved = (g.get(rung) or None) != (f.get(rung) or None)
+        stats["custody_changed"] += custody_moved
+        stats["changed"] += trust_moved or custody_moved
+        stats["severity_changed"] += g["severity"] != f["severity"]
+    if f["category"] == "persistence":
+        before = (f["severity"], f.get("custody") or None)
+        after = None if g is None else (g["severity"], g.get("custody") or None)
+        if after != before:
+            table = stats["persistence_changes"]
+            table[(before, after)] = table.get((before, after), 0) + 1
+    return g
+
+
+def _reobserve_persistence(f, memo, stats):
+    """`f`, a persistence finding, re-derived by check_persistence itself:
+    returned re-graded, None when the sensor would not emit it today, or as
+    recorded when the record cannot be rebuilt (counted, with the reason).
+
+    A change finding is a diff, so this rebuilds the pair it was a diff of.
+    The new side is the sensor's own snapshot of the item now, accepted only
+    where it still prints what the record says it changed to. The old side is
+    what the record says it changed from. Where the grade may turn on an old
+    field no line carries (the old signer, for publisher-stable), it comes
+    from the live baseline while that still holds the recorded old side;
+    otherwise every value it could have had is tried, and only one answer
+    re-derives. Writ enforcement is not applied: it judges the moment of the
+    change, and a replay can only ask about now."""
+    title, path = f.get("title"), f.get("path")
+    if title not in _REOBSERVE_PERSISTENCE_TITLES:
+        return _reobserve_apply(
+            f, ("not", "other persistence sensor: %s" % title), stats,
+            "custody")
+    if not path:
+        return _reobserve_apply(f, ("not", "the record names no item"), stats,
+                                "custody")
+    key = ("persistence", f["fingerprint"], f.get("program"),
+           str(f["detail"]).split("\n")[0])
+    if key not in memo:
+        memo[key] = _reobserve_persistence_answer(f, path, memo)
+    return _reobserve_apply(f, memo[key], stats, "custody")
+
+
+def _reobserve_agent_surface(f, memo, stats):
+    """`f`, a delegate-surface finding, re-graded by diff_agent_surface
+    itself: provenance (_custody: the intent ledger, then git) is asked again
+    of the bytes the record names — the target's for an exec target, the
+    file's for an instruction file — and only while they are still the bytes
+    on disk. A new exec entry is graded on the CONFIG file's bytes, which no
+    record carries, so it is counted and replayed as recorded."""
+    key = ("agent-surface", f["fingerprint"], f.get("path"), f.get("program"))
+    if key not in memo:
+        memo[key] = _reobserve_agent_surface_answer(f, memo)
+    return _reobserve_apply(f, memo[key], stats, "provenance")
+
+
 def _reobserve(f, memo, stats):
     """`f` re-observed with the CURRENT classifier and custody ladder, or None
     when today's sensor would not emit it; returned as recorded when it is not
-    a binary sensor this can re-derive, or its subject is gone from disk.
+    a sensor this can re-derive, or its subject is gone from disk. The two
+    change sensors are re-derived by _reobserve_persistence and
+    _reobserve_agent_surface.
 
     The classifier is asked through classify_signature, logic-versioned cache
     and all: a classifier change that does not bump _SIGCACHE_LOGIC_VERSION is
     invisible here exactly as it would be on the live install. Answers are
     memoized per subject, so a program seen in two hundred scans is asked once."""
     category = f.get("category")
+    if category == "persistence":
+        return _reobserve_persistence(f, memo, stats)
+    if category == "agent-surface":
+        return _reobserve_agent_surface(f, memo, stats)
     if category not in _REOBSERVE_CATEGORIES:
         return f
     path = f.get("path") or f.get("program")
@@ -28436,6 +28788,12 @@ def _backtest_replay(days=30, reobserve=False, now=None):
     stats = dict.fromkeys(("reobserved", "trust_changed", "custody_changed",
                            "changed", "severity_changed", "no_longer_emitted",
                            "gone"), 0)
+    # {reason: count} for findings replayed as recorded because the record
+    # cannot be rebuilt, and {((sev, rung), (sev, rung) or None): count} for
+    # what re-deriving changed on a persistence finding.
+    stats.update(not_rederivable={}, persistence_changes={})
+    asked = sum(1 for _n, batch in batches for _i, f in batch
+                if f["category"] in _REOBSERVE_CATEGORIES)
     routes, route_of, scratch_of, folded_into, finding_of = {}, {}, {}, {}, {}
     seen, memo = {}, {}
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
@@ -28574,11 +28932,16 @@ def _backtest_replay(days=30, reobserve=False, now=None):
     if len(r["assay"]) != lanes:
         problems.append("%d assay row(s) for %d lane(s)"
                         % (len(r["assay"]), lanes))
+    accounted = stats["reobserved"] + stats["gone"] + sum(
+        stats["not_rederivable"].values())
+    if reobserve and accounted != asked:
+        problems.append("%d re-derivable finding(s) but %d re-observed, gone "
+                        "or not re-derivable" % (asked, accounted))
     r.update(loaded=len(rows), in_store=in_store, unparseable=bad,
              batches=len(batches), by_scan_id=by_scan_id, memory=memory,
              weights=weights, routes=routes, open_cases=open_cases,
              noise=noise, reopened=reopened, new_cases=new_cases,
-             replayed=replayed, lanes=lanes,
+             replayed=replayed, lanes=lanes, asked=asked,
              reobserve=stats if reobserve else None)
     return r
 
@@ -28621,6 +28984,12 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
                stats["custody_changed"], stats["changed"],
                stats["severity_changed"], stats["no_longer_emitted"],
                stats["gone"], ", ".join(_REOBSERVE_CATEGORIES)))
+        reasons = stats["not_rederivable"]
+        if reasons:
+            lines.append("  not re-derivable: %d, replayed as recorded — %s"
+                         % (sum(reasons.values()), " · ".join(
+                             "%s %d" % (why, reasons[why]) for why in sorted(
+                                 reasons, key=lambda k: (-reasons[k], k)))))
     lines.append("")
     routes = r["routes"]
     columns = _REPLAY_ROUTES if stats is not None else _REPLAY_ROUTES[:-1]
@@ -28638,6 +29007,20 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
                      + " ".join("%9d" % bucket[c] for c in columns))
     lines.append("  %-18s %8d " % ("total", sum(totals.values()))
                  + " ".join("%9d" % totals[c] for c in columns))
+    if stats is not None:
+        changes = stats["persistence_changes"]
+
+        def shown(pair):
+            return "dropped" if pair is None else "%s/%s" % (pair[0],
+                                                             pair[1] or "-")
+        lines.append("\nPersistence re-derived — recorded -> current code "
+                     "(sev/custody: findings):")
+        for pair in sorted(changes, key=lambda p: (-changes[p], shown(p[0]),
+                                                    shown(p[1]))):
+            lines.append("  %s -> %s: %d" % (shown(pair[0]), shown(pair[1]),
+                                             changes[pair]))
+        if not changes:
+            lines.append("  (no change)")
     kinds = {}
     for case in r["open_cases"].values():
         kinds[case["kind"]] = kinds.get(case["kind"], 0) + 1
@@ -28698,9 +29081,12 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
         lines.append("_Self-check: %d loaded = %d in the store; %d "
                      "noise-labelled incident(s) = a direct query; %d "
                      "replayed finding(s) routed once each; %d/%d assay "
-                     "lanes accounted for._"
+                     "lanes accounted for%s._"
                      % (r["loaded"], r["in_store"], len(r["noise"]),
-                        r["replayed"], len(r["assay"]), r["lanes"]))
+                        r["replayed"], len(r["assay"]), r["lanes"],
+                        "" if stats is None else
+                        "; %d re-derivable finding(s) each re-observed, gone "
+                        "or counted not re-derivable" % r["asked"]))
     lines.append("Read-only: the live store was opened mode=ro; nothing was "
                  "written, notified, or learned.")
     print("\n".join(lines))
