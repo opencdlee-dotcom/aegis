@@ -1847,8 +1847,11 @@ class SignatureBatchPrefetch(unittest.TestCase):
         self.assertEqual({}, aegis._sigcache)
 
     def test_already_cached_paths_are_not_re_probed(self):
+        # A warm entry carries the current logic version: one without it is
+        # a pre-version entry, and the prefetch re-probes those on purpose.
         aegis._sigcache = {"C:\\a\\x.exe": {"stat": "stat:C:\\a\\x.exe",
-                                            "result": {"trust": "os-signed"}}}
+                                            "result": {"trust": "os-signed"},
+                                            "v": aegis._SIGCACHE_LOGIC_VERSION}}
         aegis.run, calls = self._counting_run(lambda env: ("", "", 0))
         self.assertEqual(0, aegis.warm_signature_cache(["C:\\a\\x.exe"]))
         self.assertEqual([], calls, "a warm cache must cost no subprocess")

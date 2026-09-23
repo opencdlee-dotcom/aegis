@@ -54,7 +54,7 @@ CONDITIONAL = frozenset(("intel",))
 # Health rows _cmd_scan_locked writes by hand rather than via _collect_sensor.
 DIRECT = frozenset(("persistence.snapshot", "coverage",
                     "process.enumerate", "process.argv", "signature.classify",
-                    "scan.cost"))
+                    "custody.grade", "scan.cost"))
 
 
 def _body():
