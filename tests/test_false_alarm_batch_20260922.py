@@ -44,6 +44,26 @@ Counted by fact rather than by row, the 14 were six things.
       verify that FAILS WITH A REASON still means `broken`: an answer is still
       an answer.
 
+      The exit half. A right verdict stops the emission, and that is all it
+      does: a beacon that is no longer emitted brings no new evidence, so the
+      re-grade exit (which reads the incident's latest evidence) never fires,
+      and a beacon is an event, not a state, so the cleared-state exit never
+      looks at it. The eight Spotify incidents would have waited out the
+      7-day age-out clock and its reminder ladder for a verdict that had
+      already been corrected. `_close_reverified_incidents` asks the sensor's
+      own question again: when the incident's own sensor answered OK this
+      scan without re-asserting the case, and the incident's newest evidence
+      names a path whose untrusted signature was the gate, the path is
+      re-classified; a publisher verdict at a location that is not risky is
+      exactly what the sensor's gate (`suspicious_sig(trust) or
+      is_risky_location(path)`) no longer emits, and the incident closes
+      FALSE_POSITIVE, "re-verified". Evidence that carries a sha must still
+      hash to it, so replacing the binary cannot close a content-keyed case,
+      and a probe that does not answer now reads `unknown`, which is not a
+      publisher. The discipline is the re-grade exit's: OPEN only, CRITICAL
+      and never-tolerate keys skipped, the severity untouched, no dismissals
+      row.
+
   A2  A program that binds ephemeral ports was one listener signal per port.
       Spotify bound 225 distinct ports, every one at or above 49152, so three
       of them inside the risk window summed to a risk incident (#527) out of
@@ -686,6 +706,324 @@ class B1AWorktreeIsStillTheRepo(Sandbox):
         self.assertEqual("OK", row["status"])
         self.assertEqual(0, row["item_count"])
         self.assertEqual("", row["detail"] or "")
+
+
+
+# --------------------------------------------------------------------------- #
+# A2 -- the exit half of A: a verdict that flips on the same bytes closes what
+# the wrong verdict opened.
+# --------------------------------------------------------------------------- #
+T0 = 1_700_000_000
+REMOTE = "203.0.113.7"          # TEST-NET-3: an address that routes nowhere
+ELSEWHERE = "/Applications/Other.app/Contents/MacOS/Other"
+
+
+def _untrusted():
+    """A verdict suspicious_sig() flags on THIS body, read from the function
+    rather than assumed: Linux flags only `broken`, and CI runs Linux."""
+    return next(t for t in ("unsigned", "broken") if aegis.suspicious_sig(t))
+
+
+def _publisher():
+    """A verdict publisher_sig() accepts on THIS body."""
+    return next(t for t in ("developer-id", "signed-valid", "os-managed")
+                if aegis.publisher_sig(t))
+
+
+def _health(sensor, status="OK"):
+    """One sensor_status row, in the shape _collect_sensor appends."""
+    return [{"sensor_id": sensor, "status": status, "detail": "",
+             "duration_ms": 0, "item_count": 0}]
+
+
+class A2AFlippedVerdictClosesItsIncident(Sandbox):
+    """Fixing the classifier stops the emission; this is the exit for what the
+    wrong verdict had already opened.
+
+    classify_signature and is_risky_location are replaced, so what is under
+    test is the closer's reading of its own evidence against the emitting
+    sensor's gate, on every body."""
+
+    def setUp(self):
+        super().setUp()
+        # setdefault: on Windows the Sandbox has already replaced
+        # classify_signature, and its ORIGINAL is what tearDown must restore.
+        for name in ("classify_signature", "is_risky_location"):
+            self._saved.setdefault(name, getattr(aegis, name))
+        self.verdict = _untrusted()
+        self.risky = False
+        self.classified = []
+
+        def classify(path):
+            self.classified.append(path)
+            return {"trust": self.verdict, "team": None, "authority": None}
+        aegis.classify_signature = classify
+        aegis.is_risky_location = lambda path: self.risky
+        self.path = os.path.join(self.tmp, "Example")
+        with open(self.path, "wb") as fh:
+            fh.write(b"\xcf\xfa\xed\xfe fixture bytes")
+
+    # ---- fixtures ------------------------------------------------------------
+
+    def _beacon(self, severity="HIGH", fingerprint=None):
+        """A beacon as _beacon_from_sightings emits it: path == program, the
+        trust it was gated on, and no sha -- the sensor's gate is path-level."""
+        key = fingerprint or "beacon:%s:%s:443" % (self.path, REMOTE)
+        return aegis.finding(
+            severity, "net-beacon",
+            "Persistent outbound connection (beacon shape)",
+            "%s [%s] has held a connection to %s:443"
+            % (self.path, _untrusted(), REMOTE),
+            key, case_fingerprint=key, path=self.path, program=self.path,
+            remote=REMOTE, port="443", trust=_untrusted(),
+            sensor_id="outbound")
+
+    def _process(self, sha):
+        """A process case as check_processes emits it: path-keyed signal,
+        sha-keyed case, and the sha in the evidence."""
+        return aegis.finding(
+            "HIGH", "process", "Suspicious running process",
+            "%s (%s) running from user-writable path"
+            % (self.path, _untrusted()),
+            "process:%s:%s:%s" % (self.path, _untrusted(), sha),
+            case_fingerprint="process:sha:%s" % sha, path=self.path,
+            trust=_untrusted(), sha256=sha, sensor_id="process")
+
+    def _row(self, f):
+        db = aegis._event_connection()
+        try:
+            r = db.execute(
+                "SELECT * FROM incidents WHERE correlation_key=?",
+                ("signal:" + (f.get("case_fingerprint") or f["fingerprint"]),)
+            ).fetchone()
+            return dict(r) if r else None
+        finally:
+            db.close()
+
+    def _open(self, f, sensor):
+        aegis.record_security_state([f], sensor_health=_health(sensor),
+                                    now=T0)
+        row = self._row(f)
+        self.assertEqual("OPEN", row["status"], "fixture did not open")
+        return row
+
+    def _rescan(self, sensor, status="OK", findings=(), at=T0 + 600):
+        aegis.record_security_state(list(findings),
+                                    sensor_health=_health(sensor, status),
+                                    now=at)
+
+    # ---- the exit ------------------------------------------------------------
+
+    def test_a_flipped_verdict_closes_the_beacon_it_opened(self):
+        f = self._beacon()
+        self._open(f, "outbound")
+        # The classifier answers now: a publisher signed these bytes. The
+        # outbound sensor ran, answered OK, and no longer emits the beacon.
+        self.verdict = _publisher()
+        self._rescan("outbound")
+        row = self._row(f)
+        # BEFORE: OPEN, with no exit but the age-out clock. No new evidence,
+        # so the re-grade exit never fired; a beacon is an event, so the
+        # cleared-state exit never looked. Live: #528-#533, #535, #536.
+        self.assertEqual("FALSE_POSITIVE", row["status"],
+                         "a corrected verdict could not reach the incident "
+                         "the wrong one opened")
+        self.assertIn("re-verified", row["resolution"] or "")
+        self.assertIn(_publisher(), row["resolution"] or "")
+        self.assertIn(self.path, self.classified)
+
+    def test_a_failed_sensor_leaves_it_standing(self):
+        f = self._beacon()
+        self._open(f, "outbound")
+        self.verdict = _publisher()
+        self._rescan("outbound", "FAILED")
+        self.assertEqual("OPEN", self._row(f)["status"],
+                         "a sensor that did not answer was read as having "
+                         "stopped asserting the case")
+        # ...nor one that did not run at all this scan.
+        self._rescan("process", at=T0 + 1200)
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_still_suspicious_stays_open(self):
+        f = self._beacon()
+        self._open(f, "outbound")
+        self._rescan("outbound")
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_probe_that_does_not_answer_now_is_not_a_flip(self):
+        """A1's rule, from the other side: `unknown` is a non-answer, and a
+        non-answer closes nothing."""
+        f = self._beacon()
+        self._open(f, "outbound")
+        self.verdict = "unknown"
+        self._rescan("outbound")
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_risky_location_stays_open(self):
+        """The beacon gate is `suspicious_sig(trust) or
+        is_risky_location(path)`: a publisher signature answers only the
+        first half, and the sensor would still emit on the second."""
+        f = self._beacon()
+        self._open(f, "outbound")
+        self.verdict = _publisher()
+        self.risky = True
+        self._rescan("outbound")
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_path_that_is_gone_stays_open(self):
+        """Nothing is left to re-verify; the other exits own a vanished file."""
+        f = self._beacon()
+        self._open(f, "outbound")
+        os.remove(self.path)
+        self.verdict = _publisher()
+        del self.classified[:]
+        self._rescan("outbound")
+        self.assertEqual("OPEN", self._row(f)["status"])
+        self.assertNotIn(self.path, self.classified)
+
+    def test_a_process_case_with_moved_bytes_stays_open(self):
+        """A content-keyed case is about BYTES. A signed binary put where the
+        flagged one stood is a different subject, and replacing the file must
+        not be a way to close the case."""
+        f = self._process(aegis.sha256(self.path))
+        self._open(f, "process")
+        with open(self.path, "wb") as fh:
+            fh.write(b"\xcf\xfa\xed\xfe other, signed-looking bytes")
+        self.verdict = _publisher()
+        self._rescan("process")
+        self.assertEqual("OPEN", self._row(f)["status"],
+                         "a replaced binary closed the case its "
+                         "predecessor opened")
+
+    def test_a_process_case_with_the_same_bytes_closes(self):
+        f = self._process(aegis.sha256(self.path))
+        self._open(f, "process")
+        self.verdict = _publisher()
+        self._rescan("process")
+        row = self._row(f)
+        self.assertEqual("FALSE_POSITIVE", row["status"])
+        self.assertIn("same bytes", row["resolution"] or "")
+
+    def test_a_verdict_about_another_file_is_not_re_asked(self):
+        """The evidence's trust must be a verdict ABOUT its path. A
+        persistence item records its PROGRAM's trust against the item's own
+        path; re-classifying the item answers a different question."""
+        f = aegis.finding(
+            "HIGH", "persistence", "New persistence item",
+            "com.example.agent -> %s [%s]" % (ELSEWHERE, _untrusted()),
+            "persistence:new:%s:abc" % self.path, path=self.path,
+            program=ELSEWHERE, trust=_untrusted(), sensor_id="persistence")
+        self._open(f, "persistence")
+        self.verdict = _publisher()
+        self._rescan("persistence")
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    # ---- the sensor still asserting it outranks the re-check -----------------
+
+    def test_an_observed_fingerprint_is_left_to_the_regrade_exit(self):
+        f = self._beacon()
+        self._open(f, "outbound")
+        self.verdict = _publisher()
+        # The sensor still emits the case this scan: whatever the closer's own
+        # re-check says, the sensor's answer is the one on the record, and the
+        # re-grade exit reads it.
+        self._rescan("outbound", findings=[f])
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_either_fingerprint_counts_as_observed(self):
+        """A process case is keyed on its sha; its signal on its path. Seeing
+        EITHER this scan means the sensor re-asserted the case."""
+        sha = aegis.sha256(self.path)
+        f = self._process(sha)
+        row = self._open(f, "process")
+        self.verdict = _publisher()
+        now = T0 + 600
+        for observed in ({f["case_fingerprint"]}, {f["fingerprint"]}):
+            with self.subTest(observed=observed):
+                db = aegis._event_connection()
+                try:
+                    with db:
+                        aegis._record_health(db, _health("process"), now)
+                        self.assertEqual(0, aegis._close_reverified_incidents(
+                            db, observed, now))
+                finally:
+                    db.close()
+                self.assertEqual("OPEN", self._row(f)["status"])
+        # ...and record_security_state hands the closer both.
+        seen = []
+        real = aegis._close_reverified_incidents
+        self._saved.setdefault("_close_reverified_incidents", real)
+
+        def spy(db, observed, now):
+            seen.append(set(observed))
+            return real(db, observed, now)
+        aegis._close_reverified_incidents = spy
+        self._rescan("process", findings=[f], at=now + 600)
+        self.assertEqual(1, len(seen))
+        self.assertIn(f["fingerprint"], seen[0])
+        self.assertIn(f["case_fingerprint"], seen[0])
+        self.assertEqual("OPEN", self._row(f)["status"])
+        self.assertEqual(row["id"], self._row(f)["id"])
+
+    # ---- the re-grade exit's discipline --------------------------------------
+
+    def test_severity_is_never_rewritten(self):
+        f = self._beacon()
+        self._open(f, "outbound")
+        self.verdict = _publisher()
+        self._rescan("outbound")
+        row = self._row(f)
+        self.assertEqual("FALSE_POSITIVE", row["status"])
+        self.assertEqual("HIGH", row["severity"],
+                         "the ratchet: a machine exit closes the case and "
+                         "never rewrites what the operator was shown")
+
+    def test_no_dismissals_row_is_written(self):
+        """A machine verdict must never feed backtest precision or acquired
+        tolerance -- the discipline every machine exit holds."""
+        f = self._beacon()
+        self._open(f, "outbound")
+        self.verdict = _publisher()
+        self._rescan("outbound")
+        self.assertEqual("FALSE_POSITIVE", self._row(f)["status"])
+        db = aegis._event_connection()
+        try:
+            self.assertEqual(
+                0, db.execute("SELECT COUNT(*) FROM dismissals").fetchone()[0])
+        finally:
+            db.close()
+
+    def test_an_acknowledged_incident_is_the_operators(self):
+        f = self._beacon()
+        row = self._open(f, "outbound")
+        db = aegis._event_connection()
+        try:
+            with db:
+                db.execute("UPDATE incidents SET status='ACK' WHERE id=?",
+                           (row["id"],))
+        finally:
+            db.close()
+        self.verdict = _publisher()
+        self._rescan("outbound")
+        self.assertEqual("ACK", self._row(f)["status"])
+
+    def test_critical_is_never_closed_this_way(self):
+        f = self._beacon(severity="CRITICAL")
+        self._open(f, "outbound")
+        self.verdict = _publisher()
+        self._rescan("outbound")
+        self.assertEqual("OPEN", self._row(f)["status"])
+
+    def test_a_never_tolerate_key_is_never_closed_this_way(self):
+        """Attack-defined evidence: no machine re-check reads it away, even
+        where its evidence could be read as a signature gate."""
+        f = self._beacon(fingerprint="decoy:replaced:%s" % self.path)
+        row = self._open(f, "outbound")
+        self.assertEqual("HIGH", row["severity"],
+                         "fixture: must fail on the prefix, not on CRITICAL")
+        self.verdict = _publisher()
+        self._rescan("outbound")
+        self.assertEqual("OPEN", self._row(f)["status"])
 
 
 if __name__ == "__main__":

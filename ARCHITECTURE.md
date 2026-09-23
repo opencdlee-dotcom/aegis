@@ -410,7 +410,13 @@ call sequence:
    visible-and-reopenable machine exit age-out already is, made
    evidence-driven instead of clock-driven. (Before this, five of fifteen
    live incidents sat OPEN at HIGH while their own `signals` rows read LOW or
-   MEDIUM, with no exit but the seven-day clock.)
+   MEDIUM, with no exit but the seven-day clock.) Its twin for the case that
+   brings NO new evidence: when a signature verdict that gated a finding is
+   corrected, the sensor simply stops emitting, so `_close_reverified_incidents`
+   re-asks the classifier about the evidence's own path (same bytes, where the
+   evidence carries a sha) once that sensor has answered OK without
+   re-asserting the case, and closes it `re-verified:` when the verdict is now
+   a publisher's at a location that is not risky.
 
 One known asymmetry, stated so it is a decision rather than a surprise: a
 custody demotion below HIGH keeps a finding out of the *standalone-signal*

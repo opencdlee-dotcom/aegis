@@ -5453,6 +5453,25 @@ def _latest_incident_grade(db, incident_id, incident_last_seen):
     `s.last_seen >= i.last_seen` clause enforced, kept because a stale grade
     must not close an incident something else has refreshed since.
     """
+    data = _latest_incident_evidence(db, incident_id,
+                                     since=incident_last_seen)
+    if data is None:
+        return None
+    sev = data.get("severity")
+    if sev not in SEV_ORDER:
+        return None
+    return sev, str(data.get("fingerprint") or "")
+
+
+def _latest_incident_evidence(db, incident_id, since=None):
+    """The newest finding recorded as evidence on `incident_id`, as a dict.
+
+    None when the incident holds no readable finding, or -- given `since` --
+    when that finding was observed before it. One reading of "the latest word
+    on the case" for both evidence-driven exits: _latest_incident_grade reads
+    its severity (and passes the incident's last_seen as `since`), and
+    _close_reverified_incidents reads the path and the verdict it was gated on.
+    """
     row = db.execute(
         "SELECT e.observed_at, e.data_json FROM events e "
         "JOIN incident_events ie ON ie.event_id=e.id "
@@ -5460,18 +5479,13 @@ def _latest_incident_grade(db, incident_id, incident_last_seen):
         "ORDER BY e.id DESC LIMIT 1", (incident_id,)).fetchone()
     if not row:
         return None
-    if (row["observed_at"] or 0) < (incident_last_seen or 0):
+    if since is not None and (row["observed_at"] or 0) < since:
         return None
     try:
         data = json.loads(row["data_json"])
     except (ValueError, TypeError):
         return None
-    if not isinstance(data, dict):
-        return None
-    sev = data.get("severity")
-    if sev not in SEV_ORDER:
-        return None
-    return sev, str(data.get("fingerprint") or "")
+    return data if isinstance(data, dict) else None
 
 
 def _close_cleared_state_incidents(db, observed, now):
@@ -5535,6 +5549,102 @@ def _close_cleared_state_incidents(db, observed, now):
             "WHERE id=? AND status IN (%s)" % marks,
             ("condition cleared: the sensor looked again and it is gone",
              now, now, incident_id) + _ACTIVE_INCIDENT_STATES)
+    return len(closed)
+
+
+def _close_reverified_incidents(db, observed, now):
+    """Close OPEN signal incidents whose gate was an untrusted signature that
+    the classifier, asked again about the same file, no longer gives.
+
+    The exit a corrected verdict needs. A sensor gated on the signature stops
+    emitting the moment the verdict is right, and that is ALL the fix does: no
+    new evidence arrives, so _close_regraded_incidents (which reads the latest
+    evidence) never fires, and the finding is an event rather than a state, so
+    _close_cleared_state_incidents never looks at it. Live: Spotify was filed
+    `unsigned` on a codesign probe that did not answer (2026-09-20 08:32) and
+    the cache kept it; eight beacon incidents (#528-#533, #535, #536) stood on
+    that one silence, and with the classifier fixed they would have waited out
+    the age-out clock and its reminders for a verdict already corrected.
+
+    So this asks the sensor's own question again, and closes only where the
+    sensor's own gate would no longer emit. The newest evidence must name a
+    path and the verdict it was gated on; that verdict must be suspicious_sig();
+    and it must be a verdict ABOUT that path -- a persistence item records its
+    program's trust against the item's own path, and re-classifying the item
+    would answer a different question. The path is re-classified now. A
+    publisher_sig() verdict at a location that is not risky is exactly what the
+    beacon gate (`suspicious_sig(trust) or is_risky_location(path)`) and the
+    process gate (`suspicious_sig(trust) and is_risky_location(path)`) no
+    longer fire on. A probe that does not answer reads `unknown`, which is not
+    a publisher, so a non-answer closes nothing here either. Evidence that
+    carries a sha must still hash to it: a content-keyed case is about BYTES,
+    and putting a signed binary where the flagged one stood must not be a way
+    to close it. Beacon evidence carries no sha because the beacon gate is
+    path-level, so for a beacon the path is what is re-verified, and the
+    resolution says which of the two was.
+
+    The discipline is the re-grade exit's, clause for clause: OPEN only,
+    FALSE_POSITIVE with a resolution that says why, CRITICAL and never-tolerate
+    keys skipped, the stored severity never rewritten, no dismissals row, and
+    the reattach path reopens the case on new evidence. Plus the cleared-state
+    exit's sensor-ran guard, for the same reason it has one: absence of a
+    finding from a sensor that did not answer OK this scan is not a changed
+    verdict. A case the sensor DID re-assert this scan, by its signal or its
+    case fingerprint, is left to the re-grade exit, which reads what the
+    sensor said.
+
+    Cheapest checks first: the classifier is asked only when everything else
+    already says close, and the file is hashed only after it has answered.
+    """
+    rows = db.execute(
+        "SELECT id, correlation_key FROM incidents WHERE status='OPEN' "
+        "AND kind='signal' AND severity<>'CRITICAL' "
+        "AND correlation_key LIKE 'signal:%'").fetchall()
+    closed = []
+    for row in rows:
+        fp = (row["correlation_key"] or "")[len("signal:"):]
+        if fp.startswith(_NEVER_TOLERATE_PREFIXES) or fp in observed:
+            continue
+        evidence = _latest_incident_evidence(db, row["id"])
+        if evidence is None:
+            continue
+        sig_fp = str(evidence.get("fingerprint") or "")
+        if sig_fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        if sig_fp in observed or evidence.get("case_fingerprint") in observed:
+            continue          # re-asserted this scan: the re-grade exit's
+        path, trust = evidence.get("path"), evidence.get("trust")
+        if not isinstance(path, str) or not path or not suspicious_sig(trust):
+            continue          # the gate was not a signature verdict
+        if evidence.get("program") not in (None, path):
+            continue          # the verdict was about another file
+        sensor = db.execute(
+            "SELECT e.source FROM events e JOIN incident_events ie "
+            "ON ie.event_id=e.id WHERE ie.incident_id=? "
+            "ORDER BY e.id DESC LIMIT 1", (row["id"],)).fetchone()
+        if not sensor or not sensor["source"]:
+            continue          # cannot prove who owned it -- leave it standing
+        ok = db.execute(
+            "SELECT 1 FROM sensor_status WHERE sensor_id=? AND status='OK' "
+            "AND last_ok_at>=?", (sensor["source"], now)).fetchone()
+        if not ok:
+            continue          # the sensor did not answer this scan
+        if not os.path.exists(path) or is_risky_location(path):
+            continue
+        verdict = (classify_signature(path) or {}).get("trust")
+        if not publisher_sig(verdict):
+            continue
+        sha = evidence.get("sha256")
+        if sha and sha256(path) != sha:
+            continue          # the bytes moved: a different subject
+        closed.append((row["id"], path, verdict, "bytes" if sha else "path"))
+    for incident_id, path, verdict, same in closed:
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=? AND status='OPEN'",
+            ("re-verified: %s now classifies as %s at the same %s; the "
+             "finding's gate was an untrusted signature (reopens on new "
+             "evidence)" % (path, verdict, same), now, incident_id))
     return len(closed)
 
 
@@ -6145,6 +6255,17 @@ def record_security_state(findings, sensor_health=(), now=None,
                     log_run("closed %d cleared state incident(s)" % cleared)
             except Exception as e:
                 log_run("state-clear close skipped: %s" % e)
+            try:
+                # Both identities: a case the sensor re-asserted this scan may
+                # be keyed on either, and it is the re-grade exit's to judge.
+                reverified = _close_reverified_incidents(
+                    db, {fp for f in findings
+                         for fp in (f.get("fingerprint"),
+                                    f.get("case_fingerprint")) if fp}, now)
+                if reverified:
+                    log_run("closed %d re-verified incident(s)" % reverified)
+            except Exception as e:
+                log_run("re-verify close skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
