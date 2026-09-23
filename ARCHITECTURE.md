@@ -416,7 +416,15 @@ call sequence:
    re-asks the classifier about the evidence's own path (same bytes, where the
    evidence carries a sha) once that sensor has answered OK without
    re-asserting the case, and closes it `re-verified:` when the verdict is now
-   a publisher's at a location that is not risky.
+   a publisher's at a location that is not risky. And for a fact that simply
+   ended: a hot-dir drop is an event keyed on path and bytes, so once the file
+   is deleted the sensor goes quiet and none of the above fires;
+   `_close_removed_drop_incidents` closes it `file gone:` as RESOLVED (the
+   finding was right, the exposure ended) only when the path no longer exists
+   *and* its folder is listable, so an unreadable folder is never read as
+   absence — and, like every machine exit, only after the sensor answered OK
+   this scan, never for CRITICAL, and reopenable by the same bytes landing
+   again.
 
 One known asymmetry, stated so it is a decision rather than a surprise: a
 custody demotion below HIGH keeps a finding out of the *standalone-signal*
