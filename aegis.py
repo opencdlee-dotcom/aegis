@@ -2298,6 +2298,8 @@ def classify_signature(path):
     # reading them describes neither version. Either way the answer is still
     # returned for this call; it is only not remembered.
     failed = result.pop("probe_failed", False)
+    if failed and stat_sig is not None:
+        _SIG_UNANSWERED[path] = stat_sig
     if (stat_sig is not None and not failed
             and _sig_stat(path) == stat_sig):
         _sigcache.pop(path, None)  # overwrite any prior entry for this path
@@ -2366,6 +2368,13 @@ def _classify_linux(path):
 # probe is a coverage gap, not a clean bill of health, so cmd_scan reports it as
 # a DEGRADED sensor rather than letting the silence read as "everything signed".
 _SIG_PROBE_FAILURES = 0
+
+# {path: stat signature} for every probe that did not answer this scan. A
+# non-answer is never cached (see classify_signature), which is right for the
+# verdict and would make the custody ladder's publisher rung ask codesign (or
+# a cold PowerShell) a SECOND time about a binary its own sensor just failed
+# to classify. Read only by _publisher_signer; reset with the count above.
+_SIG_UNANSWERED = {}
 
 # Every PowerShell-backed probe in this file is sized against MEASUREMENTS of a
 # cold powershell.exe, never a guess. A cap at or near the boot cost is not a
@@ -4617,6 +4626,32 @@ def _signal_decision(f, memory):
     return None, 0
 
 
+def _provenance_gate(f):
+    """The custody rung that keeps `f` out of the interrupt tier, or None.
+
+    Custody used to be asked last and could only demote, one step; nothing
+    consulted it before an interrupt, and 190 of the 200 HIGH interrupts the
+    operator closed as noise (30 days to 2026-09-23) carried no rung at all.
+    A finding whose ORIGIN is proven -- a self-tier rung (the operator
+    authored it) or a vouched-tier rung (a signed publisher, a package
+    receipt, an OS update) -- is an attribute-only observation about a known
+    thing, and belongs in the digest, where it stays visible and still counts
+    toward risk at its tier weight.
+
+    Three things are never gated, whatever their custody: CRITICAL, evidence
+    that is attack-DEFINED (a hostile argv, an IOC hit, a conceal imperative
+    -- origin is not innocence), and a tripped decoy/latch/canary, which no
+    provenance explains. Weak rungs (`build-output`, `supervised`, ...)
+    explain nothing here; they only ever buy the grader's one step."""
+    if SEV_ORDER.get(f.get("severity"), -1) >= SEV_ORDER["CRITICAL"]:
+        return None
+    if str(f.get("fingerprint") or "").startswith(_NEVER_TOLERATE_PREFIXES):
+        return None
+    if not _custody_explained(f):
+        return None
+    return f.get("custody") or f.get("provenance")
+
+
 def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
                    seen=None):
     """{fingerprint: {"route", "why", "decision", "verdicts"}} for a batch.
@@ -4639,7 +4674,11 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
     on the very first scan. `adopt` is the same rule for a surface an upgrade
     sees for the first time. Confidence is the second routing axis: a
     high-impact-but-noisy hit (explicit confidence='low') is logged and
-    correlated but routed to the digest instead of interrupting."""
+    correlated but routed to the digest instead of interrupting. Provenance
+    is the third: a finding whose origin custody has proven routes to the
+    digest at any severity below CRITICAL (see _provenance_gate), and says so
+    on the finding itself as `routed`, which the incident view and the report
+    print."""
     if seen is None:
         seen = load_json(SEEN, {})
     allow = set(load_json(ALLOWLIST, []))
@@ -4649,6 +4688,8 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
         if fp in out:
             continue
         decision, verdicts = _signal_decision(f, memory)
+        gate = _provenance_gate(f)
+        f.pop("routed", None)
         if fp in allow:
             route, why, decision = ROUTE_SILENT, "allowlisted", "allowlisted"
         elif fp in seen:
@@ -4658,6 +4699,9 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
             route, why = ROUTE_DIGEST, "adopted"
         elif CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0:
             route, why = ROUTE_DIGEST, "low-confidence"
+        elif gate:
+            route, why = ROUTE_DIGEST, "provenance:%s" % gate
+            f["routed"] = "digest: provenance %s" % gate
         elif SEV_ORDER[f["severity"]] < SEV_ORDER[NOTIFY_MIN_SEV]:
             route, why = ROUTE_DIGEST, "below-floor"
         elif decision:
@@ -16355,6 +16399,14 @@ _PROVENANCE_NOTE = {
                          "publisher can ship a bad build, and a stolen cert "
                          "signs too, so this quiets it rather than clearing "
                          "it.)"),
+    "publisher-signed": ("The binary carries a valid signature from a "
+                         "publisher the platform itself trusts, and the "
+                         "signer names itself — the ORIGIN of these bytes is "
+                         "a known vendor, not a drop. Origin, not innocence: "
+                         "a publisher can ship a bad build and a stolen "
+                         "certificate signs cleanly until it is revoked, so "
+                         "this demotes one step and routes to the digest; "
+                         "attack-defined behaviour keeps its full severity."),
     "package-managed": ("This binary is owned by a package-manager transaction "
                         "on this machine, proven by its receipt on disk — it "
                         "arrived through an install you ran, not a drop. "
@@ -16392,13 +16444,16 @@ _SELF_CUSTODY = ("operator-vouched", "self-attested", "self-committed",
 #                    authority as its baseline   -> a vendor update
 #   package-managed  the binary is owned by a package-manager transaction on
 #                    this machine, proven by its RECEIPT on disk
+#   publisher-signed the binary carries a valid signature from a publisher the
+#                    platform trusts (publisher_sig) that names its signer
+#                    -> a vendor's build, on FIRST sight
 #
 # They are deliberately weaker than _SELF_CUSTODY: those three are claims of
 # AUTHORSHIP, these are claims of ORIGIN. So they demote one step (HIGH ->
 # MEDIUM), never straight to LOW, except `relocated`, which is a proof that
 # the executed content is byte-identical and therefore carries no new code.
 _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed",
-                    "os-vendor")
+                    "os-vendor", "publisher-signed")
 
 # Recognised-but-weak: git knows the edit is local and unpushed. The note has
 # always read "routine if you made it" while the finding stayed HIGH anyway —
@@ -16447,10 +16502,13 @@ def _demote(severity, provenance, attack_defined=False):
     The three invariants this function exists to hold, all inherited from the
     delegate-surface grader that came before it:
 
-      * grading DEMOTES, it never suppresses — every finding stays in the
-        report at its new level, no finding is dropped, no incident is
-        auto-closed, and nothing here ever writes a dismissal, so a demotion
-        can never feed acquired tolerance;
+      * demotion never suppresses — every finding stays in the report at
+        its new level, no finding is dropped, no incident is auto-closed, and
+        nothing here ever writes a dismissal, so a demotion can never feed
+        acquired tolerance. (Keeping a proven-origin finding out of the
+        interrupt tier is the ROUTING gate's decision, _provenance_gate, not
+        this function's: the finding still reaches the digest and the risk
+        tier at its custody weight.);
       * attack-DEFINED evidence is never demoted, whoever authored it. A
         hostile argv, an IOC hit, a dylib-injection env, a conceal imperative
         keeps its severity even under perfect custody: knowing who wrote a
@@ -16675,6 +16733,68 @@ def _package_receipt(path):
     return None
 
 
+def _publisher_signer(path):
+    """The signature verdict for `path` when a publisher the platform trusts
+    vouches for these bytes AND names itself, else None.
+
+    `publisher-stable` was the only rung that read a signature, and only on a
+    re-sign in place, so a valid Developer ID binary earned nothing on first
+    sight and beaconed HIGH from $HOME. This is the first-sight half. It reads
+    classify_signature, whose verdict is stat-cached per path, so a binary the
+    sensor has already classified costs no second probe. `publisher_sig` is
+    the per-body vocabulary (developer-id / app-store / apple on macOS; a
+    `strict: detritus` verdict is still developer-id); an ad-hoc, broken,
+    unsigned or unanchored (`signed-other`) signature is never it. A verdict
+    with no team and no authority names nobody the operator could check, so
+    it earns nothing either. Never raises: this runs inside a sensor's
+    grading path, where an error must cost a rung, never a scan.
+
+    A probe that already failed this scan on these exact bytes is not asked
+    again: the answer would be the same non-answer, bought with a second
+    codesign run (or a second cold PowerShell on Windows)."""
+    if not path:
+        return None
+    failed_on = _SIG_UNANSWERED.get(path)
+    if failed_on is not None and failed_on == _sig_stat(path):
+        return None
+    try:
+        sig = classify_signature(path)
+    except Exception:
+        return None
+    if publisher_sig(sig.get("trust")) and (sig.get("team")
+                                            or sig.get("authority")):
+        return sig
+    return None
+
+
+def _publisher_line(sig):
+    """The one line that names who signed and which control stands behind
+    it, so the operator can check the claim rather than take it."""
+    trust, team = sig.get("trust"), sig.get("team")
+    authority = sig.get("authority") or ""
+    if trust == "os-managed":
+        return ("Owned by the distro package %s; the distribution's signed "
+                "package pipeline is the control that stands behind this "
+                "rung." % authority)
+    if trust in ("os-signed", "signed-valid"):
+        return ("Authenticode-signed by %s; the certificate chain and its "
+                "revocation are the control that stands behind this rung."
+                % authority)
+    if trust == "developer-id" and team:
+        name = authority.split(": ", 1)[-1]
+        if name.endswith(" (%s)" % team):
+            name = name[:-len(" (%s)" % team)]
+        who = "Developer ID team %s (%s)" % (team, name)
+    elif trust == "app-store":
+        who = "the Mac App Store%s" % (" for team %s" % team if team else "")
+    elif trust == "apple":
+        who = "Apple (%s)" % (authority or "platform binary")
+    else:
+        who = authority or "team %s" % team
+    return ("Signed by %s; Apple's notarization/revocation is the control "
+            "that stands behind this rung." % who)
+
+
 def _grade_binary(severity, path, attack_defined=False, endpoint=None,
                   sha=None, parents=None):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
@@ -16708,9 +16828,16 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     # the caller names an endpoint, the vouch must cover that exact endpoint —
     # an identity vouch never widens into "may talk to anywhere".
     if _vouch_covers(path, endpoint):
-        rung = "operator-vouched"
+        rung, signer = "operator-vouched", None
     elif _package_receipt(path):
-        rung = "package-managed"
+        rung, signer = "package-managed", None
+    else:
+        # A publisher the platform itself trusts, on FIRST sight. Asked only
+        # when neither stronger rung answered, so a vouched or receipted
+        # binary never costs a signature lookup here.
+        rung, signer = None, _publisher_signer(path)
+    if rung or signer:
+        rung = rung or "publisher-signed"
     # Last, and weakest: a generated artifact of a repo this machine commits
     # to. Before this rung existed, the two questions above were the ONLY ones
     # asked of a binary, and a developer's machine answers no to both for
@@ -16747,7 +16874,10 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     # after the grading decision, never before it, so the ledger only ever
     # holds rungs that were actually awarded.
     _custody_remember(sha or _graded_sha(path), rung, path)
-    return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
+    note = _PROVENANCE_NOTE.get(rung)
+    if signer:
+        note = "%s %s" % (_publisher_line(signer), note)
+    return _demote(severity, rung), rung, note
 
 
 # --- the vouch tier: a workload the operator signed for, by hand -------------
@@ -20551,9 +20681,10 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
     if top:
         lines.append("## New since last scan")
         for f in top:
-            lines.append("- %s **%s** — %s" % (
+            lines.append("- %s **%s** — %s%s" % (
                 SEV_ICON[f["severity"]], f["title"],
-                (f["detail"] or "").splitlines()[0][:160]))
+                (f["detail"] or "").splitlines()[0][:160],
+                " (%s)" % f["routed"] if f.get("routed") else ""))
         lines.append("")
     if crit:
         lines.append("## Open CRITICAL incidents")
@@ -20633,8 +20764,9 @@ def _full_report(payload):
             if f["category"] != cur:
                 cur = f["category"]
                 lines.append("## %s" % cur)
-            lines.append("- %s **%s** — %s" % (
-                SEV_ICON[f["severity"]], f["title"], f["detail"]))
+            lines.append("- %s **%s** — %s%s" % (
+                SEV_ICON[f["severity"]], f["title"], f["detail"],
+                " (%s)" % f["routed"] if f.get("routed") else ""))
     return "\n".join(lines) + "\n"
 
 
@@ -20883,6 +21015,7 @@ def _cmd_scan_locked(quiet=False):
     ensure_state()
     # per-scan; a stale count or flag would mislead every later run
     _SIG_PROBE_FAILURES = 0
+    _SIG_UNANSWERED.clear()
     _PROC_ENUM_FAILED = False
     _PROC_ARGV_PARTIAL = False
     _reset_unexamined()
@@ -22240,6 +22373,8 @@ def cmd_incident(incident_id, action=None, reason=None):
         try:
             data = json.loads(evidence["data_json"])
             summary = data.get("title") or data.get("status") or evidence["event_type"]
+            if data.get("routed"):
+                summary += " · %s" % data["routed"]
         except Exception:
             summary = evidence["event_type"]
         print("  - %s · %s · %s" %

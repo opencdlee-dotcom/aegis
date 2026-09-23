@@ -2265,11 +2265,25 @@ class TestListenerSurface(Sandbox):
         self.assertEqual(fs[0]["severity"], "HIGH")
         self.assertEqual(fs[0]["port"], "4444")
 
-    def test_new_signed_listener_is_medium_not_notify(self):
+    def test_new_signed_listener_is_graded_by_publisher_not_notify(self):
+        """Pinned MEDIUM until 2026-09-23 because a signature bought nothing
+        but not being `hostile`. The doctrine it guarded -- a signed listener
+        never interrupts -- still holds; what changed is that a publisher's
+        signature is now a custody rung (`publisher-signed`, one step down)
+        and the routing gate says why it is quiet."""
         fs = aegis.diff_listeners({}, {"/bin/ls:8000": "/bin/ls"})
         self.assertEqual(len(fs), 1)
-        self.assertEqual(fs[0]["severity"], "MEDIUM",
-                         "a signed listener must stay below the notify floor")
+        self.assertLess(aegis.SEV_ORDER[fs[0]["severity"]],
+                        aegis.SEV_ORDER[aegis.NOTIFY_MIN_SEV],
+                        "a signed listener must stay below the notify floor")
+        route = aegis.route_findings(fs, seen={})[fs[0]["fingerprint"]]
+        self.assertEqual("digest", route["route"])
+        if sys.platform == "darwin":
+            # A real codesign answer: /bin/ls is Apple-signed. CI's Linux leg
+            # with the mac flags forced on has no codesign, so no rung.
+            self.assertEqual(("LOW", "publisher-signed"),
+                             (fs[0]["severity"], fs[0]["custody"]))
+            self.assertEqual("provenance:publisher-signed", route["why"])
 
     def test_preexisting_listener_not_realerted(self):
         cur = {"/bin/ls:8000": "/bin/ls"}
@@ -2337,9 +2351,17 @@ class TestHotDirAppBundle(Sandbox):
             aegis.classify_signature = saved_cs
             aegis.gatekeeper_verdict = saved_gk
         self.assertEqual(len(fs), 1, fs)
-        self.assertEqual(fs[0]["severity"], "MEDIUM")
+        # MEDIUM until 2026-09-23. The Developer ID signature is now the
+        # publisher custody rung, one step down and routed to the digest; the
+        # Gatekeeper verdict and the notary fingerprint are unchanged.
+        self.assertEqual(fs[0]["severity"], "LOW")
+        self.assertEqual(fs[0]["provenance"], "publisher-signed")
+        self.assertIn("Developer ID team T (X)", fs[0]["detail"])
         self.assertEqual(fs[0]["gatekeeper"], "rejected")
         self.assertTrue(fs[0]["fingerprint"].startswith("hotdir:notary:"))
+        route = aegis.route_findings(fs, seen={})[fs[0]["fingerprint"]]
+        self.assertEqual(("digest", "provenance:publisher-signed"),
+                         (route["route"], route["why"]))
 
     def test_notarized_app_is_silent(self):
         app, _exe = self._mk_app("Fine.app")

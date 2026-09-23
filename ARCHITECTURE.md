@@ -363,11 +363,31 @@ quiet rather than silence.
    verdicts, and a ledger that crossed machines would let one compromised body
    launder bytes into every other body's known-good set.
 
+9. **Publisher signature** (binary-keyed findings) → **MEDIUM**, asked after
+   the vouch and the receipt and before `build-output`. `publisher-stable`
+   was the only rung that read a signature, and only on a re-sign in place,
+   so a valid Developer ID binary earned nothing on first sight and beaconed
+   HIGH from `$HOME` on the one sensor whose predicate is an OR. The binary
+   earns `publisher-signed` when `publisher_sig()` accepts its verdict
+   (apple / app-store / developer-id on macOS, a `strict: detritus` verdict
+   included; os-signed / signed-valid on Windows; os-managed on Linux) and
+   the verdict names a team or authority; the note names that signer and the
+   control behind it (Apple's notarization and revocation on macOS). Ad-hoc,
+   broken, unsigned and `signed-other` earn nothing. It reads the stat-cached
+   verdict the sensor already asked for, so it costs no second probe.
+
 Guards, because grading is where an attacker would want to stand:
 
-- **Grades, never mutes.** A downgraded finding is still created, still in the
-  report, still accumulates risk and joins correlation chains. Custody writes
-  no dismissal and cannot feed acquired tolerance.
+- **Demotion never suppresses; the routing gate decides what interrupts.** A
+  downgraded finding is still created, still in the report, still accumulates
+  risk and joins correlation chains, and custody writes no dismissal and
+  cannot feed acquired tolerance. What keeps a proven origin quiet is the
+  ROUTING gate (`_provenance_gate`, asked by `route_findings` before the
+  notify floor): a finding below CRITICAL whose rung is in the self or
+  vouched tier, that is not attack-defined and not a decoy/latch/canary trip,
+  routes to the digest, where it remains visible (it carries
+  `routed: digest: provenance <rung>`, which `incident` and `report` print)
+  and counts toward risk at its tier weight. Weak rungs only demote.
 - **Attack-defined content never downgrades.** A conceal imperative stays HIGH
   even when self-attested — an agent prompt-injected into persisting a hostile
   instruction attests its own write. Custody grades *churn-shaped structure*,
@@ -398,8 +418,8 @@ call sequence:
    bidirectional: a covered change drops to INFO, an uncovered change is
    promoted to at least HIGH — under enforcement, the *absence of a record*
    outranks provenance, which is the entire point of opting in.
-4. **The notify floor** (`emit`) routes by the final severity; it never
-   changes one.
+4. **The notify floor** (`emit`) routes by the final severity and, through
+   the provenance gate, by custody; it never changes a severity.
 5. **The incident ratchet** (`_severity_max`) only ever steps UP: once an
    incident opened HIGH, a later regrade of the same subject cannot quietly
    lower it — de-escalation is the operator's verdict to give, not custody's.
