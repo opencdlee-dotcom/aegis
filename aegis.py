@@ -2243,7 +2243,11 @@ def _sig_stat(path):
 #      alone carried the verdict; Obsidian's `broken` (#526) came out of the
 #      same scan. Any v2 entry may be one of those, so every one re-probes
 #      once.
-_SIGCACHE_LOGIC_VERSION = 3
+#   4  strict-only detritus: a `--strict` refusal of Finder attributes was
+#      cached as `broken` although the seal verified (_STRICT_DETRITUS_MARKERS).
+#      Live, 2026-09-23: Zoom and Zotero, both Developer ID. Any v3 `broken`
+#      may be one of those, so every v3 entry re-probes once.
+_SIGCACHE_LOGIC_VERSION = 4
 
 
 def classify_signature(path):
@@ -2628,6 +2632,27 @@ def _is_apple_os_signing(leaf, authorities):
     return _APPLE_OS_SIGNING_CA in (authorities or ())
 
 
+# `codesign --verify --strict` refuses more than a broken seal. It also refuses
+# Finder extended attributes left inside a bundle, with
+#
+#     resource fork, Finder information, or similar detritus not allowed
+#
+# and the plain verify, which checks the same seal, passes. Every non-zero
+# strict exit used to be filed `broken`, which is in suspicious_sig(). Live,
+# 2026-09-23: Zoom and Zotero, full Developer ID chains and intact seals, read
+# `broken` and raised 36 HIGH interrupts in 30 days. A real tamper reads
+# "invalid signature (code or signature have been modified)" or "a sealed
+# resource is missing or invalid" and fails without --strict too.
+#
+# So a strict failure that names detritus is asked once more without --strict,
+# and the plain verify decides: it passes -> the chain's trust stands and the
+# verdict records `strict: detritus`; it fails with a reason -> `broken`. The
+# text gate only limits the second probe to the one class known to be benign;
+# it is never the verdict, so detritus added to a modified binary cannot
+# launder it. Every other strict failure is `broken` exactly as before.
+_STRICT_DETRITUS_MARKERS = ("detritus", "resource fork", "finder information")
+
+
 def _classify_mac(path):
     global _SIG_PROBE_FAILURES
     out, err, rc = run(["codesign", "-dv", "--verbose=4", path], timeout=12)
@@ -2696,7 +2721,22 @@ def _classify_mac(path):
             result["trust"] = "unknown"
             result["probe_failed"] = True
         elif vrc != 0 and "not signed" not in (verr or "").lower():
-            result["trust"] = "broken"
+            if not any(m in (verr or "").lower()
+                       for m in _STRICT_DETRITUS_MARKERS):
+                result["trust"] = "broken"
+            else:
+                # The plain verify's non-answer is the strict one's: a timeout,
+                # or a failing exit that says nothing, is not a verdict.
+                _, perr, prc = run(["codesign", "--verify", path], timeout=20)
+                if (_probe_timed_out(perr, prc)
+                        or (prc != 0 and not (perr or "").strip())):
+                    _SIG_PROBE_FAILURES += 1
+                    result["trust"] = "unknown"
+                    result["probe_failed"] = True
+                elif prc == 0:
+                    result["strict"] = "detritus"
+                else:
+                    result["trust"] = "broken"
     return result
 
 
