@@ -1909,7 +1909,7 @@ class C1ASupervisedChildIsAWeakRung(Sandbox):
                 ("_process_ancestry_table", build),
                 ("load_vouches", lambda now=None: (vouches, None)),
                 ("classify_signature", lambda p: {
-                    "trust": "adhoc", "team": None, "authority": None}),
+                    "trust": _untrusted(), "team": None, "authority": None}),
                 ("warm_signature_cache", lambda paths: 0),
                 ("_exec_alert", lambda path, trust: (
                     None if path == self.listener
