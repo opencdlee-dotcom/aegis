@@ -20192,6 +20192,7 @@ def gather_all(baseline_snap, current_snap, health=None):
         ("decoy", check_decoys, ()),
         ("paste-guard", check_paste_guard, ()),
         ("assay", check_assay, ()),
+        ("precision", check_precision, ()),
         ("outbound", check_outbound, ()),
         ("web-protection", check_web_protection, ()),
         ("hardening", check_hardening, ()),
@@ -21142,6 +21143,11 @@ def _cmd_scan_locked(quiet=False):
 
     if not quiet:
         print(md)
+    # Last of all, after the beat and the report: the daily precision snapshot
+    # runs the backtest replay (minutes on a real store), so it must not delay
+    # what the scan exists to produce, and a failure in it costs the snapshot,
+    # never the scan -- _precision_tail catches and logs.
+    _precision_tail()
     return 0
 
 
@@ -21317,9 +21323,11 @@ def cmd_report(full=False):
                 sys.stdout.write(f.read())
         else:
             print("No report yet. Run: aegis.py scan")
+        print("\n" + _precision_line(_precision_load()))
         return 0
     if full:
         sys.stdout.write(_full_report(payload))
+        print("\n" + _precision_line(_precision_load()))
         return 0
     findings = payload.get("findings") or []
     fresh = set(payload.get("new_fingerprints") or [])
@@ -21337,6 +21345,7 @@ def cmd_report(full=False):
         learning_days, payload.get("aged") or 0,
         quiet=payload.get("quiet") or 0,
         prev_scan_at=payload.get("scan_at")))
+    print("\n" + _precision_line(_precision_load()))
     return 0
 
 
@@ -22804,6 +22813,9 @@ def cmd_status():
     # an operator asks whether the coverage is real.
     a_mark, a_text = _assay_coverage_line()
     emit("  %s %-32s %s" % (a_mark, "Detector positive controls", a_text))
+    # The number the precision fixes are judged on, beside the recall it may
+    # never be bought with. Unmarked: a measurement, not a pass/fail check.
+    emit("  " + _precision_line(_precision_load()))
     health = get_sensor_health()
     if health:
         emit("\n# Sensor coverage")
@@ -28707,6 +28719,317 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
     return 1 if r["problems"] else 0
 
 
+# --------------------------------------------------------------------------- #
+# The precision snapshot: `backtest replay`'s answer, cached where the
+# operator reads, and a regression that surfaces without anyone asking.
+#
+# The replay is the number every precision fix is judged on, and it costs
+# minutes on the live store, so it ran only when a human remembered to -- which
+# made "the queue got shorter" the working measure again between runs. The
+# scan's tail refreshes it at most once a day (the integrity check's cadence
+# rule), `report` and `status` print it as one line, and check_precision turns
+# a regression between two snapshots into an ordinary finding, so it routes
+# and correlates like everything else. The replay is read-only on the store;
+# the snapshot file is the one thing this writes.
+# --------------------------------------------------------------------------- #
+
+# <= 0 = never from the scan path (`aegis.py precision --refresh` still
+# measures). Module-level so a test can pin it, the same idiom as
+# SCAN_TIME_BUDGET: the suite pins it to 0 so an ordinary scan test never pays
+# for a replay.
+PRECISION_SNAPSHOT_EVERY_SECS = 24 * 3600
+PRECISION_DAYS = 30
+# A rise this large in re-alerting noise or teaching evaporation between two
+# snapshots is a regression; a smaller move is the corpus breathing.
+_PRECISION_RISE = 3
+_PRECISION_NUMBERS = ("noise_reopened", "noise_total", "interrupts",
+                      "open_cases", "assay_routable_interrupting",
+                      "assay_routable_total", "assay_predicate_passing",
+                      "assay_predicate_total", "teaching_evaporation")
+# Resolutions the machine writes on an incident in the pass that opens it
+# (_auto_tolerate, _close_allowlisted): there the operator's teaching HELD, so
+# the incident is not evaporation.
+_TAUGHT_AT_BIRTH = ("auto-tolerated", "learning-period", "allowlisted")
+
+
+def _precision_path():
+    """Resolved against the CURRENT STATE_DIR at call time, as _run_log_path
+    is, so redirecting STATE_DIR is sufficient."""
+    return os.path.join(STATE_DIR, "precision.json")
+
+
+def _precision_load():
+    rec = load_json(_precision_path(), None)
+    return rec if isinstance(rec, dict) else None
+
+
+def _teaching_evaporation(live, since):
+    """Incidents opened since `since` whose tolerance identity matches one the
+    operator had ALREADY closed benign-positive or false-positive before it
+    opened: teaching that did not hold.
+
+    The identity is _incident_identity's, the one the tolerance layer keys on.
+    Where it cannot generalize (no content hash or version in the key) the
+    exact correlation key stands in, which is what the exact-key reattach
+    already treats as the same case. A verdict is a dismissals row, so only a
+    human act counts: machine closes write none."""
+    judged = {}
+    for row in live.execute(
+            "SELECT d.dismissed_at, i.correlation_key, i.subject_json "
+            "FROM dismissals d JOIN incidents i ON i.id=d.incident_id "
+            "WHERE d.reason_code IN ('benign-positive','false-positive') "
+            "AND i.correlation_key LIKE 'signal:%'"):
+        ident = _incident_identity(row)[0] or row["correlation_key"]
+        at = row["dismissed_at"]
+        if ident not in judged or at < judged[ident]:
+            judged[ident] = at
+    marks = ",".join("?" for _ in _TAUGHT_AT_BIRTH)
+    evaporated = 0
+    for row in live.execute(
+            "SELECT created_at, correlation_key, subject_json FROM incidents "
+            "WHERE created_at>=? AND correlation_key LIKE 'signal:%%' "
+            "AND COALESCE(resolution,'') NOT IN (%s)" % marks,
+            (since,) + _TAUGHT_AT_BIRTH):
+        ident = _incident_identity(row)[0] or row["correlation_key"]
+        if ident in judged and judged[ident] < row["created_at"]:
+            evaporated += 1
+    return evaporated
+
+
+def _precision_measure(now):
+    """One snapshot: `backtest replay --days PRECISION_DAYS --reobserve`
+    reduced to the numbers the loop is judged on, plus teaching evaporation.
+    Raises when there is nothing to measure; never writes the store."""
+    r = _backtest_replay(PRECISION_DAYS, reobserve=True, now=now)
+    if r.get("missing"):
+        raise RuntimeError("no event store at %s" % r["missing"])
+    live = _replay_live_store()
+    if live is None:
+        raise RuntimeError("the event store went away mid-measurement")
+    try:
+        evaporation = _teaching_evaporation(live,
+                                            now - PRECISION_DAYS * 86400)
+    finally:
+        live.close()
+    status = [row["status"] for row in r["assay"]]
+    routable = status.count("interrupt") + status.count("digest")
+    # A lane that FAILED never got as far as building a finding, so it cannot
+    # be told apart from a predicate lane: it is counted there, as not
+    # passing. A routable lane that fails still drops the routable numerator.
+    predicate = status.count("predicate") + status.count("FAILED")
+    problems = list(r["problems"])
+    # Rule 17: every lane lands in exactly one bucket, or the snapshot says so.
+    if routable + predicate + status.count("not run") != len(status):
+        problems.append("assay statuses %s do not partition %d lane(s)"
+                        % (sorted(set(status)), len(status)))
+    return {
+        "epoch": now,
+        "ts": datetime.fromtimestamp(now, timezone.utc).astimezone()
+        .isoformat(timespec="seconds"),
+        "days": r["days"],
+        "noise_reopened": len(r["reopened"]),
+        "noise_total": len(r["noise"]),
+        "interrupts": sum(bucket[ROUTE_INTERRUPT]
+                          for bucket in r["routes"].values()),
+        "open_cases": len(r["open_cases"]),
+        "assay_routable_interrupting": status.count("interrupt"),
+        "assay_routable_total": routable,
+        "assay_predicate_passing": status.count("predicate"),
+        "assay_predicate_total": predicate,
+        "teaching_evaporation": evaporation,
+        "problems": problems,
+    }
+
+
+def _precision_refresh(now=None):
+    """Measure now and write the snapshot, carrying the previous snapshot's
+    numbers as the baseline the regression rules compare against. A failed
+    measurement keeps the last good snapshot, stamps the attempt (so the
+    cadence holds and the failure is on record) and re-raises."""
+    now = _epoch(now)
+    old = _precision_load()
+    try:
+        snap = _precision_measure(now)
+    except Exception as e:
+        save_json(_precision_path(),
+                  dict(old or {}, attempted=now, error=str(e)[:300]))
+        raise
+    if old and old.get("epoch"):
+        snap["previous"] = {k: old.get(k)
+                            for k in ("epoch", "ts") + _PRECISION_NUMBERS}
+    save_json(_precision_path(), snap)
+    return snap
+
+
+def _precision_due(now=None):
+    """True when the scan path should refresh the snapshot. The integrity
+    check's cadence rule (_integrity_scan_due): a missing or unreadable stamp
+    is DUE, a stamp from the future is DUE. A failed attempt counts as a run,
+    so a replay that fails is retried tomorrow, not on every tick."""
+    if (PRECISION_SNAPSHOT_EVERY_SECS or 0) <= 0:
+        return False
+    now = _epoch(now)
+    rec = _precision_load()
+    if rec is None:
+        return True
+    try:
+        last = max(int(rec.get("epoch") or 0), int(rec.get("attempted") or 0))
+    except (TypeError, ValueError):
+        return True
+    return (now - last) >= PRECISION_SNAPSHOT_EVERY_SECS or last > now
+
+
+def _precision_tail(now=None):
+    """The scan's last step: refresh the snapshot when due. A failure, or an
+    exception anywhere in here, costs the snapshot and a run-log line, never
+    the scan. True when a snapshot was written."""
+    try:
+        if not _precision_due(now):
+            return False
+        snap = _precision_refresh(now)
+        log_run("precision snapshot: " + _precision_line(snap))
+        return True
+    except Exception as e:
+        log_run("precision snapshot failed (the scan is unaffected): %s" % e)
+        return False
+
+
+def _precision_regressions(prev, cur):
+    """Findings for a regression from snapshot `prev` to `cur`; [] when there
+    is no baseline (a first snapshot) or nothing moved the wrong way.
+
+    Asymmetric on purpose. ANY drop in the assay's routable lanes that
+    interrupt, or its predicate lanes that pass, is HIGH: precision may never
+    be bought with recall, and a positive control that stopped firing is a
+    detector that stopped working. Precision gets slack: re-alerting noise or
+    teaching evaporation must rise by _PRECISION_RISE before it is MEDIUM,
+    which is the digest, below the notify floor. Each fingerprint carries the
+    snapshot's epoch, so one regression is one case re-asserted each scan
+    until the next snapshot, and a later regression is a new case."""
+    if not isinstance(prev, dict) or not isinstance(cur, dict):
+        return []
+
+    def pair(key):
+        a, b = prev.get(key), cur.get(key)
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in (a, b)):
+            return None
+        return a, b
+
+    between = "%s and %s" % (prev.get("ts") or prev.get("epoch"),
+                             cur.get("ts") or cur.get("epoch"))
+    findings = []
+    drops = []
+    for key, label in (("assay_routable_interrupting",
+                        "routable lanes that interrupt"),
+                       ("assay_predicate_passing",
+                        "predicate lanes that pass")):
+        got = pair(key)
+        if got and got[1] < got[0]:
+            drops.append("%s %d -> %d" % (label, got[0], got[1]))
+    if drops:
+        findings.append(finding(
+            "HIGH", "self-protection",
+            "A detector positive control stopped firing",
+            "Between the precision snapshots of %s the assay lost ground: %s. "
+            "A control that fired on its own known stimulus no longer does, "
+            "so recall broke. `aegis.py backtest replay` names the lane."
+            % (between, "; ".join(drops)),
+            "self:precision:recall:%s" % cur.get("epoch")))
+    rises = []
+    for key, label in (("noise_reopened",
+                        "judged-noise incidents that would re-alert"),
+                       ("teaching_evaporation", "teaching evaporation")):
+        got = pair(key)
+        if got and got[1] - got[0] >= _PRECISION_RISE:
+            rises.append("%s %d -> %d" % (label, got[0], got[1]))
+    if rises:
+        findings.append(finding(
+            "MEDIUM", "self-protection", "Precision regressed",
+            "Between the precision snapshots of %s: %s. Noise you already "
+            "judged is coming back. `aegis.py backtest replay --reobserve` "
+            "lists the incidents by id." % (between, "; ".join(rises)),
+            "self:precision:regressed:%s" % cur.get("epoch")))
+    return findings
+
+
+def check_precision():
+    """Sensor: a regression between the last two precision snapshots. Silent
+    until a second snapshot exists; a first one has no baseline."""
+    snap = _precision_load()
+    if snap is None:
+        return []
+    return _precision_regressions(snap.get("previous"), snap)
+
+
+def _precision_numbers_text(snap):
+    return ("%s/%s judged-noise would re-alert \u00b7 %s interrupts \u00b7 "
+            "assay %s/%s routable + %s/%s predicate \u00b7 teaching "
+            "evaporation %s" % tuple(snap.get(k, "?") for k in (
+                "noise_reopened", "noise_total", "interrupts",
+                "assay_routable_interrupting", "assay_routable_total",
+                "assay_predicate_passing", "assay_predicate_total",
+                "teaching_evaporation")))
+
+
+def _precision_line(snap):
+    """The one line `report` and `status` print. A failed self-check leads
+    it, and a refresh that failed after the snapshot is named beside the
+    numbers it left standing."""
+    days = PRECISION_DAYS
+    if not snap or not snap.get("epoch"):
+        if snap and snap.get("error"):
+            return ("Precision (%dd replay): not measured \u2014 the last "
+                    "attempt, %s, failed: %s"
+                    % (days, _ago(snap.get("attempted")), snap["error"]))
+        return ("Precision (%dd replay): not measured yet \u2014 run "
+                "`aegis.py precision --refresh` (minutes), or let a scan "
+                "measure it" % days)
+    line = "Precision (%sd replay, %s): " % (snap.get("days") or days,
+                                             _ago(snap["epoch"]))
+    if snap.get("problems"):
+        line += "SELF-CHECK FAILED (%s) \u2014 " % "; ".join(snap["problems"])
+    line += _precision_numbers_text(snap)
+    try:
+        failed_after = int(snap.get("attempted") or 0) > int(snap["epoch"])
+    except (TypeError, ValueError):
+        failed_after = False
+    if failed_after and snap.get("error"):
+        line += " \u00b7 refresh %s failed: %s" % (_ago(snap["attempted"]),
+                                                   snap["error"])
+    return line
+
+
+def cmd_precision(refresh=False):
+    """`precision`: the cached snapshot `report` and `status` print, its age,
+    and the baseline it is compared against. Read-only unless --refresh,
+    which measures now (minutes on a real store) and writes the snapshot
+    file only."""
+    if refresh:
+        ensure_state()
+        try:
+            _precision_refresh()
+        except Exception as e:
+            print("Precision refresh failed: %s" % e)
+            return 1
+    snap = _precision_load()
+    print(_precision_line(snap))
+    if snap and snap.get("epoch"):
+        print("  open cases the replay leaves: %s" % snap.get("open_cases"))
+        prev = snap.get("previous")
+        if isinstance(prev, dict) and prev.get("epoch"):
+            print("  baseline, %s: %s" % (_ago(prev["epoch"]),
+                                         _precision_numbers_text(prev)))
+            regressions = _precision_regressions(prev, snap)
+            for f in regressions:
+                print("  %s %s: %s" % (f["severity"], f["title"], f["detail"]))
+            if not regressions:
+                print("  no regression against the baseline")
+        else:
+            print("  first snapshot: no baseline yet, so no regression can be "
+                  "raised")
+    return 1 if snap and snap.get("problems") else 0
+
+
 def cmd_backtest(category=None):
     """Score a detection category against this machine's own dismissal labels.
 
@@ -31533,6 +31856,15 @@ HELP = """aegis.py - personal security monitor for macOS, Linux and Windows
                    signature classifier and custody ladder about every binary
                    still on disk, so a classifier or ladder fix is scoreable.
                    Asserts its own counts against the store. Read-only
+  precision [--refresh]
+                   the cached snapshot `report` and `status` print: `backtest
+                   replay --days 30 --reobserve` reduced to judged noise that
+                   would re-alert, interrupts, assay recall, and teaching
+                   evaporation (incidents opened in an identity you had
+                   already closed as noise), with its age. A scan refreshes it
+                   once a day and raises a self-protection finding when recall
+                   drops (HIGH) or noise or evaporation rise by 3+ (MEDIUM).
+                   --refresh measures now (minutes). Read-only on the store
 """
 
 
@@ -31928,6 +32260,12 @@ def main(argv):
                 return 1
             return cmd_backtest_replay(days, reobserve)
         return cmd_backtest(argv[2] if len(argv) > 2 else None)
+    if cmd == "precision":
+        rest = argv[2:]
+        if rest not in ([], ["--refresh"]):
+            print("usage: aegis.py precision [--refresh]")
+            return 1
+        return cmd_precision(refresh=bool(rest))
     if cmd == "cauterize":
         return cmd_cauterize(argv[2] if len(argv) > 2 else None,
                              argv[3] if len(argv) > 3 else None)
