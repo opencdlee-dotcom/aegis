@@ -28656,11 +28656,64 @@ def _persistence_rebuilt_old(rec, program, shown):
     return old, unknown
 
 
+_PAYLOAD_CASE_PREFIX = "persistence:payload-update:"
+
+
+def _persistence_rederives(g, line, path):
+    """True when `g`, what check_persistence emits for a rebuilt per-item
+    change, is that record re-derived: it prints the recorded line, or it is
+    the payload case that now carries a change confined to a payload's bytes
+    (one finding per payload and new sha, whatever the jobs running it) —
+    naming this item among those jobs, and the payload and bytes the recorded
+    line printed."""
+    head = str(g["detail"]).split("\n")[0]
+    if head == line:
+        return True
+    if not str(g["fingerprint"]).startswith(_PAYLOAD_CASE_PREFIX) \
+            or path not in (g.get("referrer_paths") or ()):
+        return False
+    # "payload <path> bytes <old> -> <new>; N persistence item(s) run it: …",
+    # against the recorded "<label>: payload <path> bytes <old> -> <new>"
+    return line.endswith(": " + head.split("; ", 1)[0])
+
+
+def _reobserve_payload_case_answer(f, memo):
+    """("ok", finding) | ("gone", None) | ("not", reason) for a recorded
+    payload case: the change rebuilt on every job the record names, each
+    accepted only where it still runs the payload at the recorded new bytes.
+    Which old bytes each job had is not recorded when they differed, and
+    does not move the grade: the sensor needs only that they changed."""
+    fp = str(f["fingerprint"])
+    payload = f.get("script_target") or f.get("path")
+    sha = fp.rsplit(":", 1)[-1]
+    head = str(f["detail"]).split("\n")[0]
+    prefix = "payload %s bytes " % payload
+    referrers = list(f.get("referrer_paths") or ())
+    if not referrers or not head.startswith(prefix) \
+            or " -> " not in head[len(prefix):]:
+        return "not", "the record names no item"
+    was = head[len(prefix):].split(" -> ", 1)[0].split(",")[0]
+    live = _reobserve_live(memo, "persistence")
+    now = {p: live.get(p) for p in referrers}
+    if all(rec is None for rec in now.values()):
+        return "gone", None
+    if any(rec is None or rec.get("script_target") != payload
+           or rec.get("target_sha") != sha for rec in now.values()):
+        return "not", _REPLAY_MOVED_ON
+    out = check_persistence({p: dict(rec, target_sha=was)
+                             for p, rec in now.items()}, now)
+    if len(out) != 1 or out[0]["fingerprint"] != fp:
+        return "not", "the rebuilt change does not reproduce the record"
+    return "ok", out[0]
+
+
 def _reobserve_persistence_answer(f, path, memo):
     """("ok", finding) | ("dropped", None) | ("gone", None) | ("not", reason)
     for one persistence record; see _reobserve_persistence."""
     import itertools
     title = f["title"]
+    if str(f["fingerprint"]).startswith(_PAYLOAD_CASE_PREFIX):
+        return _reobserve_payload_case_answer(f, memo)
     if title == "OS program referenced by persistence items was updated":
         program = f.get("program") or path
         sha = ((f.get("subject") or {}).get("content")
@@ -28712,7 +28765,7 @@ def _reobserve_persistence_answer(f, path, memo):
         out = check_persistence(
             {path: dict(old, **dict(zip(unknown, values)))}, {path: rec})
         if len(out) != 1 or (out[0]["title"] == title and
-                             out[0]["detail"].split("\n")[0] != line):
+                             not _persistence_rederives(out[0], line, path)):
             return "not", "the rebuilt change does not reproduce the record"
         g = out[0]
         answers.setdefault((g["title"], g["severity"], g.get("custody"),
