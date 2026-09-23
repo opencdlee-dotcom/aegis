@@ -16044,6 +16044,9 @@ def _reset_custody_probes():
     _REPO_ROOT_CACHE.clear()
     _REPO_SELFNESS_CACHE.clear()
     _BUILD_OUTPUT_CACHE.clear()
+    # Not a git probe, but the same per-scan lifetime: the parsed cargo-dist
+    # receipts (see _cargo_dist_receipts).
+    _CARGO_DIST_CACHE.clear()
 
 
 def _repo_root_of(git, d):
@@ -16779,6 +16782,178 @@ def _choco_receipt(real):
     return None
 
 
+# --- installer receipts: two installers that are not package managers --------
+#
+# The cargo-dist installer (`curl ... | sh` for uv and most Rust CLIs) and
+# Playwright's browser download both leave a receipt as readable as Homebrew's,
+# and their binaries were the residue of the process sensor's queue: an ad-hoc
+# `uv` in ~/.local/bin and a Playwright Firefox whose seal reads broken. (That
+# `uv` is also the PROGRAM of LaunchAgents a uv-run toolkit installs; the
+# persistence ladder does not consult package receipts, so this does not
+# reach those findings.)
+#
+# Doctrine, the same as every receipt above: a receipt is a same-uid file, so
+# anything already running as the operator can forge one — exactly as it can
+# drop an INSTALL_RECEIPT.json beside a Cellar file. That is why these answer
+# only the vouched tier's `package-managed` rung: one severity step, never to
+# LOW, a 0.25 weight in the risk tier, and `_grade_binary` never consults them
+# for attack-defined evidence. Origin is not innocence; a receipt quiets the
+# identity half of a finding and nothing else.
+
+# Parsed receipts per config root, for one scan: {root: {binary key: label}}.
+# Cleared by _reset_custody_probes, so a receipt the next install rewrites is
+# read again on the next scan and not before.
+_CARGO_DIST_CACHE = {}
+
+
+def _cargo_dist_config_roots():
+    """Where a cargo-dist installer writes `<app>/<app>-receipt.json`.
+
+    Read from the installers themselves (uv 0.11.6, cargo-dist 0.31.0):
+    install.sh uses ${XDG_CONFIG_HOME:-$HOME/.config} (or %LOCALAPPDATA% from
+    a Windows posix shell), install.ps1 uses %XDG_CONFIG_HOME% else
+    %LOCALAPPDATA%. XDG_CONFIG_HOME is asked first and the default as well,
+    because the environment Aegis runs under is not the shell that installed.
+    """
+    roots = []
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.isabs(xdg):
+        roots.append(xdg)
+    if IS_WIN:
+        default = os.environ.get("LOCALAPPDATA")
+    else:
+        default = os.path.join(HOME, ".config")
+    if default and default not in roots:
+        roots.append(default)
+    return roots
+
+
+def _binary_key(path):
+    """One spelling of a file for comparing two paths to it: links resolved,
+    and case folded where the filesystem folds it."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _parse_cargo_dist_receipt(receipt_path, dirname):
+    """{binary key: label} for one receipt, or {} when it is not one.
+
+    Only a plain file name in `binaries` is honoured: an entry with a
+    separator in it would turn a same-uid JSON file into a vouch for any path
+    on the disk. The hierarchical layouts record the root and install one
+    level down in bin/; flat (and a receipt that predates the field) installs
+    into the prefix itself."""
+    try:
+        data = json.loads(_read_text(receipt_path, limit=64 * 1024) or "")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    binaries, prefix = data.get("binaries"), data.get("install_prefix")
+    if (not isinstance(binaries, list) or not isinstance(prefix, str)
+            or not os.path.isabs(prefix)):
+        return {}
+    if data.get("install_layout") in ("hierarchical", "cargo-home"):
+        prefix = os.path.join(prefix, "bin")
+    source = data.get("source") if isinstance(data.get("source"), dict) else {}
+    name = source.get("name") or source.get("app_name") or dirname
+    label = "cargo-dist:%s" % name
+    if source.get("owner"):
+        label = "cargo-dist:%s/%s" % (source["owner"], name)
+    if data.get("version"):
+        label += "@%s" % data["version"]
+    found = {}
+    for b in binaries:
+        if (isinstance(b, str) and b not in ("", ".", "..")
+                and os.path.basename(b) == b):
+            found[_binary_key(os.path.join(prefix, b))] = label
+    return found
+
+
+def _cargo_dist_receipts():
+    """{binary key: label} over every cargo-dist receipt on this body, read
+    once per scan. Bounded to `<root>/<d>/<d>-receipt.json`: the installer
+    names the receipt after its own directory, and nothing else is read."""
+    out = {}
+    for root in _cargo_dist_config_roots():
+        if root not in _CARGO_DIST_CACHE:
+            found = {}
+            try:
+                names = sorted(os.listdir(root))
+            except OSError:
+                names = []
+            for d in names:
+                rp = os.path.join(root, d, d + "-receipt.json")
+                if os.path.isfile(rp):
+                    found.update(_parse_cargo_dist_receipt(rp, d))
+            _CARGO_DIST_CACHE[root] = found
+        out.update(_CARGO_DIST_CACHE[root])
+    return out
+
+
+def _cargo_dist_receipt(real):
+    """A binary a cargo-dist installer put on disk: `real` resolves to
+    `<install_prefix>/<binary>` for a binary its receipt lists. Same-uid
+    forgeable like the Homebrew receipt, hence vouched-tier only (see the
+    section comment above)."""
+    if not real:
+        return None
+    return _cargo_dist_receipts().get(_binary_key(real))
+
+
+# `<browser>-<revision>`; the browser part may carry `_` and a host-platform
+# tag (`webkit_ubuntu20.04-x64_special-2092`), the revision is digits.
+_PLAYWRIGHT_BROWSER_DIR = re.compile(r"^[^.].*-\d+$")
+
+
+def _playwright_roots():
+    """The browser caches Playwright installs into, as its registry resolves
+    them: PLAYWRIGHT_BROWSERS_PATH when it names an absolute directory, and
+    the platform default as well (Aegis's environment is not the installer's).
+    "0" (node_modules/.../.local-browsers) and a relative value (resolved
+    against the installing process's cwd) are not knowable here and are not
+    guessed at."""
+    roots = []
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env and env != "0" and os.path.isabs(env):
+        roots.append(env)
+    if IS_MAC:
+        default = os.path.join(HOME, "Library", "Caches", "ms-playwright")
+    elif IS_WIN:
+        base = (os.environ.get("LOCALAPPDATA")
+                or os.path.join(HOME, "AppData", "Local"))
+        default = os.path.join(base, "ms-playwright")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+        default = os.path.join(base, "ms-playwright")
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
+def _playwright_receipt(real):
+    """A file inside a `<browser>-<revision>` directory directly under a
+    Playwright cache root that holds INSTALLATION_COMPLETE — the marker
+    Playwright's download worker writes after the extract finished, never
+    before. The marker is only evidence where Playwright writes it: the same
+    tree anywhere else answers nothing. Same-uid forgeable like the Homebrew
+    receipt, hence vouched-tier only (see the section comment above)."""
+    if not real:
+        return None
+    target = os.path.normcase(os.path.abspath(real))
+    for root in _playwright_roots():
+        for base in {os.path.normcase(os.path.abspath(root)),
+                     os.path.normcase(os.path.realpath(root))}:
+            if not target.startswith(base.rstrip(os.sep) + os.sep):
+                continue
+            rest = target[len(base.rstrip(os.sep)) + 1:].split(os.sep)
+            if len(rest) < 2 or not _PLAYWRIGHT_BROWSER_DIR.match(rest[0]):
+                continue
+            if os.path.isfile(os.path.join(base, rest[0],
+                                           "INSTALLATION_COMPLETE")):
+                return "playwright:%s" % rest[0]
+    return None
+
+
 def _os_package_receipt(real):
     """The OS-NATIVE package manager's claim on `real`.
 
@@ -16800,6 +16975,7 @@ def _os_package_receipt(real):
 # questions first, so the expensive one is only asked when no cheap answer won.
 _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
                      _uv_python_receipt, _winget_receipt, _choco_receipt,
+                     _playwright_receipt, _cargo_dist_receipt,
                      _os_package_receipt)
 
 
