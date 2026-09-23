@@ -1707,6 +1707,19 @@ def run(cmd, timeout=15, extra_env=None, stdin_data=None):
         return "", str(e), 1
 
 
+def _probe_timed_out(err, rc):
+    """Did this run() result come from its TIMEOUT branch rather than from the
+    tool? A timed-out probe hands its caller ("", "timeout", 124), and a parser
+    that reads that as output finds no marker it recognises and falls through
+    to whatever it concludes from nothing -- which for codesign was `unsigned`.
+    This is the one spelling of the question, so every caller that must treat
+    a timeout as a non-answer reads it exactly the way run() writes it.
+
+    Both halves, because each alone is an ordinary answer: 124 is also GNU
+    `timeout`'s own exit status, and any tool may print the word."""
+    return rc == 124 and (err or "") == "timeout"
+
+
 def sha256(path):
     try:
         h = hashlib.sha256()
@@ -2222,7 +2235,15 @@ def _sig_stat(path):
 #      leaf string, so every platform binary on macOS >= 26 read signed-other.
 #   2  `_is_apple_os_signing`: leaf matched as a family, conjunctive with
 #      Apple's OS-signing CA.
-_SIGCACHE_LOGIC_VERSION = 2
+#   3  non-answers: an empty or timed-out codesign probe minted `unsigned` (or,
+#      from the strict verify, `broken`) under v2 and was cached on a stat
+#      that never changes. Live, 2026-09-20 08:32: Spotify's main binary and a
+#      helper went `unsigned` in a scan that landed 18 minutes after its
+#      predecessor on a 10-minute cadence, and 366 findings on the main binary
+#      alone carried the verdict; Obsidian's `broken` (#526) came out of the
+#      same scan. Any v2 entry may be one of those, so every one re-probes
+#      once.
+_SIGCACHE_LOGIC_VERSION = 3
 
 
 def classify_signature(path):
@@ -2265,7 +2286,16 @@ def classify_signature(path):
     else:
         result = _classify_mac(path)
 
-    if stat_sig is not None and not result.pop("probe_failed", False):
+    # A probe that did not answer is never cached: caching it would make one
+    # silence the verdict for as long as the file's stat holds, which for an
+    # installed app is until its next update. And a verdict is cached only if
+    # the file did not change underneath the probe -- the stat is read again
+    # AFTER it, because an answer about bytes that moved while codesign was
+    # reading them describes neither version. Either way the answer is still
+    # returned for this call; it is only not remembered.
+    failed = result.pop("probe_failed", False)
+    if (stat_sig is not None and not failed
+            and _sig_stat(path) == stat_sig):
         _sigcache.pop(path, None)  # overwrite any prior entry for this path
         _sigcache[path] = {"stat": stat_sig, "result": result,
                            "v": _SIGCACHE_LOGIC_VERSION}
@@ -2590,10 +2620,27 @@ def _is_apple_os_signing(leaf, authorities):
 
 
 def _classify_mac(path):
-    out, err, _ = run(["codesign", "-dv", "--verbose=4", path], timeout=12)
+    global _SIG_PROBE_FAILURES
+    out, err, rc = run(["codesign", "-dv", "--verbose=4", path], timeout=12)
     text = (out or "") + (err or "")  # codesign writes detail to stderr
 
     result = {"trust": "unknown", "team": None, "authority": None}
+
+    # Every rung of the ladder below reads an ABSENCE -- no "not signed at
+    # all" marker, no Authority= line, no adhoc flag -- so a probe that timed
+    # out or printed nothing fell through all of them, was filed as
+    # `unsigned`, and was cached on a stat that never changes. Live,
+    # 2026-09-20: Spotify, Developer ID signed, read `unsigned` for two days
+    # from one scan whose probe did not answer, and eight beacon incidents
+    # (#528-#533, #535, #536) stood on it. A non-answer is the Windows
+    # classifier's contract (probe_failed, counted for the
+    # `signature.classify` health row, never cached) and now this one's.
+    # suspicious_sig() does not flag `unknown`, so the cost is one scan of
+    # fail-open that reports itself DEGRADED, not a verdict nobody took.
+    if _probe_timed_out(err, rc) or not text.strip():
+        _SIG_PROBE_FAILURES += 1
+        result["probe_failed"] = True
+        return result
 
     if "code object is not signed at all" in text:
         result["trust"] = "unsigned"
@@ -2630,7 +2677,16 @@ def _classify_mac(path):
     # Integrity check - a tampered signature is a strong signal.
     if result["trust"] not in ("unsigned", "missing"):
         _, verr, vrc = run(["codesign", "--verify", "--strict", path], timeout=20)
-        if vrc != 0 and "not signed" not in (verr or "").lower():
+        # A PASSING strict verify is silent with exit 0, so silence alone is
+        # not the non-answer here; a failing exit that says nothing is. A
+        # failure that names its reason ("a sealed resource is missing or
+        # invalid") is an answer, and still means `broken`.
+        silent = vrc != 0 and not (verr or "").strip()
+        if _probe_timed_out(verr, vrc) or silent:
+            _SIG_PROBE_FAILURES += 1
+            result["trust"] = "unknown"
+            result["probe_failed"] = True
+        elif vrc != 0 and "not signed" not in (verr or "").lower():
             result["trust"] = "broken"
     return result
 

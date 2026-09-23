@@ -1201,7 +1201,13 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   is a *privilege wall* the unprivileged agent is not meant to cross; both are
   counted on the row, never alarmed — nothing can be examined about a thing
   that is not there, and a boundary the design forbids crossing is not a
-  fault. A retired sensor id is declared in `_RETIRED_SENSOR_IDS` so its
+  fault. A verdict probe whose answers are *cached* is a third form, and
+  the one where a single silence lasts: a signature probe that times out or
+  prints nothing returns `probe_failed`, counts toward the
+  `signature.classify` DEGRADED row, and is never cached (2026-09-20: one
+  silent `codesign` filed a Developer ID app as `unsigned`, and the
+  stat-keyed cache kept it for two days under eight beacon incidents). A
+  retired sensor id is declared in `_RETIRED_SENSOR_IDS` so its
   health row cannot haunt `doctor` as "DID NOT RUN". A sensor that concludes from a fact another
   sensor could not take (`_browser_loopback_entries` reading "no debugging
   flag" off an argv the `ps` call never returned) consults that sensor's
