@@ -8199,6 +8199,79 @@ def _payload_update(old, rec, prog_changed, env_changed, args_changed,
     return payload
 
 
+# Programs whose whole job is to start ANOTHER program that their argv names
+# without a path: `open -b <bundle id>`, `powershell -enc <blob>`,
+# `rundll32 x.dll,Entry`. Their own receipt says nothing about what they start.
+_PERSIST_LAUNCHER_NAMES = frozenset((
+    "open", "launchctl", "xargs", "nice", "chroot", "cmd", "cmd.exe",
+    "powershell", "powershell.exe", "pwsh", "pwsh.exe", "rundll32",
+    "rundll32.exe", "mshta", "mshta.exe", "wscript", "wscript.exe", "cscript",
+    "cscript.exe", "regsvr32", "regsvr32.exe", "msiexec", "msiexec.exe",
+    "explorer", "explorer.exe", "conhost", "conhost.exe",
+))
+
+
+def _persistence_exec_extra(args, program, payload):
+    """Why this job's argv can run code other than its program and its
+    payload, or None when those two are all it runs.
+
+    A persistence item is graded by what it EXECUTES: the program and, when
+    it has one, the payload script. That is a complete account only when the
+    argv names nothing else that runs, so the rule is stated in one place and
+    it fails closed -- any of these and the item earns no custody rung:
+
+      * a URL anywhere in the argv (`uv run --from git+https://...`, a
+        fetched payload): the code is somewhere this cannot hash;
+      * a launcher wrapper in front (`caffeinate -i ...`): the plist's program
+        is not the thing that runs the payload;
+      * an interpreter or runner with no payload FILE (`python -m pkg`,
+        `node -e`, `npx some-package`): the code is named, not graded;
+      * an interpreter or runner given anything before its payload other than
+        its one declared subcommand (`uv run --with evil run.py`,
+        `uv run --directory D python -m mod`, `python -X ...`): an
+        interpreter option can pull in code, and a list of the harmless ones
+        is a list that rots, so there is no such list;
+      * a program that is not an interpreter, given a path (`/` or `\\`,
+        including `--opt=<path>`), or one of the launchers above given any
+        argument: it names another thing to run.
+
+    Arguments AFTER the payload are the payload's own input, and the payload
+    is graded, so they are not held against it.
+    """
+    if not isinstance(args, list) or not args:
+        return None
+    flat = [str(a) for a in args if a is not None]
+    if any("://" in a for a in flat[1:]):
+        return "a URL in its arguments"
+    if _effective_argv(args, program)[0] != flat:
+        return "a launcher wrapper in front of what it runs"
+    names = {os.path.basename(str(c)).lower() for c in (program, flat[0]) if c}
+    if _interp_fronted(flat, program):
+        if not payload:
+            return "an interpreter that runs no script file"
+        try:
+            at = flat.index(payload, 1)
+        except ValueError:
+            return "a script target that is not one of its arguments"
+        before = flat[1:at]
+        subs = set()
+        for name in names:
+            subs.update(_RUNNER_SUBCOMMANDS.get(name) or ())
+        if before and before[0] in subs:
+            before = before[1:]
+        if before:
+            return "interpreter options before its script (%s)" % (
+                " ".join(before)[:80])
+        return None
+    if len(flat) > 1 and names & _PERSIST_LAUNCHER_NAMES:
+        return "a launcher that starts what its arguments name"
+    for a in flat[1:]:
+        value = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+        if "/" in value or "\\" in value:
+            return "a path in its arguments (%s)" % a[:80]
+    return None
+
+
 def check_persistence(baseline_snap, current_snap):
     findings = []
     # (program, new_sha) -> [labels of the jobs that reference it]
@@ -8206,6 +8279,10 @@ def check_persistence(baseline_snap, current_snap):
     # (payload, new_sha) -> [(path, old, rec, severity)] of the jobs whose
     # only change is that payload's bytes
     payload_updates = {}
+    # One custody answer per program and per payload for this call: seven
+    # jobs sharing uv and run.py ask git and the receipts once, not seven
+    # times (see _custody_executes).
+    custody_memo = {}
     base = baseline_snap or {}
     for path, rec in current_snap.items():
         if path not in base:
@@ -8214,10 +8291,24 @@ def check_persistence(baseline_snap, current_snap):
                 # by content -- so an edited copy is NOT ours and lands below.
                 continue
             sev = _persistence_severity(rec)
+            # Graded by what it EXECUTES. Until 2026-09-23 a NEW item was
+            # never asked who made its program or its script, so the
+            # operator's own scheduler kit (#287 #288 #295 #296 #300 #302
+            # #307) and a Homebrew menu-bar app (#399) interrupted HIGH on
+            # every sighting. Attack-defined jobs get no rung here, as
+            # everywhere.
+            attack_defined = _env_attack_defined(rec.get("env")) \
+                or _hostile_args(rec.get("args"), rec.get("program"))
+            prov, note = (None, None) if attack_defined \
+                else _custody_executes(rec, sev, custody_memo)
+            detail = "%s -> %s [%s]" % (rec["label"],
+                                        rec.get("program") or "?",
+                                        rec.get("trust"))
+            if prov and note:
+                detail = "%s\n%s" % (detail, note)
             findings.append(finding(
-                sev, "persistence", "New persistence item",
-                "%s -> %s [%s]" % (rec["label"], rec.get("program") or "?",
-                                   rec.get("trust")),
+                _demote(sev, prov, attack_defined=attack_defined),
+                "persistence", "New persistence item", detail,
                 "persistence:new:%s:%s" % (path, rec.get("sha256")),
                 subject=_subject(
                     "persistence", path, op="new", content=rec.get("sha256"),
@@ -8234,6 +8325,7 @@ def check_persistence(baseline_snap, current_snap):
                 # back from the store could not say which producer it was.
                 program_sha=rec.get("sha256"),
                 target_sha=rec.get("target_sha"),
+                custody=prov,
                 run_at_load=rec.get("run_at_load")))
         else:
             old = base[path]
@@ -8381,7 +8473,10 @@ def check_persistence(baseline_snap, current_snap):
     for (payload, sha), jobs in sorted(payload_updates.items()):
         jobs.sort(key=lambda job: job[0])
         worst = max(jobs, key=lambda job: SEV_ORDER[job[3]])
-        prov, note = _custody_payload(payload, sha)
+        key = ("payload", payload, sha)
+        if key not in custody_memo:
+            custody_memo[key] = _custody_payload(payload, sha)
+        prov, note = custody_memo[key]
         labels = sorted(str(rec.get("label") or path)
                         for path, _old, rec, _sev in jobs)
         olds = sorted({(old.get("target_sha") or "?")[:12]
@@ -17719,6 +17814,58 @@ def _custody_payload(path, sha):
     if carried:
         return "copy-of-graded", _custody_carry_note(carried)
     return None, ""
+
+
+def _weaker_rung(severity, first, second):
+    """The rung that explains LESS: the one the risk tier weighs heavier
+    (_RISK_CUSTODY_WEIGHT; no rung, or one that does not demote, weighs 1.0),
+    then the one that leaves the higher severity. Ties keep `first`."""
+    def weakness(item):
+        rung = item[0]
+        return (_RISK_CUSTODY_WEIGHT.get(rung, 1.0),
+                SEV_ORDER.get(_demote(severity, rung), 0))
+    return max((first, second), key=weakness)
+
+
+def _custody_executes(rec, severity, graded=None):
+    """(rung, note) for a NEW persistence item, graded by what it executes.
+
+    The program through the binary ladder (_grade_binary: vouched, package
+    receipts, build output, carried copies) and the payload script, when
+    there is one, through _custody_payload. The item's rung is the WEAKER of
+    the two: a strong program running an unexplained script explains
+    nothing, and neither does an explained script run by an unexplained
+    program. No payload means the program's rung alone.
+
+    No rung at all when the argv can run anything else
+    (_persistence_exec_extra), when the program is not on disk, or when the
+    payload has no hash to grade -- an unhashed script is not an explained
+    one. The caller has already refused attack-defined jobs.
+
+    `graded` memoizes answers for one check_persistence call, keyed on the
+    program's and the payload's bytes.
+    """
+    graded = {} if graded is None else graded
+    program, args = rec.get("program"), rec.get("args")
+    if not program or not rec.get("sha256"):
+        return None, None
+    payload = _script_target(args, program)
+    if _persistence_exec_extra(args, program, payload):
+        return None, None
+    if payload and not rec.get("target_sha"):
+        return None, None
+    key = ("program", program, rec.get("sha256"))
+    if key not in graded:
+        _sev, rung, note = _grade_binary(severity, program,
+                                         sha=rec.get("sha256"))
+        graded[key] = (rung, note)
+    result = graded[key]
+    if payload:
+        key = ("payload", payload, rec.get("target_sha"))
+        if key not in graded:
+            graded[key] = _custody_payload(payload, rec.get("target_sha"))
+        result = _weaker_rung(severity, result, graded[key])
+    return result
 
 
 
