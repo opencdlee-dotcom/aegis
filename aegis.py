@@ -14965,23 +14965,47 @@ def _git_bin():
 
 
 def _git_created_here(git, cwd, sha, author_email):
-    """True iff `sha` was CREATED in this working copy by its own configured
+    """True iff `sha` was CREATED in this repository by its own configured
     identity. Two independent records must agree: the commit's author email
-    equals the repo's `user.email`, and the HEAD reflog remembers the commit
-    being MADE here — a locally created commit enters the reflog as a
+    equals the repo's `user.email`, and a reflog remembers the commit being
+    MADE here — a locally created commit enters the reflog as a
     `commit`/`commit (amend)` entry, while a commit that arrived from
     elsewhere enters as `pull:`/`merge:`/`fetch:`/`clone:` and never as
     `commit`. Both records are same-uid-writable, so this is attribution
     evidence for GRADING a finding, never proof of authorship — and both
     checks fail toward suspicion (expired reflog, identity mismatch, any git
-    error all return False)."""
-    me, _e, rc = run([git, "-C", cwd, "config", "user.email"], timeout=10)
+    error all return False).
+
+    EVERY reflog of the repository (`--all`), not only HEAD's. Branch reflogs
+    live in the common git dir and are shared by every worktree; a commit
+    made in any worktree enters its branch's reflog as `commit:`. A
+    worktree's own HEAD log holds only `reset:`/`checkout:` until something
+    is committed IN that worktree, so reading HEAD's alone, a fresh `git
+    worktree add` of the operator's own repo answered "not made here" about
+    the very commit it was created from, and main answered the same about
+    every commit an agent made in a worktree and fast-forwarded in (proven by
+    experiment 2026-09-22; #537 is an agent's dev build in a fresh worktree,
+    graded with no rung). The scope is the SAME repository and no wider:
+    remote-tracking reflogs record `fetch:` and `update by push`, never
+    `commit`, and the author email is still required to match. 4000 entries
+    across every ref, where HEAD alone read 400: the largest agent repo on the
+    reference Mac holds 819 across 473 refs and 45 worktrees, read in 0.18 s
+    cold and 0.04 s warm (HEAD's alone: 0.01 s).
+
+    None, not False, when git did not answer in time. A probe that timed out
+    has not said the commit came from elsewhere, and the caller must be able
+    to tell the two apart (_repo_is_self_committed)."""
+    me, err, rc = run([git, "-C", cwd, "config", "user.email"], timeout=10)
+    if _probe_timed_out(err, rc):
+        return None
     if rc != 0 or not (me or "").strip():
         return False
     if (author_email or "").strip() != me.strip():
         return False
-    rl, _e, rc = run([git, "-C", cwd, "log", "-g", "--format=%H %gs",
-                      "-n", "400"], timeout=15)
+    rl, err, rc = run([git, "-C", cwd, "log", "-g", "--all", "--format=%H %gs",
+                       "-n", "4000"], timeout=15)
+    if _probe_timed_out(err, rc):
+        return None
     if rc != 0:
         return False
     for line in (rl or "").splitlines():
@@ -15006,11 +15030,16 @@ def _git_fleet_signed(git, cwd, sha):
     re-pins. Only an exact 'G' (good, signer in the roster) vouches; every
     other verdict — unsigned, bad, unknown key, expired, error — is a
     non-match, and asymmetric keys mean this machine holds nothing that can
-    MAKE a signature, only what checks one."""
+    MAKE a signature, only what checks one.
+
+    None when git did not answer in time: not a verdict of any kind, for the
+    same reason as _git_created_here."""
     if not os.path.isfile(FLEET_SIGNERS):
         return False
-    out, _e, rc = run([git, "-c", "gpg.ssh.allowedSignersFile=%s" % FLEET_SIGNERS,
-                       "-C", cwd, "log", "-1", "--format=%G?", sha], timeout=15)
+    out, err, rc = run([git, "-c", "gpg.ssh.allowedSignersFile=%s" % FLEET_SIGNERS,
+                        "-C", cwd, "log", "-1", "--format=%G?", sha], timeout=15)
+    if _probe_timed_out(err, rc):
+        return None
     return rc == 0 and (out or "").strip() == "G"
 
 
@@ -15020,8 +15049,9 @@ def _git_provenance(path):
       'untracked'      — exists only in the working tree, never committed
       'worktree'       — tracked, with uncommitted local modifications
       'self-committed' — the commit that last touched it was CREATED on this
-                         machine by the repo's own configured identity (HEAD
-                         reflog records it as a `commit`), pushed or not
+                         machine by the repo's own configured identity (a
+                         reflog of the repository records it as a `commit`),
+                         pushed or not
       'fleet-signed'   — the commit arrived from elsewhere but carries a
                          signature verifying against the PINNED device
                          roster: made on one of the operator's own machines
@@ -15072,16 +15102,43 @@ def _git_provenance(path):
 # that had already been run for a sibling -- about 2.3 s against a 1 % scan
 # cost ceiling. Per directory that collapses to two calls per distinct
 # directory and nothing for repeats.
+#
+# Per SCAN, not per process: _reset_custody_probes clears all three at the
+# start of every scan. `cmd_watch` runs cmd_scan in-process, so until
+# 2026-09-22 these outlived the scan that filled them, and an answer given
+# about a worktree while it was fresh stood for the life of the daemon --
+# through every commit made in that worktree afterwards.
 _REPO_ROOT_CACHE = {}
 _REPO_SELFNESS_CACHE = {}
 _BUILD_OUTPUT_CACHE = {}
 
+# Custody questions this scan asked git and got no answer to, because a probe
+# timed out. Each one is a finding graded at full severity with no rung -- the
+# fail-toward-suspicion outcome, which is correct -- and so is a coverage gap
+# rather than a verdict: cmd_scan reports it as the `custody.grade` DEGRADED
+# row, the same contract `signature.classify` keeps for codesign.
+_CUSTODY_PROBE_FAILURES = 0
+
+
+def _reset_custody_probes():
+    global _CUSTODY_PROBE_FAILURES
+    _CUSTODY_PROBE_FAILURES = 0
+    _REPO_ROOT_CACHE.clear()
+    _REPO_SELFNESS_CACHE.clear()
+    _BUILD_OUTPUT_CACHE.clear()
+
 
 def _repo_root_of(git, d):
-    """The work-tree root containing `d`, or None. Cached per directory."""
+    """The work-tree root containing `d`, None when `d` is in no repo, or
+    False when git did not answer in time. Cached per directory -- except
+    False: a rev-parse that timed out has not said `d` is outside every repo,
+    so it must not be remembered as if it had."""
     if d in _REPO_ROOT_CACHE:
         return _REPO_ROOT_CACHE[d]
-    out, _e, rc = run([git, "-C", d, "rev-parse", "--show-toplevel"], timeout=10)
+    out, err, rc = run([git, "-C", d, "rev-parse", "--show-toplevel"],
+                       timeout=10)
+    if _probe_timed_out(err, rc):
+        return False
     root = (out or "").strip()
     _REPO_ROOT_CACHE[d] = root if (rc == 0 and root) else None
     return _REPO_ROOT_CACHE[d]
@@ -15093,20 +15150,47 @@ def _repo_is_self_committed(git, d):
     Asks about the repo's HEAD rather than about the file, because the file
     this is asked on behalf of has no history at all -- being generated is the
     whole point of it.
+
+    (root, True) and (root, False) are answers, and are cached. (root, None)
+    is a NON-answer -- a git probe timed out, so neither rung said yes and
+    they did not both say no -- and is neither cached nor read as "no". Read
+    as False and cached, one slow git under an agent's build storm (10-15 s
+    caps, a scan at background QoS) graded every binary in that repo as a
+    stranger's for the rest of the scan, and in watch mode for the rest of the
+    daemon. (None, None) is the same non-answer from the rev-parse that finds
+    the root. Each is counted into _CUSTODY_PROBE_FAILURES, so the scan says
+    what it could not ask.
     """
+    global _CUSTODY_PROBE_FAILURES
     root = _repo_root_of(git, d)
+    if root is False:
+        _CUSTODY_PROBE_FAILURES += 1
+        return (None, None)
     if not root:
         return None
     if root in _REPO_SELFNESS_CACHE:
         return _REPO_SELFNESS_CACHE[root]
     verdict = False
-    out, _e, rc = run([git, "-C", root, "log", "-1", "--format=%H|%ae"],
-                      timeout=10)
+    out, err, rc = run([git, "-C", root, "log", "-1", "--format=%H|%ae"],
+                       timeout=10)
+    if _probe_timed_out(err, rc):
+        _CUSTODY_PROBE_FAILURES += 1
+        return (root, None)
     out = (out or "").strip()
     if rc == 0 and "|" in out:
         sha, author = out.split("|", 1)
-        verdict = bool(_git_created_here(git, root, sha, author)
-                       or _git_fleet_signed(git, root, sha))
+        created = _git_created_here(git, root, sha, author)
+        if created:
+            verdict = True
+        else:
+            # Either rung's yes is an answer whatever the other one did; a
+            # no is only an answer when BOTH rungs gave one.
+            fleet = _git_fleet_signed(git, root, sha)
+            if fleet:
+                verdict = True
+            elif created is None or fleet is None:
+                _CUSTODY_PROBE_FAILURES += 1
+                return (root, None)
     _REPO_SELFNESS_CACHE[root] = (root, verdict)
     return _REPO_SELFNESS_CACHE[root]
 
@@ -15143,6 +15227,7 @@ def _build_output_rung(path):
     build artifact is a claim about a file's ORIGIN, and origin is not
     innocence -- the same sentence `_grade_binary` was already written around.
     """
+    global _CUSTODY_PROBE_FAILURES
     if not path:
         return None
     git = _git_bin()
@@ -15153,6 +15238,11 @@ def _build_output_rung(path):
         return _BUILD_OUTPUT_CACHE[d]
     result = None
     selfness = _repo_is_self_committed(git, d)
+    if selfness and selfness[1] is None:
+        # git did not answer: no rung, so the finding keeps its full severity,
+        # and nothing remembered, so the next ask -- at the latest the next
+        # scan -- gets the real answer and the incident re-grades on it.
+        return None
     if selfness and selfness[1]:
         root = selfness[0]
         # The repo's own declaration that this directory is generated. Asked
@@ -15160,8 +15250,11 @@ def _build_output_rung(path):
         # practice (`dist/`, `build/`, `app/staging/`) and what makes one
         # answer serve every file beside it. -q so nothing is printed; rc 0
         # means ignored, 1 means not, 128 means the question did not apply.
-        _o, _e, rc = run([git, "-C", root, "check-ignore", "-q", d],
-                         timeout=10)
+        _o, err, rc = run([git, "-C", root, "check-ignore", "-q", d],
+                          timeout=10)
+        if _probe_timed_out(err, rc):
+            _CUSTODY_PROBE_FAILURES += 1
+            return None
         if rc == 0:
             result = "build-output"
     _BUILD_OUTPUT_CACHE[d] = result
@@ -19868,6 +19961,9 @@ def _cmd_scan_locked(quiet=False):
     _PROC_ENUM_FAILED = False
     _PROC_ARGV_PARTIAL = False
     _reset_unexamined()
+    # The custody git caches too: cmd_watch scans in-process, so these
+    # outlived the scan that filled them.
+    _reset_custody_probes()
     health = []
     scan_started, cpu_started = time.monotonic(), _cpu_seconds()
     baseline, baseline_corrupt = load_baseline()
@@ -19979,6 +20075,14 @@ def _cmd_scan_locked(quiet=False):
                    "were NOT vouched for" % _SIG_PROBE_FAILURES)
         if _SIG_PROBE_FAILURES else "",
         "duration_ms": 0, "item_count": _SIG_PROBE_FAILURES})
+    health.append({
+        "sensor_id": "custody.grade",
+        "status": "DEGRADED" if _CUSTODY_PROBE_FAILURES else "OK",
+        "detail": ("%d custody probe(s) timed out; those findings were graded "
+                   "at full severity with no rung and re-grade when git "
+                   "answers" % _CUSTODY_PROBE_FAILURES)
+        if _CUSTODY_PROBE_FAILURES else "",
+        "duration_ms": 0, "item_count": _CUSTODY_PROBE_FAILURES})
     # The scan's own cost, recorded where every other coverage fact is so it
     # is durable per scan. duration_ms is wall time; item_count is CPU
     # milliseconds for this process AND every command it waited on.

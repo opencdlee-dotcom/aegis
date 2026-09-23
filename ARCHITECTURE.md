@@ -244,7 +244,9 @@ this arrive through something the operator set up?*
    git cannot: untracked files and binaries outside any repo.
 2. **Git self-vs-foreign**. A commit is `self-committed` → **LOW** only when two
    independent records agree: its author email equals the repo's configured
-   `user.email`, *and* the HEAD reflog remembers it being **created** here (a
+   `user.email`, *and* a reflog of the repository (any branch, made from any
+   worktree: branch reflogs are shared, and a fresh worktree's own HEAD log
+   holds only `reset:`) remembers it being **created** here (a
    local commit enters the reflog as `commit:`; a pulled one as
    `pull:`/`merge:`/`clone:`, never `commit:`). Reachable from a remote with no
    local authorship record is `remote-foreign` → **HIGH** with the
@@ -1202,11 +1204,15 @@ occupied. Destroy verifies deletion but does not claim secure erase on APFS/SSD.
   counted on the row, never alarmed — nothing can be examined about a thing
   that is not there, and a boundary the design forbids crossing is not a
   fault. A verdict probe whose answers are *cached* is a third form, and
-  the one where a single silence lasts: a signature probe that times out or
-  prints nothing returns `probe_failed`, counts toward the
-  `signature.classify` DEGRADED row, and is never cached (2026-09-20: one
-  silent `codesign` filed a Developer ID app as `unsigned`, and the
-  stat-keyed cache kept it for two days under eight beacon incidents). A
+  the one where a single silence lasts: a signature or git probe that does
+  not answer (a `codesign` that times out or prints nothing, a custody `git`
+  that times out) returns a non-answer (`probe_failed`; `None` from the git
+  rungs), counts toward its DEGRADED row (`signature.classify`,
+  `custody.grade`), and is never cached (2026-09-20: one silent `codesign`
+  filed a Developer ID app as `unsigned`, and the stat-keyed cache kept it
+  for two days under eight beacon incidents). The custody git caches are
+  per scan for the same reason: `cmd_watch` scans in-process, and an answer
+  given about a fresh worktree stood for the life of the daemon. A
   retired sensor id is declared in `_RETIRED_SENSOR_IDS` so its
   health row cannot haunt `doctor` as "DID NOT RUN". A sensor that concludes from a fact another
   sensor could not take (`_browser_loopback_entries` reading "no debugging

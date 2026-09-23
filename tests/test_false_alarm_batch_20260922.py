@@ -55,6 +55,33 @@ Counted by fact rather than by row, the 14 were six things.
       agents build in fresh worktrees all day; #537 is a dev build of a
       bundled `plugin-container` graded with no custody rung at all.
 
+      `_git_created_here` read `git log -g`: the reflog of the worktree's OWN
+      HEAD. Branch reflogs live in the common git dir and are shared by every
+      worktree of the repository, and a commit made in any of them enters its
+      branch's reflog as `commit:`. So the question ("did this machine make
+      HEAD?") was the right one, asked of the one record a fresh worktree does
+      not have. MEASURED by experiment 2026-09-22: a local commit answers True
+      from the checkout that made it and False from a `git worktree add` of
+      the same repo at the same commit; a commit made in a worktree and
+      fast-forwarded into main answers False from main, whose HEAD log says
+      `merge agent/x: Fast-forward`. `--all` reads every reflog of the same
+      repository, so all three answer True. The scope widens no further than
+      that: remote-tracking reflogs record `fetch:` and `update by push`,
+      never `commit:`, and the author email must still equal `user.email`.
+
+      Two more ways a "no" could be recorded that git never said, both A's
+      family. A git probe that timed out (10-15 s caps, a scan at background
+      QoS, an agent's build storm) fell through to False and was cached as
+      (root, False). And `cmd_watch` runs every scan IN-PROCESS, so the three
+      custody caches outlived the scan that filled them: an answer given about
+      a worktree while it was fresh stood for the life of the daemon, through
+      every commit made in it afterwards. Which of the three minted #537's
+      null is not recoverable from the store; offline, the same path grades
+      (MEDIUM, build-output). A timed-out custody probe is now a non-answer --
+      no rung, full severity, never cached, counted into a `custody.grade`
+      DEGRADED health row -- and the caches are cleared at the start of every
+      scan, so the incident re-grades the first time git answers.
+
   C   A runner workload outgrows its vouch on every self-update.
       `Runner.Worker` is spawned by the vouched `Runner.Listener` out of the
       same install directory and has never been vouched itself (#534).
@@ -74,13 +101,15 @@ are CACHED is the third form, and the one where a single silence lasts
 forever.
 """
 import os
+import subprocess
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import aegis                                    # noqa: E402
-from test_regression import Sandbox, needs_the_real_body      # noqa: E402
+from test_regression import (                                 # noqa: E402
+    Sandbox, needs_real_scan_lock, needs_the_real_body)
 
 # `codesign -dv --verbose=4` on a Developer ID binary. codesign writes this
 # detail to STDERR and exits 0; the field names and their order are the real
@@ -282,6 +311,338 @@ class A1ANonAnswerIsNotAVerdict(Sandbox):
         """Every v2 verdict could be a silence that became `unsigned` or
         `broken`; the bump is what makes the fix reach a running install."""
         self.assertEqual(3, aegis._SIGCACHE_LOGIC_VERSION)
+
+
+# The binary under custody here is the git the rung itself runs.
+GIT = aegis._git_bin()
+ME = "me@example.invalid"
+SOMEONE_ELSE = "someone-else@example.invalid"
+
+# A repo this machine commits to, as the custody probes see it: one answer per
+# question, keyed by _git_question(). Any single one is replaced per test.
+FAKE_ROOT = "/work/repo"
+FAKE_SHA = "a" * 40
+SELF_COMMITTED = {
+    "rev-parse": (FAKE_ROOT + "\n", "", 0),
+    "head": ("%s|%s\n" % (FAKE_SHA, ME), "", 0),
+    "config": (ME + "\n", "", 0),
+    "reflog": ("%s commit: build\n" % FAKE_SHA, "", 0),
+    "signature": ("N\n", "", 0),
+    "check-ignore": ("", "", 0),
+}
+
+
+def _git_question(cmd):
+    """Which custody question a git argv asks. The fleet probe passes its
+    roster with `-c`, so it is told apart by its format, not by `config`."""
+    args = list(cmd)
+    for q in ("rev-parse", "check-ignore", "config"):
+        if q in args:
+            return q
+    if "log" in args:
+        if "-g" in args:
+            return "reflog"
+        if "--format=%G?" in args:
+            return "signature"
+        return "head"
+    raise AssertionError("not a custody question: %r" % (args,))
+
+
+class B1AWorktreeIsStillTheRepo(Sandbox):
+    """"Does this machine commit here?" is a question about the REPOSITORY,
+    and a timed-out git is not an answer to it.
+
+    Two halves. The real-git tests build a repo and its worktrees in the
+    sandbox, because what is under test there is git's own reflog layout. The
+    mocked tests replace run() and so run on every body: what is under test
+    there is how the rung reads a git that did not answer."""
+
+    def setUp(self):
+        super().setUp()
+        # Sandbox.tearDown restores everything in _saved.
+        self._saved["run"] = aegis.run
+        self._saved["_git_bin"] = aegis._git_bin
+        self._saved["_CUSTODY_PROBE_FAILURES"] = getattr(
+            aegis, "_CUSTODY_PROBE_FAILURES", 0)
+        aegis._CUSTODY_PROBE_FAILURES = 0
+        self._clear_caches()
+        self.addCleanup(self._clear_caches)
+        # realpath: git reports its top level resolved (/private/var on a
+        # Mac, the long form of an 8.3 name on Windows), and the rung's caches
+        # are keyed on what git reports.
+        self.base = os.path.realpath(self.tmp)
+        self.dist = os.path.join(self.base, "dist")
+        os.makedirs(self.dist)
+        self.binary = os.path.join(self.dist, "bin")
+
+    @staticmethod
+    def _clear_caches():
+        aegis._REPO_ROOT_CACHE.clear()
+        aegis._REPO_SELFNESS_CACHE.clear()
+        aegis._BUILD_OUTPUT_CACHE.clear()
+
+    # ---- fixtures: a fake git ------------------------------------------------
+
+    def _fake_git(self, **answers):
+        """Patch run() with a git that answers SELF_COMMITTED, overridden per
+        question. Returns the questions asked, in order."""
+        table = dict(SELF_COMMITTED)
+        table.update(answers)
+        asked = []
+
+        def fake(cmd, timeout=15, extra_env=None, stdin_data=None):
+            q = _git_question(cmd)
+            asked.append(q)
+            return table[q]
+        aegis.run = fake
+        aegis._git_bin = lambda: "git"
+        return asked
+
+    def _pin_a_fleet_roster(self):
+        # The fleet rung asks nothing unless a roster has been pinned.
+        with open(aegis.FLEET_SIGNERS, "w") as fh:
+            fh.write("")
+
+    # ---- fixtures: a real git ------------------------------------------------
+
+    def _git(self, cwd, *args, **kw):
+        """A fixture git that the operator's own config cannot reach: global
+        and system config are nulled, and signing is off by `-c` as well, so a
+        machine that signs every commit (this one does) cannot make a fixture
+        commit it did not mean to."""
+        env = dict(os.environ)
+        env.update({"GIT_TERMINAL_PROMPT": "0",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_SYSTEM": os.devnull})
+        cmd = [GIT, "-c", "commit.gpgsign=false",
+               "-c", "user.email=%s" % kw.get("email", ME),
+               "-c", "user.name=Custody Test",
+               "-c", "init.defaultBranch=main",
+               "-C", cwd] + list(args)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise AssertionError("fixture git %r failed: %s"
+                                 % (args, r.stderr.strip()))
+        return r.stdout
+
+    def _repo(self, email=ME):
+        """The operator's repo: `user.email` configured, and a committed
+        .gitignore declaring dist/ as build output. The config is written
+        into the repo because the rung reads it through run(), which sees the
+        real global config -- the repo's own value is what must win."""
+        repo = os.path.join(self.base, "repo")
+        os.makedirs(repo)
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", ME)
+        with open(os.path.join(repo, ".gitignore"), "wb") as fh:
+            fh.write(b"dist/\n")
+        self._git(repo, "add", ".gitignore")
+        self._git(repo, "commit", "-q", "-m", "dist/ is build output",
+                  email=email)
+        return repo
+
+    def _worktree(self, repo, name, branch):
+        wt = os.path.join(self.base, name)
+        self._git(repo, "worktree", "add", "-q", "-b", branch, wt)
+        return wt
+
+    @staticmethod
+    def _build(tree):
+        """A generated artifact under `tree`'s dist/: an agent's dev build."""
+        d = os.path.join(tree, "dist")
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        p = os.path.join(d, "bin")
+        with open(p, "wb") as fh:
+            fh.write(b"\xcf\xfa\xed\xfe fixture build output")
+        return p
+
+    # ---- the worktree is still the repo (real git) ---------------------------
+
+    @unittest.skipUnless(GIT, "no git binary on this machine")
+    @needs_the_real_body
+    def test_a_fresh_worktree_inherits_the_repos_selfness(self):
+        repo = self._repo()
+        wt = self._worktree(repo, "wt", "agent/x")
+        # Positive control: from the checkout that made the commit it was
+        # always a rung.
+        self.assertEqual("build-output",
+                         aegis._build_output_rung(self._build(repo)))
+        # BEFORE: None. The worktree's own HEAD log holds `reset: moving to
+        # HEAD` and nothing else; `commit (initial)` is in main's reflog.
+        self.assertEqual("build-output",
+                         aegis._build_output_rung(self._build(wt)))
+        got = aegis._repo_is_self_committed(GIT, os.path.join(wt, "dist"))
+        self.assertIs(True, got[1], got)
+
+    @unittest.skipUnless(GIT, "no git binary on this machine")
+    @needs_the_real_body
+    def test_a_commit_made_in_one_worktree_counts_from_another(self):
+        """The landing path: an agent commits in its worktree, the branch is
+        fast-forwarded into main, and main's HEAD log records a MERGE."""
+        repo = self._repo()
+        wt = self._worktree(repo, "wt", "agent/x")
+        with open(os.path.join(wt, "work.txt"), "wb") as fh:
+            fh.write(b"made in the worktree\n")
+        self._git(wt, "add", "work.txt")
+        self._git(wt, "commit", "-q", "-m", "made in the worktree")
+        self._git(repo, "merge", "-q", "--ff-only", "agent/x")
+        head = self._git(repo, "log", "-g", "-n", "1", "--format=%gs").strip()
+        self.assertTrue(head.startswith("merge agent/x"), head)
+        # BEFORE: None -- main's HEAD log never saw the commit being made.
+        self.assertEqual("build-output",
+                         aegis._build_output_rung(self._build(repo)))
+
+    @unittest.skipUnless(GIT, "no git binary on this machine")
+    @needs_the_real_body
+    def test_a_real_no_is_still_cached(self):
+        """A commit authored by someone else is an ANSWER: not this machine's.
+        It is cached, and it counts as nothing timing out."""
+        repo = self._repo(email=SOMEONE_ELSE)
+        d = os.path.join(repo, "dist")
+        os.makedirs(d)
+        got = aegis._repo_is_self_committed(GIT, d)
+        self.assertIsNotNone(got)
+        self.assertIs(False, got[1], got)
+        self.assertEqual(got, aegis._REPO_SELFNESS_CACHE.get(got[0]))
+        self.assertIsNone(aegis._build_output_rung(self._build(repo)))
+        self.assertIn(d, aegis._BUILD_OUTPUT_CACHE)
+        self.assertEqual(0, aegis._CUSTODY_PROBE_FAILURES)
+
+    # ---- a timed-out git is not a no (mocked, every body) --------------------
+
+    def test_a_timed_out_git_log_is_not_a_no(self):
+        self._fake_git(head=TIMED_OUT, reflog=TIMED_OUT, signature=TIMED_OUT)
+        got = aegis._repo_is_self_committed("git", self.dist)
+        # BEFORE: (FAKE_ROOT, False), cached for the rest of the scan -- and,
+        # in watch mode, for the life of the daemon.
+        self.assertEqual((FAKE_ROOT, None), got)
+        self.assertNotIn(FAKE_ROOT, aegis._REPO_SELFNESS_CACHE)
+        self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
+        self.assertIsNone(aegis._build_output_rung(self.binary))
+        self.assertNotIn(self.dist, aegis._BUILD_OUTPUT_CACHE)
+        # Asked again, because nothing was remembered -- and counted again.
+        self.assertEqual(2, aegis._CUSTODY_PROBE_FAILURES)
+
+    def test_every_custody_probe_that_times_out_is_a_non_answer(self):
+        self._pin_a_fleet_roster()
+        cases = {
+            "rev-parse": {},
+            "head": {},
+            "config": {},
+            "reflog": {},
+            # The fleet rung is asked only after the reflog has said no.
+            "signature": {"reflog": ("", "", 0)},
+        }
+        for question, setup in sorted(cases.items()):
+            with self.subTest(question=question):
+                self._clear_caches()
+                aegis._CUSTODY_PROBE_FAILURES = 0
+                answers = dict(setup)
+                answers[question] = TIMED_OUT
+                asked = self._fake_git(**answers)
+                got = aegis._repo_is_self_committed("git", self.dist)
+                self.assertIn(question, asked)
+                self.assertIsNotNone(got, "a timeout read as 'no repo'")
+                self.assertIsNone(got[1], "a timeout read as an answer")
+                self.assertEqual({}, aegis._REPO_SELFNESS_CACHE)
+                if question == "rev-parse":
+                    # Not "this directory is in no repo", either.
+                    self.assertNotIn(self.dist, aegis._REPO_ROOT_CACHE)
+                self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
+                self.assertIsNone(aegis._build_output_rung(self.binary))
+                self.assertEqual({}, aegis._BUILD_OUTPUT_CACHE)
+
+    def test_a_timed_out_check_ignore_is_not_a_no(self):
+        self._fake_git(**{"check-ignore": TIMED_OUT})
+        self.assertIsNone(aegis._build_output_rung(self.binary))
+        self.assertNotIn(self.dist, aegis._BUILD_OUTPUT_CACHE)
+        self.assertEqual(1, aegis._CUSTODY_PROBE_FAILURES)
+        # The repo's selfness WAS answered, and stays remembered.
+        self.assertEqual((FAKE_ROOT, True),
+                         aegis._REPO_SELFNESS_CACHE.get(FAKE_ROOT))
+
+    def test_an_answer_from_either_rung_still_stands(self):
+        """One rung timing out does not void the other's answer: a verified
+        fleet signature is a yes whatever the reflog did."""
+        self._pin_a_fleet_roster()
+        self._fake_git(reflog=TIMED_OUT, signature=("G\n", "", 0))
+        self.assertEqual((FAKE_ROOT, True),
+                         aegis._repo_is_self_committed("git", self.dist))
+        self.assertIn(FAKE_ROOT, aegis._REPO_SELFNESS_CACHE)
+        self.assertEqual(0, aegis._CUSTODY_PROBE_FAILURES)
+
+        # ...and a yes from the reflog never asks the fleet rung at all.
+        self._clear_caches()
+        asked = self._fake_git(signature=TIMED_OUT)
+        self.assertEqual((FAKE_ROOT, True),
+                         aegis._repo_is_self_committed("git", self.dist))
+        self.assertNotIn("signature", asked)
+        self.assertEqual(0, aegis._CUSTODY_PROBE_FAILURES)
+
+    def test_the_first_answer_after_a_timeout_is_the_grade(self):
+        self._fake_git(head=TIMED_OUT)
+        self.assertIsNone(aegis._build_output_rung(self.binary))
+        self._fake_git()
+        self.assertEqual("build-output", aegis._build_output_rung(self.binary))
+        self.assertEqual("build-output", aegis._BUILD_OUTPUT_CACHE[self.dist])
+
+    # ---- the caches are per scan ---------------------------------------------
+
+    def test_the_git_caches_do_not_outlive_a_scan(self):
+        aegis._REPO_ROOT_CACHE["/seeded"] = "/seeded"
+        aegis._REPO_SELFNESS_CACHE["/seeded"] = ("/seeded", False)
+        aegis._BUILD_OUTPUT_CACHE["/seeded/dist"] = None
+        aegis._CUSTODY_PROBE_FAILURES = 3
+        aegis._reset_custody_probes()
+        self.assertEqual({}, aegis._REPO_ROOT_CACHE)
+        self.assertEqual({}, aegis._REPO_SELFNESS_CACHE)
+        self.assertEqual({}, aegis._BUILD_OUTPUT_CACHE)
+        self.assertEqual(0, aegis._CUSTODY_PROBE_FAILURES)
+
+    @needs_real_scan_lock
+    def test_a_scan_starts_clean_and_reports_what_did_not_answer(self):
+        """cmd_watch runs every scan in-process, so the reset has to happen
+        inside the scan, before any sensor grades a binary. gather_all is
+        replaced so the scan is cheap and so it can look at the caches at
+        the moment sensors would."""
+        seen = {}
+
+        def sensors(baseline_snap, current_snap, health=None):
+            seen["selfness"] = dict(aegis._REPO_SELFNESS_CACHE)
+            seen["build"] = dict(aegis._BUILD_OUTPUT_CACHE)
+            aegis._CUSTODY_PROBE_FAILURES += seen.get("fail", 0)
+            return []
+
+        self._saved["gather_all"] = aegis.gather_all
+        aegis.gather_all = sensors
+
+        def custody_row():
+            rows = [r for r in aegis.get_sensor_health()
+                    if r["sensor_id"] == "custody.grade"]
+            self.assertEqual(1, len(rows), rows)
+            return rows[0]
+
+        aegis._REPO_SELFNESS_CACHE["/seeded"] = ("/seeded", False)
+        aegis._BUILD_OUTPUT_CACHE["/seeded/dist"] = None
+        aegis._CUSTODY_PROBE_FAILURES = 5
+        seen["fail"] = 2
+        aegis.cmd_scan(quiet=True)
+        self.assertEqual({}, seen["selfness"],
+                         "a previous scan's answer was still standing")
+        self.assertEqual({}, seen["build"])
+        row = custody_row()
+        self.assertEqual("DEGRADED", row["status"])
+        self.assertEqual(2, row["item_count"],
+                         "the count must be this scan's, not the daemon's")
+        self.assertIn("2 custody probe(s) timed out", row["detail"])
+
+        seen["fail"] = 0
+        aegis.cmd_scan(quiet=True)
+        row = custody_row()
+        self.assertEqual("OK", row["status"])
+        self.assertEqual(0, row["item_count"])
+        self.assertEqual("", row["detail"] or "")
 
 
 if __name__ == "__main__":
