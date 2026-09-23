@@ -12244,7 +12244,71 @@ def snapshot_listeners():
     return snap
 
 
+# The bottom of the range the OS hands out when a program binds port 0 and
+# lets the kernel pick. macOS and Windows use the IANA dynamic range,
+# 49152-65535 (`sysctl net.inet.ip.portrange.first` is 49152 on a Mac); Linux's
+# `ip_local_port_range` defaults to 32768-60999. A port in it is one no service
+# is registered on, which is the OS's own definition of "not a service port".
+_EPHEMERAL_PORT_FLOOR = 32768 if IS_LINUX else 49152
+
+
+def _listener_fingerprint(path, port):
+    """The signal a new listener is filed under: `listener:<path>:<port>` for a
+    service port, `listener:<path>:#ephemeral` for any port at or above the
+    ephemeral floor. A port that is not a number, and a listener no process
+    could be attributed to (`?`), keep the exact form.
+
+    The per-port key is right for a service -- a program that starts serving on
+    a new port is a new fact -- and wrong for a program that asks the kernel
+    for ANY free port, because then every bind is a port nothing has seen.
+    Spotify held 225 distinct `listener:` fingerprints on the reference store,
+    every port at or above 49152, and three new ones inside RISK_WINDOW summed
+    3 x 2.0 x 0.7 = 4.2 past the threshold: risk incident #527, the same shape
+    that had closed once as #406. The fold follows content with the OS's own
+    definition of the range, not a list of programs.
+
+    What folds and what does not, layer by layer:
+
+      * the SNAPSHOT is untouched. snapshot_listeners still keys `<path>:<port>`,
+        so no baseline re-keys on upgrade (which would storm every known
+        listener) and a restart on the same port is still not news. Only a key
+        the baseline has never held reaches new_fn, exactly as before.
+      * the FINGERPRINT folds, and everything that reads it reads one signal:
+        the signals row counts occurrences, the seen ledger routes a later
+        ephemeral bind as `seen` rather than a new interrupt, the signal
+        incident is `signal:listener:<path>:#ephemeral`, and _accumulate_risk
+        counts it once. _recurrence_identity has no endpoint class for a
+        listener and hands the fingerprint back unchanged, so no fold is needed
+        there -- the same effect the beacon fold (`beacon:<prog>:#ip:#port`)
+        buys for endpoint churn, reached by naming the fact once instead.
+      * _tolerance_identity is unchanged. `#ephemeral` carries no `/`, so it is
+        never version-normalized, and it is not a hash, so it is never
+        stripped: a versionless program path still generalizes to None, as a
+        per-port key did, and a versioned one generalizes its path and keeps
+        this field in place of the port.
+      * a service port below the floor keeps its number byte for byte, so no
+        signal, incident or seen entry recorded before this changes key.
+
+    Nothing is suppressed: the first ephemeral bind is a finding at the same
+    severity, the hostile shape still grades HIGH, a second program is a
+    second listener, and the browser debug listener (attack-defined) never
+    comes here. `?` is not folded because it names no program -- every socket
+    no process could be tied to shares it -- so "the same program again" is
+    not a thing it can say."""
+    port = str(port)
+    if path and path != "?" and port.isdigit() \
+            and int(port) >= _EPHEMERAL_PORT_FLOOR:
+        return "listener:%s:#ephemeral" % path
+    return "listener:%s:%s" % (path, port)
+
+
 def diff_listeners(prior, cur):
+    # The snapshot still holds one key per port, so a scan that catches N new
+    # ephemeral binds by one program calls new_fn N times for what
+    # _listener_fingerprint files as ONE fact: the first becomes the finding,
+    # the rest are the same observation again.
+    emitted = set()
+
     def new_fn(key, val):
         # The snapshot VALUE is a bare path string on macOS/Windows and in any
         # baseline written before uid attribution existed; Linux now records
@@ -12283,6 +12347,13 @@ def diff_listeners(prior, cur):
                 "listener:%s" % key, path=path, port=port, confidence="high",
                 custody=rung,
                 markers=["session-theft", "cookie", "browser-automation"])
+        # Built from the KEY's own path half, not the value's, so a service
+        # port's fingerprint stays byte-identical to the "listener:<key>" it
+        # has always been, whatever shape the value arrived in.
+        fingerprint = _listener_fingerprint(key.rsplit(":", 1)[0], port)
+        if fingerprint in emitted:
+            return None
+        ephemeral = fingerprint.endswith(":#ephemeral")
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
         trust = classify_signature(path)["trust"] if resolvable else "unknown"
         # On Linux there is no signature to lean on, so the hostile shape is
@@ -12301,16 +12372,20 @@ def diff_listeners(prior, cur):
                 else "an unattributable process"))
         graded, rung, note = _grade_binary(
             "HIGH" if hostile else "MEDIUM", path if resolvable else None)
+        emitted.add(fingerprint)
         return finding(
             graded,
             "net-listener", "New network listener",
-            "%s is accepting connections on TCP port %s [%s]%s%s"
+            "%s is accepting connections on TCP port %s [%s]%s%s%s"
             % (who, port, trust,
                " — an untrusted binary in a user-writable path listening "
                "on the network is a bind-shell / rogue-server shape" if hostile
                else " — reachable from the network; verify you started this",
+               ("; %s is an ephemeral-range port, and further ephemeral binds "
+                "by this program fold into this finding" % port)
+               if ephemeral else "",
                ("\n" + note) if note else ""),
-            "listener:%s" % key, path=path, port=port, trust=trust, uid=uid,
+            fingerprint, path=path, port=port, trust=trust, uid=uid,
             custody=rung)
     return _diff_map(prior, cur, new_fn)
 

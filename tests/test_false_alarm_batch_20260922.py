@@ -65,9 +65,42 @@ Counted by fact rather than by row, the 14 were six things.
       row.
 
   A2  A program that binds ephemeral ports was one listener signal per port.
-      Spotify bound 225 distinct ports, every one at or above 49152, so three
-      of them inside the risk window summed to a risk incident (#527) out of
+      The listener sensor keys its snapshot on `<path>:<port>`, so a restart
+      is not news and a new port is, and the finding took the same key as its
+      fingerprint. For a service that is right: a program that starts serving
+      on a new port is a new fact. For a program that asks the kernel for any
+      free port, every bind is a port nothing has seen, so every scan that
+      caught one minted a fresh signal -- and `_accumulate_risk` counts
+      DISTINCT signals. Three new ports inside RISK_WINDOW are 3 x MEDIUM
+      (2.0) x medium confidence (0.7) = 4.2, over a threshold of 4.0, out of
       churn the OS itself defines as "not a service port".
+
+      MEASURED on the live store: Spotify held 225 distinct `listener:`
+      fingerprints, every port at or above 49152, 70 of them first seen in
+      the seven days to 2026-09-22, and it was the only program with three or
+      more. That is #527, "3 signals across 1 sensor, score 4.2", with 166
+      evidence events; the same shape had already closed once as #406.
+      Nothing the store already had could fold it: a listener key carries no
+      content hash and no version, so `_tolerance_identity` has nothing to
+      generalize, and the endpoint fold that stops beacon churn counting
+      (`beacon:<prog>:#ip:#port`) only ever reads beacons.
+
+      A port at or above the OS's own ephemeral floor -- 49152 on macOS and
+      Windows, the IANA dynamic range; 32768 on Linux, the bottom of
+      `ip_local_port_range` -- is now filed as `listener:<path>:#ephemeral`,
+      and a scan that sees several of them from one program emits one
+      finding. Spotify's one fixed port, 57621, sits in that range and folds
+      with the rest: the range is one no service is registered in, not a
+      promise that none listens there. The snapshot is untouched -- still
+      one key per port, so no baseline re-keys on upgrade and a restart is
+      still not news -- and so is everything below the floor: a service port
+      keeps its number byte for byte. Nothing is suppressed. The first
+      ephemeral bind alerts at the severity it always did, the hostile shape
+      still grades HIGH, and a second program is a second listener; what
+      stops is churn counting as corroboration. The browser debug listener
+      is attack-defined and keeps its exact port, and a listener no process
+      could be attributed to (`?`) is not folded: it names no program, so
+      "the same program again" is not a thing it can say.
 
   B   Custody asked the WORKTREE whether this machine commits to the repo, and
       a fresh worktree always answers no: its own HEAD reflog holds only
@@ -1024,6 +1057,185 @@ class A2AFlippedVerdictClosesItsIncident(Sandbox):
         self.verdict = _publisher()
         self._rescan("outbound")
         self.assertEqual("OPEN", self._row(f)["status"])
+
+
+# A program on disk, by path: a listener's identity. It does not exist, and
+# nothing here needs it to -- classify_signature is replaced.
+LISTENER = "/Applications/Example.app/Contents/MacOS/Example"
+OTHER_LISTENER = "/Applications/Other.app/Contents/MacOS/Other"
+BROWSER = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# At or above 49152 is ephemeral on every body (Linux starts at 32768), so
+# these fold everywhere; below 32768 is a service port everywhere.
+EPHEMERAL = ("50001", "50002", "57621")
+SERVICE = ("8080", "8081", "8082")
+
+
+def _listening(path, *ports):
+    """A snapshot in snapshot_listeners' shape: {'<path>:<port>': path}."""
+    return {"%s:%s" % (path, port): path for port in ports}
+
+
+class A3EphemeralPortsAreOneListener(Sandbox):
+    """A program that asks the kernel for any free port is one listener, not
+    one per port.
+
+    diff_listeners is a pure function of two snapshots; classify_signature is
+    replaced so every listener carries one known verdict on every body, and
+    what is under test is the identity the finding is filed under."""
+
+    def setUp(self):
+        super().setUp()
+        # setdefault: on Windows the Sandbox has already replaced
+        # classify_signature, and its ORIGINAL is what tearDown must restore.
+        self._saved.setdefault("classify_signature", aegis.classify_signature)
+        aegis.classify_signature = lambda path: {
+            "trust": _publisher(), "team": None, "authority": None}
+
+    def _fingerprints(self, findings):
+        return sorted(f["fingerprint"] for f in findings)
+
+    # ---- the fold ------------------------------------------------------------
+
+    def test_two_ephemeral_binds_are_one_listener(self):
+        fs = aegis.diff_listeners({}, _listening(LISTENER, *EPHEMERAL[:2]))
+        # BEFORE: two findings, listener:<path>:50001 and listener:<path>:50002
+        # -- two distinct signals for one program asking for any free port.
+        self.assertEqual(["listener:%s:#ephemeral" % LISTENER],
+                         self._fingerprints(fs),
+                         "each ephemeral port was filed as its own listener")
+        f = fs[0]
+        self.assertIn(f["port"], EPHEMERAL[:2],
+                      "the evidence must still name a port it actually saw")
+        self.assertIn("ephemeral", f["detail"])
+
+    def test_a_later_ephemeral_bind_is_the_same_listener(self):
+        """The #527 mechanism is across scans: every scan's new port was a
+        signal nothing had seen. The next scan's new port is the SAME one."""
+        first = aegis.diff_listeners({}, _listening(LISTENER, EPHEMERAL[0]))
+        prior = _listening(LISTENER, EPHEMERAL[0])
+        cur = _listening(LISTENER, *EPHEMERAL[:2])
+        later = aegis.diff_listeners(prior, cur)
+        self.assertEqual(1, len(later), "only the new port is news")
+        self.assertEqual(first[0]["fingerprint"], later[0]["fingerprint"])
+        self.assertEqual(EPHEMERAL[1], later[0]["port"])
+
+    def test_the_folded_listener_alerts_as_a_service_port_would(self):
+        """Nothing is suppressed: the first ephemeral bind is a finding at the
+        severity and category the same program on a service port gets."""
+        eph = aegis.diff_listeners({}, _listening(LISTENER, EPHEMERAL[0]))
+        svc = aegis.diff_listeners({}, _listening(LISTENER, SERVICE[0]))
+        self.assertEqual(1, len(eph))
+        self.assertEqual((svc[0]["severity"], svc[0]["category"]),
+                         (eph[0]["severity"], eph[0]["category"]))
+
+    # ---- what does not fold --------------------------------------------------
+
+    def test_a_service_port_keeps_its_number(self):
+        """Byte-identical to the old key, so no existing signal re-keys."""
+        key = "%s:22000" % LISTENER
+        fs = aegis.diff_listeners({}, {key: LISTENER})
+        self.assertEqual(["listener:" + key], self._fingerprints(fs))
+
+    def test_two_service_ports_are_two_listeners(self):
+        fs = aegis.diff_listeners({}, _listening(LISTENER, *SERVICE[:2]))
+        self.assertEqual(["listener:%s:%s" % (LISTENER, p)
+                          for p in SERVICE[:2]], self._fingerprints(fs))
+
+    def test_a_service_port_beside_ephemeral_churn_is_its_own_listener(self):
+        cur = _listening(LISTENER, SERVICE[0], *EPHEMERAL)
+        fs = aegis.diff_listeners({}, cur)
+        self.assertEqual(sorted(["listener:%s:%s" % (LISTENER, SERVICE[0]),
+                                 "listener:%s:#ephemeral" % LISTENER]),
+                         self._fingerprints(fs))
+
+    def test_a_second_program_is_a_second_listener(self):
+        cur = _listening(LISTENER, EPHEMERAL[0])
+        cur.update(_listening(OTHER_LISTENER, EPHEMERAL[1]))
+        fs = aegis.diff_listeners({}, cur)
+        self.assertEqual(sorted("listener:%s:#ephemeral" % p
+                                for p in (LISTENER, OTHER_LISTENER)),
+                         self._fingerprints(fs))
+
+    def test_the_browser_debug_listener_keeps_its_exact_key(self):
+        """Attack-defined: a browser's loopback listener is the in-memory CDP
+        enable, and each one is its own case at its own port."""
+        cur = {"loopback:%s:%s" % (BROWSER, p): BROWSER
+               for p in EPHEMERAL[:2]}
+        fs = aegis.diff_listeners({}, cur)
+        self.assertEqual(sorted("listener:" + k for k in cur),
+                         self._fingerprints(fs))
+
+    def test_an_unattributable_listener_is_not_folded(self):
+        """`?` names no program -- every socket no process could be tied to
+        shares it -- so "the same program again" is not a thing it can say."""
+        cur = {"?:%s" % p: "?" for p in EPHEMERAL[:2]}
+        fs = aegis.diff_listeners({}, cur)
+        self.assertEqual(sorted("listener:" + k for k in cur),
+                         self._fingerprints(fs))
+
+    def test_a_port_that_is_not_a_number_is_left_as_it_came(self):
+        self.assertEqual("listener:%s:*" % LISTENER,
+                         aegis._listener_fingerprint(LISTENER, "*"))
+
+    # ---- the floor -----------------------------------------------------------
+
+    def test_the_floor_is_the_os_definition(self):
+        # The range belongs to the KERNEL, and the constant is read from it
+        # once, at import. simbody flips aegis.IS_LINUX after that and
+        # cannot move the kernel, so the expectation is read from
+        # sys.platform, the spelling aegis's own flags are built on.
+        floor = aegis._EPHEMERAL_PORT_FLOOR
+        real_linux = not (sys.platform == "darwin"
+                          or sys.platform.startswith("win"))
+        self.assertEqual(32768 if real_linux else 49152, floor)
+        self.assertEqual("listener:%s:#ephemeral" % LISTENER,
+                         aegis._listener_fingerprint(LISTENER, str(floor)))
+        self.assertEqual("listener:%s:%d" % (LISTENER, floor - 1),
+                         aegis._listener_fingerprint(LISTENER,
+                                                     str(floor - 1)))
+
+    def test_the_floor_is_read_when_the_finding_is_made(self):
+        self._saved["_EPHEMERAL_PORT_FLOOR"] = aegis._EPHEMERAL_PORT_FLOOR
+        aegis._EPHEMERAL_PORT_FLOOR = 40000
+        fs = aegis.diff_listeners(
+            {}, _listening(LISTENER, "39999", "40000", "40001"))
+        self.assertEqual(sorted(["listener:%s:39999" % LISTENER,
+                                 "listener:%s:#ephemeral" % LISTENER]),
+                         self._fingerprints(fs))
+
+    # ---- what the fold is for ------------------------------------------------
+
+    def _risk(self):
+        return [i for i in aegis.list_incidents()
+                if i["title"].startswith("Accumulated risk")]
+
+    def _three_scans(self, ports):
+        """Three scans ten minutes apart, each seeing one new port: all three
+        inside RISK_WINDOW, as the live scans behind #527 were."""
+        prior = {}
+        for i, port in enumerate(ports):
+            cur = dict(prior)
+            cur.update(_listening(LISTENER, port))
+            fs = aegis.diff_listeners(prior, cur)
+            self.assertEqual(1, len(fs), "fixture: one new port per scan")
+            aegis.record_security_state(fs, now=T0 + 600 * i)
+            prior = cur
+
+    def test_ephemeral_churn_does_not_accumulate_risk(self):
+        self._three_scans(EPHEMERAL)
+        # BEFORE: "Accumulated risk on <path> (3 signals across 1 sensor,
+        # score 4.2)" -- three ports, three distinct signals, 3 x 2.0 x 0.7.
+        self.assertEqual([], self._risk(),
+                         "a program's ephemeral port churn summed into a risk "
+                         "incident")
+
+    def test_new_service_ports_still_accumulate(self):
+        """The control: a program that starts serving on three new service
+        ports is three facts, and the risk tier still hears them."""
+        self._three_scans(SERVICE)
+        self.assertEqual(1, len(self._risk()),
+                         "three service-port listeners no longer "
+                         "accumulate -- the fold reached past the floor")
 
 
 if __name__ == "__main__":
