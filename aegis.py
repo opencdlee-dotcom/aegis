@@ -28143,9 +28143,12 @@ _REPLAY_ASSAY_NOT_RUN = {
 # sensors whose severity is their own trust gate graded by _grade_binary, and
 # the two change sensors, whose record is a diff and is re-derived by
 # rebuilding the pair it was a diff of (_reobserve_persistence,
-# _reobserve_agent_surface).
+# _reobserve_agent_surface); behavior, re-scored from the command preview it
+# recorded (_reobserve_behavior); and hot-dir, re-derived by check_hot_dirs
+# over the item's own directory (_reobserve_hot_dir).
 _REOBSERVE_CATEGORIES = ("process", "net-listener", "net-beacon",
-                         "net-outbound", "persistence", "agent-surface")
+                         "net-outbound", "persistence", "agent-surface",
+                         "behavior", "hot-dir")
 
 # The persistence findings check_persistence emits from a launchd / unit /
 # Run-key diff. The category's other titles come from other sensors (cron, a
@@ -28158,6 +28161,15 @@ _REOBSERVE_PERSISTENCE_TITLES = (
 # finding that changes shape keeps these from the record it replaces.
 _REPLAY_ENVELOPE = ("ts", "presence", "idle_secs", "screen_locked",
                     "sensor_id")
+
+# What a re-derived finding takes from the sensor's answer when it is the same
+# fact re-graded; the record keeps everything else, its identity included.
+_REOBSERVE_GRADE = ("severity", "trust", "custody", "provenance", "markers",
+                    "confidence")
+
+# The reason a finding whose subject is no longer on disk is replayed as
+# recorded, as the headline split counts it.
+_REPLAY_GONE = "gone from disk"
 
 # The old-side fields a "program bytes" / "program" / "args" line cannot carry,
 # named the way the not-re-derivable count reports them.
@@ -28294,15 +28306,20 @@ _REPLAY_MOVED_ON = "the item on disk no longer shows the recorded change"
 
 
 def _reobserve_live(memo, part):
-    """Live state a change finding is re-derived against, read once per replay
-    and only when the corpus asks: the baseline FILE (never load_baseline(),
-    which migrates and writes) or the persistence sensor's own snapshot of the
-    items on disk now."""
+    """Live state a finding is re-derived against, read once per replay and
+    only when the corpus asks: the baseline FILE (never load_baseline(), which
+    migrates and writes), the programs the operator vouched for (the only
+    parents the `supervised` rung can answer for), or the persistence
+    sensor's own snapshot of the items on disk now."""
     key = ("live", part)
     if key not in memo:
         if part == "baseline":
             base = load_json(BASELINE, {})
             memo[key] = base if isinstance(base, dict) else {}
+        elif part == "supervisors":
+            memo[key] = tuple(sorted({
+                str(rec["path"]) for rec in load_vouches()[0].values()
+                if isinstance(rec, dict) and rec.get("path")}))
         else:
             memo[key] = snapshot_persistence() or {}
     return memo[key]
@@ -28527,24 +28544,26 @@ def _reobserve_agent_surface_answer(f, memo):
     return "ok", next(iter(answers.values()))
 
 
-def _reobserve_apply(f, answer, stats, rung):
-    """`f` as the answer re-derives it, counted the way _reobserve counts its
-    own. `rung` is the field the sensor carries custody in."""
+def _reobserve_apply(f, answer, stats, rung, take=_REOBSERVE_GRADE):
+    """(finding, as_recorded) for `f` as the answer re-derives it, counted the
+    way _reobserve counts its own: the re-derived finding (None when the
+    sensor would not emit it today) and None, or `f` as recorded and the
+    reason it could not be re-derived. `rung` is the field the sensor carries
+    custody in; `take` is what a same-titled answer replaces."""
     kind, got = answer
     if kind == "gone":
         stats["gone"] += 1
-        return f
+        return f, _REPLAY_GONE
     if kind == "not":
         reasons = stats["not_rederivable"]
         reasons[got] = reasons.get(got, 0) + 1
-        return f
+        return f, got
     if got is None:
         g = None
     elif got["title"] == f["title"]:
         # The same fact re-graded: keep the record's identity, take the grade.
         g = dict(f)
-        for field in ("severity", "trust", "custody", "provenance", "markers",
-                      "confidence"):
+        for field in take:
             if field in got:
                 g[field] = got[field]
         if isinstance(g.get("subject"), dict) and "trust" in g["subject"]:
@@ -28571,13 +28590,14 @@ def _reobserve_apply(f, answer, stats, rung):
         if after != before:
             table = stats["persistence_changes"]
             table[(before, after)] = table.get((before, after), 0) + 1
-    return g
+    return g, None
 
 
 def _reobserve_persistence(f, memo, stats):
     """`f`, a persistence finding, re-derived by check_persistence itself:
-    returned re-graded, None when the sensor would not emit it today, or as
-    recorded when the record cannot be rebuilt (counted, with the reason).
+    re-graded, None when the sensor would not emit it today, or as recorded
+    when the record cannot be rebuilt (counted, with the reason); returned as
+    _reobserve_apply returns it.
 
     A change finding is a diff, so this rebuilds the pair it was a diff of.
     The new side is the sensor's own snapshot of the item now, accepted only
@@ -28616,28 +28636,160 @@ def _reobserve_agent_surface(f, memo, stats):
     return _reobserve_apply(f, memo[key], stats, "provenance")
 
 
+def _reobserve_behavior_answer(f):
+    """("ok", finding) | ("ok", None) | ("not", reason) for one behavior
+    record; see _reobserve_behavior."""
+    preview = f.get("command_preview")
+    if not isinstance(preview, str) or not preview:
+        return "not", "field missing: command_preview"
+    if "…" in preview:
+        return "not", "preview elided"
+    if len(preview) >= _ARGV_PREVIEW_BUDGET:
+        return "not", "preview clipped at its budget"
+    if "[REDACTED]" in preview:
+        return "not", "preview redacted"
+    signals = _argv_signals(preview)
+    if not signals:
+        return "ok", None
+    names = "|".join(sorted(n for n, _ in signals))
+    base = os.path.basename(str(f.get("program") or ""))
+    argv_sha = str(f["fingerprint"]).rsplit(":", 1)[-1]
+    return "ok", dict(
+        f, severity=max(signals, key=lambda s: SEV_ORDER[s[1]])[1],
+        markers=sorted(n for n, _ in signals),
+        fingerprint="behavior:%s:%s:%s" % (base, names, argv_sha),
+        case_fingerprint="behavior:%s:%s:%s" % (base, names,
+                                                _argv_case_identity(preview)))
+
+
+def _reobserve_behavior(f, memo, stats):
+    """`f`, a behavior finding, re-scored by the current _argv_signals and
+    re-keyed by the current _argv_case_identity, the two things check_behavior
+    asks of an argv. None when the current rules find nothing in it.
+
+    The only argv a record holds is its `command_preview`, and it is read as
+    the command only where it is ALL of it. Four records are not:
+      * elided (`…`): the preview spends its budget on the matched regions;
+      * clipped at the budget with no mark: before 2026-09-19 the preview was
+        the first 240 characters of argv, which for a harness line is the
+        wrapper prologue alone — read as the command, the current rules find
+        nothing in it and every such finding would read as dropped;
+      * redacted: redact_sensitive can swallow the very token a rule reads
+        (`TOKEN=$(curl …` loses `$(curl` to the secret-assignment rule), and
+        a preview without `[REDACTED]` is one it left untouched, because every
+        substitution it makes writes that mark;
+      * absent: records from before the sensor stored one.
+    Each is counted with its reason and replayed as recorded.
+
+    The preview is the argv with whitespace runs collapsed to one space. Every
+    argv rule treats a newline as a barrier (`[^\\n]{0,N}`) and bounds its
+    reach, so collapsing can only add matches: `dropped` is sound, and a
+    finding that still fires may be one the live argv would not raise. The
+    case identity is taken over the same collapsed text, and the signal
+    fingerprint keeps the recorded argv hash, which no preview can
+    reproduce. Ancestry is not read: on a behavior record it is names and
+    pids, enrichment the sensor never grades on."""
+    key = ("behavior", f["fingerprint"], f.get("command_preview"))
+    if key not in memo:
+        memo[key] = _reobserve_behavior_answer(f)
+    return _reobserve_apply(
+        f, memo[key], stats, "custody",
+        take=_REOBSERVE_GRADE + ("fingerprint", "case_fingerprint"))
+
+
+def _reobserve_hot_dir_answer(f, memo):
+    """("ok", finding) | ("ok", None) | ("gone", None) | ("not", reason) for
+    one hot-dir record; see _reobserve_hot_dir."""
+    path = f.get("path")
+    if not path:
+        return "not", "the record names no item"
+    if not os.path.exists(path):
+        return "gone", None
+    # The sha the sensor keys on is the executable's: a bundle's main binary,
+    # else the file itself.
+    exe = _bundle_executable(path) if os.path.isdir(path) else path
+    sha = _reobserve_sha(memo, exe) if exe else None
+    if not sha or sha != (f.get("sha256")
+                          or str(f["fingerprint"]).rsplit(":", 1)[-1]):
+        return "not", _REPLAY_MOVED_ON
+    where = os.path.dirname(path)
+    if os.path.realpath(where) not in {os.path.realpath(d) for d in HOT_DIRS}:
+        return "ok", None
+    key = ("live", "hot-dir", where)
+    if key not in memo:
+        # Freshness asks about the moment of the drop, which the record
+        # already answered; opened back to the epoch, so an item that has
+        # since aged is still graded.
+        with _replay_overrides(HOT_DIRS=[where]):
+            memo[key] = check_hot_dirs(
+                max_age_days=int(time.time() // 86400) + 1)
+    hits = [g for g in memo[key] if g.get("path") == path]
+    return "ok", (hits[0] if hits else None)
+
+
+def _reobserve_hot_dir(f, memo, stats):
+    """`f`, a hot-dir finding, re-derived by check_hot_dirs itself — the
+    classifier, the download provenance, the Gatekeeper verdict for a bundle
+    and _grade_binary, all as the sensor asks them — over the one directory
+    the item sits in, and only while its executable is still the bytes the
+    record names. None when the sensor would not emit it today, including
+    when the directory is no longer one it watches."""
+    key = ("hot-dir", f["fingerprint"], f.get("path"))
+    if key not in memo:
+        memo[key] = _reobserve_hot_dir_answer(f, memo)
+    return _reobserve_apply(f, memo[key], stats, "provenance")
+
+
+def _reobserve_grade(base, path, endpoints, parents, rotating, memo):
+    """(severity, rung) _grade_binary gives `path` at `base`: the strictest
+    answer over the endpoints the sensor graded against."""
+    graded = rung = None
+    for endpoint in endpoints:
+        sev, got, _note = _grade_binary(
+            base, path, endpoint=endpoint, sha=_reobserve_sha(memo, path),
+            parents=list(parents) or None)
+        if graded is None or SEV_ORDER[sev] > SEV_ORDER[graded]:
+            graded, rung = sev, got
+    if rotating:
+        graded = _step_down(graded)
+    return graded, rung
+
+
 def _reobserve(f, memo, stats):
-    """`f` re-observed with the CURRENT classifier and custody ladder, or None
-    when today's sensor would not emit it; returned as recorded when it is not
-    a sensor this can re-derive, or its subject is gone from disk. The two
-    change sensors are re-derived by _reobserve_persistence and
-    _reobserve_agent_surface.
+    """(finding, as_recorded): `f` re-observed with the CURRENT classifier and
+    custody ladder — None when today's sensor would not emit it — and None;
+    or `f` as recorded and the reason, when it is not a sensor this can
+    re-derive, its subject is gone from disk, or the record lacks what the
+    re-derivation needs. The two change sensors are re-derived by
+    _reobserve_persistence and _reobserve_agent_surface, behavior by
+    _reobserve_behavior, hot-dir by _reobserve_hot_dir.
 
     The classifier is asked through classify_signature, logic-versioned cache
     and all: a classifier change that does not bump _SIGCACHE_LOGIC_VERSION is
     invisible here exactly as it would be on the live install. Answers are
-    memoized per subject, so a program seen in two hundred scans is asked once."""
+    memoized per subject, so a program seen in two hundred scans is asked once.
+
+    A process record's ancestry (exe paths, nearest first) is passed to
+    _grade_binary as the sensor passes it. The sensor records it only while
+    a vouch exists, so an older record carries none; where a vouched program
+    could then have earned the binary the `supervised` rung, the missing
+    field decides the grade, and the finding is counted and replayed as
+    recorded rather than graded as if it had no parent."""
     category = f.get("category")
     if category == "persistence":
         return _reobserve_persistence(f, memo, stats)
     if category == "agent-surface":
         return _reobserve_agent_surface(f, memo, stats)
+    if category == "behavior":
+        return _reobserve_behavior(f, memo, stats)
+    if category == "hot-dir":
+        return _reobserve_hot_dir(f, memo, stats)
     if category not in _REOBSERVE_CATEGORIES:
-        return f
+        return f, "category not re-derivable: %s" % category
     path = f.get("path") or f.get("program")
     if not path or not os.path.exists(path):
         stats["gone"] += 1
-        return f
+        return f, _REPLAY_GONE
     rotating = str(f["fingerprint"]).startswith("beacon:rotating:")
     parents = tuple(f.get("ancestry") or ()) if category == "process" else ()
     endpoints = _reobserve_endpoints(f)
@@ -28645,28 +28797,26 @@ def _reobserve(f, memo, stats):
     if key not in memo:
         trust = classify_signature(path)["trust"]
         base = _reobserve_base(f, path, trust)
-        graded = rung = None
+        graded = rung = unknown = None
         if base is not None:
-            sha = memo.get(("sha", path))
-            if sha is None:
-                sha = memo[("sha", path)] = sha256(path)
-            for endpoint in endpoints:
-                sev, got, _note = _grade_binary(
-                    base, path, endpoint=endpoint, sha=sha,
-                    parents=list(parents) or None)
-                if graded is None or SEV_ORDER[sev] > SEV_ORDER[graded]:
-                    graded, rung = sev, got
-            if rotating:
-                graded = _step_down(graded)
-        memo[key] = (trust, graded, rung)
-    trust, graded, rung = memo[key]
+            graded, rung = _reobserve_grade(base, path, endpoints, parents,
+                                            rotating, memo)
+            if category == "process" and not parents and any(
+                    _reobserve_grade(base, path, endpoints, (supervisor,),
+                                     rotating, memo) != (graded, rung)
+                    for supervisor in _reobserve_live(memo, "supervisors")):
+                unknown = "field missing: ancestry"
+        memo[key] = (trust, graded, rung, unknown)
+    trust, graded, rung, unknown = memo[key]
+    if unknown:
+        return _reobserve_apply(f, ("not", unknown), stats, "custody")
     stats["reobserved"] += 1
     trust_moved = trust != f.get("trust")
     stats["trust_changed"] += trust_moved
     if graded is None:
         stats["changed"] += trust_moved
         stats["no_longer_emitted"] += 1
-        return None
+        return None, None
     custody_moved = rung != (f.get("custody") or None)
     stats["custody_changed"] += custody_moved
     stats["changed"] += trust_moved or custody_moved
@@ -28674,7 +28824,7 @@ def _reobserve(f, memo, stats):
     g = dict(f, trust=trust, custody=rung, severity=graded)
     if isinstance(g.get("subject"), dict) and "trust" in g["subject"]:
         g["subject"] = dict(g["subject"], trust=trust)
-    return g
+    return g, None
 
 
 def _replay_assay(memory, now):
@@ -28742,6 +28892,24 @@ def _replay_assay(memory, now):
     return rows
 
 
+def _replay_split(reopened, as_recorded):
+    """([incident], {incident: (reason, live event id)}): each re-opened
+    noise incident by the recorded findings that re-open it. Re-derived when
+    every one of them was re-observed with the current code — a residue a
+    code change can move; as recorded, with the first such finding's reason,
+    when any of them was replayed as recorded — one no code change can."""
+    rederived, recorded = [], {}
+    for iid in sorted(reopened):
+        why = [(as_recorded[live_id], live_id)
+               for live_id in reopened[iid]["opened_by"]
+               if live_id in as_recorded]
+        if why:
+            recorded[iid] = min(why, key=lambda pair: pair[1])
+        else:
+            rederived.append(iid)
+    return rederived, recorded
+
+
 def _backtest_replay(days=30, reobserve=False, now=None):
     """Everything `backtest replay` reports, as data; cmd_backtest_replay
     renders it. See the banner above for what is run and what is not."""
@@ -28795,7 +28963,9 @@ def _backtest_replay(days=30, reobserve=False, now=None):
     asked = sum(1 for _n, batch in batches for _i, f in batch
                 if f["category"] in _REOBSERVE_CATEGORIES)
     routes, route_of, scratch_of, folded_into, finding_of = {}, {}, {}, {}, {}
-    seen, memo = {}, {}
+    # {live event id: reason} for every finding --reobserve replayed as
+    # recorded; a finding it re-derived has no entry.
+    seen, memo, as_recorded = {}, {}, {}
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
 
     # The operator's teaching comes from the live store, read once: the
@@ -28819,7 +28989,9 @@ def _backtest_replay(days=30, reobserve=False, now=None):
                 if reobserve:
                     kept = []
                     for live_id, f in batch:
-                        g = _reobserve(f, memo, stats)
+                        g, why = _reobserve(f, memo, stats)
+                        if why:
+                            as_recorded[live_id] = why
                         if g is None:
                             route_of[live_id] = "dropped"
                             routes.setdefault(f["category"], dict.fromkeys(
@@ -28872,17 +29044,30 @@ def _backtest_replay(days=30, reobserve=False, now=None):
     finally:
         scratch.close()
 
+    live_of = {s: l for l, s in scratch_of.items()}
+    folded_by_case = {}
+    for live_id, case in folded_into.items():
+        folded_by_case.setdefault(case, set()).add(live_id)
+
+    def evidence_of(case):
+        """The recorded findings a scratch case holds, as live event ids."""
+        return ({live_of[ev] for ev in events_of.get(case, ()) if ev in live_of}
+                | folded_by_case.get(case, set()))
+
     def reopens(live_id):
-        """How this finding re-opens under the current code, or None."""
+        """(how this finding re-opens under the current code, the recorded
+        findings that open it: itself when it interrupts, else what the open
+        case it joined holds), or (None, an empty set)."""
         if route_of.get(live_id) == ROUTE_INTERRUPT:
-            return "interrupt"
+            return "interrupt", {live_id}
         cases = set(cases_of.get(scratch_of.get(live_id), ()))
         if live_id in folded_into:
             cases.add(folded_into[live_id])
         for case in sorted(cases):
             if case in open_cases:
-                return "open %s case" % open_cases[case]["kind"]
-        return None
+                return ("open %s case" % open_cases[case]["kind"],
+                        evidence_of(case))
+        return None, set()
 
     noise = {}
     for live_id in sorted(links):
@@ -28893,19 +29078,18 @@ def _backtest_replay(days=30, reobserve=False, now=None):
                     "evidence"].append(live_id)
     reopened = {}
     for iid in sorted(noise):
+        opened_by = set()
         for live_id in noise[iid]["evidence"]:
-            how = reopens(live_id)
-            if how:
+            how, by = reopens(live_id)
+            if how and iid not in reopened:
                 reopened[iid] = {"how": how, "finding": finding_of[live_id]}
-                break
+            opened_by |= by
+        if iid in reopened:
+            reopened[iid]["opened_by"] = sorted(opened_by)
     noise_events = {ev for info in noise.values() for ev in info["evidence"]}
-    live_of = {s: l for l, s in scratch_of.items()}
-    folded_by_case = {}
-    for live_id, case in folded_into.items():
-        folded_by_case.setdefault(case, set()).add(live_id)
     new_cases = [case for case in open_cases
-                 if not (({live_of.get(ev) for ev in events_of.get(case, ())}
-                          | folded_by_case.get(case, set())) & noise_events)]
+                 if not (evidence_of(case) & noise_events)]
+    split = _replay_split(reopened, as_recorded) if reobserve else None
 
     replayed = sum(len(batch) for _n, batch in batches)
     routed = sum(n for bucket in routes.values() for n in bucket.values())
@@ -28937,12 +29121,19 @@ def _backtest_replay(days=30, reobserve=False, now=None):
     if reobserve and accounted != asked:
         problems.append("%d re-derivable finding(s) but %d re-observed, gone "
                         "or not re-derivable" % (asked, accounted))
+    if split is not None:
+        rederived, recorded = split
+        if len(rederived) + len(recorded) != len(reopened) \
+                or set(rederived) | set(recorded) != set(reopened):
+            problems.append("re-derived %d + as recorded %d != %d re-opened"
+                            % (len(rederived), len(recorded), len(reopened)))
+        split = {"re-derived": rederived, "as-recorded": recorded}
     r.update(loaded=len(rows), in_store=in_store, unparseable=bad,
              batches=len(batches), by_scan_id=by_scan_id, memory=memory,
              weights=weights, routes=routes, open_cases=open_cases,
              noise=noise, reopened=reopened, new_cases=new_cases,
              replayed=replayed, lanes=lanes, asked=asked,
-             reobserve=stats if reobserve else None)
+             reobserve=stats if reobserve else None, split=split)
     return r
 
 
@@ -29027,16 +29218,20 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
     lines.append("\nCases the replay leaves OPEN: %d%s" % (
         len(r["open_cases"]), " (%s)" % ", ".join(
             "%s %d" % (k, kinds[k]) for k in sorted(kinds)) if kinds else ""))
+    split = r["split"]
     lines.append("\nNoise-labelled incidents the current code re-opens "
-                 "(id, closed as, category, title — path, how):")
+                 "(id, closed as, category, title — path, how%s):"
+                 % ("" if split is None else ", as recorded: why"))
     for iid in sorted(r["reopened"]):
         hit = r["reopened"][iid]
         f = hit["finding"]
         label = (r["noise"][iid].get("resolution")
                  or "false-positive").split(":")[0]
-        lines.append("  #%-5d %-16s %-14s %s — %s · %s" % (
+        why = "" if split is None or iid not in split["as-recorded"] \
+            else " · as recorded: %s" % split["as-recorded"][iid][0]
+        lines.append("  #%-5d %-16s %-14s %s — %s · %s%s" % (
             iid, label[:16], f["category"][:14], f["title"],
-            f.get("path") or f.get("program") or "-", hit["how"]))
+            f.get("path") or f.get("program") or "-", hit["how"], why))
     if not r["reopened"]:
         lines.append("  (none)")
     by_label = {}
@@ -29046,8 +29241,29 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
         pair[1] += 1
         pair[0] += iid in r["reopened"]
     lines.append("")
-    lines.append("noise re-opened: %d of %d" % (len(r["reopened"]),
-                                                len(r["noise"])))
+    # The total stays first and unchanged, so every number printed before
+    # the split is still comparable. Only its re-derived half is a target: the
+    # rest re-opens on evidence the replay could not ask again.
+    head = "noise re-opened: %d of %d" % (len(r["reopened"]), len(r["noise"]))
+    if split is None:
+        lines.append(head + " — not split: every finding was replayed as "
+                            "recorded (--reobserve splits it)")
+    else:
+        recorded = split["as-recorded"]
+        lines.append(head + " — re-derived %d (the target), as recorded %d"
+                     % (len(split["re-derived"]), len(recorded)))
+        lines.append("  re-derived (the current code still re-opens these): "
+                     + (" ".join("#%d" % i for i in split["re-derived"])
+                        or "(none)"))
+        by_reason = {}
+        for iid in sorted(recorded):
+            by_reason.setdefault(recorded[iid][0], []).append(iid)
+        lines.append("  as recorded (evidence the replay could not ask again), "
+                     "by the reason the first such finding was not re-derived:"
+                     + ("" if by_reason else " (none)"))
+        for why in sorted(by_reason, key=lambda k: (-len(by_reason[k]), k)):
+            lines.append("    %s %d: %s" % (why, len(by_reason[why]), " ".join(
+                "#%d" % i for i in by_reason[why])))
     if by_label:
         lines.append("  by label: " + " · ".join(
             "%s %d/%d" % (label, by_label[label][0], by_label[label][1])
@@ -29086,7 +29302,10 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
                         r["replayed"], len(r["assay"]), r["lanes"],
                         "" if stats is None else
                         "; %d re-derivable finding(s) each re-observed, gone "
-                        "or counted not re-derivable" % r["asked"]))
+                        "or counted not re-derivable; re-derived %d + as "
+                        "recorded %d = %d re-opened"
+                        % (r["asked"], len(split["re-derived"]),
+                           len(split["as-recorded"]), len(r["reopened"]))))
     lines.append("Read-only: the live store was opened mode=ro; nothing was "
                  "written, notified, or learned.")
     print("\n".join(lines))
