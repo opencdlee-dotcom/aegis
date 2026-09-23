@@ -8445,7 +8445,16 @@ def check_processes():
     # before, so a failed prefetch costs speed and never changes a verdict.
     warm_signature_cache([c for _p, _o, c, _a in procs
                           if c and not _is_trusted_prefix(c)])
-    for _pid, _owner, comm, _argv in procs:
+    # Who started each process, for the one rung that asks (_supervised_rung).
+    # The ancestry table is a second read of the process table, so it is built
+    # at most once per scan, on the first finding that could use it, and never
+    # on a host with no vouch to earn that rung from -- the common case, which
+    # pays nothing. A tampered vouch store earns nothing either, so it is
+    # skipped the same way.
+    exe_by_pid = {str(p): c for p, _o, c, _a in procs if c}
+    vouched_any = bool(load_vouches()[0])
+    table = None
+    for pid, _owner, comm, _argv in procs:
         if not comm:
             continue
         if IS_WIN:
@@ -8481,8 +8490,18 @@ def check_processes():
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
-            graded, rung, note = _grade_binary(sev, comm, sha=sha)
-            findings.append(finding(
+            parents = []
+            if vouched_any:
+                if table is None:
+                    table = _process_ancestry_table()
+                # "?" for an ancestor with no exe path this user can read: it
+                # is still a link in the chain, and _supervised_rung ends the
+                # walk there rather than stepping over it.
+                parents = [exe_by_pid.get(p) or "?"
+                           for p in _ancestry(pid, table)]
+            graded, rung, note = _grade_binary(sev, comm, sha=sha,
+                                               parents=parents)
+            f = finding(
                 graded, "process", "Suspicious running process",
                 "%s (%s) %s%s" % (comm, sig["trust"], reason,
                                   ("\n" + note) if note else ""),
@@ -8502,7 +8521,13 @@ def check_processes():
                                   else "process:%s" % _program_subject(comm)),
                 subject=_subject("process", comm, trust=sig["trust"],
                                  content=sha),
-                path=comm, trust=sig["trust"], sha256=sha, custody=rung))
+                path=comm, trust=sig["trust"], sha256=sha, custody=rung)
+            if parents:
+                # The programs it ran under, by exe path -- the operator's
+                # answer to "why supervised?", and to why not. Paths rather
+                # than pids, so the evidence does not change every restart.
+                f["ancestry"] = parents
+            findings.append(f)
     return findings
 
 
@@ -15667,6 +15692,64 @@ def _build_output_rung(path):
     return result
 
 
+def _supervised_rung(path, parents):
+    """'supervised' when `path` was started by a program the operator vouched
+    for, out of that program's own install directory, else None.
+
+    #534, 2026-09-21: `<runner>/bin.2.337.0/Runner.Worker`, ad-hoc signed in a
+    user-writable path, HIGH with no rung. The operator had signed four
+    vouches, every one of them for a `Runner.Listener` -- the process that
+    holds the connection and beacons -- and the Listener is what starts the
+    Worker, from the directory it was installed into, for every job. The
+    Worker was never vouched and cannot usefully be: each runner self-update
+    mints new Worker and PluginHost bytes, so a vouch for them is outgrown by
+    the next update, and tolerance, which follows content, cannot carry a
+    verdict across bytes either. `_vouch_superseded_by` answers for a sibling
+    VERSION of the vouched program; nothing answered for a different program
+    the vouched one runs.
+
+    The claim is narrow, and every clause is checked at this call:
+
+      * the SUPERVISOR's vouch verifies now -- `_vouch_covers` with no
+        endpoint, which re-hashes its bytes -- so a supervisor that changed,
+        was revoked or expired passes nothing on, and nothing is remembered
+        between calls: the custody ledger never records this rung, so a
+        child cannot keep it as `copy-of-graded` once the check fails;
+      * the child sits inside the supervisor's own resolved directory
+        (`bin.<version>/`, reached through the `bin` link the runner
+        repoints), so what the runner RUNS from anywhere else -- every job
+        step under `_work/` -- never earns it;
+      * every program between the two is from that directory as well, so a
+        binary started by a job step's shell is the workload's even when it
+        sits beside the supervisor, and an ancestor nobody can name ends the
+        walk. Dropping a payload beside a vouched binary buys nothing by
+        itself -- the one thing `_vouch_superseded_by` refuses -- because the
+        ancestry must show the supervisor started it.
+
+    `parents` is the ancestor exe list, nearest first, as `_ancestry` walks
+    it; that walk already stops at a pid slot re-used since the child started.
+
+    WEAK by construction, like `build-output`: the vouch is the parent's and
+    is not re-conferred, `_demote` moves one step and never suppresses, and
+    `_RISK_CUSTODY_WEIGHT` still lets the finding corroborate at half weight.
+    """
+    if not (path and parents):
+        return None
+    real = os.path.realpath(path)
+    between = []
+    for parent in parents:
+        if not (parent and os.path.isabs(parent)):
+            return None
+        resolved = os.path.realpath(parent)
+        home = os.path.dirname(resolved) + os.sep
+        if (real.startswith(home)
+                and all(p.startswith(home) for p in between)
+                and _vouch_covers(parent)):
+            return "supervised"
+        between.append(resolved)
+    return None
+
+
 # --- the custody ledger: a rung is earned by BYTES, not by a directory -------
 #
 # Every rung above answers "what is true of this file where it sits now?".
@@ -15731,6 +15814,12 @@ def _custody_remember(sha, rung, path):
         return False
     if rung == "copy-of-graded":
         return False           # carried rungs are not themselves carriable
+    if rung == "supervised":
+        # A fact about who STARTED this run, earned only while the
+        # supervisor's vouch verifies. Remembered against the bytes, it would
+        # outlive that check: the child would stay a step down after the
+        # vouch was revoked or the supervisor swapped.
+        return False
     try:
         if _custody_carried(sha):
             return False       # already known; keep the ledger one-row-per-sha
@@ -15877,6 +15966,18 @@ _PROVENANCE_NOTE = {
                        "a modified binary — and because it demotes one step "
                        "and never suppresses, a copy that starts behaving "
                        "badly alarms on its behaviour exactly as before."),
+    "supervised": ("This program was started by one you vouched for, whose "
+                   "vouch verified against its bytes when this was graded, "
+                   "and it sits inside that program's own install directory "
+                   "— the shape of a supervisor running the worker it ships "
+                   "with, as a CI runner's listener runs its job worker. The "
+                   "vouch is the SUPERVISOR's, not this file's, and it is not "
+                   "re-conferred: this demotes one step only and never "
+                   "suppresses. Bounded to the supervisor's own directory and "
+                   "to its own chain of programs, so what it runs from "
+                   "anywhere else — a job step, and anything a job step "
+                   "starts — never earns it. The finding's `ancestry` names "
+                   "the programs it ran under."),
     "operator-vouched": ("The operator signed a vouch for exactly these bytes "
                          "at exactly this path, with a passphrase-protected "
                          "key verified against the pinned vouch roster. This "
@@ -15973,7 +16074,13 @@ _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed",
 # re-confers the rung it found. That is what stops a vouch from widening: a
 # vouch is bound to one path (and, for outbound, one endpoint), so carrying it
 # as itself would silently grant "may live anywhere, may talk to anywhere".
-_WEAK_CUSTODY = ("worktree", "local-commit", "build-output", "copy-of-graded")
+# `supervised` is the other way a vouch reaches past its own bytes without
+# widening: a program the vouched supervisor itself started, from its own
+# install directory (`_supervised_rung`). The vouch stays the supervisor's --
+# its bytes, its path -- and the child gets only this weakest step, re-checked
+# against the supervisor's vouch every time it is graded.
+_WEAK_CUSTODY = ("worktree", "local-commit", "build-output", "copy-of-graded",
+                 "supervised")
 
 _CUSTODY_FLOOR = {"relocated": "LOW", "os-vendor": "LOW"}
 # How much a custody-graded finding may still CORROBORATE in the risk tier.
@@ -16231,7 +16338,7 @@ def _package_receipt(path):
 
 
 def _grade_binary(severity, path, attack_defined=False, endpoint=None,
-                  sha=None):
+                  sha=None, parents=None):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
 
     process / net-listener / net-outbound / net-beacon all raise on the same
@@ -16250,6 +16357,11 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     computes it for its own fingerprint). It is only otherwise derived when a
     rung is actually at stake, so the ledger costs a hash for the binaries
     being graded and nothing for the rest.
+
+    `parents` is the running process's ancestor exe list, nearest first, when
+    the caller has one (check_processes, and only on a host with a vouch). It
+    is the only input here that is not about the file: the `supervised` rung
+    asks who STARTED it, which no path, receipt or repo can answer.
     """
     if attack_defined:
         return severity, None, None
@@ -16268,10 +16380,17 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     # volume it did and why each round of tuning could only move the threshold.
     elif _build_output_rung(path):
         rung = "build-output"
+    # A program the vouched supervisor started from its own install directory
+    # (#534: the runner's Worker, beside the Listener the operator vouched).
+    # Weak like build-output, and asked after it: the supervisor's vouch is
+    # re-verified on every call, which costs a hash of the supervisor. The
+    # one rung the ledger below never records (see _custody_remember).
+    elif parents and _supervised_rung(path, parents):
+        rung = "supervised"
     else:
         # Nothing about WHERE this file sits explains it. Ask the only question
         # left: were these exact bytes already explained somewhere else? This
-        # is the stage of the operator's own pipeline the three rungs above
+        # is the stage of the operator's own pipeline the rungs above
         # cannot see — the copy in ~/Downloads, the one dragged to
         # /Applications, the one a release script moved out of the build tree.
         carried = _custody_carried(sha or _graded_sha(path))

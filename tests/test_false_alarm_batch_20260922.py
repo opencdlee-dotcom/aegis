@@ -163,6 +163,31 @@ Counted by fact rather than by row, the 14 were six things.
       the operator, who knows which, decides. A parent or child directory
       does not match, and the vouched file is not its own neighbour.
 
+      What the note cannot tell apart, the process table can. The Listener
+      is what STARTS the Worker, from its own directory, for every job; a
+      file that only sits beside it was started by nothing the operator
+      vouched for. `supervised` is a new WEAK rung, earned only while all
+      three hold: the supervisor's vouch verifies at grading time
+      (`_vouch_covers`, no endpoint, its bytes re-hashed), the child sits
+      inside the supervisor's resolved directory (`bin/` is a link the
+      runner repoints), and every program between the two is from that
+      directory too. So a job step under `_work/` never earns it, a binary
+      a job step's shell starts never earns it even beside the Listener,
+      and a pid slot re-used since the child started ends the walk
+      (`_ancestry`'s start-time guard). One step only, never suppression,
+      half weight in the risk tier; the vouch stays the Listener's and is
+      not re-conferred, and the custody ledger never records the rung, so
+      the Worker's bytes cannot keep it as `copy-of-graded` after the
+      Listener's vouch fails. check_processes builds the ancestry table
+      once per scan, only when a vouch exists, and records the parent exe
+      list as the finding's `ancestry`, with `?` for an ancestor it cannot
+      name, which ends the walk. Where the rung is earned the binary is
+      graded, so the note is not printed; everywhere else it still is.
+      Offline, #534's path under the live Listener now grades (MEDIUM,
+      supervised). After a runner self-update the operator re-vouches the
+      Listener once, as before; the Worker, and any helper it starts from
+      the same directory, follow it.
+
   D   A hot-dir finding had no exit when its file is gone. `/tmp/qtest_local`
       (#525) was a throwaway test binary, deleted since; nothing could close
       its incident before age-out.
@@ -1618,6 +1643,302 @@ class EAnOrphanedBehaviorCaseIsRetired(Sandbox):
         fn = dict((k, fn) for k, fn, _log in aegis._STORE_MIGRATIONS)[
             "behavior_case_identity_20260922"]
         self.assertIs(aegis._retire_orphaned_behavior_incidents, fn)
+
+
+VOUCH_PRINCIPAL = "operator@test.invalid"
+# {pid: (ppid, start)} in _process_ancestry_table's shape: the supervisor (100)
+# started the worker (200). pid 1 is outside the table, which ends the walk.
+SUPERVISED_TABLE = {"200": ("100", "20"), "100": ("1", "10")}
+
+
+class C1ASupervisedChildIsAWeakRung(Sandbox):
+    """A workload its vouched supervisor started, out of the supervisor's own
+    install directory, earns one weak step -- and nothing else does.
+
+    _vouch_covers is replaced by a set of vouched real paths, so what is under
+    test is the rung's own rule (who started it, from where, verified when),
+    not the signature verifier; one test signs a vouch for real. The process
+    sensor is driven over a fixed table, with _exec_alert replaced so the same
+    binary alerts on every body."""
+
+    def setUp(self):
+        super().setUp()
+        # The custody ledger's in-process memos outlive a test: a rung earned
+        # by one test's bytes would otherwise be CARRIED into the next.
+        aegis._CUSTODY_CARRY_CACHE.clear()
+        aegis._GRADED_SHA_CACHE.clear()
+        self.addCleanup(aegis._CUSTODY_CARRY_CACHE.clear)
+        self.addCleanup(aegis._GRADED_SHA_CACHE.clear)
+        runner = os.path.join(self.tmp, "actions-runners", "ci")
+        self.bin = os.path.join(runner, "bin.2.337.0")
+        self.listener = self._file(self.bin, "Runner.Listener")
+        self.worker = self._file(self.bin, "Runner.Worker")
+        self.plugin = self._file(self.bin, "Runner.PluginHost")
+        self.step = self._file(os.path.join(runner, "_work", "repo"), "tool")
+        self.shell = self._file(os.path.join(self.tmp, "usr", "bin"), "bash")
+        self.vouched = {os.path.realpath(self.listener)}
+        self.asked = []
+        self._saved["_vouch_covers"] = aegis._vouch_covers
+        aegis._vouch_covers = self._covers
+
+    def _file(self, d, name):
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, "wb") as f:
+            f.write(("%s bytes\n" % path).encode("utf-8"))
+        return path
+
+    def _covers(self, path, endpoint=None, now=None):
+        """An identity vouch: it covers the bytes, and names no endpoint."""
+        self.asked.append((path, endpoint))
+        return endpoint is None and os.path.realpath(path) in self.vouched
+
+    # ---- the rung ------------------------------------------------------------
+
+    def test_a_worker_its_vouched_supervisor_started_earns_the_rung(self):
+        # BEFORE: there was no such rung -- #534, Runner.Worker, HIGH with
+        # custody null, beside a Runner.Listener the operator had vouched.
+        self.assertEqual("supervised",
+                         aegis._supervised_rung(self.worker, [self.listener]))
+        self.assertEqual([(self.listener, None)],
+                         [a for a in self.asked if a[0] == self.listener],
+                         "the supervisor's vouch is asked about its IDENTITY, "
+                         "with no endpoint")
+
+    def test_the_supervisors_vouch_is_verified_now_not_remembered(self):
+        self.assertEqual("supervised",
+                         aegis._supervised_rung(self.worker, [self.listener]))
+        self.vouched.clear()     # the supervisor's bytes no longer verify
+        self.assertIsNone(aegis._supervised_rung(self.worker,
+                                                 [self.listener]))
+
+    def test_an_unvouched_supervisor_earns_nothing(self):
+        self.vouched.clear()
+        self.assertIsNone(aegis._supervised_rung(self.worker,
+                                                 [self.listener]))
+
+    def test_a_child_outside_the_supervisors_directory_earns_nothing(self):
+        """A job step under _work/ is the runner's WORKLOAD, not the runner."""
+        self.assertIsNone(aegis._supervised_rung(
+            self.step, [self.shell, self.worker, self.listener]))
+
+    def test_a_directory_that_only_shares_a_prefix_is_not_inside(self):
+        twin = self._file(self.bin + "-extra", "Runner.Worker")
+        self.assertIsNone(aegis._supervised_rung(twin, [self.listener]))
+
+    def test_the_supervisors_own_worker_passes_it_one_level_down(self):
+        """Listener -> Worker -> PluginHost: every program between the child
+        and the supervisor is the supervisor's own, from its own directory."""
+        self.assertEqual("supervised", aegis._supervised_rung(
+            self.plugin, [self.worker, self.listener]))
+
+    def test_a_program_a_job_step_starts_never_qualifies(self):
+        """Even from inside the install directory. A shell from somewhere else
+        stands between it and the supervisor, so the supervisor is not what
+        ran it -- its workload is, and the workload is what the operator never
+        vouched for."""
+        dropped = self._file(self.bin, "payload")
+        self.assertIsNone(aegis._supervised_rung(
+            dropped, [self.shell, self.worker, self.listener]))
+
+    def test_an_ancestor_nobody_can_name_ends_the_walk(self):
+        """`?` is a process whose exe this user cannot read -- another user's,
+        or one gone between the two table reads. Unknown is never clean, so
+        it is never stepped over to reach the supervisor behind it."""
+        self.assertIsNone(aegis._supervised_rung(
+            self.worker, ["?", self.listener]))
+        self.assertIsNone(aegis._supervised_rung(
+            self.worker, ["", self.listener]))
+
+    def test_the_supervisor_named_through_its_version_link_still_counts(self):
+        """The live Listener runs as `<runner>/bin/Runner.Listener`, a symlink
+        the runner repoints at `bin.<version>` on every self-update, and
+        #534's worker as `bin.2.337.0/Runner.Worker`. The directories are
+        compared after both paths are resolved."""
+        link = os.path.join(os.path.dirname(self.bin), "bin")
+        try:
+            os.symlink(self.bin, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("this body cannot create a symlink unprivileged")
+        self.assertEqual("supervised", aegis._supervised_rung(
+            self.worker, [os.path.join(link, "Runner.Listener")]))
+
+    def test_no_ancestry_is_no_rung(self):
+        self.assertIsNone(aegis._supervised_rung(self.worker, []))
+        self.assertIsNone(aegis._supervised_rung(self.worker, None))
+
+    # ---- the grade -----------------------------------------------------------
+
+    def test_it_grades_one_step_through_grade_binary(self):
+        self.assertEqual(
+            ("MEDIUM", "supervised", aegis._PROVENANCE_NOTE["supervised"]),
+            aegis._grade_binary("HIGH", self.worker, parents=[self.listener]))
+
+    def test_the_grade_is_not_remembered_once_the_vouch_stops_verifying(self):
+        """The custody ledger remembers `sha -> rung` for every rung earned
+        and carries it to later sightings of the same bytes. Carried, this
+        rung would outlive the check that earned it: the Worker would stay a
+        step down after the Listener's vouch was revoked or its bytes swapped.
+        It is a fact about who started this run, so it is never carried."""
+        self.assertEqual(("MEDIUM", "supervised"), aegis._grade_binary(
+            "HIGH", self.worker, parents=[self.listener])[:2])
+        self.assertIsNone(aegis._custody_carried(aegis.sha256(self.worker)))
+        self.vouched.clear()
+        self.assertEqual(("HIGH", None), aegis._grade_binary(
+            "HIGH", self.worker, parents=[self.listener])[:2])
+
+    def test_without_ancestry_grade_binary_is_unchanged(self):
+        sev, rung, _note = aegis._grade_binary("HIGH", self.worker)
+        self.assertEqual(("HIGH", None), (sev, rung))
+
+    def test_attack_defined_evidence_is_never_graded_by_it(self):
+        self.assertEqual(("HIGH", None, None), aegis._grade_binary(
+            "HIGH", self.worker, attack_defined=True,
+            parents=[self.listener]))
+
+    def test_it_is_weak_by_construction(self):
+        """One step, never suppression, still corroborating at half weight:
+        the vouch is the SUPERVISOR's, and it is not re-conferred."""
+        self.assertIn("supervised", aegis._WEAK_CUSTODY)
+        self.assertNotIn("supervised",
+                         aegis._SELF_CUSTODY + aegis._VOUCHED_CUSTODY)
+        self.assertEqual(0.5, aegis._RISK_CUSTODY_WEIGHT["supervised"])
+        self.assertEqual("MEDIUM", aegis._demote("HIGH", "supervised"))
+        self.assertEqual("HIGH", aegis._demote("CRITICAL", "supervised"))
+        self.assertTrue(aegis._PROVENANCE_NOTE.get("supervised"))
+
+    # The real body only: a simulated Windows pins run()'s PATH to system
+    # directories that do not exist here, so ssh-keygen never verifies.
+    @needs_the_real_body
+    @unittest.skipUnless(os.path.exists("/usr/bin/ssh-keygen"),
+                         "ssh-keygen not available")
+    def test_a_real_vouch_grades_the_worker_until_the_supervisor_changes(self):
+        aegis._vouch_covers = self._saved["_vouch_covers"]
+        aegis._VOUCH_CACHE.update({"key": None, "active": None,
+                                   "reason": None})
+        self.addCleanup(aegis._VOUCH_CACHE.update,
+                        {"key": None, "active": None, "reason": None})
+        key = os.path.join(self.tmp, "vouchkey")
+        subprocess.check_call(
+            ["/usr/bin/ssh-keygen", "-t", "ed25519", "-N", "", "-C", "test",
+             "-f", key], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(key + ".pub", encoding="utf-8") as f:
+            pub = f.read().strip()
+        with open(aegis.VOUCH_SIGNERS, "w", encoding="utf-8") as f:
+            f.write("%s %s\n" % (VOUCH_PRINCIPAL, pub))
+        aegis._vouch_append(aegis._vouch_record(
+            "vouch", self.listener, VOUCH_PRINCIPAL,
+            endpoints=("20.85.130.105:443",)), key)
+        self.assertEqual(("MEDIUM", "supervised"), aegis._grade_binary(
+            "HIGH", self.worker, parents=[self.listener])[:2])
+        with open(self.listener, "ab") as f:
+            f.write(b"swapped\n")
+        self.assertEqual(("HIGH", None), aegis._grade_binary(
+            "HIGH", self.worker, parents=[self.listener])[:2])
+
+    # ---- the process sensor --------------------------------------------------
+
+    def _process_sensor(self, procs, table, vouches):
+        """The REAL check_processes over `procs` [(pid, exe)], with
+        _process_ancestry_table answering `table` and counting its calls.
+        Everything but the supervisor alerts."""
+        self.tables_built = 0
+
+        def build():
+            self.tables_built += 1
+            return dict(table)
+
+        me = aegis._own_owner()
+        for name, fake in (
+                ("_iter_processes",
+                 lambda: iter([(pid, me, exe, exe) for pid, exe in procs])),
+                ("_process_ancestry_table", build),
+                ("load_vouches", lambda now=None: (vouches, None)),
+                ("classify_signature", lambda p: {
+                    "trust": "adhoc", "team": None, "authority": None}),
+                ("warm_signature_cache", lambda paths: 0),
+                ("_exec_alert", lambda path, trust: (
+                    None if path == self.listener
+                    else ("HIGH", "running from user-writable path")))):
+            self._saved.setdefault(name, getattr(aegis, name))
+            setattr(aegis, name, fake)
+        return {f["path"]: f for f in self._saved["check_processes"]()}
+
+    def _vouches(self):
+        real = os.path.realpath(self.listener)
+        return {aegis._vouch_subject(real): {"path": real}}
+
+    @needs_the_real_body
+    def test_the_process_sensor_grades_a_supervised_worker(self):
+        fs = self._process_sensor(
+            [("100", self.listener), ("200", self.worker)],
+            SUPERVISED_TABLE, self._vouches())
+        f = fs[self.worker]
+        # BEFORE: ('HIGH', None) -- #534.
+        self.assertEqual(("MEDIUM", "supervised"),
+                         (f["severity"], f["custody"]))
+        self.assertEqual([self.listener], f["ancestry"],
+                         "the finding must show the operator WHY: the "
+                         "supervisor it ran under")
+
+    @needs_the_real_body
+    def test_without_a_vouch_the_ancestry_table_is_never_built(self):
+        fs = self._process_sensor(
+            [("100", self.listener), ("200", self.worker)],
+            SUPERVISED_TABLE, {})
+        f = fs[self.worker]
+        self.assertEqual(0, self.tables_built,
+                         "a host with no vouches paid for a process-table "
+                         "read no rung could use")
+        self.assertEqual(("HIGH", None), (f["severity"], f["custody"]))
+        self.assertNotIn("ancestry", f)
+
+    @needs_the_real_body
+    def test_the_ancestry_table_is_built_once_per_scan(self):
+        table = dict(SUPERVISED_TABLE, **{"300": ("1", "30")})
+        fs = self._process_sensor(
+            [("100", self.listener), ("200", self.worker),
+             ("300", self.shell)], table, self._vouches())
+        self.assertEqual(1, self.tables_built)
+        self.assertEqual("supervised", fs[self.worker]["custody"])
+        self.assertEqual(("HIGH", None), (fs[self.shell]["severity"],
+                                          fs[self.shell]["custody"]))
+
+    @needs_the_real_body
+    def test_the_same_worker_started_by_something_else_stays_high(self):
+        table = {"200": ("150", "20"), "150": ("1", "15")}
+        fs = self._process_sensor(
+            [("150", self.shell), ("200", self.worker)], table,
+            self._vouches())
+        f = fs[self.worker]
+        self.assertEqual(("HIGH", None), (f["severity"], f["custody"]))
+        self.assertEqual([self.shell], f["ancestry"])
+
+    @needs_the_real_body
+    def test_a_reused_parent_slot_earns_nothing(self):
+        """pid 100 started AFTER its supposed child: the slot was re-used, and
+        whoever holds it now did not start the worker. _ancestry's start-time
+        guard ends the chain there."""
+        table = {"200": ("100", "20"), "100": ("1", "50")}
+        fs = self._process_sensor(
+            [("100", self.listener), ("200", self.worker)], table,
+            self._vouches())
+        f = fs[self.worker]
+        self.assertEqual(("HIGH", None), (f["severity"], f["custody"]))
+
+    @needs_the_real_body
+    def test_a_parent_missing_from_the_process_rows_is_named_unknown(self):
+        """pid 150 is in the ancestry table but in no process row: it exited
+        between the two reads, or its exe is unreadable. The evidence says
+        so, and the supervisor behind it is not reached."""
+        table = {"200": ("150", "20"), "150": ("100", "15"),
+                 "100": ("1", "10")}
+        fs = self._process_sensor(
+            [("100", self.listener), ("200", self.worker)], table,
+            self._vouches())
+        f = fs[self.worker]
+        self.assertEqual(("HIGH", None), (f["severity"], f["custody"]))
+        self.assertEqual(["?", self.listener], f["ancestry"])
 
 
 if __name__ == "__main__":
