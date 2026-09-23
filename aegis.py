@@ -3834,7 +3834,18 @@ def _tolerance_identity(fingerprint):
             changed = changed or (versionless != part) or ("#" in versionless)
             part = versionless
         normalized.append(part)
-    if not changed or len(normalized) < 2:
+    # What survives the strip must still NAME A SUBJECT, not just a category
+    # and a structural literal. `process:sha:<sha>` — the content-keyed shape
+    # the process sensor moved to — strips to the two components
+    # `process:sha`, which is not an identity at all: it is every content-keyed
+    # process incident on the machine sharing one bucket, so three
+    # benign-positive verdicts on three UNRELATED binaries would have tolerized
+    # the sensor outright. The floor of three exists to make tolerance
+    # antigen-specific and that string defeats it by naming no antigen. Three
+    # components is the real requirement (`persistence:changed:<path>`,
+    # `process:<path>:<trust>`, `behavior:bash:<markers>` all clear it); the
+    # bytes keep their own identity via _fingerprint_content_identity.
+    if not changed or len(normalized) < 3:
         return None
     return ":".join(normalized)
 
@@ -3997,7 +4008,15 @@ def _subject_identity(sub):
         return "persistence:%s:%s" % (sub.get("op") or "changed", path)
     if kind == "process" and generalizes:
         return "process:%s:%s" % (path, sub.get("trust") or "")
-    if kind == "beacon" and generalizes:
+    # A beacon subject now carries `content` so the content-keyed identity can
+    # be rendered from it — but content must NOT be what qualifies the
+    # PATH-keyed rendering below, or adding that field would silently grant
+    # every stable-path beacon the generalization _tolerance_identity still
+    # refuses it (see its `changed` guard: tolerating a never-normalized path
+    # hands a binary replaced IN PLACE at a reused endpoint the operator's
+    # verdicts). Path churn stays the only qualifier here, so the two
+    # derivations keep agreeing; the bytes get their own identity instead.
+    if kind == "beacon" and (path != sub.get("raw_path") or "#" in path):
         # net-beacon is named in the comment above as one of the three sensors
         # that declare a subject, and it was the one kind this function never
         # handled -- every beacon subject fell through to None. That was
@@ -4012,6 +4031,59 @@ def _subject_identity(sub):
         return "beacon:%s:%s:%s" % (path, sub.get("ip") or "",
                                     sub.get("port") or "")
     return None
+
+
+# A trailing full-length sha256 in a fingerprint is the subject's CONTENT.
+_CONTENT_SHA_RE = re.compile(r"^[0-9a-f]{64}$", re.I)
+
+
+def _content_identity(kind, content, ip=None, port=None):
+    """The content-keyed tolerance identity for a process or beacon, or None.
+
+    This is the SECOND identity a verdict on these two sensors accumulates
+    under, never a replacement for the path-keyed one above — see
+    _finding_content_identity for why it had to be additive.
+    """
+    content = str(content or "")
+    if not _CONTENT_SHA_RE.match(content):
+        return None
+    if kind == "process":
+        return "process:content:%s" % content.lower()
+    if kind == "beacon":
+        return "beacon:content:%s:%s:%s" % (content.lower(), ip or "",
+                                            port or "")
+    return None
+
+
+def _subject_content_identity(sub):
+    """Content-keyed identity from a subject that carries its content hash."""
+    if not isinstance(sub, dict):
+        return None
+    return _content_identity(sub.get("kind"), sub.get("content"),
+                             sub.get("ip"), sub.get("port"))
+
+
+def _fingerprint_content_identity(fp):
+    """The same identity recovered from a fingerprint string, for rows written
+    before their sensor declared a subject — and for BOTH process key shapes,
+    the pre-custody `process:<path>:<trust>:<sha>` and the content-keyed
+    `process:sha:<sha>` that replaced it. Recovering it from the old shape is
+    what lets verdicts the operator already gave carry forward on their own,
+    with no migration and no closer.
+
+    It also closes a hole the new shape opened. `process:sha:<sha>` fed to
+    _tolerance_identity strips its trailing hash as churn and returns the
+    two-component identity `process:sha` — one identity shared by every
+    content-keyed process incident on the machine, so three benign-positive
+    verdicts on three UNRELATED binaries would have tolerized the sensor
+    outright. Claiming that string here means it never reaches that stripper.
+    """
+    parts = str(fp or "").split(":")
+    if len(parts) < 3 or parts[0] != "process":
+        return None
+    if not _CONTENT_SHA_RE.match(parts[-1]):
+        return None
+    return _content_identity("process", parts[-1])
 
 
 def _subject_endpoint_classes(sub):
@@ -4092,6 +4164,39 @@ def _finding_identity(f):
     if sub:
         return _subject_identity(sub)
     return _tolerance_identity(f.get("fingerprint"))
+
+
+def _finding_content_identity(f):
+    """The finding's content-keyed identity, ADDED to the path-keyed one above
+    rather than replacing it.
+
+    Additive because the two cover opposite churn and neither covers both. A
+    vendor app updates IN PLACE or under a versioned directory: its path is
+    stable (or normalizes to one) while its bytes change every release, so
+    only the path-keyed identity can accumulate. The operator's own build
+    output does the reverse — one binary reproduced into staging dirs, release
+    dirs, per-agent worktrees, DMG scratch mounts and Downloads — so the bytes
+    are the stable thing and only a content-keyed identity can accumulate.
+    Keying on one of them alone means the other sensor population never
+    converges, which is exactly what the live queue showed: 30 process
+    verdicts spread over 28 path identities, every one of them below the
+    floor of three, so the process sensor had learned nothing at all.
+
+    Content is also the only part of a process subject that is STABLE. The
+    same uv binary at ~/.local/bin/uv graded 'broken' when the
+    operator dismissed it and 'adhoc' when it reopened as #514, so the trust
+    class in the path-keyed identity manufactures churn of its own.
+
+    This is strictly narrower than the identity it joins: it pins the exact
+    bytes, so replacing a vouched binary mints a new identity that has earned
+    nothing, and every existing guard still applies (never CRITICAL, never
+    above the reviewed severity, never a disputed identity, never
+    attack-defined, and still three distinct verdicts).
+    """
+    sub = f.get("subject")
+    if sub:
+        return _subject_content_identity(sub)
+    return _fingerprint_content_identity(f.get("fingerprint"))
 
 
 def _finding_endpoint_classes(f):
@@ -4229,6 +4334,23 @@ def _incident_identity(row):
     return _tolerance_identity(fp), _beacon_endpoint_classes(fp)
 
 
+def _incident_content_identity(row):
+    """The stored incident's content-keyed identity, derived exactly as
+    _finding_content_identity derives a finding's — subject first, then the
+    correlation key — so a verdict and the finding it should later match
+    render the same string."""
+    raw = row["subject_json"] if "subject_json" in row.keys() else None
+    if raw:
+        try:
+            ident = _subject_content_identity(json.loads(raw))
+            if ident:
+                return ident
+        except Exception:
+            pass
+    return _fingerprint_content_identity(
+        (row["correlation_key"] or "")[len("signal:"):])
+
+
 def _rotating_endpoint_memory(db, now):
     """{endpoint_class: (verdicts, max_reviewed_sev)} for classes the operator
     has dismissed across enough DISTINCT endpoints to establish rotation.
@@ -4325,13 +4447,18 @@ def _tolerance_memory(db, now):
         return memory
     seen = {}
     for row in rows:
-        ident = _incident_identity(row)[0]
-        if not ident:
-            continue
-        bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
-        bucket["incidents"].add(row["incident_id"])
-        bucket["sev"] = max(bucket["sev"],
-                            SEV_ORDER.get(row["severity"], -1))
+        # Both identities a verdict counts toward: the path-keyed one and,
+        # where the subject or key names the bytes, the content-keyed one.
+        # A single verdict contributes one incident to each bucket, so the
+        # floor of three still means three DISTINCT incidents either way.
+        for ident in (_incident_identity(row)[0],
+                      _incident_content_identity(row)):
+            if not ident:
+                continue
+            bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
+            bucket["incidents"].add(row["incident_id"])
+            bucket["sev"] = max(bucket["sev"],
+                                SEV_ORDER.get(row["severity"], -1))
     for ident, bucket in seen.items():
         if len(bucket["incidents"]) >= _TOLERANCE_MIN_VERDICTS:
             memory[ident] = (len(bucket["incidents"]), bucket["sev"])
@@ -4370,6 +4497,13 @@ def _disputed_identities(db):
         ident, classes = _incident_identity(row)
         if ident:
             idents.add(ident)
+        # A dispute is about a SUBJECT, so it has to reach every identity that
+        # subject accumulates under — otherwise a `reopen` revokes the
+        # path-keyed tolerance while the content-keyed one keeps closing the
+        # very incidents the operator just reopened.
+        content_ident = _incident_content_identity(row)
+        if content_ident:
+            idents.add(content_ident)
         for klass, _observed in classes:
             idents.add(klass)
         raw = row["subject_json"] if "subject_json" in row.keys() else None
@@ -4595,6 +4729,9 @@ def _signal_decision(f, memory):
         ident = _finding_identity(f)
         if ident:
             candidates.append((ident, tolerance))
+        content_ident = _finding_content_identity(f)
+        if content_ident:
+            candidates.append((content_ident, tolerance))
         if rotating:
             for klass, _observed in _finding_endpoint_classes(f):
                 candidates.append((klass, rotating))
@@ -13394,7 +13531,8 @@ def _beacon_from_sightings(sightings, current_rows):
                 "beacon:rotating:%s:%s" % (_program_subject(path), rport),
                 case_fingerprint=dev_case or (
                     "beacon:rotating:%s:%s" % (_program_subject(path), rport)),
-                subject=_subject("beacon", path, port=rport),
+                subject=_subject("beacon", path, port=rport,
+                                 content=_graded_sha(path)),
                 path=path, program=path, port=rport, trust=trust,
                 endpoint_count=len(fleet), endpoints=shown,
                 custody=rung, markers=["outbound-exfil", "beacon"]))
@@ -13417,7 +13555,8 @@ def _beacon_from_sightings(sightings, current_rows):
             "beacon:%s:%s:%s" % (_program_subject(path), rip, rport),
             case_fingerprint=dev_case or ("beacon:%s:%s:%s" % (
                 _program_subject(path), rip, rport)),
-            subject=_subject("beacon", path, ip=rip, port=rport),
+            subject=_subject("beacon", path, ip=rip, port=rport,
+                             content=_graded_sha(path)),
             path=path, program=path,
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
@@ -21889,6 +22028,71 @@ SENSOR_BENIGN_NOTES = {
 }
 
 
+_EVIDENCE_MAX_ROWS = 12
+_EVIDENCE_WIDTH = 150
+
+
+def _evidence_descriptor(data, event_type):
+    """The one line that distinguishes an evidence row from its siblings.
+
+    The stored finding's `detail` opens with the specific fact — the path and
+    trust class for a process, the endpoint and span for a beacon, the matched
+    idioms and the command for a behaviour hit — so its first line is the
+    per-observation descriptor for every sensor at once. The title is not: it
+    is the same string on every row in the incident.
+    """
+    detail = str((data or {}).get("detail") or "").strip()
+    if detail:
+        line = detail.splitlines()[0].strip()
+        if line:
+            return line[:_EVIDENCE_WIDTH - 1] + "…" \
+                if len(line) > _EVIDENCE_WIDTH else line
+    return str((data or {}).get("title") or (data or {}).get("status")
+               or event_type)
+
+
+def _evidence_rows(evidence):
+    """Print an incident's evidence as DISTINCT observations.
+
+    Rows are folded on their descriptor rather than listed per scan, because
+    the same fact re-observed twenty times is one fact with a count — and
+    folding is what makes the rows that genuinely differ visible. #505 is the
+    worked example: twenty rows that all read "Suspicious running process"
+    are, once folded, eight distinct interpreter paths sharing one sha256,
+    which is the whole content of the finding and was not previously on
+    screen anywhere.
+    """
+    folded = {}
+    for row in evidence:
+        try:
+            data = json.loads(row["data_json"])
+        except Exception:
+            data = {}
+        desc = _evidence_descriptor(data, row["event_type"])
+        seen = folded.setdefault(desc, {"n": 0, "first": row["observed_at"],
+                                        "last": row["observed_at"],
+                                        "source": row["source"]})
+        seen["n"] += 1
+        seen["first"] = min(seen["first"], row["observed_at"])
+        seen["last"] = max(seen["last"], row["observed_at"])
+    for desc, seen in list(folded.items())[:_EVIDENCE_MAX_ROWS]:
+        when = _short_ts(seen["last"])
+        if seen["n"] > 1:
+            when = "%s, %dx since %s" % (when, seen["n"],
+                                         _short_ts(seen["first"]))
+        print("  - %s · %s\n      %s" % (when, seen["source"], desc))
+    extra = len(folded) - _EVIDENCE_MAX_ROWS
+    if extra > 0:
+        print("  - … %d more distinct observation(s)" % extra)
+
+
+def _short_ts(epoch):
+    try:
+        return datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(epoch)
+
+
 def _benign_note_for(item):
     """The benign-cause notes relevant to an incident, keyed on its evidence
     categories (falling back to the correlation key's own prefix)."""
@@ -22236,14 +22440,16 @@ def cmd_incident(incident_id, action=None, reason=None):
         print("  seen:     %d observations since %s" % (
             item["occurrences"],
             datetime.fromtimestamp(item["first_occurrence"]).isoformat()))
-    for evidence in item.get("evidence", []):
-        try:
-            data = json.loads(evidence["data_json"])
-            summary = data.get("title") or data.get("status") or evidence["event_type"]
-        except Exception:
-            summary = evidence["event_type"]
-        print("  - %s · %s · %s" %
-              (evidence["observed_at"], evidence["source"], summary))
+    # Every evidence row here used to render the finding's TITLE, which is
+    # constant for the whole incident by construction — the title is part of
+    # what groups them. So an incident carrying twenty observations printed
+    # the same sentence twenty times ("Suspicious running process" x20 on
+    # #505) and the operator could not see what any of them was about, let
+    # alone what made them differ, while the path, the trust class and the
+    # custody rung sat in the stored event the whole time. An evidence list
+    # has to show what VARIES across the rows or it is just a count with
+    # extra steps.
+    _evidence_rows(item.get("evidence", []))
     adjudication = _adjudication_notes(item)
     if adjudication:
         print("\nWas this you? (evidence, never a verdict — same-uid "
