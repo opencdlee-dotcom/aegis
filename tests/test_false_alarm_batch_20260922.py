@@ -447,8 +447,9 @@ class A1ANonAnswerIsNotAVerdict(Sandbox):
 
     def test_logic_version_is_bumped(self):
         """Every v2 verdict could be a silence that became `unsigned` or
-        `broken`; the bump is what makes the fix reach a running install."""
-        self.assertEqual(3, aegis._SIGCACHE_LOGIC_VERSION)
+        `broken`; the bump is what makes the fix reach a running install.
+        At least 3: a later bump keeps this one's guarantee."""
+        self.assertGreaterEqual(aegis._SIGCACHE_LOGIC_VERSION, 3)
 
 
 # The binary under custody here is the git the rung itself runs.
