@@ -20799,7 +20799,7 @@ def _migrate_baseline(data):
 
 
 @contextmanager
-def _scan_lock(wait=False, what="scan", quiet=False):
+def _scan_lock(wait=False, what="scan", quiet=False, name=".scan.lock"):
     """The one-writer lock. Yields True if we took it, False if someone has it.
 
     NON-BLOCKING by default, and that is the whole point. It used to be an
@@ -20823,9 +20823,12 @@ def _scan_lock(wait=False, what="scan", quiet=False):
     On contention the holder's pid and start time come from the lock file
     itself (_write_lock_holder), because "a scan is already running" without a
     pid is not something an operator can act on.
+
+    `name` is the lock file. The daily precision snapshot takes its own
+    (".precision.lock"), which no scan contends on.
     """
     ensure_state()
-    path = os.path.join(STATE_DIR, ".scan.lock")
+    path = os.path.join(STATE_DIR, name)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     got = False
     try:
@@ -20876,7 +20879,14 @@ def cmd_scan(quiet=False, wait=False):
     with _scan_lock(what="scan", wait=wait, quiet=quiet) as acquired:
         if not acquired:
             return 0
-        return _cmd_scan_locked(quiet)
+        rc = _cmd_scan_locked(quiet)
+    # AFTER the scan lock is released: the daily precision snapshot replays
+    # for minutes, and holding the one-writer lock that long made every other
+    # scan exit "already running" for the whole window. It takes its own lock,
+    # which no scan contends on, and a failure in it costs the snapshot, never
+    # the scan (_precision_tail catches and logs).
+    _precision_tail()
+    return rc
 
 
 def _cmd_scan_locked(quiet=False):
@@ -21143,11 +21153,6 @@ def _cmd_scan_locked(quiet=False):
 
     if not quiet:
         print(md)
-    # Last of all, after the beat and the report: the daily precision snapshot
-    # runs the backtest replay (minutes on a real store), so it must not delay
-    # what the scan exists to produce, and a failure in it costs the snapshot,
-    # never the scan -- _precision_tail catches and logs.
-    _precision_tail()
     return 0
 
 
@@ -28796,10 +28801,58 @@ def _teaching_evaporation(live, since):
     return evaporated
 
 
+def _ledger_rows_rejected():
+    """(key_on_disk, {ledger: rows rejected}) over the in-window rows of the
+    two HMAC-signed ledgers the custody ladder reads, asked the way their
+    lookups ask (_custody_carried, _intent_attested): same byte bound, same
+    age cutoff, same MAC. A rejected row is a rung nothing can award, so a
+    replay that rejects rows the operator's own scans accept is measuring a
+    different pipeline -- which is what a copied state dir without its
+    hmac.key does, silently, since _hmac_key() mints a fresh key in its place.
+    With no key on disk nothing verifies, and none is minted to find that
+    out."""
+    try:
+        key_on_disk = os.path.getsize(HMAC_KEY_FILE) >= 16
+    except OSError:
+        key_on_disk = False
+    now = _epoch()
+    rejected = {}
+    for ledger, path, limit, days, mac in (
+            ("custody", CUSTODY_FILE, _CUSTODY_MAX_BYTES,
+             _CUSTODY_MAX_AGE_DAYS,
+             lambda rec: _custody_mac(rec.get("ts"), rec.get("sha256"),
+                                      rec.get("rung"), rec.get("path"))),
+            ("intent", INTENT_FILE, _INTENT_MAX_BYTES, _INTENT_MAX_AGE_DAYS,
+             lambda rec: _intent_mac(rec.get("ts"), rec.get("path"),
+                                     rec.get("sha256"), rec.get("tool")))):
+        rejected[ledger] = 0
+        try:
+            with open(path, "rb") as f:
+                blob = f.read(limit).decode("utf-8", "replace")
+        except OSError:
+            continue            # no ledger: nothing to verify, nothing lost
+        for ln in blob.splitlines():
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue        # the lookups skip it the same way
+            if not isinstance(rec, dict) \
+                    or _epoch(rec.get("ts")) < now - days * 86400:
+                continue
+            if not key_on_disk or not hmac.compare_digest(
+                    mac(rec), str(rec.get("mac") or "")):
+                rejected[ledger] += 1
+    return key_on_disk, rejected
+
+
 def _precision_measure(now):
     """One snapshot: `backtest replay --days PRECISION_DAYS --reobserve`
     reduced to the numbers the loop is judged on, plus teaching evaporation.
     Raises when there is nothing to measure; never writes the store."""
+    # BEFORE the replay: re-observing grades custody, and a custody lookup
+    # with no key on disk mints one, after which "was there a key" has no
+    # answer.
+    key_on_disk, rejected = _ledger_rows_rejected()
     r = _backtest_replay(PRECISION_DAYS, reobserve=True, now=now)
     if r.get("missing"):
         raise RuntimeError("no event store at %s" % r["missing"])
@@ -28838,6 +28891,8 @@ def _precision_measure(now):
         "assay_predicate_total": predicate,
         "teaching_evaporation": evaporation,
         "problems": problems,
+        "hmac_key": key_on_disk,
+        "ledger_rows_rejected": rejected,
     }
 
 
@@ -28880,13 +28935,20 @@ def _precision_due(now=None):
 
 
 def _precision_tail(now=None):
-    """The scan's last step: refresh the snapshot when due. A failure, or an
-    exception anywhere in here, costs the snapshot and a run-log line, never
-    the scan. True when a snapshot was written."""
+    """Run by cmd_scan once its lock is released: refresh the snapshot when
+    due. Under its own lock (".precision.lock"), so two scans finishing
+    together do not both replay, and no scan ever waits on it; "due" is asked
+    again under the lock, because the other holder may just have written it.
+    A failure, or an exception anywhere in here, costs the snapshot and a
+    run-log line, never the scan. True when a snapshot was written."""
     try:
         if not _precision_due(now):
             return False
-        snap = _precision_refresh(now)
+        with _scan_lock(what="precision snapshot", quiet=True,
+                        name=".precision.lock") as got:
+            if not got or not _precision_due(now):
+                return False
+            snap = _precision_refresh(now)
         log_run("precision snapshot: " + _precision_line(snap))
         return True
     except Exception as e:
@@ -28988,6 +29050,13 @@ def _precision_line(snap):
                                              _ago(snap["epoch"]))
     if snap.get("problems"):
         line += "SELF-CHECK FAILED (%s) \u2014 " % "; ".join(snap["problems"])
+    rejected = snap.get("ledger_rows_rejected")
+    unverified = sum(n for n in rejected.values() if isinstance(n, int)) \
+        if isinstance(rejected, dict) else 0
+    if unverified:
+        line += "inputs unverified: %d ledger row%s rejected%s \u2014 " % (
+            unverified, "" if unverified == 1 else "s",
+            "" if snap.get("hmac_key", True) else " (no HMAC key on disk)")
     line += _precision_numbers_text(snap)
     try:
         failed_after = int(snap.get("attempted") or 0) > int(snap["epoch"])

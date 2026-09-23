@@ -49,6 +49,9 @@ class PrecisionSandbox(ReplaySandbox):
     def setUp(self):
         super().setUp()
         self.stub("PRECISION_SNAPSHOT_EVERY_SECS", 24 * 3600)
+        # ReplaySandbox leaves the key at ~/.aegis/hmac.key; the ledger check
+        # reads it, so it lives in the sandbox here.
+        self.stub("HMAC_KEY_FILE", os.path.join(self.state, "hmac.key"))
 
     def count_replays(self, fail=False):
         calls = []
@@ -71,7 +74,10 @@ class PrecisionSandbox(ReplaySandbox):
             return ""
 
 
+@needs_real_scan_lock
 class TheSnapshotIsThrottledToOnceADay(PrecisionSandbox):
+    """_precision_tail takes its own lock, so these need a real one."""
+
     def test_runs_once_in_24h_not_twice(self):
         calls = self.count_replays()
         self.assertTrue(aegis._precision_tail(now=NOW))
@@ -130,6 +136,18 @@ class TheSnapshotIsThrottledToOnceADay(PrecisionSandbox):
         self.assertFalse(aegis._precision_tail(now=NOW))
         self.assertEqual([], calls)
 
+    def test_a_held_snapshot_lock_skips_instead_of_replaying_twice(self):
+        calls = self.count_replays()
+        with aegis._scan_lock(what="precision snapshot", quiet=True,
+                              name=".precision.lock") as got:
+            self.assertTrue(got)
+            self.assertFalse(aegis._precision_tail(now=NOW))
+        self.assertEqual([], calls)
+        self.assertTrue(aegis._precision_tail(now=NOW))
+        self.assertEqual(1, len(calls))
+
+
+class TheNumbersAreTheReplays(PrecisionSandbox):
     def test_the_numbers_are_the_replays_numbers(self):
         self.seed()
         r = aegis._backtest_replay(days=30, reobserve=True, now=NOW)
@@ -188,6 +206,32 @@ class AFailingReplayDoesNotBreakTheScan(Sandbox):
         aegis.cmd_scan(quiet=True)
         aegis.cmd_scan(quiet=True)
         self.assertEqual(1, len(calls))
+        self.assertTrue(os.path.exists(aegis._precision_path()))
+
+    def test_a_scan_started_while_the_snapshot_runs_completes(self):
+        """The replay runs for minutes once a day. Held inside the scan lock,
+        every scan that started in that window exited "already running" -- a
+        daily blind spot. A scan started from INSIDE the replay must run to
+        completion, and must not start a second replay of its own."""
+        calls, inner = [], []
+        real = self._saved_replay
+
+        def replay_with_a_scan_inside(*a, **k):
+            calls.append(1)
+            if not inner:
+                inner.append(aegis.cmd_scan(quiet=True))
+            return real(*a, **k)
+
+        aegis._backtest_replay = replay_with_a_scan_inside
+        self.assertEqual(0, aegis.cmd_scan(quiet=True))
+        self.assertEqual([0], inner)
+        with open(aegis._run_log_path(), encoding="utf-8") as f:
+            log = f.read()
+        self.assertNotIn("scan skipped", log)
+        self.assertEqual(2, log.count("  scan: "),
+                         "both scans must have run to their own log line")
+        self.assertEqual(1, len(calls), "the inner scan must not replay too")
+        self.assertIn("precision snapshot skipped", log)
         self.assertTrue(os.path.exists(aegis._precision_path()))
 
 
@@ -354,7 +398,87 @@ class ReportAndStatusPrintTheLine(Sandbox):
         self.assertIn(TheLineTheOperatorReads.LINE, out)
 
 
-class TeachingEvaporation(ReplaySandbox):
+class TheSnapshotAssertsItsOwnInputs(PrecisionSandbox):
+    """Rule 17 for the inputs. The custody and intent ledgers are HMAC-signed,
+    and a replay run without the key the rows were signed with rejects every
+    one of them: measured 2026-09-23 on one copy of the live state, the same
+    replay read 143/214 noise re-opened and 165 interrupts with no key, and
+    127/214 and 130 with the real one. Nothing said so. The snapshot now
+    counts the rows it cannot verify, and the line leads with it."""
+
+    def key(self, raw):
+        with open(aegis.HMAC_KEY_FILE, "wb") as f:
+            f.write(raw)
+
+    def sign_rows(self, ts=None):
+        """One custody and one intent row, signed with the key on disk."""
+        ts = ts or aegis.now_iso()
+        sha = "c" * 64
+        custody = {"ts": ts, "sha256": sha, "rung": "package-managed",
+                   "path": "/opt/ledger/tool"}
+        custody["mac"] = aegis._custody_mac(ts, sha, custody["rung"],
+                                            custody["path"])
+        intent = {"ts": ts, "path": "/opt/ledger/cfg.json", "sha256": sha,
+                  "tool": "Write"}
+        intent["mac"] = aegis._intent_mac(ts, intent["path"], sha, "Write")
+        for path, rec in ((aegis.CUSTODY_FILE, custody),
+                          (aegis.INTENT_FILE, intent)):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+
+    def test_rows_that_verify_leave_the_line_clean(self):
+        self.key(b"k" * 32)
+        self.sign_rows()
+        snap = aegis._precision_measure(NOW)
+        self.assertEqual({"custody": 0, "intent": 0},
+                         snap["ledger_rows_rejected"])
+        self.assertTrue(snap["hmac_key"])
+        self.assertNotIn("inputs unverified", aegis._precision_line(snap))
+
+    def test_no_key_on_disk_rejects_every_row_and_says_so(self):
+        self.key(b"k" * 32)
+        self.sign_rows()
+        os.remove(aegis.HMAC_KEY_FILE)
+        snap = aegis._precision_measure(NOW)
+        self.assertEqual({"custody": 1, "intent": 1},
+                         snap["ledger_rows_rejected"])
+        self.assertFalse(snap["hmac_key"],
+                         "asked BEFORE the replay, which may mint a key")
+        line = aegis._precision_line(snap)
+        head = line.split(": ", 1)[1]
+        self.assertTrue(head.startswith(
+            "inputs unverified: 2 ledger rows rejected (no HMAC key on "
+            "disk)"), line)
+
+    def test_a_row_signed_under_another_key_is_rejected(self):
+        self.key(b"k" * 32)
+        self.sign_rows()
+        self.key(b"z" * 32)
+        snap = aegis._precision_measure(NOW)
+        self.assertEqual({"custody": 1, "intent": 1},
+                         snap["ledger_rows_rejected"])
+        self.assertTrue(snap["hmac_key"])
+        line = aegis._precision_line(snap)
+        self.assertIn("inputs unverified: 2 ledger rows rejected — ",
+                      line)
+        self.assertNotIn("no HMAC key", line)
+
+    def test_a_row_past_retention_is_not_counted(self):
+        """The lookups never consult it, so it cannot cost a rung."""
+        self.key(b"k" * 32)
+        self.sign_rows(ts="2020-01-01T00:00:00+00:00")
+        self.key(b"z" * 32)
+        self.assertEqual((True, {"custody": 0, "intent": 0}),
+                         aegis._ledger_rows_rejected())
+
+    def test_one_row_is_singular(self):
+        snap = snapshot(int(time.time()) - 60,
+                        ledger_rows_rejected={"custody": 1, "intent": 0})
+        self.assertIn("inputs unverified: 1 ledger row rejected",
+                      aegis._precision_line(snap))
+
+
+class TeachingEvaporation(PrecisionSandbox):
     """An incident opened AFTER the operator already closed its identity as
     noise is teaching that did not hold. One opened BEFORE the verdict is
     just the incident the verdict was about."""
