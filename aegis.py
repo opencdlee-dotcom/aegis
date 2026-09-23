@@ -6489,6 +6489,64 @@ def _retire_unjoinable_chain_incidents(db, now):
     return retired
 
 
+# FROZEN recognizer for the 2026-09-23 payload-case migration: the first
+# detail line check_persistence wrote for a change confined to a payload's
+# bytes, `<label>: payload <path> bytes <old12> -> <new12>` and nothing else.
+# Any other part of a change (program, args, env) is joined on with "; " and
+# the anchors refuse it.
+_MIG_PAYLOAD_ONLY_DETAIL_RE = re.compile(
+    r"^.*?: payload (.+) bytes [0-9a-f?]{1,12} -> [0-9a-f?]{1,12}$")
+
+
+def _fold_payload_update_cases(db, now):
+    """One-time: fold the per-job incidents about one payload's bytes into
+    the one case per payload that check_persistence now mints.
+
+    Before the 2026-09-23 payload case, a rewrite of a script several jobs
+    run was one incident per referring plist -- #383 and #392-#397 were one
+    edit to aikit's run.py. The forward fix changes which key a NEW incident
+    is minted under and does nothing for the rows already open, so they are
+    folded here: the newest is re-keyed to `persistence:payload-update:<path>`
+    and inherits every sibling's evidence, and the siblings close as
+    superseded. Folding rather than retiring, unlike the OS-program
+    migration, because the new case IS about the same fact -- the payload
+    and its bytes are in the evidence, so nothing is guessed.
+
+    Matched on EVIDENCE, never on key shape: `changed:<plist>` is still the
+    live key for every change that is not payload-only. An incident folds only
+    when its newest evidence is a payload-only detail naming the same path as
+    its recorded script_target, on the plist its key names. Incidents created
+    in the scan that runs the migration are out of scope by construction, and
+    adjudicated rows are never touched.
+    """
+    groups = {}
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE "
+            "'signal:persistence:changed:%' AND created_at < ? ORDER BY id",
+            (now,)).fetchall():
+        key = _MIG_PERSIST_CHANGED_CASE_RE.match(row["correlation_key"] or "")
+        if not key:
+            continue
+        ev = _mig_latest_event(db, row["id"])
+        head = str(ev.get("detail") or "").split("\n", 1)[0]
+        hit = _MIG_PAYLOAD_ONLY_DETAIL_RE.match(head)
+        if not hit or hit.group(1) != ev.get("script_target"):
+            continue
+        if ev.get("path") not in (None, key.group(1)):
+            continue
+        groups.setdefault(hit.group(1), []).append(row["id"])
+    folded = 0
+    for payload, ids in sorted(groups.items()):
+        folded += _fold_incidents(
+            db, now, "signal:persistence:payload-update:%s" % payload, ids,
+            "superseded: a change to a payload script's BYTES is now one case "
+            "per payload, not one per persistence item that runs it — one "
+            "edit to a shared run.py minted seven HIGH incidents. Folded into "
+            "the payload's case with its evidence")
+    return folded
+
+
 _STORE_MIGRATIONS = (
     ("exec_identity_migrated", _retire_legacy_exec_incidents,
      "retired %d incident(s) keyed on the old positional exec identity"),
@@ -6515,6 +6573,12 @@ _STORE_MIGRATIONS = (
     # ones they would not have formed receive nothing that could close them.
     ("chain_legs_20260923", _retire_unjoinable_chain_incidents,
      "retired %d chain incident(s) the current join rules would not form"),
+    # The 2026-09-23 payload case: a change confined to a payload script's
+    # bytes is one case per payload, and the per-job cases minted before it
+    # fold into it, evidence and all.
+    ("persistence_payload_case_20260923", _fold_payload_update_cases,
+     "folded %d per-job persistence incident(s) into one case per rewritten "
+     "payload"),
 )
 
 
@@ -8097,10 +8161,128 @@ def _os_program_update(old, rec, prog_changed,
     return program
 
 
+def _payload_update(old, rec, prog_changed, env_changed, args_changed,
+                    target_changed, attack_defined):
+    """The payload path when this persistence change is confined to the bytes
+    of the script the job runs.
+
+    The payload twin of _os_program_update, for the same reason. On
+    2026-09-10 one edit to ~/Ai/Universe/tools/aikit/schedule/run.py
+    (4a1646366adf -> 25ee9a4593c2) minted seven HIGH incidents, #383 and
+    #392-#397 -- one per `com.aikit.*` plist that runs it, each keyed on the
+    referring PLIST, none of them about the plist, which was untouched. The
+    fact was one script's bytes; the plists were where it was seen.
+
+    Every conjunct is load-bearing:
+
+      confined to payload bytes   a program, argv or env change alongside is
+                                  a repointed or injected job -- the attack
+                                  this sensor exists for -- and keeps its own
+                                  per-job case.
+      same payload PATH           a job told to run a DIFFERENT script is a
+                                  config edit, not a rewrite of this one.
+      not attack-defined          a hostile argv or a loader-injection env on
+                                  the job is never folded, so the payload's
+                                  custody can never be what quiets it.
+
+    Unlike the OS case this makes no severity claim of its own: the payload's
+    custody, asked once for all the jobs, is the only thing that may demote
+    it.
+    """
+    if not target_changed or attack_defined:
+        return None
+    if prog_changed or env_changed or args_changed:
+        return None
+    payload = rec.get("script_target")
+    if not payload or payload != old.get("script_target"):
+        return None
+    return payload
+
+
+# Programs whose whole job is to start ANOTHER program that their argv names
+# without a path: `open -b <bundle id>`, `powershell -enc <blob>`,
+# `rundll32 x.dll,Entry`. Their own receipt says nothing about what they start.
+_PERSIST_LAUNCHER_NAMES = frozenset((
+    "open", "launchctl", "xargs", "nice", "chroot", "cmd", "cmd.exe",
+    "powershell", "powershell.exe", "pwsh", "pwsh.exe", "rundll32",
+    "rundll32.exe", "mshta", "mshta.exe", "wscript", "wscript.exe", "cscript",
+    "cscript.exe", "regsvr32", "regsvr32.exe", "msiexec", "msiexec.exe",
+    "explorer", "explorer.exe", "conhost", "conhost.exe",
+))
+
+
+def _persistence_exec_extra(args, program, payload):
+    """Why this job's argv can run code other than its program and its
+    payload, or None when those two are all it runs.
+
+    A persistence item is graded by what it EXECUTES: the program and, when
+    it has one, the payload script. That is a complete account only when the
+    argv names nothing else that runs, so the rule is stated in one place and
+    it fails closed -- any of these and the item earns no custody rung:
+
+      * a URL anywhere in the argv (`uv run --from git+https://...`, a
+        fetched payload): the code is somewhere this cannot hash;
+      * a launcher wrapper in front (`caffeinate -i ...`): the plist's program
+        is not the thing that runs the payload;
+      * an interpreter or runner with no payload FILE (`python -m pkg`,
+        `node -e`, `npx some-package`): the code is named, not graded;
+      * an interpreter or runner given anything before its payload other than
+        its one declared subcommand (`uv run --with evil run.py`,
+        `uv run --directory D python -m mod`, `python -X ...`): an
+        interpreter option can pull in code, and a list of the harmless ones
+        is a list that rots, so there is no such list;
+      * a program that is not an interpreter, given a path (`/` or `\\`,
+        including `--opt=<path>`), or one of the launchers above given any
+        argument: it names another thing to run.
+
+    Arguments AFTER the payload are the payload's own input, and the payload
+    is graded, so they are not held against it.
+    """
+    if not isinstance(args, list) or not args:
+        return None
+    flat = [str(a) for a in args if a is not None]
+    if any("://" in a for a in flat[1:]):
+        return "a URL in its arguments"
+    if _effective_argv(args, program)[0] != flat:
+        return "a launcher wrapper in front of what it runs"
+    names = {os.path.basename(str(c)).lower() for c in (program, flat[0]) if c}
+    if _interp_fronted(flat, program):
+        if not payload:
+            return "an interpreter that runs no script file"
+        try:
+            at = flat.index(payload, 1)
+        except ValueError:
+            return "a script target that is not one of its arguments"
+        before = flat[1:at]
+        subs = set()
+        for name in names:
+            subs.update(_RUNNER_SUBCOMMANDS.get(name) or ())
+        if before and before[0] in subs:
+            before = before[1:]
+        if before:
+            return "interpreter options before its script (%s)" % (
+                " ".join(before)[:80])
+        return None
+    if len(flat) > 1 and names & _PERSIST_LAUNCHER_NAMES:
+        return "a launcher that starts what its arguments name"
+    for a in flat[1:]:
+        value = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+        if "/" in value or "\\" in value:
+            return "a path in its arguments (%s)" % a[:80]
+    return None
+
+
 def check_persistence(baseline_snap, current_snap):
     findings = []
     # (program, new_sha) -> [labels of the jobs that reference it]
     os_updates = {}
+    # (payload, new_sha) -> [(path, old, rec, severity)] of the jobs whose
+    # only change is that payload's bytes
+    payload_updates = {}
+    # One custody answer per program and per payload for this call: seven
+    # jobs sharing uv and run.py ask git and the receipts once, not seven
+    # times (see _custody_executes).
+    custody_memo = {}
     base = baseline_snap or {}
     for path, rec in current_snap.items():
         if path not in base:
@@ -8109,19 +8291,41 @@ def check_persistence(baseline_snap, current_snap):
                 # by content -- so an edited copy is NOT ours and lands below.
                 continue
             sev = _persistence_severity(rec)
+            # Graded by what it EXECUTES. Until 2026-09-23 a NEW item was
+            # never asked who made its program or its script, so the
+            # operator's own scheduler kit (#287 #288 #295 #296 #300 #302
+            # #307) and a Homebrew menu-bar app (#399) interrupted HIGH on
+            # every sighting. Attack-defined jobs get no rung here, as
+            # everywhere.
+            attack_defined = _env_attack_defined(rec.get("env")) \
+                or _hostile_args(rec.get("args"), rec.get("program"))
+            prov, note = (None, None) if attack_defined \
+                else _custody_executes(rec, sev, custody_memo)
+            detail = "%s -> %s [%s]" % (rec["label"],
+                                        rec.get("program") or "?",
+                                        rec.get("trust"))
+            if prov and note:
+                detail = "%s\n%s" % (detail, note)
             findings.append(finding(
-                sev, "persistence", "New persistence item",
-                "%s -> %s [%s]" % (rec["label"], rec.get("program") or "?",
-                                   rec.get("trust")),
+                _demote(sev, prov, attack_defined=attack_defined),
+                "persistence", "New persistence item", detail,
                 "persistence:new:%s:%s" % (path, rec.get("sha256")),
                 subject=_subject(
                     "persistence", path, op="new", content=rec.get("sha256"),
                     program_sha=rec.get("sha256"), trust=rec.get("trust"),
                     target=_script_target(rec.get("args"),
-                                          rec.get("program"))),
+                                          rec.get("program")),
+                    target_sha=rec.get("target_sha")),
                 path=path, program=rec.get("program"), trust=rec.get("trust"),
                 script_target=_script_target(rec.get("args"),
                                              rec.get("program")),
+                # The bytes of both halves of what the job executes, as the
+                # snapshot hashed them -- the pair a CHANGED diff compares.
+                # The recorded evidence named neither, so a NEW finding read
+                # back from the store could not say which producer it was.
+                program_sha=rec.get("sha256"),
+                target_sha=rec.get("target_sha"),
+                custody=prov,
                 run_at_load=rec.get("run_at_load")))
         else:
             old = base[path]
@@ -8173,6 +8377,17 @@ def check_persistence(baseline_snap, current_snap):
                 # payload can never be quieted by proving who moved it.
                 attack_defined = _env_attack_defined(rec.get("env")) \
                     or _hostile_args(rec.get("args"), rec.get("program"))
+                # One payload rewritten is ONE fact, however many jobs run
+                # it: collected here, graded once after the loop, keyed on
+                # the payload. See _payload_update.
+                payload = _payload_update(
+                    old, rec, prog_changed, env_changed, args_changed,
+                    target_changed, attack_defined)
+                if payload:
+                    payload_updates.setdefault(
+                        (payload, rec.get("target_sha")), []).append(
+                            (path, old, rec, sev))
+                    continue
                 prov = (None if attack_defined
                         else _custody_persistence(old, rec)
                         or (_custody(path, rec.get("sha256"))[0]
@@ -8182,8 +8397,11 @@ def check_persistence(baseline_snap, current_snap):
                 # so grading only `path` can never see who did it and every
                 # payload update reads as a swap. Ask the ledger about the
                 # payload that actually changed. Same rung, same demote-only
-                # ladder, same attack-defined refusal above.
-                if prov is None and target_changed:
+                # ladder, same attack-defined refusal above -- asked here too,
+                # or a DYLD-injected job whose payload is committed would
+                # record custody=self-committed on an attack-defined finding
+                # that the grader downstream cannot tell apart.
+                if prov is None and target_changed and not attack_defined:
                     tgt = rec.get("script_target") or _script_target(
                         rec.get("args"), rec.get("program"))
                     if tgt and rec.get("target_sha") and _intent_worthy(tgt):
@@ -8244,6 +8462,42 @@ def check_persistence(baseline_snap, current_snap):
             path=program, program=program, trust="apple",
             custody="os-vendor",
             referrer_count=len(labels), referrers=sorted(labels)))
+    # One finding per rewritten payload, carrying every job that runs it, so
+    # the operator adjudicates the edit once. Custody is asked ONCE, about
+    # the payload: seven jobs sharing run.py asked git seven times a scan,
+    # and every probe that timed out re-minted a case at HIGH. Severity is
+    # the worst any job scores (each already floored at HIGH, exactly as a
+    # single job's is) before the payload's rung demotes it. The signal key
+    # carries the new sha, so the NEXT edit is a new finding rather than a
+    # silenced recurrence.
+    for (payload, sha), jobs in sorted(payload_updates.items()):
+        jobs.sort(key=lambda job: job[0])
+        worst = max(jobs, key=lambda job: SEV_ORDER[job[3]])
+        key = ("payload", payload, sha)
+        if key not in custody_memo:
+            custody_memo[key] = _custody_payload(payload, sha)
+        prov, note = custody_memo[key]
+        labels = sorted(str(rec.get("label") or path)
+                        for path, _old, rec, _sev in jobs)
+        olds = sorted({(old.get("target_sha") or "?")[:12]
+                       for _path, old, _rec, _sev in jobs})
+        detail = ("payload %s bytes %s -> %s; %d persistence item(s) run it: "
+                  "%s" % (payload, ",".join(olds), sha[:12], len(labels),
+                          ", ".join(labels[:12])
+                          + (" …" if len(labels) > 12 else "")))
+        if note:
+            detail = "%s\n%s" % (detail, note)
+        findings.append(finding(
+            _demote(worst[3], prov), "persistence",
+            "Persistence item CHANGED", detail,
+            "persistence:payload-update:%s:%s" % (payload, sha),
+            case_fingerprint="persistence:payload-update:%s" % payload,
+            subject=_subject("persistence", payload, content=sha),
+            path=payload, program=worst[2].get("program"),
+            trust=worst[2].get("trust"), custody=prov,
+            script_target=payload, target_sha=sha,
+            referrer_count=len(jobs), referrers=labels,
+            referrer_paths=[path for path, _old, _rec, _sev in jobs]))
     return findings
 
 
@@ -15885,6 +16139,9 @@ def _reset_custody_probes():
     _REPO_ROOT_CACHE.clear()
     _REPO_SELFNESS_CACHE.clear()
     _BUILD_OUTPUT_CACHE.clear()
+    # Not a git probe, but the same per-scan lifetime: the parsed cargo-dist
+    # receipts (see _cargo_dist_receipts).
+    _CARGO_DIST_CACHE.clear()
 
 
 def _repo_root_of(git, d):
@@ -16620,6 +16877,178 @@ def _choco_receipt(real):
     return None
 
 
+# --- installer receipts: two installers that are not package managers --------
+#
+# The cargo-dist installer (`curl ... | sh` for uv and most Rust CLIs) and
+# Playwright's browser download both leave a receipt as readable as Homebrew's,
+# and their binaries were the residue of the process sensor's queue: an ad-hoc
+# `uv` in ~/.local/bin and a Playwright Firefox whose seal reads broken. (That
+# `uv` is also the PROGRAM of LaunchAgents a uv-run toolkit installs; the
+# persistence ladder does not consult package receipts, so this does not
+# reach those findings.)
+#
+# Doctrine, the same as every receipt above: a receipt is a same-uid file, so
+# anything already running as the operator can forge one — exactly as it can
+# drop an INSTALL_RECEIPT.json beside a Cellar file. That is why these answer
+# only the vouched tier's `package-managed` rung: one severity step, never to
+# LOW, a 0.25 weight in the risk tier, and `_grade_binary` never consults them
+# for attack-defined evidence. Origin is not innocence; a receipt quiets the
+# identity half of a finding and nothing else.
+
+# Parsed receipts per config root, for one scan: {root: {binary key: label}}.
+# Cleared by _reset_custody_probes, so a receipt the next install rewrites is
+# read again on the next scan and not before.
+_CARGO_DIST_CACHE = {}
+
+
+def _cargo_dist_config_roots():
+    """Where a cargo-dist installer writes `<app>/<app>-receipt.json`.
+
+    Read from the installers themselves (uv 0.11.6, cargo-dist 0.31.0):
+    install.sh uses ${XDG_CONFIG_HOME:-$HOME/.config} (or %LOCALAPPDATA% from
+    a Windows posix shell), install.ps1 uses %XDG_CONFIG_HOME% else
+    %LOCALAPPDATA%. XDG_CONFIG_HOME is asked first and the default as well,
+    because the environment Aegis runs under is not the shell that installed.
+    """
+    roots = []
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.isabs(xdg):
+        roots.append(xdg)
+    if IS_WIN:
+        default = os.environ.get("LOCALAPPDATA")
+    else:
+        default = os.path.join(HOME, ".config")
+    if default and default not in roots:
+        roots.append(default)
+    return roots
+
+
+def _binary_key(path):
+    """One spelling of a file for comparing two paths to it: links resolved,
+    and case folded where the filesystem folds it."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _parse_cargo_dist_receipt(receipt_path, dirname):
+    """{binary key: label} for one receipt, or {} when it is not one.
+
+    Only a plain file name in `binaries` is honoured: an entry with a
+    separator in it would turn a same-uid JSON file into a vouch for any path
+    on the disk. The hierarchical layouts record the root and install one
+    level down in bin/; flat (and a receipt that predates the field) installs
+    into the prefix itself."""
+    try:
+        data = json.loads(_read_text(receipt_path, limit=64 * 1024) or "")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    binaries, prefix = data.get("binaries"), data.get("install_prefix")
+    if (not isinstance(binaries, list) or not isinstance(prefix, str)
+            or not os.path.isabs(prefix)):
+        return {}
+    if data.get("install_layout") in ("hierarchical", "cargo-home"):
+        prefix = os.path.join(prefix, "bin")
+    source = data.get("source") if isinstance(data.get("source"), dict) else {}
+    name = source.get("name") or source.get("app_name") or dirname
+    label = "cargo-dist:%s" % name
+    if source.get("owner"):
+        label = "cargo-dist:%s/%s" % (source["owner"], name)
+    if data.get("version"):
+        label += "@%s" % data["version"]
+    found = {}
+    for b in binaries:
+        if (isinstance(b, str) and b not in ("", ".", "..")
+                and os.path.basename(b) == b):
+            found[_binary_key(os.path.join(prefix, b))] = label
+    return found
+
+
+def _cargo_dist_receipts():
+    """{binary key: label} over every cargo-dist receipt on this body, read
+    once per scan. Bounded to `<root>/<d>/<d>-receipt.json`: the installer
+    names the receipt after its own directory, and nothing else is read."""
+    out = {}
+    for root in _cargo_dist_config_roots():
+        if root not in _CARGO_DIST_CACHE:
+            found = {}
+            try:
+                names = sorted(os.listdir(root))
+            except OSError:
+                names = []
+            for d in names:
+                rp = os.path.join(root, d, d + "-receipt.json")
+                if os.path.isfile(rp):
+                    found.update(_parse_cargo_dist_receipt(rp, d))
+            _CARGO_DIST_CACHE[root] = found
+        out.update(_CARGO_DIST_CACHE[root])
+    return out
+
+
+def _cargo_dist_receipt(real):
+    """A binary a cargo-dist installer put on disk: `real` resolves to
+    `<install_prefix>/<binary>` for a binary its receipt lists. Same-uid
+    forgeable like the Homebrew receipt, hence vouched-tier only (see the
+    section comment above)."""
+    if not real:
+        return None
+    return _cargo_dist_receipts().get(_binary_key(real))
+
+
+# `<browser>-<revision>`; the browser part may carry `_` and a host-platform
+# tag (`webkit_ubuntu20.04-x64_special-2092`), the revision is digits.
+_PLAYWRIGHT_BROWSER_DIR = re.compile(r"^[^.].*-\d+$")
+
+
+def _playwright_roots():
+    """The browser caches Playwright installs into, as its registry resolves
+    them: PLAYWRIGHT_BROWSERS_PATH when it names an absolute directory, and
+    the platform default as well (Aegis's environment is not the installer's).
+    "0" (node_modules/.../.local-browsers) and a relative value (resolved
+    against the installing process's cwd) are not knowable here and are not
+    guessed at."""
+    roots = []
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env and env != "0" and os.path.isabs(env):
+        roots.append(env)
+    if IS_MAC:
+        default = os.path.join(HOME, "Library", "Caches", "ms-playwright")
+    elif IS_WIN:
+        base = (os.environ.get("LOCALAPPDATA")
+                or os.path.join(HOME, "AppData", "Local"))
+        default = os.path.join(base, "ms-playwright")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+        default = os.path.join(base, "ms-playwright")
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
+def _playwright_receipt(real):
+    """A file inside a `<browser>-<revision>` directory directly under a
+    Playwright cache root that holds INSTALLATION_COMPLETE — the marker
+    Playwright's download worker writes after the extract finished, never
+    before. The marker is only evidence where Playwright writes it: the same
+    tree anywhere else answers nothing. Same-uid forgeable like the Homebrew
+    receipt, hence vouched-tier only (see the section comment above)."""
+    if not real:
+        return None
+    target = os.path.normcase(os.path.abspath(real))
+    for root in _playwright_roots():
+        for base in {os.path.normcase(os.path.abspath(root)),
+                     os.path.normcase(os.path.realpath(root))}:
+            if not target.startswith(base.rstrip(os.sep) + os.sep):
+                continue
+            rest = target[len(base.rstrip(os.sep)) + 1:].split(os.sep)
+            if len(rest) < 2 or not _PLAYWRIGHT_BROWSER_DIR.match(rest[0]):
+                continue
+            if os.path.isfile(os.path.join(base, rest[0],
+                                           "INSTALLATION_COMPLETE")):
+                return "playwright:%s" % rest[0]
+    return None
+
+
 def _os_package_receipt(real):
     """The OS-NATIVE package manager's claim on `real`.
 
@@ -16641,6 +17070,7 @@ def _os_package_receipt(real):
 # questions first, so the expensive one is only asked when no cheap answer won.
 _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
                      _uv_python_receipt, _winget_receipt, _choco_receipt,
+                     _playwright_receipt, _cargo_dist_receipt,
                      _os_package_receipt)
 
 
@@ -17343,6 +17773,101 @@ def _custody_persistence(old, rec):
     return None
 
 
+def _custody_payload(path, sha):
+    """(rung, note) for the payload script of a CHANGED persistence item.
+
+    The two questions _custody asks -- a signed intent receipt for these
+    exact bytes at this path, then git -- with two differences the live store
+    showed were needed (2026-09-23):
+
+      * no `_intent_worthy` prefilter. That exists to keep HOOK mode from
+        recording every file an agent touches; a script a persistence item
+        runs is worth grading by definition. #319's payload,
+        ~/.local/bin/improver, has no extension, so it was never asked.
+      * when git gives NO answer -- not in a repo, or a probe timed out --
+        the bytes are asked what _grade_binary asks last: were they already
+        explained somewhere else? By the custody ledger (a rung this payload
+        earned on an earlier scan, which is what stops a git timeout flipping
+        a graded case back to HIGH: 23 of the 217 scans that recorded run.py
+        did exactly that, taking 11-190 s per job against 0-1 s when git
+        answered), or by an intent receipt for the same sha at another path
+        (#319: the agent wrote improver.py, an install step copied the
+        bytes). Either carries as `copy-of-graded` -- the weakest rung, one
+        step, never a re-conferral.
+
+    A carried rung fills a non-answer and never argues with an answer:
+    `untracked` and `remote-foreign` stand as git gave them. A rung earned
+    here is remembered against the bytes, so the next non-answer can carry it.
+    """
+    rung, note = _custody(path, sha)
+    if rung in _SELF_CUSTODY or rung in _VOUCHED_CUSTODY \
+            or rung in _WEAK_CUSTODY:
+        _custody_remember(sha, rung, path)
+        return rung, note
+    if rung is not None:
+        return rung, note
+    carried = _custody_carried(sha)
+    if carried is None:
+        receipt = _intent_receipt(sha)
+        if receipt:
+            carried = ("self-attested",) + receipt
+    if carried:
+        return "copy-of-graded", _custody_carry_note(carried)
+    return None, ""
+
+
+def _weaker_rung(severity, first, second):
+    """The rung that explains LESS: the one the risk tier weighs heavier
+    (_RISK_CUSTODY_WEIGHT; no rung, or one that does not demote, weighs 1.0),
+    then the one that leaves the higher severity. Ties keep `first`."""
+    def weakness(item):
+        rung = item[0]
+        return (_RISK_CUSTODY_WEIGHT.get(rung, 1.0),
+                SEV_ORDER.get(_demote(severity, rung), 0))
+    return max((first, second), key=weakness)
+
+
+def _custody_executes(rec, severity, graded=None):
+    """(rung, note) for a NEW persistence item, graded by what it executes.
+
+    The program through the binary ladder (_grade_binary: vouched, package
+    receipts, build output, carried copies) and the payload script, when
+    there is one, through _custody_payload. The item's rung is the WEAKER of
+    the two: a strong program running an unexplained script explains
+    nothing, and neither does an explained script run by an unexplained
+    program. No payload means the program's rung alone.
+
+    No rung at all when the argv can run anything else
+    (_persistence_exec_extra), when the program is not on disk, or when the
+    payload has no hash to grade -- an unhashed script is not an explained
+    one. The caller has already refused attack-defined jobs.
+
+    `graded` memoizes answers for one check_persistence call, keyed on the
+    program's and the payload's bytes.
+    """
+    graded = {} if graded is None else graded
+    program, args = rec.get("program"), rec.get("args")
+    if not program or not rec.get("sha256"):
+        return None, None
+    payload = _script_target(args, program)
+    if _persistence_exec_extra(args, program, payload):
+        return None, None
+    if payload and not rec.get("target_sha"):
+        return None, None
+    key = ("program", program, rec.get("sha256"))
+    if key not in graded:
+        _sev, rung, note = _grade_binary(severity, program,
+                                         sha=rec.get("sha256"))
+        graded[key] = (rung, note)
+    result = graded[key]
+    if payload:
+        key = ("payload", payload, rec.get("target_sha"))
+        if key not in graded:
+            graded[key] = _custody_payload(payload, rec.get("target_sha"))
+        result = _weaker_rung(severity, result, graded[key])
+    return result
+
+
 
 
 def cmd_vouch(argv):
@@ -17670,6 +18195,41 @@ def _intent_attested(path, sha):
         if hmac.compare_digest(expect, str(rec.get("mac") or "")):
             return True
     return False
+
+
+def _intent_receipt(sha):
+    """(path, ts) of the newest valid intent record for content `sha` at ANY
+    path, or None.
+
+    _intent_attested binds bytes to the path the agent wrote. This asks about
+    the bytes alone, for the one caller that must recognise a copy: an agent
+    writes a script in its repo and an install step copies it to where a
+    persistence item runs it (#319: improver.py -> ~/.local/bin/improver,
+    same sha a588f96d11b4). What that proves is carried, never re-conferred
+    -- see _custody_payload. Same validity rules: newest first, and a bad MAC
+    or a stale timestamp is a non-match."""
+    if not sha:
+        return None
+    try:
+        with open(INTENT_FILE, "rb") as f:
+            blob = f.read(_INTENT_MAX_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return None
+    cutoff = _epoch() - _INTENT_MAX_AGE_DAYS * 86400
+    for ln in reversed(blob.splitlines()):
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(rec, dict) or rec.get("sha256") != sha:
+            continue
+        if _epoch(rec.get("ts")) < cutoff:
+            continue
+        expect = _intent_mac(rec.get("ts"), rec.get("path"),
+                             rec.get("sha256"), rec.get("tool"))
+        if hmac.compare_digest(expect, str(rec.get("mac") or "")):
+            return rec.get("path"), rec.get("ts")
+    return None
 
 
 def _intent_worthy(path):
@@ -21515,25 +22075,34 @@ def _accept_into_baseline(incident_ids):
             if f["fingerprint"] not in wanted and not (
                     case in wanted and f["fingerprint"] in reviewed):
                 continue
-            entry = _accepted_entry_key(f, prior, live)
-            if entry is None:
+            # A payload case is one fact carried as evidence on every job
+            # that runs the reviewed bytes (check_persistence lists them in
+            # referrer_paths), so one verdict accepts them all. Only jobs
+            # the recomputed diff still names are listed, which keeps the
+            # guard above: a job that moved on is in a different finding.
+            entries = [p for p in (f.get("referrer_paths") or ())
+                       if p in live or p in prior] \
+                or [_accepted_entry_key(f, prior, live)]
+            if entries == [None]:
                 continue
-            if entry in live:
-                # Stored verbatim from the snapshot, which is ALREADY in
-                # baseline shape (persistence emits args_sha256 alongside args,
-                # exactly as the store holds it). Re-deriving the shape here
-                # would make the accepted record differ from every other one,
-                # and the diffs compare those fields like-for-like — so the
-                # item would report CHANGED on every scan from then on, which
-                # is the noise this whole path exists to end.
-                prior[entry] = live[entry]
-            else:
-                prior.pop(entry, None)
+            for entry in entries:
+                if entry in live:
+                    # Stored verbatim from the snapshot, which is ALREADY in
+                    # baseline shape (persistence emits args_sha256 alongside
+                    # args, exactly as the store holds it). Re-deriving the
+                    # shape here would make the accepted record differ from
+                    # every other one, and the diffs compare those fields
+                    # like-for-like — so the item would report CHANGED on
+                    # every scan from then on, which is the noise this whole
+                    # path exists to end.
+                    prior[entry] = live[entry]
+                else:
+                    prior.pop(entry, None)
+                accepted.append(entry)
             baseline[key] = prior
             wanted.discard(f["fingerprint"])
             if case:
                 wanted.discard(case)
-            accepted.append(entry)
             dirty = True
     if not dirty:
         return []
