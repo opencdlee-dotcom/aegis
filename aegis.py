@@ -658,6 +658,19 @@ _PIPE_LAUNCH = r"(?:(?:/\S*/)?env\s+(?:-\S+\s+|[\w.]+=\S*\s+)*)?(?:/\S*/)?"
 # linear. Python 3.9 has no atomic groups / possessive quantifiers, so a numeric
 # bound is the portable fix — same technique as _SECRET_FLAG_RE. `_hostile_content`
 # additionally caps its input as defence in depth.
+#
+# COMMAND-BOUNDARY DISCIPLINE. A COMPOSITE idiom claims two tokens belong to
+# ONE command ("nohup ... curl" is fileless staging; "curl ... 1.2.3.4" is a
+# bare-IP fetch). The skip-run between them must therefore not cross a shell
+# separator, or the regex fuses two unrelated commands into an idiom neither
+# of them is. That is not hypothetical here: an agent harness passes a whole
+# session as a single `bash -c` string, so `nohup llama-server &` earlier in
+# the line and `curl` later in it reported as `nohup-curl-fileless` at HIGH
+# (incident #503). `network-fetch` above already had the right instinct with
+# `[^\n|]`; this is that instinct named, widened to the other separators, and
+# applied to every composite that needs it. Single-token idioms (/dev/tcp/,
+# base64-decode) take no run and are unaffected.
+_ARGV_SAME_CMD = r"[^\n;&|]"
 _HOSTILE_CONTENT_RES = [
     (re.compile(r"\b(?:curl|wget|nscurl|fetch)\b[^\n|]{0,512}\bhttps?://", re.I), "network-fetch"),
     (re.compile(r"\|\s*" + _PIPE_LAUNCH + r"(?:ba|z|d)?sh\b", re.I), "pipe-to-shell"),
@@ -699,13 +712,31 @@ _HOSTILE_CONTENT_RES = [
     (re.compile(r"\bbase64\b\s+(?:--?d(?:ecode)?|-D)\b", re.I), "base64-decode"),
     (re.compile(r"\beval\b[^\n]{0,512}\$\(", re.I), "eval-subshell"),
     (re.compile(r"/dev/tcp/", re.I), "bash-reverse-shell"),
-    (re.compile(r"\bn(?:c|cat)\b[^\n]{0,512}\s-[a-z]*e\b", re.I), "netcat-exec"),
+    (re.compile(r"\bn(?:c|cat)\b" + _ARGV_SAME_CMD + r"{0,512}\s-[a-z]*e\b", re.I), "netcat-exec"),
     (re.compile(r"\bosascript\b[^\n]{0,512}do\s+shell\s+script", re.I), "osascript-shell"),
     (re.compile(r"\bpython[0-9.]*\b[^\n]{0,120}-c[^\n]{0,120}\bimport\s+(?:os|socket|pty|subprocess)", re.I), "python-oneliner"),
-    (re.compile(r"\b(?:curl|wget)\b[^\n]{0,512}\bhttps?://\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
-    (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b[^\n]{0,512}/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
+    # A bare ROUTABLE address. The threat this names is a C2 reached without
+    # DNS (AMOS ships bare-IP endpoints), and a loopback or RFC1918 address is
+    # not one: `curl http://127.0.0.1:8080/health` against a local dev server
+    # is the single most common command on a developer's box. Aegis already
+    # knows this — the listener sensor drops loopback binds for exactly this
+    # reason ("dev servers churn on 127.0.0.1 constantly") — the knowledge
+    # just never reached the argv scanner, so a llama-server health check read
+    # as a raw-IP C2 fetch, at HIGH, and fed a CRITICAL chain (incident #503).
+    # Excluded: 127/8 loopback, 0/8, 10/8, 172.16/12, 192.168/16, 169.254/16
+    # link-local, and 100.64/10 CGNAT (Tailscale and every carrier NAT).
+    # Anything else — including 100.60.x, which is public — still matches.
+    (re.compile(r"\b(?:curl|wget)\b" + _ARGV_SAME_CMD + r"{0,512}\bhttps?://"
+                r"(?!(?:127|10|0)\.|169\.254\.|192\.168\."
+                r"|172\.(?:1[6-9]|2[0-9]|3[01])\."
+                r"|100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)"
+                r"\d{1,3}(?:\.\d{1,3}){3}", re.I), "raw-ip-fetch"),
+    (re.compile(r"\blaunchctl\b\s+(?:load|bootstrap)\b" + _ARGV_SAME_CMD +
+                r"{0,512}/(?:tmp|var/folders|Users/Shared)", re.I), "launchctl-tmp"),
     (re.compile(r"display\s+dialog.{0,512}hidden\s+answer", re.I | re.S), "osascript-password-phish"),
-    (re.compile(r"\bsecurity\b[^\n]{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I), "keychain-dump"),
+    (re.compile(r"\bsecurity\b" + _ARGV_SAME_CMD +
+                r"{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I),
+     "keychain-dump"),
     # ClickLock (Group-IB, 2026) coerces a password by killing the very apps a
     # user would open to notice/stop it — Activity Monitor, the menu-bar
     # (SystemUIServer), NotificationCenter (suppresses Gatekeeper warnings),
@@ -838,23 +869,36 @@ _HOSTILE_ARGV_RES = [
     (re.compile(r"\bdscl\b\s+\.?\s+(?:-)?authonly\b", re.I), "dscl-authonly-passcheck", "HIGH"),
     # Provenance strip: defeats Aegis's own quarantine check if we only read xattrs
     # at rest — so we catch the STRIP invocation itself.
-    (re.compile(r"\bxattr\b[^\n]{0,120}\s-[a-z]*(?:c|d|dr)\b[^\n]{0,120}com\.apple\.quarantine", re.I), "quarantine-strip", "HIGH"),
+    (re.compile(r"\bxattr\b" + _ARGV_SAME_CMD + r"{0,120}\s-[a-z]*(?:c|d|dr)\b" +
+                _ARGV_SAME_CMD + r"{0,120}com\.apple\.quarantine", re.I),
+     "quarantine-strip", "HIGH"),
     (re.compile(r"\bxattr\b\s+-c\b", re.I), "xattr-clear-all", "HIGH"),
     # Invisible DMG mount (new ClickFix DMG variant, Unit42 2026).
-    (re.compile(r"\bhdiutil\b\s+attach\b[^\n]{0,512}-nobrowse\b", re.I), "hdiutil-nobrowse", "HIGH"),
+    (re.compile(r"\bhdiutil\b\s+attach\b" + _ARGV_SAME_CMD + r"{0,512}-nobrowse\b", re.I),
+     "hdiutil-nobrowse", "HIGH"),
     # Wipes the TCC privacy DB — resets Aegis's own grants; a tamper signal.
     (re.compile(r"\btccutil\b\s+reset\b", re.I), "tccutil-reset", "HIGH"),
     # Keychain theft residue: copy login.keychain-db out, or dump it.
     (re.compile(r"login\.keychain-db\b", re.I), "keychain-db-access", "HIGH"),
-    (re.compile(r"\bsecurity\b[^\n]{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I),
+    (re.compile(r"\bsecurity\b" + _ARGV_SAME_CMD +
+                r"{0,512}\b(?:dump-keychain|find-generic-password|find-internet-password)\b", re.I),
      "keychain-security-dump", "HIGH"),
     # Exfil POST of a staged archive (curl -F file=@/tmp/*.zip … to a remote host).
-    (re.compile(r"\bcurl\b[^\n]{0,120}-F\b[^\n]{0,120}file=@[^\n]{0,120}\.(?:zip|tar|gz)", re.I), "curl-exfil-post", "HIGH"),
+    (re.compile(r"\bcurl\b" + _ARGV_SAME_CMD + r"{0,120}-F\b" + _ARGV_SAME_CMD +
+                r"{0,120}file=@" + _ARGV_SAME_CMD + r"{0,120}\.(?:zip|tar|gz)", re.I),
+     "curl-exfil-post", "HIGH"),
     # TLS-verification-disabled streaming download (curl -k | base64 -d | …).
-    (re.compile(r"\bcurl\b[^\n]{0,120}\s-[a-z]*k\b[^\n]{0,120}\|\s*(?:base64|gunzip|(?:ba|z)?sh|osascript)", re.I),
+    # The trailing `\|` IS the idiom, so only the interior runs — which are
+    # one curl's own flags — are separator-bounded.
+    (re.compile(r"\bcurl\b" + _ARGV_SAME_CMD + r"{0,120}\s-[a-z]*k\b" +
+                _ARGV_SAME_CMD + r"{0,120}\|\s*(?:base64|gunzip|(?:ba|z)?sh|osascript)", re.I),
      "curl-insecure-pipe", "HIGH"),
-    # Fileless staging: nohup curl pulling a payload run in memory.
-    (re.compile(r"\bnohup\b[^\n]{0,512}\bcurl\b", re.I), "nohup-curl-fileless", "HIGH"),
+    # Fileless staging: nohup curl pulling a payload run in memory. The run is
+    # separator-bounded (see _ARGV_SAME_CMD): `nohup` detaching one process
+    # and a `curl` in a LATER command of the same line are two facts, not one
+    # idiom, and an agent harness puts a whole session on one line.
+    (re.compile(r"\bnohup\b" + _ARGV_SAME_CMD + r"{0,512}\bcurl\b", re.I),
+     "nohup-curl-fileless", "HIGH"),
     # ClickLock (2026) password-coercion / anti-analysis: killing Activity
     # Monitor / SystemUIServer / NotificationCenter / Console. HIGH alone; the
     # tight-loop variant escalates to CRITICAL in _argv_signals (below).
@@ -4917,6 +4961,70 @@ def _dedupe_chain_incidents(db, chains_raised, now):
     return closed
 
 
+def _chain_severity(leg_pairs, attack_defined=False):
+    """A chain ESCALATES its legs; it does not manufacture a severity.
+
+    This asserted a flat "CRITICAL" for every chain, whatever the two
+    findings it was built from actually said. On the live store that
+    produced incident #511 — `Persistence followed by execution`,
+    CRITICAL, for 24 days — out of a LOW leg and a MEDIUM one:
+
+      left   /bin/bash's bytes changed. The persistence sensor had ALREADY
+             graded it `custody=os-vendor` -> LOW and written the sentence
+             "Apple-platform-signed on the sealed system volume (SIP
+             enabled) ... the shape of a system update, not of a config
+             edit" into its own detail.
+      right  `bash -c` from the operator's agent harness -> MEDIUM.
+
+    Two findings the graders had already explained were fused into the
+    single highest severity the system can emit. The chain rules are
+    right that co-occurrence is worth more than the parts — the
+    credential-capture rule says so explicitly — but "worth more than the
+    parts" is an escalation FROM the parts, and a pair of explained
+    events has nothing to escalate.
+
+    So: one step above the WEAKER leg (the chain's claim is only as strong
+    as its thinner half), and CRITICAL reserved for a pair that has earned
+    it — both legs at HIGH or above, either leg attack-defined, or a rule
+    that is attack-defined BY CONSTRUCTION. An attack-defined leg is never
+    demoted anywhere else in this file and is not demoted here: a payload
+    stays a payload whoever owns the other half of the pair.
+
+    `attack_defined` is the discriminator that separates the five chain
+    rules into the two kinds they have always been, which is visible in
+    their own predicates:
+
+      by construction   `chain:clickfix` and `chain:credential-capture`
+                        select their left leg on hostile MARKERS — a
+                        password phish, a keychain dump, a quarantine
+                        strip. The rule cannot fire without a payload
+                        idiom, so the pair is a kill chain and the
+                        credential-capture rule's own comment is right
+                        that it is worth more than two HIGHs. CRITICAL.
+      by co-occurrence  `chain:persistence-execution`, `:supply-chain`
+                        and `:remote-access` select on CATEGORY alone, so
+                        ANY two ordinary findings on one entity match.
+                        These are the rules that turned explained facts
+                        into CRITICALs, and these are the ones that now
+                        have to earn it from their legs.
+    """
+    best = "LOW"
+    for left, right in leg_pairs or ():
+        if attack_defined or left.get("attack_defined") \
+                or right.get("attack_defined"):
+            return "CRITICAL"
+        left_sev = left.get("severity") if left.get("severity") in SEV_ORDER \
+            else "LOW"
+        right_sev = right.get("severity") if right.get("severity") in SEV_ORDER \
+            else "LOW"
+        weaker = left_sev if SEV_ORDER[left_sev] <= SEV_ORDER[right_sev] \
+            else right_sev
+        if SEV_ORDER[weaker] >= SEV_ORDER["HIGH"]:
+            return "CRITICAL"
+        best = _severity_max(best, _step_up(weaker))
+    return best
+
+
 def _apply_correlations(db, new_events, now, initially_notified=False,
                         suppressed_categories=frozenset(), routing=None):
     """Run a deliberately tiny set of high-precision, versioned chain rules."""
@@ -4963,8 +5071,10 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
     # _dedupe_chain_incidents.
     chains_raised = []
 
-    def correlate(base_key, title, left_pred, right_pred, window=900):
+    def correlate(base_key, title, left_pred, right_pred, window=900,
+                  attack_defined=False):
         matches_by_entity = {}
+        legs_by_entity = {}
         for left_id, right_id, left, right in _correlation_pairs(
                 observations, left_pred, right_pred, window):
             if left_id in new_ids or right_id in new_ids:
@@ -4973,10 +5083,13 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
                     entity.encode("utf-8", "replace")).hexdigest()[:16]
                 matches_by_entity.setdefault(entity_key, set()).update(
                     (left_id, right_id))
+                legs_by_entity.setdefault(entity_key, []).append((left, right))
         for entity_key, matches in matches_by_entity.items():
             key = "%s:%s" % (base_key, entity_key)
+            severity = _chain_severity(legs_by_entity.get(entity_key, ()),
+                                       attack_defined=attack_defined)
             incident_id = _upsert_incident(
-                db, key, title, "CRITICAL", "correlation", now,
+                db, key, title, severity, "correlation", now,
                 sorted(matches), initially_notified)
             # A signal may have opened a standalone incident in an earlier scan.
             # Once independent evidence promotes it into a chain, close those
@@ -5004,7 +5117,10 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         lambda f: f.get("category") in ("behavior", "shell-history") and
         has_marker(f, {"fileless-fetch-exec", "password-phish",
                        "quarantine-strip", "invisible-dmg"}),
-        lambda f: f.get("category") in ("persistence", "staging", "hot-dir"))
+        lambda f: f.get("category") in ("persistence", "staging", "hot-dir"),
+        # Attack-defined: the left predicate is a payload idiom, so this rule
+        # cannot fire on two ordinary findings. See _chain_severity.
+        attack_defined=True)
     correlate(
         "chain:persistence-execution", "Persistence followed by execution",
         lambda f: f.get("category") == "persistence",
@@ -5028,7 +5144,12 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
             "keychain-db-access", "keychain-security-dump", "keychain-dump",
             "gui-kill-coercion", "gui-kill-loop-coercion"}),
         lambda f: f.get("category") in ("persistence", "staging", "net-listener")
-        or has_marker(f, {"curl-exfil-post", "fileless-fetch-exec"}))
+        or has_marker(f, {"curl-exfil-post", "fileless-fetch-exec"}),
+        # Attack-defined: the left predicate is a credential-theft idiom
+        # (password phish, keychain dump, coercion kill). The comment above is
+        # right that this pair is worth more than two HIGHs — that is exactly
+        # what being attack-defined by construction buys it.
+        attack_defined=True)
 
     # Two chain rules can describe one fact. Reconcile them once every rule has
     # run — never inside correlate(), which cannot see the rules after it.
@@ -5220,21 +5341,44 @@ def _close_regraded_incidents(db, now):
     Same discipline as age-out: no dismissals row (a machine verdict must
     never feed backtest precision or acquired tolerance), CRITICAL is never
     closed this way, never-tolerate prefixes are skipped, and the reattach
-    path reopens the case the moment it carries something new."""
+    path reopens the case the moment it carries something new.
+
+    WHY THIS READS THE INCIDENT'S OWN EVIDENCE INSTEAD OF JOINING `signals`.
+    It shipped as `JOIN signals s ON ('signal:' || s.fingerprint) =
+    i.correlation_key` — correct only for an incident keyed on a raw
+    fingerprint. Since the process/beacon identity redesign, the incidents
+    that carry the custody grades are keyed on their CASE
+    (`signal:process:sha:<sha>`) while their signals stay path-keyed
+    (`process:<path>:adhoc:<sha>`), so the string join matched nothing and the
+    exit was structurally unreachable for them. Measured on the live store
+    before this change: 23 of 41 open signal incidents had no joinable signal
+    row at all, including EVERY `process:sha:` one — which is the entire
+    population this function was written for. #509 sat OPEN at HIGH with two
+    LOW `operator-vouched` re-grades attached to it, the strongest rung the
+    ladder has.
+
+    The unit test did not catch it because it builds a finding with no
+    `case_fingerprint` — the one shape the join could handle. So the lookup
+    now goes through the evidence the incident actually holds, which is both
+    key shapes at once and is also the text the operator is shown."""
     rows = db.execute(
-        "SELECT i.id, i.severity AS inc_sev, i.correlation_key, "
-        "s.severity AS sig_sev FROM incidents i "
-        "JOIN signals s ON ('signal:' || s.fingerprint) = i.correlation_key "
-        "WHERE i.status='OPEN' AND i.kind='signal' "
-        "AND i.severity<>'CRITICAL' AND s.last_seen>=i.last_seen").fetchall()
+        "SELECT id, severity AS inc_sev, correlation_key, last_seen "
+        "FROM incidents WHERE status='OPEN' AND kind='signal' "
+        "AND severity<>'CRITICAL'").fetchall()
     closed = []
     for row in rows:
         fp = (row["correlation_key"] or "")[len("signal:"):]
         if fp.startswith(_NEVER_TOLERATE_PREFIXES):
             continue
-        if SEV_ORDER.get(row["sig_sev"], 99) >= SEV_ORDER["HIGH"]:
+        latest = _latest_incident_grade(db, row["id"], row["last_seen"])
+        if latest is None:
             continue
-        closed.append((row["id"], row["sig_sev"]))
+        sig_sev, sig_fp = latest
+        if sig_fp.startswith(_NEVER_TOLERATE_PREFIXES):
+            continue
+        if SEV_ORDER.get(sig_sev, 99) >= SEV_ORDER["HIGH"]:
+            continue
+        closed.append((row["id"], sig_sev))
     for incident_id, sig_sev in closed:
         db.execute(
             "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
@@ -5242,6 +5386,36 @@ def _close_regraded_incidents(db, now):
             ("re-graded: the signal now reads %s (reopens on new evidence)"
              % sig_sev, now, incident_id))
     return len(closed)
+
+
+def _latest_incident_grade(db, incident_id, incident_last_seen):
+    """(severity, fingerprint) of the newest evidence on `incident_id`.
+
+    The LATEST word on the case, whatever the case is keyed on. Returns None
+    when the incident holds no readable evidence, or when its newest evidence
+    predates its own `last_seen` — the same freshness guard the old
+    `s.last_seen >= i.last_seen` clause enforced, kept because a stale grade
+    must not close an incident something else has refreshed since.
+    """
+    row = db.execute(
+        "SELECT e.observed_at, e.data_json FROM events e "
+        "JOIN incident_events ie ON ie.event_id=e.id "
+        "WHERE ie.incident_id=? AND e.event_type='observation.finding' "
+        "ORDER BY e.id DESC LIMIT 1", (incident_id,)).fetchone()
+    if not row:
+        return None
+    if (row["observed_at"] or 0) < (incident_last_seen or 0):
+        return None
+    try:
+        data = json.loads(row["data_json"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    sev = data.get("severity")
+    if sev not in SEV_ORDER:
+        return None
+    return sev, str(data.get("fingerprint") or "")
 
 
 def _close_cleared_state_incidents(db, observed, now):
@@ -5428,7 +5602,18 @@ _LEGACY_PERSIST_CASE_RE = re.compile(
     r"^(signal:persistence:changed:.*):[0-9a-f]{8,64}$")
 
 
-_LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:.*:[0-9a-f]{64}$")
+# `(?!sha:)` excludes the CURRENT content-keyed case, `signal:process:sha:
+# <sha256>`, which this pattern otherwise matches exactly (`.*` = "sha"). That
+# shape did not exist when this migration shipped, so excluding it changes
+# nothing about how a 2026-08-23-era key migrates — it only stops a retirement
+# sweep from eating the identity that replaced the keys it retires. Without
+# it, on any store where this migration has not already run (a fresh install,
+# a restore from backup, a second machine upgrading late — the exact cases the
+# FROZEN note above exists for) every process incident is closed as
+# "superseded" in the same scan that opened it, and the monitor silently
+# discards its own process findings. Caught by the sandbox, which is by
+# construction a store that has never migrated.
+_LEGACY_PROCESS_KEY_RE = re.compile(r"^signal:process:(?!sha:).*:[0-9a-f]{64}$")
 # FROZEN copies of _BEACON_FP_RE / _TOLERANCE_VERSION_RE as they stood when this
 # migration shipped (2026-08-23). A migration's meaning must not drift when the
 # live detection patterns evolve: a store restored from backup, or a second
@@ -5616,6 +5801,43 @@ def _fold_incidents(db, now, key, ids, reason):
     return len(dupes)
 
 
+def _fold_rotating_beacon_cases(db, now):
+    """Fold per-ADDRESS beacon incidents onto one (program, port) case.
+
+    Extracted so it can run a second time under its own stamp. Dispersion is
+    counted here from the OPEN INCIDENTS themselves, which is a history and
+    always was -- unlike the live sensor, which until 2026-09-19 counted only
+    the addresses that happened to be live in one scan and therefore kept
+    minting per-address cases a rotating endpoint could never escape. Fixing
+    the sensor leaves the incidents already minted under the old rule behind;
+    this is how every previous identity redesign retired its orphans.
+    """
+    disp, rows = {}, []
+    for row in db.execute(
+            "SELECT id,correlation_key FROM incidents WHERE status IN "
+            "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
+            "AND created_at < ? ORDER BY id", (now,)):
+        m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
+        if not m:
+            continue
+        prog, rip, rport = m.group(1), m.group(2), m.group(3)
+        key = (_program_subject(prog), rport)
+        disp.setdefault(key, set()).add(rip)
+        rows.append((row["id"], key))
+    groups = {}
+    for inc_id, key in rows:
+        if len(disp.get(key, ())) >= _MIG_BEACON_DISPERSION_MIN:
+            groups.setdefault(
+                "signal:beacon:rotating:%s:%s" % key, []).append(inc_id)
+    folded = 0
+    for key, ids in sorted(groups.items()):
+        folded += _fold_incidents(
+            db, now, key, ids,
+            "superseded: many addresses on one port from one program is one "
+            "rotating endpoint relationship, not one beacon per address")
+    return folded
+
+
 def _merge_2026_09_case_identities(db, now):
     """One-time: fold the incidents the 2026-09-17 identity fixes de-duplicate.
 
@@ -5689,28 +5911,7 @@ def _merge_2026_09_case_identities(db, now):
             "copied to")
 
     # --- beacon: per-address -> one rotating relationship ----------------
-    disp, rows = {}, []
-    for row in db.execute(
-            "SELECT id,correlation_key FROM incidents WHERE status IN "
-            "('OPEN','ACK') AND correlation_key LIKE 'signal:beacon:%' "
-            "AND created_at < ? ORDER BY id", (now,)):
-        m = _MIG_BEACON_CASE_RE.match(row["correlation_key"] or "")
-        if not m:
-            continue
-        prog, rip, rport = m.group(1), m.group(2), m.group(3)
-        key = (_program_subject(prog), rport)
-        disp.setdefault(key, set()).add(rip)
-        rows.append((row["id"], key))
-    groups = {}
-    for inc_id, key in rows:
-        if len(disp.get(key, ())) >= _MIG_BEACON_DISPERSION_MIN:
-            groups.setdefault(
-                "signal:beacon:rotating:%s:%s" % key, []).append(inc_id)
-    for key, ids in sorted(groups.items()):
-        folded += _fold_incidents(
-            db, now, key, ids,
-            "superseded: many addresses on one port from one program is one "
-            "rotating endpoint relationship, not one beacon per address")
+    folded += _fold_rotating_beacon_cases(db, now)
 
     # --- persistence: orphaned by the program-keyed case -----------------
     orphaned = []
@@ -5778,6 +5979,11 @@ _STORE_MIGRATIONS = (
      "for processes, rotating endpoints for beacons, program for persistence)"),
     ("program_case_migrated", _retire_orphaned_program_incidents,
      "retired %d incident(s) keyed on the old versioned-path program identity"),
+    # The 2026-09-19 dispersion fix changed which beacon cases the SENSOR
+    # mints; the per-address cases minted under the old live-sockets-only rule
+    # are its orphans. Same fold, second stamp.
+    ("beacon_rotation_refold_20260919", _fold_rotating_beacon_cases,
+     "folded %d per-address beacon incident(s) onto their rotating case"),
 )
 
 
@@ -8199,6 +8405,47 @@ def _argv_match_spans(argv):
     return spans
 
 
+# Scratch-path nonces: tokens a harness mints fresh every session, which are
+# not part of what the command DOES. Named shapes only, never a general
+# "collapse digits" — over-normalizing here would fold two genuinely different
+# hostile commands onto one identity, and the operator's verdict on the first
+# would silently cover the second.
+_ARGV_NONCE_RES = (
+    # Claude Code / Codex shell snapshots: snapshot-bash-<epoch_ms>-<rand>.sh
+    (re.compile(r"snapshot-(bash|zsh|sh)-\d+-[A-Za-z0-9]+\.sh"), r"snapshot-\1-#.sh"),
+    # macOS per-session temp root: /var/folders/<2>/<hash>/T/...
+    (re.compile(r"/var/folders/[^/\s]{1,4}/[^/\s]+/(?=[CT]/)"), "/var/folders/#/"),
+    # uv / mkdtemp build dirs: .tmpAb3xYz, tmp1234abcd
+    (re.compile(r"\.tmp[A-Za-z0-9]{6,}"), ".tmp#"),
+    # uv cached environments: <name>-<16 hex>
+    (re.compile(r"-[0-9a-f]{16}(?=[/\s]|$)"), "-#"),
+)
+
+
+def _argv_case_identity(argv, length=16):
+    """A digest of `argv` with session nonces normalized away — the CASE key.
+
+    The signal fingerprint stays on the EXACT argv sha, so a genuinely new
+    command still alerts exactly once. This answers the different question the
+    rest of the file already separates out: what THING is the operator being
+    asked to judge, and therefore what does a verdict on it cover.
+
+    Without this the two are the same string, and the agent harness puts a
+    per-session nonce in every command it runs
+    (`source ~/.claude/shell-snapshots/snapshot-bash-1789621597725-dtpjwq.sh`
+    prefixes the whole line). So the identity of "bash did X" changed every
+    session, a benign-positive could never accumulate the three verdicts
+    acquired tolerance needs, and the same command shape opened a fresh HIGH
+    incident forever — #450 and #503 are the same finding twice, minted eight
+    days apart under two nonces.
+    """
+    flat = argv or ""
+    for rx, repl in _ARGV_NONCE_RES:
+        flat = rx.sub(repl, flat)
+    flat = _program_subject(flat)
+    return hashlib.sha256(flat.encode("utf-8", "replace")).hexdigest()[:length]
+
+
 def _argv_evidence_preview(argv, budget=_ARGV_PREVIEW_BUDGET):
     """A preview centred on WHAT MATCHED, not on the head of the string.
 
@@ -8329,7 +8576,10 @@ def check_behavior():
             top, "behavior", "Suspicious process behavior",
             "%s triggered [%s]; command sha256=%s; command: %s" %
             (base, names, command_sha[:16], preview),
-            fp, program=argv.split(None, 1)[0] if argv else "",
+            fp, case_fingerprint="behavior:%s:%s:%s" % (
+                base, "|".join(sorted(n for n, _ in signals)),
+                _argv_case_identity(argv)),
+            program=argv.split(None, 1)[0] if argv else "",
             pid=pid, markers=[n for n, _ in signals], command_sha256=command_sha,
             command_preview=preview))
     _annotate_ancestry(findings)
@@ -12244,7 +12494,7 @@ def _beacon_add_sighting(sightings, ts, rows):
 BEACON_DISPERSION_MIN = 4
 
 
-def _beacon_dispersion(rows, sightings):
+def _beacon_dispersion(sightings):
     """(program_subject, port) -> set of RECURRING remote IPs.
 
     Built before any finding is emitted, because the decision "is this one
@@ -12262,18 +12512,30 @@ def _beacon_dispersion(rows, sightings):
     function weakens exactly the detection the sensor exists for, and does it
     in the attacker's favour. Ephemeral churn is the noise this sensor already
     defines itself against; it must not be allowed to vote on identity.
+
+    And the gate is the ONLY thing allowed to vote: dispersion is read from
+    the sighting HISTORY, not from the current socket table. It shipped
+    iterating `rows` -- this instant's live sockets -- which asks a question
+    about simultaneity that rotation does not answer. A rotating endpoint
+    rotates: the program holds one or two sockets at a time and moves between
+    addresses across hours, so the count only reached four on the rare scan
+    where four happened to overlap. Live cost on this store: eight separate
+    HIGH beacon incidents for ONE program on port 443 (#510, #512-#518) while
+    a rotating case for that same (program, port) -- #506, carrying one of the
+    very same addresses -- was already open beside them. Every address counted
+    here still had to clear BEACON_MIN_SCANS and BEACON_MIN_SPAN_SECS on its
+    own, so a fixed-endpoint C2 still has a dispersion of one and still keeps
+    the full alarm; what changes is only that "how many endpoints does this
+    program use" stops being answered by a stopwatch.
     """
     disp = {}
-    for row in rows:
-        if len(row) < 3:
-            continue
-        path, rip, rport = str(row[0]), str(row[1]), str(row[2])
-        stamps = sightings.get((path, rip, rport), ())
+    for (path, rip, rport), stamps in sightings.items():
         if len(stamps) < BEACON_MIN_SCANS:
             continue
         if max(stamps) - min(stamps) < BEACON_MIN_SPAN_SECS:
             continue
-        disp.setdefault((_program_subject(path), rport), set()).add(rip)
+        disp.setdefault((_program_subject(str(path)), str(rport)),
+                        set()).add(str(rip))
     return disp
 
 
@@ -12281,7 +12543,7 @@ def _beacon_from_sightings(sightings, current_rows):
     """The recurrence DECISION, over an already-built sightings map."""
     findings = []
     rows = sorted(set(tuple(r) for r in current_rows))
-    dispersion = _beacon_dispersion(rows, sightings)
+    dispersion = _beacon_dispersion(sightings)
     dispersed_done = set()
     for row in rows:
         # Length-guarded like the history fold above. Live, current_rows always
@@ -15218,6 +15480,17 @@ def _step_down(severity):
     except ValueError:
         return severity
     return _SEV_LADDER[max(0, i - 1)]
+
+
+def _step_up(severity):
+    """One rung up the ladder, clamped at the top. The escalation half of
+    `_step_down`, used only by the chain correlator: co-occurrence is worth
+    more than either finding alone, and this is how much more."""
+    try:
+        i = _SEV_LADDER.index(severity)
+    except ValueError:
+        return severity
+    return _SEV_LADDER[min(len(_SEV_LADDER) - 1, i + 1)]
 
 
 # --- package-manager receipts -------------------------------------------------
