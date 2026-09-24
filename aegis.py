@@ -17456,6 +17456,12 @@ def _demote(severity, provenance, attack_defined=False):
         target = _step_down(severity)
     else:
         return severity
+    # Demotion never suppresses, so it never goes below LOW: INFO is what a
+    # sensor says when it has nothing to report, not a grade custody hands
+    # out. Without this a vouched or weak rung stepped a LOW finding -- a new
+    # LaunchAgent running an Apple-signed program -- down to INFO.
+    if SEV_ORDER[target] < SEV_ORDER["LOW"] <= SEV_ORDER[severity]:
+        target = "LOW"
     return target if SEV_ORDER[target] < SEV_ORDER[severity] else severity
 
 
