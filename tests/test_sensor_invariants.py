@@ -41,6 +41,9 @@ PORTABLE = frozenset((
     # then there was none — a corrupt aegis.db silenced every incident while
     # findings kept flowing and the report kept reading clean).
     "notary", "event-store",
+    # A regression between the last two precision snapshots (backtest replay
+    # reduced to numbers, refreshed daily at the scan's tail).
+    "precision",
 ))
 PLATFORM = {
     "mac": frozenset(("cron", "xprotect", "security-log", "amfid-log")),

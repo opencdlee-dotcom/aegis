@@ -853,3 +853,28 @@ class PrivilegeWallIsRemembered(unittest.TestCase):
             self.assertIsNone(aegis.snapshot_btm(),
                               "one flake is not yet a wall")
         self.assertIs(aegis.snapshot_btm(), aegis.SURFACE_PRIVILEGED)
+
+
+class DemotionNeverGoesBelowLow(unittest.TestCase):
+    """Demotion never suppresses, so it never takes a finding below LOW.
+
+    Found integrating the precision batch (2026-09-23): S7 grades a NEW
+    persistence item by the program it runs, S5 gives an Apple-signed program
+    the publisher rung, and the pair demoted "/bin/echo hello" as a new
+    LaunchAgent from LOW to INFO -- a new launch item out of view. Main
+    already did the same for a package-managed LOW. INFO is what a sensor
+    says when it has nothing to report, not a grade custody may hand out."""
+
+    def test_every_rung_stops_at_low(self):
+        for rung in (aegis._SELF_CUSTODY + aegis._VOUCHED_CUSTODY
+                     + aegis._WEAK_CUSTODY):
+            self.assertEqual(aegis._demote("LOW", rung), "LOW", rung)
+
+    def test_info_stays_info(self):
+        for rung in aegis._VOUCHED_CUSTODY + aegis._WEAK_CUSTODY:
+            self.assertEqual(aegis._demote("INFO", rung), "INFO", rung)
+
+    def test_one_step_still_applies_above_low(self):
+        self.assertEqual(aegis._demote("MEDIUM", "package-managed"), "LOW")
+        self.assertEqual(aegis._demote("HIGH", "build-output"), "MEDIUM")
+

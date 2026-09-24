@@ -163,7 +163,12 @@ Allowed states are `OPEN`, `ACK`, `INVESTIGATING`, `CONTAINED`, `RECOVERING`,
 `MONITORING`, `RESOLVED`, and `FALSE_POSITIVE`. Transitions are validated so a
 closed incident cannot silently return to containment. An unresolved incident
 gets at most three reminders (about +1 hour, +24 hours, and +72 hours); afterward
-the durable open state is the reminder. A reviewed `FALSE_POSITIVE` suppresses
+the durable open state is the reminder. An incident opened only by evidence the
+routing gate sent to the digest (the provenance gate, low confidence, below the
+floor) records why in `digest_only` and gets none: no reminder ever turns it
+into a notification. It stays open, counted and listed, and becomes an ordinary
+notified incident only when evidence that would itself interrupt attaches. A
+reviewed `FALSE_POSITIVE` suppresses
 only the exact correlation key while retaining later occurrences as evidence;
 a changed content hash gets a new key (unless *acquired tolerance*, below, has
 earned the right to pre-close it). A `RESOLVED` threat that recurs opens a
@@ -363,11 +368,37 @@ quiet rather than silence.
    verdicts, and a ledger that crossed machines would let one compromised body
    launder bytes into every other body's known-good set.
 
+9. **Publisher signature** (binary-keyed findings) → **MEDIUM**, asked after
+   the vouch and the receipt and before `build-output`. `publisher-stable`
+   was the only rung that read a signature, and only on a re-sign in place,
+   so a valid Developer ID binary earned nothing on first sight and beaconed
+   HIGH from `$HOME` on the one sensor whose predicate is an OR. The binary
+   earns `publisher-signed` when `publisher_sig()` accepts its verdict
+   (apple / app-store / developer-id on macOS, a `strict: detritus` verdict
+   included; os-signed / signed-valid on Windows; os-managed on Linux) and
+   the verdict names a team or authority; the note names that signer and the
+   control behind it (Apple's notarization and revocation on macOS). Ad-hoc,
+   broken, unsigned and `signed-other` earn nothing. It reads the stat-cached
+   verdict the sensor already asked for, so it costs no second probe. Two
+   limits. The OS vendor's own signature (`apple`, Windows `os-signed`) earns
+   it only inside `TRUSTED_PREFIXES`, on the resolved path, and is never
+   carried to a copy: the same signed bytes in `/tmp`, `$HOME` or `%TEMP%` are
+   the living-off-the-land shape. And a caller whose evidence says the
+   platform's control refused the bytes withholds it (`publisher_ok=False`):
+   the hot-dir sensor after Gatekeeper rejects a bundle.
+
 Guards, because grading is where an attacker would want to stand:
 
-- **Grades, never mutes.** A downgraded finding is still created, still in the
-  report, still accumulates risk and joins correlation chains. Custody writes
-  no dismissal and cannot feed acquired tolerance.
+- **Demotion never suppresses; the routing gate decides what interrupts.** A
+  downgraded finding is still created, still in the report, still accumulates
+  risk and joins correlation chains, and custody writes no dismissal and
+  cannot feed acquired tolerance. What keeps a proven origin quiet is the
+  ROUTING gate (`_provenance_gate`, asked by `route_findings` before the
+  notify floor): a finding below CRITICAL whose rung is in the self or
+  vouched tier, that is not attack-defined and not a decoy/latch/canary trip,
+  routes to the digest, where it remains visible (it carries
+  `routed: digest: provenance <rung>`, which `incident` and `report` print)
+  and counts toward risk at its tier weight. Weak rungs only demote.
 - **Attack-defined content never downgrades.** A conceal imperative stays HIGH
   even when self-attested — an agent prompt-injected into persisting a hostile
   instruction attests its own write. Custody grades *churn-shaped structure*,
@@ -398,8 +429,8 @@ call sequence:
    bidirectional: a covered change drops to INFO, an uncovered change is
    promoted to at least HIGH — under enforcement, the *absence of a record*
    outranks provenance, which is the entire point of opting in.
-4. **The notify floor** (`emit`) routes by the final severity; it never
-   changes one.
+4. **The notify floor** (`emit`) routes by the final severity and, through
+   the provenance gate, by custody; it never changes a severity.
 5. **The incident ratchet** (`_severity_max`) only ever steps UP: once an
    incident opened HIGH, a later regrade of the same subject cannot quietly
    lower it — de-escalation is the operator's verdict to give, not custody's.
@@ -530,10 +561,13 @@ above. An allowlisted fingerprint still opened and refreshed incidents and
 drove reminders, because `emit` skipped it while every finding flowed into
 the incident tier untouched. And one genuine new HIGH marked every incident
 created that scan as already-notified, so a digest-routed sibling lost the
-reminder that was its only path to a human.
+reminder that was its only path to a human. (That reminder was itself removed
+on 2026-09-23: a digest-only incident is never reminded — see Incident
+workflow. The per-finding "notified" mark stands.)
 
 `route_findings` is the one place the order is written down: allowlisted →
-seen → adopted → low-confidence → below-floor → tolerated/learning → new.
+seen → adopted → low-confidence → provenance → below-floor →
+tolerated/learning → new.
 The scan path computes it once with the incident tier's memory and hands the
 same verdicts to `emit`, to `record_security_state` (which now marks
 "notified" per finding and closes an allowlisted incident as `allowlisted`,
@@ -567,6 +601,32 @@ observations re-rendered as though fresh. 118 of 120 dismissals were
 
 The menu-bar plugin counts OPEN INCIDENTS, so that — not findings-per-scan —
 is the number the operator actually reads, and it is what this tier targets.
+
+### Ground truth: `backtest replay`
+
+Every earlier fix in this tier was measured by silence ("the queue got
+shorter"), which is also what broken detection looks like. `aegis.py backtest
+replay [--days N] [--reobserve]` scores the CURRENT code against the answer key
+the store already holds: it opens the live store read-only (`mode=ro`, one
+snapshot), groups the recorded `observation.finding` events into their scans
+(by `observed_at`: no writer sets `scan_id`), and re-runs each batch through
+`route_findings` with the live tolerance memory and the learning period OFF,
+the scan's own record-and-fold (`_record_finding_events`, shared with
+`record_security_state`) and `_apply_correlations` (chains, lineage, risk,
+incidents) in an in-memory store. It reports per-category interrupts, lists by
+id every incident the operator closed as noise (`FALSE_POSITIVE`, whatever the
+resolution) whose evidence would open an interrupt again — `noise re-opened: N
+of M` — counts open cases with no noise-labelled evidence (`new interrupts
+from corpus`), and routes the findings the 21 assay lanes build through the
+same gate (`assay recall: X/21`; predicate-only lanes and the one lane that
+writes live state are named, not skipped). `--reobserve` first re-asks the
+classifier and the custody ladder about every binary a process, listener,
+beacon or outbound finding names that is still on disk, and re-derives its
+severity from that sensor's own gate, so a classifier or ladder fix is
+scoreable and not only a routing fix. The scan-tail closers are deliberately
+not run: they key on what a scan re-asserted, and the event log holds only
+what the live fold recorded. The command asserts its counts against the store
+before printing them and puts a failed assertion at the top.
 
 ### Identity fixes (what a finding is *about*)
 

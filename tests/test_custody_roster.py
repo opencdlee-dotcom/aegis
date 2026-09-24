@@ -117,6 +117,11 @@ GRADED = {
     ("check_persistence", "persistence"),
     ("check_processes", "process"),
     ("diff_agent_surface", "agent-surface"),
+    # Graded 2026-09-23 (#329-#332): the operator's skills are symlinks into
+    # his skills repos, and custody is asked of the changed files at their
+    # realpath, never of the link git cannot answer for.
+    ("diff_agent_skills.changed_fn", "agent-skill"),
+    ("diff_agent_skills.new_fn", "agent-skill"),
     ("diff_extra_persistence._mk.f", "persistence"),
     ("diff_listeners.new_fn", "net-listener"),
     ("diff_python_site._mk.f", "persistence"),
@@ -135,14 +140,14 @@ CUSTODY_DEBT = {
     ("check_browser_automation", "session-theft"): 3,
     ("check_clipboard", "clipboard"): 1,
     ("check_cron", "persistence"): 2,
-    ("check_persistence", "persistence"): 2,
+    # 1: the NEW finding is graded by what it executes since 2026-09-23;
+    # the remaining site is "Persistence item removed".
+    ("check_persistence", "persistence"): 1,
     ("check_processes", "process"): 1,
     ("check_shell_history", "shell-history"): 1,
     ("check_staging", "staging"): 1,
     ("check_supply_chain", "supply-chain"): 2,
     ("check_web_protection", "web-protection"): 2,
-    ("diff_agent_skills.changed_fn", "agent-skill"): 1,
-    ("diff_agent_skills.new_fn", "agent-skill"): 1,
     ("diff_appinit.changed_fn", "appinit"): 1,
     ("diff_appinit.new_fn", "appinit"): 1,
     ("diff_auth_sessions.new_fn", "auth-session"): 1,
@@ -175,7 +180,7 @@ CUSTODY_DEBT = {
 # Pinned totals. Both are ratchets: sites may move from DEBT to GRADED, never
 # the other way, and a brand-new emitter belongs in one of the three rosters
 # before it belongs on main.
-DEBT_SITES_MAX = 61
+DEBT_SITES_MAX = 59
 MIN_CALL_SITES = 130
 
 
