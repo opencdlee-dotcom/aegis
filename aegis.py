@@ -4869,13 +4869,38 @@ def _accumulate_risk(db, now, new_ids):
         "SELECT id, observed_at, data_json FROM events "
         "WHERE event_type='observation.finding' AND observed_at>=?",
         (now - RISK_WINDOW,)).fetchall()
-    demote = _category_dismissal_weights(db, now)
-    by_entity = {}
+    findings = []
     for row in rows:
         try:
-            f = json.loads(row["data_json"])
+            findings.append((row["id"], json.loads(row["data_json"])))
         except Exception:
             continue
+    by_entity = _risk_buckets(findings, _category_dismissal_weights(db, now),
+                              new_ids)
+    for ek, b in by_entity.items():
+        score, min_signals = _risk_score(b)
+        if b["new"] and len(b["fps"]) >= min_signals \
+                and score >= RISK_THRESHOLD:
+            # Severity follows the score instead of a hardcoded "HIGH":
+            # barely past threshold is a MEDIUM worth a look, not an
+            # interrupt-grade verdict the number never supported.
+            sev = "HIGH" if score >= 2 * RISK_THRESHOLD else "MEDIUM"
+            _upsert_incident(
+                db, "risk:%s" % ek,
+                "Accumulated risk on %s (%d signals across %d sensor%s, score %.1f)"
+                % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
+                   "" if len(b["cats"]) == 1 else "s", score),
+                sev, "risk", now, sorted(b["ids"]))
+
+
+def _risk_buckets(findings, demote, new_ids=()):
+    """{entity key: {weight, fps, ids, cats, entity, new}} for [(event id,
+    finding)]: what _accumulate_risk sums per entity before it scores, with
+    `demote` the per-category dismissal weights. One function, so a pile
+    re-scored later (_rejudge_open_incidents) is scored the way it was
+    opened."""
+    by_entity = {}
+    for event_id, f in findings:
         # Single primary entity on purpose, unlike the chain rules: accumulation
         # counts weak signals piling up on ONE object, so bucketing a finding
         # under its every identity would both double-count it and pool unrelated
@@ -4951,29 +4976,22 @@ def _accumulate_risk(db, now, new_ids):
             continue  # count each distinct signal once, not once per rescan
         b["fps"].add(fp)
         b["weight"] += w
-        b["ids"].add(row["id"])
+        b["ids"].add(event_id)
         b["cats"].add(_RISK_SENSOR_GROUP.get(category, category))
-        if row["id"] in new_ids:
+        if event_id in new_ids:
             b["new"] = True
-    for ek, b in by_entity.items():
-        # Corroboration across sensors is the higher-precision evidence: it needs
-        # fewer signals AND scores higher against the same constant threshold.
-        # One sensor keeps the original bar, so no existing detection regresses.
-        multi = len(b["cats"]) >= 2
-        min_signals = RISK_MIN_SIGNALS_MULTI_SENSOR if multi else RISK_MIN_SIGNALS
-        score = b["weight"] * (RISK_CORROBORATION_BONUS if multi else 1.0)
-        if b["new"] and len(b["fps"]) >= min_signals \
-                and score >= RISK_THRESHOLD:
-            # Severity follows the score instead of a hardcoded "HIGH":
-            # barely past threshold is a MEDIUM worth a look, not an
-            # interrupt-grade verdict the number never supported.
-            sev = "HIGH" if score >= 2 * RISK_THRESHOLD else "MEDIUM"
-            _upsert_incident(
-                db, "risk:%s" % ek,
-                "Accumulated risk on %s (%d signals across %d sensor%s, score %.1f)"
-                % (b["entity"][:80], len(b["fps"]), len(b["cats"]),
-                   "" if len(b["cats"]) == 1 else "s", score),
-                sev, "risk", now, sorted(b["ids"]))
+    return by_entity
+
+
+def _risk_score(b):
+    """(score, signals needed) for one _risk_buckets entry."""
+    # Corroboration across sensors is the higher-precision evidence: it needs
+    # fewer signals AND scores higher against the same constant threshold.
+    # One sensor keeps the original bar, so no existing detection regresses.
+    multi = len(b["cats"]) >= 2
+    min_signals = RISK_MIN_SIGNALS_MULTI_SENSOR if multi else RISK_MIN_SIGNALS
+    return (b["weight"] * (RISK_CORROBORATION_BONUS if multi else 1.0),
+            min_signals)
 
 
 # --------------------------------------------------------------------------- #
@@ -6316,6 +6334,233 @@ def _close_removed_drop_incidents(db, observed, now):
     return len(closed)
 
 
+# Re-judging open incidents with the current code (_rejudge_open_incidents).
+# Bump _REJUDGE_LOGIC_VERSION when what may close changes; a new aegis.py is a
+# new logic too (its code sha is part of the key), so an install re-judges on
+# its first scan instead of an hour later.
+_REJUDGE_LOGIC_VERSION = 1
+_REJUDGE_INTERVAL = 3600
+_REJUDGE_MAX_INCIDENTS = 25     # per run; the rest wait for the next one
+_REJUDGE_BUDGET = 30.0          # seconds of re-derivation per run
+_REJUDGE_KINDS = ("signal", "risk", "correlation")
+
+
+def _rejudge_logic():
+    """What judged: this closer's version and the code it ran in."""
+    return "%d:%s" % (_REJUDGE_LOGIC_VERSION,
+                      (_running_code_sha() or "unknown")[:12])
+
+
+def _rejudge_subject(f):
+    """`<category> <file name>`, the way a resolution names a finding."""
+    return ("%s %s" % (f.get("category") or "finding", os.path.basename(
+        str(f.get("path") or f.get("program") or "")))).strip()
+
+
+def _rejudge_change(f, g):
+    """What the current code says differently about `f`, re-derived as `g`."""
+    parts = []
+    if g.get("trust") and (g.get("trust") or None) != (f.get("trust") or None):
+        parts.append("now classifies %s" % g["trust"])
+    rung = g.get("custody") or g.get("provenance")
+    if rung and rung != (f.get("custody") or f.get("provenance")):
+        parts.append("custody %s" % rung)
+    if g["severity"] != f["severity"]:
+        parts.append("%s -> %s" % (f["severity"], g["severity"]))
+    return "%s: %s" % (_rejudge_subject(f), ", ".join(parts) or "as recorded")
+
+
+def _rejudge_summary(reasons, limit=4):
+    distinct = []
+    for why in reasons:
+        if why not in distinct:
+            distinct.append(why)
+    extra = len(distinct) - limit
+    return "; ".join(distinct[:limit]) + ("; +%d more" % extra
+                                          if extra > 0 else "")
+
+
+def _rejudge_incident(db, row, memory, demote, memo, stats):
+    """Why the current code would not raise incident `row` today, as one
+    line, or None when it would, or when that cannot be shown.
+
+    Every observation finding it holds is re-derived by `_reobserve`, the
+    path `backtest replay --reobserve` scores with. Any finding replayed as
+    recorded -- a subject gone from disk, a sensor it does not model, a field
+    the record never carried -- and the incident stands: absence of an answer
+    is not an answer. So does any CRITICAL, attack-defined or never-tolerate
+    evidence, whatever the current grade. Then, by kind: a signal case needs
+    every finding dropped or routed below the interrupt tier; a risk pile is
+    scored again (_risk_buckets, _risk_score) the way _accumulate_risk scores
+    it -- over the findings inside one RISK_WINDOW, at each moment one of them
+    was observed -- and no window may still cross; a co-occurrence chain must
+    be one the current join rules would not form
+    (_unjoinable_chain_resolution)."""
+    evidence = []
+    for ev in db.execute(
+            "SELECT e.id, e.observed_at, e.data_json FROM incident_events ie "
+            "JOIN events e ON e.id=ie.event_id WHERE ie.incident_id=? AND "
+            "e.event_type='observation.finding' ORDER BY e.id", (row["id"],)):
+        try:
+            f = json.loads(ev["data_json"])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(f, dict) or not f.get("fingerprint") \
+                or f.get("severity") not in SEV_ORDER:
+            return None
+        if SEV_ORDER[f["severity"]] >= SEV_ORDER["CRITICAL"] \
+                or f.get("attack_defined") \
+                or str(f["fingerprint"]).startswith(_NEVER_TOLERATE_PREFIXES):
+            return None
+        evidence.append((ev["id"], ev["observed_at"] or 0, f))
+    if not evidence:
+        return None
+    judged = []
+    for event_id, at, f in evidence:
+        g, as_recorded = _reobserve(dict(f), memo, stats)
+        if as_recorded:
+            return None
+        judged.append((event_id, at, f, g))
+    kind, key = row["kind"], row["correlation_key"] or ""
+    if kind == "signal":
+        reasons, routed = [], set()
+        for _event_id, _at, f, g in judged:
+            if g is None:
+                reasons.append("%s: no longer emitted" % _rejudge_subject(f))
+                continue
+            if g["fingerprint"] in routed:
+                continue            # one fact, re-derived once per scan held
+            routed.add(g["fingerprint"])
+            verdict = route_findings([dict(g)], memory=memory,
+                                     seen={})[g["fingerprint"]]
+            if verdict["route"] == ROUTE_INTERRUPT:
+                return None
+            reasons.append("%s (%s: %s)" % (_rejudge_change(f, g),
+                                            verdict["route"], verdict["why"]))
+        return _rejudge_summary(reasons)
+    kept = [(event_id, at, g) for event_id, at, _f, g in judged
+            if g is not None]
+    if kind == "risk" and key.startswith("risk:"):
+        # Each scan scores the findings of the last RISK_WINDOW, so the
+        # evidence of an incident that re-crossed for days is many piles,
+        # never one: summed whole, a program that picks a new port per launch
+        # is 68 distinct signals (#527). Every window the evidence holds is
+        # asked, and the highest is reported.
+        peak = (0.0, 0, RISK_MIN_SIGNALS)
+        for anchor in sorted({at for _event_id, at, _g in kept}):
+            b = _risk_buckets(
+                [(event_id, g) for event_id, at, g in kept
+                 if anchor - RISK_WINDOW <= at <= anchor],
+                demote).get(key[len("risk:"):])
+            if not b:
+                continue
+            score, needed = _risk_score(b)
+            if len(b["fps"]) >= needed and score >= RISK_THRESHOLD:
+                return None
+            peak = max(peak, (score, len(b["fps"]), needed))
+        changes = [_rejudge_change(f, g) if g is not None
+                   else "%s: no longer emitted" % _rejudge_subject(f)
+                   for _event_id, _at, f, g in judged]
+        return _rejudge_summary(changes + [
+            "the pile now peaks at %.1f from %d signal(s) in any %d-minute "
+            "window, under the risk threshold (%.1f from %d)"
+            % (peak[0], peak[1], RISK_WINDOW // 60, RISK_THRESHOLD, peak[2])])
+    if kind == "correlation" and key.startswith("chain:") \
+            and not key.startswith("chain:lineage:"):
+        why = _unjoinable_chain_resolution(_chain_entity_key(key),
+                                           [g for _event_id, _at, g in kept])
+        if not why:
+            return None
+        return why.replace("superseded: ", "", 1).replace(
+            " — reopens on new evidence", "")
+    return None
+
+
+def _rejudge_open_incidents(db, now):
+    """Close OPEN/ACK incidents the CURRENT code would not raise; the number
+    closed, or None when this run was throttled.
+
+    Every other exit waits for the sensor to say something: re-grade reads
+    the newest evidence, re-verify re-asks one signature, cleared-state and
+    removed-file need the sensor to look again. An incident opened by code
+    that has since been fixed hears none of that unless the same subject is
+    re-observed, so it waited out the age-out clock. Live, 2026-09-23: #527,
+    a Spotify risk case built from listener findings recorded `unsigned`
+    while codesign was not answering (Spotify is Developer ID), and #537, a
+    staging plugin-container the current code grades MEDIUM on its
+    build-output rung. The harness already re-derives recorded evidence with
+    the current code; this uses the same path to heal, not only to score.
+
+    Judged with the live teaching (the suppression memory, the dismissal
+    weights), the learning period off -- the question is whether the code
+    would raise this, not whether the machine is still learning -- and the
+    seen-ledger empty, since having told the operator once is not a verdict.
+    Read-only on everything but the incident row: the custody ledger is not
+    written while the ladder is asked. See _rejudge_incident for what stands.
+
+    The discipline is the other machine exits': FALSE_POSITIVE with a
+    resolution that says why and which logic judged it, no dismissals row
+    (a machine verdict never feeds precision or tolerance), and new evidence
+    opens the case again. Never an incident created by the scan that runs it.
+
+    Hourly at most, and at once when the logic changes (a new version or a
+    new aegis.py). Bounded per run by _REJUDGE_MAX_INCIDENTS and
+    _REJUDGE_BUDGET; a run that stops early says how many it left, and the
+    next resumes after the last incident it examined."""
+    logic = _rejudge_logic()
+    meta = {r["key"]: r["value"] for r in db.execute(
+        "SELECT key, value FROM meta WHERE key IN "
+        "('rejudge_logic','rejudge_at','rejudge_cursor')")}
+    try:
+        last, cursor = int(meta.get("rejudge_at") or 0), \
+            int(meta.get("rejudge_cursor") or 0)
+    except ValueError:
+        last, cursor = 0, 0
+    if meta.get("rejudge_logic") == logic and now - last < _REJUDGE_INTERVAL:
+        return None
+    marks = ",".join("?" for _ in _REJUDGE_KINDS)
+    rows = db.execute(
+        "SELECT id, kind, correlation_key FROM incidents WHERE status IN "
+        "('OPEN','ACK') AND kind IN (%s) AND severity<>'CRITICAL' AND "
+        "created_at<? ORDER BY id" % marks, _REJUDGE_KINDS + (now,)).fetchall()
+    rows = [r for r in rows if r["id"] > cursor] + \
+        [r for r in rows if r["id"] <= cursor]
+    memory = _suppression_memory(db, now)
+    memory = tuple(memory[:3]) + (False,) + tuple(memory[4:])
+    demote = _category_dismissal_weights(db, now)
+    memo, stats = {}, _reobserve_stats()
+    deadline = time.monotonic() + _REJUDGE_BUDGET
+    closed, examined = [], []
+    with _replay_overrides(_custody_remember=lambda *_a, **_k: False):
+        for row in rows:
+            if len(examined) >= _REJUDGE_MAX_INCIDENTS \
+                    or time.monotonic() > deadline:
+                break
+            examined.append(row["id"])
+            why = _rejudge_incident(db, row, memory, demote, memo, stats)
+            if why:
+                closed.append((row["id"], why))
+    for incident_id, why in closed:
+        db.execute(
+            "UPDATE incidents SET status='FALSE_POSITIVE',resolution=?,"
+            "updated_at=?,next_reminder_at=NULL WHERE id=? AND status IN "
+            "('OPEN','ACK')",
+            ("re-judged by current code (logic %s): %s — reopens on new "
+             "evidence" % (logic, why), now, incident_id))
+    left = len(rows) - len(examined)
+    resume = (examined[-1] if examined else cursor) if left else 0
+    for key, value in (("rejudge_logic", logic), ("rejudge_at", now),
+                       ("rejudge_cursor", resume)):
+        db.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) "
+                   "DO UPDATE SET value=excluded.value", (key, str(value)))
+    if rows:
+        log_run("re-judged %d open incident(s) with current code (logic %s), "
+                "closed %d%s" % (len(examined), logic, len(closed),
+                                 "; %d left for the next run" % left
+                                 if left else ""))
+    return len(closed)
+
+
 def _age_out_incidents(db, now, days=_AGE_OUT_DAYS):
     """Close OPEN incidents that stopped producing evidence, and say so.
 
@@ -7205,6 +7450,10 @@ def record_security_state(findings, sensor_health=(), now=None,
                     log_run("closed %d removed-file incident(s)" % removed)
             except Exception as e:
                 log_run("removed-file close skipped: %s" % e)
+            try:
+                _rejudge_open_incidents(db, now)
+            except Exception as e:
+                log_run("re-judge skipped: %s" % e)
             try:
                 global _LAST_AGED_OUT
                 aged = _age_out_incidents(db, now)
@@ -30827,6 +31076,19 @@ def _reobserve_grade(base, path, endpoints, parents, rotating, memo):
     return graded, rung
 
 
+def _reobserve_stats():
+    """The counters _reobserve keeps, zeroed. Besides the counts: {reason:
+    count} for findings replayed as recorded because the record cannot be
+    rebuilt, {((sev, rung), (sev, rung) or None): count} for what re-deriving
+    changed on a persistence finding, and {reason: count} for re-derived
+    findings the sensor would not emit, where it says why."""
+    stats = dict.fromkeys(("reobserved", "trust_changed", "custody_changed",
+                           "changed", "severity_changed", "no_longer_emitted",
+                           "gone"), 0)
+    stats.update(not_rederivable={}, persistence_changes={}, dropped_why={})
+    return stats
+
+
 def _reobserve(f, memo, stats):
     """(finding, as_recorded): `f` re-observed with the CURRENT classifier and
     custody ladder — None when today's sensor would not emit it — and None;
@@ -31031,14 +31293,7 @@ def _backtest_replay(days=30, reobserve=False, now=None):
     # reason that has nothing to do with the code being measured.
     memory = tuple(memory[:3]) + (False,) + tuple(memory[4:])
     batches, bad, by_scan_id = _replay_batches(rows)
-    stats = dict.fromkeys(("reobserved", "trust_changed", "custody_changed",
-                           "changed", "severity_changed", "no_longer_emitted",
-                           "gone"), 0)
-    # {reason: count} for findings replayed as recorded because the record
-    # cannot be rebuilt, {((sev, rung), (sev, rung) or None): count} for
-    # what re-deriving changed on a persistence finding, and {reason: count}
-    # for re-derived findings the sensor would not emit, where it says why.
-    stats.update(not_rederivable={}, persistence_changes={}, dropped_why={})
+    stats = _reobserve_stats()
     asked = sum(1 for _n, batch in batches for _i, f in batch
                 if f["category"] in _REOBSERVE_CATEGORIES)
     routes, route_of, scratch_of, folded_into, finding_of = {}, {}, {}, {}, {}
