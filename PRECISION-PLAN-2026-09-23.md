@@ -139,3 +139,39 @@ second, opens an incident against `self-protection`. The number the operator see
   and a full Developer ID chain today. S1 verifies with `codesign --verify` (no `--strict`) as the discriminator.
 - Spotify's `unsigned` run was the non-answer-as-verdict defect PR #52 fixed; no `unsigned` event since the 08:09
   restart today. S0's `--reobserve` will confirm rather than assume.
+
+## Results, 2026-09-24 (tip 4c36153)
+
+**Done-condition 1 was restated during the work, and why.** "0 judged-noise incidents re-alert on replay" mixed two things:
+incidents the current code still alerts on after re-deriving their evidence, and incidents whose evidence cannot be
+re-asked (subject gone from disk, recorded before a field existed, a clipped preview). The second group cannot reach 0 by
+any code change, so the target became the re-derived count, with the as-recorded count reported beside it.
+
+| replay, `--days 30 --reobserve` | main | 4c36153 |
+|---|---|---|
+| judged-noise incidents that would alert again | 135 of 213 | 53 of 213 |
+| — re-derived (the target) | not measurable | 3 |
+| — as recorded (cannot be re-asked) | not measurable | 50 |
+| interrupts | 138 | 52 |
+| open cases | 140 | 55 |
+| assay: routable lanes interrupting / predicate lanes passing | 9/9 · 11/11 | 9/9 · 11/11 |
+
+- **Done-condition 1:** 3 remain. #382 (Chrome app-shortcut loader, ad-hoc by design, never judged) and #432/#452 (the
+  operator's own RNAfold Deck build, newer bytes than the judged ones). Each needs one verdict, which now covers those
+  exact bytes anywhere. Not met to zero; the gap is named.
+- **Done-condition 2:** met. Recall is unchanged, and the directive detector gained a hostile pole of five multi-step
+  exfiltration probes after a first version silenced them.
+- **Done-condition 3:** full suite 2517 passed at 4c36153. The simbody win/mac diff against main runs in CI on the final PR.
+- **Done-condition 4:** partly met. A real scan of 4c36153 against a sandboxed copy of the live state closed 5 of 6 open
+  incidents by the mechanism that explains them and opened none. #526 stays, because its subject is gone. The 48-hour live
+  window starts at `install watch` after merge.
+- **Pass cap:** Phase 2/3 used 4 build-verify passes of the 6.
+
+**Found on the way, not in the plan:**
+- The test suite appended real rows to `~/.aegis/custody.jsonl`. A conftest guard now refuses and counts those writes. One
+  row a branch-only rung leaked was removed by hand (backup beside the file).
+- Two rows in that ledger, dated 2026-09-19, fail MAC verification under the real key. The live code already ignores them.
+  They were not removed, because they predate this work; the operator decides.
+- S5 and S7 together demoted a new LaunchAgent to INFO. Demotion now never goes below LOW.
+- `intent hook <tool>` exists, but only Claude Code calls it. Codex and Hermes edits never produce receipts, which is why
+  some agent-config changes still alert.
