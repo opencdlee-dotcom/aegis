@@ -98,6 +98,24 @@ def _no_real_repo_roots():
 
 
 @pytest.fixture(autouse=True)
+def _no_precision_snapshot_on_scan():
+    """Keep the daily precision snapshot off the scan path.
+
+    Every scan-level test starts from a fresh sandbox, so every one of them
+    would be "due" and run a full `backtest replay` -- assay lanes and all --
+    at the tail of its first scan: slower, and a second pipeline running
+    inside tests that are about something else. The tests that are about the
+    snapshot (tests/test_precision_snapshot.py) turn it back on. Restored by
+    VALUE, as _no_real_repo_roots is."""
+    original = aegis.PRECISION_SNAPSHOT_EVERY_SECS
+    aegis.PRECISION_SNAPSHOT_EVERY_SECS = 0
+    try:
+        yield
+    finally:
+        aegis.PRECISION_SNAPSHOT_EVERY_SECS = original
+
+
+@pytest.fixture(autouse=True)
 def _forbid_real_state_writes():
     """Refuse any durable write aimed at the developer's real ~/.aegis."""
     real_conn = aegis._event_connection
