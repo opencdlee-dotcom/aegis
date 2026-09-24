@@ -30313,10 +30313,32 @@ def _reobserve_agent_surface_answer(f, memo):
     subject = f.get("program") if kind in ("target", "materialized") else path
     if not subject:
         return "not", "the record names no item"
+    moved = False
+    if kind in ("target", "materialized"):
+        # The entry is asked of the sensor's own parser first: a record says
+        # what the parser of its day registered and resolved, and a parser
+        # fix changes both without touching the config.
+        if not _NEW_EXEC_ID_RE.search(head):
+            return "not", "the fingerprint names a positional exec key"
+        if not os.path.exists(path):
+            return "gone", None
+        rec = _reobserve_agent_config(memo, path)
+        if rec is None:
+            return "not", "the current parser could not read the config"
+        now = (rec.get("execs") or {}).get(head)
+        if not isinstance(now, dict):
+            return "dropped", "the current parser registers no such entry"
+        target = now.get("target")
+        if not target or os.path.realpath(target) != os.path.realpath(subject):
+            # The resolver names another file today: its bytes are what the
+            # sensor diffs and its custody what the sensor asks.
+            if not target or not now.get("target_sha"):
+                return "dropped", "the current resolver names no file to diff"
+            subject, moved = target, True
     sha = _reobserve_sha(memo, subject)
     if not sha:
         return "gone", None
-    if sha[:12] != sha12:
+    if not moved and sha[:12] != sha12:
         return "not", _REPLAY_MOVED_ON
     if kind in ("imperative", "newfile-imperative"):
         cur = {path: {"imperatives": head.split(","), "sha256": sha}}
@@ -30348,10 +30370,13 @@ def _reobserve_agent_surface_answer(f, memo):
                     for t in teams]
         runs = [({path: {"execs": {head: old}}}, {path: {"execs": {head: ent}}})
                 for old in olds]
+    # The record's own fingerprint, or — against a target the resolver has
+    # moved to — the one the sensor mints for that target's bytes.
+    want = "%s%s:%s" % (prefix, head, sha[:12])
     answers = {}
     for prior, cur in runs:
         hit = [g for g in diff_agent_surface(prior, cur)
-               if g["fingerprint"] == fp]
+               if g["fingerprint"] == want]
         if len(hit) != 1:
             return "not", "the rebuilt change does not reproduce the record"
         answers.setdefault((hit[0]["severity"], hit[0].get("provenance")),
@@ -30361,12 +30386,26 @@ def _reobserve_agent_surface_answer(f, memo):
     return "ok", next(iter(answers.values()))
 
 
+def _reobserve_agent_config(memo, path):
+    """The sensor's own record of the config at `path` as it reads now, or
+    None when it cannot read it: snapshot_agent_surface over that one file,
+    so the parse, the process-table refusal and the target resolver are the
+    ones a scan runs. Read once per path per replay."""
+    key = ("live", "agent-config", path)
+    if key not in memo:
+        with _replay_overrides(_agent_config_files=lambda: [path]):
+            memo[key] = snapshot_agent_surface().get(path)
+    return memo[key]
+
+
 def _reobserve_apply(f, answer, stats, rung, take=_REOBSERVE_GRADE):
     """(finding, as_recorded) for `f` as the answer re-derives it, counted the
     way _reobserve counts its own: the re-derived finding (None when the
     sensor would not emit it today) and None, or `f` as recorded and the
     reason it could not be re-derived. `rung` is the field the sensor carries
-    custody in; `take` is what a same-titled answer replaces."""
+    custody in; `take` is what a same-titled answer replaces. ("dropped",
+    why) is a re-derivation the sensor would not emit, with the reason it
+    says so, counted by that reason."""
     kind, got = answer
     if kind == "gone":
         stats["gone"] += 1
@@ -30375,6 +30414,11 @@ def _reobserve_apply(f, answer, stats, rung, take=_REOBSERVE_GRADE):
         reasons = stats["not_rederivable"]
         reasons[got] = reasons.get(got, 0) + 1
         return f, got
+    if kind == "dropped":
+        if got:
+            dropped = stats["dropped_why"]
+            dropped[got] = dropped.get(got, 0) + 1
+        got = None
     if got is None:
         g = None
     elif got["title"] == f["title"]:
@@ -30780,9 +30824,10 @@ def _backtest_replay(days=30, reobserve=False, now=None):
                            "changed", "severity_changed", "no_longer_emitted",
                            "gone"), 0)
     # {reason: count} for findings replayed as recorded because the record
-    # cannot be rebuilt, and {((sev, rung), (sev, rung) or None): count} for
-    # what re-deriving changed on a persistence finding.
-    stats.update(not_rederivable={}, persistence_changes={})
+    # cannot be rebuilt, {((sev, rung), (sev, rung) or None): count} for
+    # what re-deriving changed on a persistence finding, and {reason: count}
+    # for re-derived findings the sensor would not emit, where it says why.
+    stats.update(not_rederivable={}, persistence_changes={}, dropped_why={})
     asked = sum(1 for _n, batch in batches for _i, f in batch
                 if f["category"] in _REOBSERVE_CATEGORIES)
     routes, route_of, scratch_of, folded_into, finding_of = {}, {}, {}, {}, {}
@@ -31005,6 +31050,12 @@ def cmd_backtest_replay(days=30, reobserve=False, now=None):
                          % (sum(reasons.values()), " · ".join(
                              "%s %d" % (why, reasons[why]) for why in sorted(
                                  reasons, key=lambda k: (-reasons[k], k)))))
+        dropped = stats["dropped_why"]
+        if dropped:
+            lines.append("  no longer emitted, where the sensor says why — %s"
+                         % " · ".join("%s %d" % (why, dropped[why])
+                                      for why in sorted(dropped, key=lambda k: (
+                                          -dropped[k], k))))
     lines.append("")
     routes = r["routes"]
     columns = _REPLAY_ROUTES if stats is not None else _REPLAY_ROUTES[:-1]
