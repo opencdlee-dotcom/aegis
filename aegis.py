@@ -3004,7 +3004,8 @@ _EVENT_SCHEMA_SQL = """
             last_notified_at INTEGER,
             resolution TEXT,
             subject_json TEXT,
-            last_novel_at INTEGER
+            last_novel_at INTEGER,
+            digest_only TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_incidents_active
             ON incidents(status, next_reminder_at);
@@ -3064,7 +3065,7 @@ _EVENT_SCHEMA_SQL = """
 # Bumped ONLY when _EVENT_SCHEMA_SQL or the ALTER migrations below change.
 # Stamped into the store's own `PRAGMA user_version`, which is what stops the
 # schema being re-executed on every connection open (see _event_connection).
-_EVENT_SCHEMA_VERSION = 1
+_EVENT_SCHEMA_VERSION = 2
 
 # Two retention buckets, not one. `events` used to keep the newest 50,000 rows
 # full stop, and _record_health writes ONE row per sensor per scan (~45). At the
@@ -3161,6 +3162,10 @@ def _event_connection():
                 # new is eligible immediately, the correct verdict on it.
                 db.execute("UPDATE incidents SET last_novel_at=created_at "
                            "WHERE last_novel_at IS NULL")
+            if "digest_only" not in cols:
+                # NULL for every existing row: an incident opened before the
+                # mark existed keeps the reminders it was promised.
+                db.execute("ALTER TABLE incidents ADD COLUMN digest_only TEXT")
             db.execute("PRAGMA user_version=%d" % _EVENT_SCHEMA_VERSION)
             db.commit()
     except sqlite3.DatabaseError as e:
@@ -3495,8 +3500,21 @@ def _mark_novelty(db, incident_id, event_ids, now):
 
 
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
-                     initially_notified=False, subject=None):
+                     initially_notified=False, subject=None, route=None):
+    """Open or update the incident for `key`; returns its id.
+
+    `route` is the routing verdict (route_findings) for the evidence being
+    attached, when the caller has one. It carries the one reminder rule: an
+    incident OPENED by evidence the gate sent to the digest -- the provenance
+    gate, low confidence, anything below the interrupt tier -- records why in
+    `digest_only`, is never claimed by a reminder, and so is never turned into
+    a notification later by the clock. Evidence that would itself interrupt
+    clears the mark when it attaches, and the incident becomes an ordinary
+    notified one from that moment. Callers without a routing (the correlation
+    and risk tiers, legacy callers) pass None and keep the old behaviour."""
     subject_json = json.dumps(subject, sort_keys=True) if subject else None
+    routed = (route or {}).get("route")
+    digest_why = (route or {}).get("why") if routed == ROUTE_DIGEST else None
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     row = db.execute(
         "SELECT * FROM incidents WHERE correlation_key=? AND status IN (%s) "
@@ -3514,6 +3532,13 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                    "updated_at=?, subject_json=COALESCE(subject_json,?) "
                    "WHERE id=?",
                    (new_sev, new_status, now, now, subject_json, incident_id))
+        if row["digest_only"] and routed == ROUTE_INTERRUPT:
+            # The one way out: this evidence interrupted on its own merits,
+            # so the operator has just been told, and the case is an ordinary
+            # notified incident from here on.
+            db.execute("UPDATE incidents SET digest_only=NULL, "
+                       "last_notified_at=?, next_reminder_at=? WHERE id=?",
+                       (now, now + _REMINDER_DELAYS[0], incident_id))
         _mark_novelty(db, incident_id, event_ids, now)
     else:
         # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
@@ -3550,10 +3575,11 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                 "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
                 "created_at,first_seen,last_seen,updated_at,reminder_count,"
                 "next_reminder_at,last_notified_at,subject_json,"
-                "last_novel_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "last_novel_at,digest_only) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-                 now + _REMINDER_DELAYS[0], last_notified, subject_json, now))
+                 None if digest_why else now + _REMINDER_DELAYS[0],
+                 last_notified, subject_json, now, digest_why))
             incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
@@ -5426,7 +5452,8 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         incident_id = _upsert_incident(
             db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
             f["title"], f["severity"], "signal", now, [event_id],
-            notified or bool(decision), subject=f.get("subject"))
+            notified or bool(decision), subject=f.get("subject"),
+            route=verdict)
         if decision == "allowlisted":
             _close_allowlisted(db, incident_id, now)
         elif decision == "tolerated":
@@ -6943,6 +6970,10 @@ def claim_due_incident_reminders(now=None):
             rows = db.execute(
                 "SELECT * FROM incidents WHERE status IN (%s) AND "
                 "next_reminder_at IS NOT NULL AND next_reminder_at<=? "
+                # The reminder rule's enforcement point: a digest-only
+                # incident is never claimed, whoever armed its timer (a
+                # hand `reopen` does) -- see _upsert_incident.
+                "AND digest_only IS NULL "
                 "ORDER BY severity DESC,next_reminder_at" % marks,
                 _ACTIVE_INCIDENT_STATES + (now,)).fetchall()
             for row in rows:
@@ -9707,7 +9738,13 @@ def _check_hot_app(path, st, cutoff):
     # "Verify you built/trust it" is a question custody can often answer
     # outright: an app this machine built, or a copy of one, is the ordinary
     # reading of signed-but-un-notarized on a developer's Mac.
-    graded, rung, rung_note = _grade_binary("MEDIUM", exe, sha=sha)
+    #
+    # Gatekeeper just refused this bundle, and Gatekeeper's notarization check
+    # is the control the publisher rung leans on: the platform said no, so the
+    # signature earns nothing here (publisher_ok=False). The same bytes, once
+    # notarized, earn it from every other sensor.
+    graded, rung, rung_note = _grade_binary("MEDIUM", exe, sha=sha,
+                                            publisher_ok=False)
     return [finding(
         graded, "hot-dir", "Un-notarized app in watched folder",
         "%s [%s] is signed but NOT notarized (Gatekeeper: %s%s), modified %s — "
@@ -16733,6 +16770,17 @@ def _package_receipt(path):
     return None
 
 
+# The OS vendor's own platform signature, per body. Its origin claim is only
+# as good as WHERE the bytes run: inside the platform's protected install tree
+# (TRUSTED_PREFIXES -- the sealed system volume on macOS; SystemRoot and the
+# admin-only Program Files trees on Windows) it is the OS; a copy of the same
+# signed bytes in /tmp, $HOME or %TEMP% is the living-off-the-land shape, and
+# the signature says nothing about who put them there. A third-party vendor's
+# signature (developer-id, app-store, signed-valid) names that vendor wherever
+# it runs; Linux's os-managed is already a claim about the package's own path.
+_PLATFORM_SIGNATURES = ("apple", "os-signed")
+
+
 def _publisher_signer(path):
     """The signature verdict for `path` when a publisher the platform trusts
     vouches for these bytes AND names itself, else None.
@@ -16751,7 +16799,11 @@ def _publisher_signer(path):
 
     A probe that already failed this scan on these exact bytes is not asked
     again: the answer would be the same non-answer, bought with a second
-    codesign run (or a second cold PowerShell on Windows)."""
+    codesign run (or a second cold PowerShell on Windows).
+
+    A platform signature (_PLATFORM_SIGNATURES) earns the rung only inside
+    the system tree, judged on the resolved path so a symlink or a `..`
+    cannot walk a copy in."""
     if not path:
         return None
     failed_on = _SIG_UNANSWERED.get(path)
@@ -16761,10 +16813,13 @@ def _publisher_signer(path):
         sig = classify_signature(path)
     except Exception:
         return None
-    if publisher_sig(sig.get("trust")) and (sig.get("team")
-                                            or sig.get("authority")):
-        return sig
-    return None
+    if not (publisher_sig(sig.get("trust"))
+            and (sig.get("team") or sig.get("authority"))):
+        return None
+    if sig.get("trust") in _PLATFORM_SIGNATURES and \
+            not _is_trusted_prefix(os.path.realpath(path)):
+        return None
+    return sig
 
 
 def _publisher_line(sig):
@@ -16796,7 +16851,7 @@ def _publisher_line(sig):
 
 
 def _grade_binary(severity, path, attack_defined=False, endpoint=None,
-                  sha=None, parents=None):
+                  sha=None, parents=None, publisher_ok=True):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
 
     process / net-listener / net-outbound / net-beacon all raise on the same
@@ -16820,6 +16875,12 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     the caller has one (check_processes, and only on a host with a vouch). It
     is the only input here that is not about the file: the `supervised` rung
     asks who STARTED it, which no path, receipt or repo can answer.
+
+    `publisher_ok=False` is a caller saying the platform's own control has
+    already refused these bytes -- the hot-dir sensor after Gatekeeper
+    rejected the bundle. The publisher rung leans on exactly that control
+    (notarization and revocation), so it is not asked; the rest of the ladder
+    is.
     """
     if attack_defined:
         return severity, None, None
@@ -16835,7 +16896,8 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
         # A publisher the platform itself trusts, on FIRST sight. Asked only
         # when neither stronger rung answered, so a vouched or receipted
         # binary never costs a signature lookup here.
-        rung, signer = None, _publisher_signer(path)
+        rung, signer = None, (_publisher_signer(path) if publisher_ok
+                              else None)
     if rung or signer:
         rung = rung or "publisher-signed"
     # Last, and weakest: a generated artifact of a repo this machine commits
@@ -16872,8 +16934,11 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
                 _custody_carry_note(carried))
     # A rung earned HERE is what a later copy elsewhere will inherit. Recorded
     # after the grading decision, never before it, so the ledger only ever
-    # holds rungs that were actually awarded.
-    _custody_remember(sha or _graded_sha(path), rung, path)
+    # holds rungs that were actually awarded. Except a platform signature: it
+    # earned the rung only BECAUSE of where it runs, so a copy of those bytes
+    # elsewhere must not inherit even `copy-of-graded` from it.
+    if not (signer and signer.get("trust") in _PLATFORM_SIGNATURES):
+        _custody_remember(sha or _graded_sha(path), rung, path)
     note = _PROVENANCE_NOTE.get(rung)
     if signer:
         note = "%s %s" % (_publisher_line(signer), note)
@@ -22363,6 +22428,10 @@ def cmd_incident(incident_id, action=None, reason=None):
               item["correlation_key"],
               datetime.fromtimestamp(item["created_at"]).isoformat(),
               datetime.fromtimestamp(item["updated_at"]).isoformat()))
+    if item.get("digest_only"):
+        print("  routed:   digest only (%s) — no reminders; it notifies only "
+              "if evidence that would itself interrupt attaches"
+              % item["digest_only"])
     # The honest statement of a standing fact: one line with a count, not one
     # evidence row per scan (still-true re-observations fold into the count).
     if (item.get("occurrences") or 0) > 1:

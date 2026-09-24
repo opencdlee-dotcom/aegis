@@ -163,7 +163,12 @@ Allowed states are `OPEN`, `ACK`, `INVESTIGATING`, `CONTAINED`, `RECOVERING`,
 `MONITORING`, `RESOLVED`, and `FALSE_POSITIVE`. Transitions are validated so a
 closed incident cannot silently return to containment. An unresolved incident
 gets at most three reminders (about +1 hour, +24 hours, and +72 hours); afterward
-the durable open state is the reminder. A reviewed `FALSE_POSITIVE` suppresses
+the durable open state is the reminder. An incident opened only by evidence the
+routing gate sent to the digest (the provenance gate, low confidence, below the
+floor) records why in `digest_only` and gets none: no reminder ever turns it
+into a notification. It stays open, counted and listed, and becomes an ordinary
+notified incident only when evidence that would itself interrupt attaches. A
+reviewed `FALSE_POSITIVE` suppresses
 only the exact correlation key while retaining later occurrences as evidence;
 a changed content hash gets a new key (unless *acquired tolerance*, below, has
 earned the right to pre-close it). A `RESOLVED` threat that recurs opens a
@@ -374,7 +379,13 @@ quiet rather than silence.
    the verdict names a team or authority; the note names that signer and the
    control behind it (Apple's notarization and revocation on macOS). Ad-hoc,
    broken, unsigned and `signed-other` earn nothing. It reads the stat-cached
-   verdict the sensor already asked for, so it costs no second probe.
+   verdict the sensor already asked for, so it costs no second probe. Two
+   limits. The OS vendor's own signature (`apple`, Windows `os-signed`) earns
+   it only inside `TRUSTED_PREFIXES`, on the resolved path, and is never
+   carried to a copy: the same signed bytes in `/tmp`, `$HOME` or `%TEMP%` are
+   the living-off-the-land shape. And a caller whose evidence says the
+   platform's control refused the bytes withholds it (`publisher_ok=False`):
+   the hot-dir sensor after Gatekeeper rejects a bundle.
 
 Guards, because grading is where an attacker would want to stand:
 
@@ -550,10 +561,13 @@ above. An allowlisted fingerprint still opened and refreshed incidents and
 drove reminders, because `emit` skipped it while every finding flowed into
 the incident tier untouched. And one genuine new HIGH marked every incident
 created that scan as already-notified, so a digest-routed sibling lost the
-reminder that was its only path to a human.
+reminder that was its only path to a human. (That reminder was itself removed
+on 2026-09-23: a digest-only incident is never reminded — see Incident
+workflow. The per-finding "notified" mark stands.)
 
 `route_findings` is the one place the order is written down: allowlisted →
-seen → adopted → low-confidence → below-floor → tolerated/learning → new.
+seen → adopted → low-confidence → provenance → below-floor →
+tolerated/learning → new.
 The scan path computes it once with the incident tier's memory and hands the
 same verdicts to `emit`, to `record_security_state` (which now marks
 "notified" per finding and closes an allowlisted incident as `allowlisted`,

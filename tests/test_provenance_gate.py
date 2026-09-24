@@ -25,17 +25,17 @@ broken, unsigned or unanchored signature earns nothing.
 import contextlib
 import io
 import os
+import shutil
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from conftest import (PUBLISHER_TRUST, SUSPICIOUS_TRUST,      # noqa: E402
-                      aegis)
+from conftest import SUSPICIOUS_TRUST, aegis                  # noqa: E402
 from test_codesign_detritus import (CLEAN_VERIFY, DEV_ID_DV,   # noqa: E402
                                     TIMED_OUT)
 from test_regression import Sandbox                           # noqa: E402
-from test_routing_gate import GateSandbox                     # noqa: E402
+from test_routing_gate import NOW, GateSandbox                # noqa: E402
 
 # Gated on BOTH, as test_signature_corpus is: CI runs a Linux leg with
 # aegis.IS_MAC forced on, and that leg has no codesign to be right about.
@@ -48,11 +48,32 @@ SKY = "/Users/op/.codex/computer-use/SkyComputerUseService"
 PUBLISHER_NAME = "Example Publisher Ltd"
 
 
+def _vendor_trust():
+    """A publisher verdict in THIS body's vocabulary that belongs to a
+    third-party vendor, and so is valid wherever the binary runs: Developer
+    ID on macOS, a non-Microsoft Authenticode chain on Windows, a distro
+    package on Linux (whose claim is already about the package's own path).
+    Not conftest.PUBLISHER_TRUST: that is `apple` / `os-signed`, the
+    platform's own signature, which earns the rung only in the system tree."""
+    if aegis.IS_LINUX:
+        return "os-managed"
+    if aegis.IS_WIN:
+        return "signed-valid"
+    return "developer-id"
+
+
+def _platform_trust():
+    """The verdict that means "the OS vendor's own platform binary", or None
+    on a body that has no such spelling."""
+    if aegis.IS_LINUX:
+        return None
+    return "os-signed" if aegis.IS_WIN else "apple"
+
+
 def _publisher_verdict():
-    """A classify_signature() answer publisher_sig() accepts on THIS body
-    (conftest.PUBLISHER_TRUST), naming its signer. The Developer ID shape is
-    macOS vocabulary and lives in DeveloperIdRung, which is gated."""
-    return {"trust": PUBLISHER_TRUST, "team": None,
+    """A classify_signature() answer publisher_sig() accepts on THIS body at
+    any location, naming its signer."""
+    return {"trust": _vendor_trust(), "team": None,
             "authority": PUBLISHER_NAME}
 
 
@@ -171,9 +192,13 @@ class _RungSandbox(Sandbox):
 
     def setUp(self):
         super().setUp()
+        # setdefault, never assignment: on a Windows body Sandbox has already
+        # pinned classify_signature and saved the REAL one; overwriting that
+        # entry would "restore" Sandbox's stub at tearDown and leak it into
+        # every later test (found by the simbody win leg on PR #60).
         for name in ("classify_signature", "_vouch_covers", "_package_receipt",
                      "_build_output_rung", "run"):
-            self._saved[name] = getattr(aegis, name)
+            self._saved.setdefault(name, getattr(aegis, name))
         aegis._CUSTODY_CARRY_CACHE.clear()
         aegis._GRADED_SHA_CACHE.clear()
         aegis._SIG_UNANSWERED.clear()
@@ -225,7 +250,7 @@ class PublisherRung(_RungSandbox):
                 self.assertEqual(("HIGH", None), (sev, rung))
 
     def test_a_publisher_verdict_that_names_no_signer_earns_nothing(self):
-        self.verdict(trust=PUBLISHER_TRUST, team=None, authority=None)
+        self.verdict(trust=_vendor_trust(), team=None, authority=None)
         self.assertEqual(("HIGH", None),
                          aegis._grade_binary("HIGH", self.bin)[:2])
 
@@ -253,6 +278,25 @@ class PublisherRung(_RungSandbox):
         self.assertEqual("build-output",
                          aegis._grade_binary("HIGH", self.bin)[1])
 
+    def test_the_platforms_no_withholds_the_rung(self):
+        """A caller whose own evidence says the platform's control refused
+        these bytes (the hot-dir sensor, after Gatekeeper rejected the
+        bundle) withholds the rung, and the classifier is not even asked."""
+        self.verdict(**_publisher_verdict())
+        self.assertEqual(("HIGH", None),
+                         aegis._grade_binary("HIGH", self.bin,
+                                             publisher_ok=False)[:2])
+        self.assertEqual([], self.asked)
+
+    def test_a_vendor_signature_under_home_earns_the_rung(self):
+        """The corpus shape: Codex's helper under ~/.codex, Developer ID."""
+        aegis._build_output_rung = lambda path: None
+        home_bin = os.path.join(aegis.HOME, ".codex", "computer-use",
+                                "SkyComputerUseService")
+        self.verdict(**_publisher_verdict())
+        self.assertEqual(("MEDIUM", "publisher-signed"),
+                         aegis._grade_binary("HIGH", home_bin)[:2])
+
     def test_attack_defined_evidence_earns_nothing(self):
         self.verdict(**_publisher_verdict())
         self.assertEqual(("HIGH", None, None),
@@ -267,6 +311,58 @@ class PublisherRung(_RungSandbox):
         self.assertEqual("HIGH", aegis._demote("CRITICAL", "publisher-signed"))
         self.assertEqual(0.25, aegis._RISK_CUSTODY_WEIGHT["publisher-signed"])
         self.assertTrue(aegis._PROVENANCE_NOTE.get("publisher-signed"))
+
+
+@unittest.skipIf(_platform_trust() is None,
+                 "no platform-binary signature on this body")
+class PlatformSignatureStaysInTheSystemTree(_RungSandbox):
+    """`apple` / `os-signed` is the OS vendor's own binary. Where it runs
+    from the sealed system tree its origin is proven; a copy of it anywhere
+    else -- /tmp, $HOME, /Users/Shared, %TEMP% -- is the living-off-the-land
+    shape, and the signature on the bytes says nothing about who put them
+    there."""
+
+    def setUp(self):
+        super().setUp()
+        aegis._build_output_rung = lambda path: None
+        # Built from the tree itself rather than a known binary: on a
+        # simulated body WIN_SYSTEMROOT is empty and the prefixes are the
+        # host's, and the rule under test is "inside TRUSTED_PREFIXES".
+        self.system_bin = os.path.join(aegis.TRUSTED_PREFIXES[0],
+                                       "aegis-platform-probe")
+        self.remembered = []
+        self._saved.setdefault("_custody_remember", aegis._custody_remember)
+        aegis._custody_remember = (
+            lambda sha, rung, path: self.remembered.append((rung, path)))
+
+    def platform(self):
+        self.verdict(trust=_platform_trust(), team=None,
+                     authority="Software Signing")
+
+    def test_inside_the_system_tree_it_earns_the_rung(self):
+        self.platform()
+        self.assertEqual(("MEDIUM", "publisher-signed"),
+                         aegis._grade_binary("HIGH", self.system_bin)[:2])
+
+    def test_a_copy_outside_the_system_tree_earns_nothing(self):
+        self.platform()
+        for path in (self.bin, os.path.join(aegis.HOME, "Library", "nc")):
+            with self.subTest(path=path):
+                self.assertEqual(("HIGH", None),
+                                 aegis._grade_binary("HIGH", path)[:2])
+
+    def test_the_system_tree_rung_is_not_carried_to_a_copy(self):
+        """Carried custody would otherwise hand a copy `copy-of-graded` on
+        the strength of the original's location, so the rung is not written
+        to the ledger. A vendor's signature, which is not about location,
+        still is."""
+        self.platform()
+        self.assertEqual("publisher-signed",
+                         aegis._grade_binary("HIGH", self.system_bin)[1])
+        self.assertEqual([], self.remembered)
+        self.verdict(**_publisher_verdict())
+        aegis._grade_binary("HIGH", self.bin, sha="f" * 64)
+        self.assertEqual([("publisher-signed", self.bin)], self.remembered)
 
 
 class DeveloperIdRung(_RungSandbox):
@@ -367,6 +463,21 @@ class LivePublisherRung(Sandbox):
         aegis._GRADED_SHA_CACHE.clear()
         super().tearDown()
 
+    def test_a_copied_platform_binary_earns_nothing(self):
+        """The real tool, both halves: /bin/ls in place is Apple's and earns
+        the rung; the same bytes copied into a user-writable temp dir keep
+        Apple's signature and earn nothing -- not even `copy-of-graded`."""
+        self.assertEqual(("LOW", "publisher-signed"),
+                         aegis._grade_binary("MEDIUM", "/bin/ls")[:2])
+        copy = os.path.join(self.tmp, "ls")
+        shutil.copyfile("/bin/ls", copy)
+        os.chmod(copy, 0o755)
+        self.assertEqual("apple", aegis.classify_signature(copy)["trust"],
+                         "fixture: the copy should still verify as Apple's")
+        self.assertTrue(aegis.is_risky_location(copy), copy)
+        self.assertEqual(("HIGH", None),
+                         aegis._grade_binary("HIGH", copy)[:2])
+
     def test_spotify_grades_publisher_signed(self):
         if not os.path.exists(SPOTIFY):
             self.skipTest("Spotify is not installed here")
@@ -375,6 +486,125 @@ class LivePublisherRung(Sandbox):
         team = aegis.classify_signature(SPOTIFY)["team"]
         self.assertTrue(team)
         self.assertIn("Developer ID team %s" % team, note)
+
+
+class DigestOnlyIncidentsAreNeverEscalated(GateSandbox):
+    """An incident opened only by digest-routed evidence -- the provenance
+    gate, low confidence, anything below the interrupt tier -- is recorded
+    as such, and no reminder ever turns it into a notification. It notifies
+    only when evidence that would itself interrupt attaches to it."""
+
+    def case(self, f):
+        rows = [i for i in self.incidents()
+                if i["correlation_key"] == "signal:" + f["case_fingerprint"]]
+        self.assertEqual(1, len(rows), rows)
+        return rows[0]
+
+    def assert_never_reminded(self):
+        for days in (0.05, 1, 3, 30):
+            self.assertEqual(
+                [], aegis.claim_due_incident_reminders(
+                    now=NOW + int(days * 86400)), days)
+
+    def test_a_provenance_digest_incident_is_never_reminded(self):
+        f = self.process(SKY, "c" * 64, custody="publisher-signed")
+        _routing, new_high = self.scan_path([f])
+        self.assertEqual([], new_high)
+        inc = self.case(f)
+        self.assertEqual("provenance:publisher-signed", inc["digest_only"])
+        self.assertIsNone(inc["next_reminder_at"])
+        self.assertIsNone(inc["last_notified_at"])
+        self.assert_never_reminded()
+        self.assertEqual([], self.notified)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            aegis.cmd_incident(inc["id"])
+        self.assertIn("digest only (provenance:publisher-signed)",
+                      out.getvalue())
+
+    def test_a_low_confidence_digest_incident_is_never_reminded(self):
+        f = self.process(SKY, "e" * 64, confidence="low")
+        _routing, new_high = self.scan_path([f])
+        self.assertEqual([], new_high)
+        self.assertEqual("low-confidence", self.case(f)["digest_only"])
+        self.assert_never_reminded()
+        self.assertEqual([], self.notified)
+
+    def test_a_reopen_by_hand_does_not_arm_reminders(self):
+        f = self.process(SKY, "c" * 64, custody="publisher-signed")
+        self.scan_path([f])
+        inc = self.case(f)
+        self.assertTrue(aegis.transition_incident(inc["id"], "ACK", now=NOW))
+        self.assertTrue(aegis.transition_incident(inc["id"], "RESOLVED",
+                                                  now=NOW))
+        self.assertTrue(aegis.transition_incident(inc["id"], "OPEN", now=NOW))
+        self.assert_never_reminded()
+
+    def test_a_seen_reobservation_does_not_escalate(self):
+        f = self.process(SKY, "c" * 64, custody="publisher-signed")
+        self.scan_path([f])
+        self.scan_path([dict(f)])
+        self.assertEqual("provenance:publisher-signed",
+                         self.case(f)["digest_only"])
+        self.assert_never_reminded()
+
+    def test_an_interrupting_finding_escalates_it(self):
+        quiet = self.process(SKY, "c" * 64, custody="publisher-signed")
+        self.scan_path([quiet])
+        loud = self.process(SKY, "d" * 64)     # same case, no custody
+        routing, new_high = self.scan_path([loud])
+        self.assertEqual("interrupt", routing[loud["fingerprint"]]["route"])
+        self.assertEqual(1, len(new_high))
+        inc = self.case(loud)
+        self.assertIsNone(inc["digest_only"])
+        self.assertEqual(NOW, inc["last_notified_at"])
+        self.assertEqual(NOW + aegis._REMINDER_DELAYS[0],
+                         inc["next_reminder_at"])
+        due = aegis.claim_due_incident_reminders(
+            now=NOW + aegis._REMINDER_DELAYS[0])
+        self.assertEqual([inc["id"]], [d["id"] for d in due])
+
+    def test_an_interrupt_opened_incident_still_reminds(self):
+        f = self.process(SKY, "f" * 64)
+        self.scan_path([f])
+        inc = self.case(f)
+        self.assertIsNone(inc["digest_only"])
+        self.assertEqual(NOW + aegis._REMINDER_DELAYS[0],
+                         inc["next_reminder_at"])
+        due = aegis.claim_due_incident_reminders(
+            now=NOW + aegis._REMINDER_DELAYS[0])
+        self.assertEqual([inc["id"]], [d["id"] for d in due])
+
+    def test_digest_evidence_does_not_mute_a_notified_incident(self):
+        loud = self.process(SKY, "d" * 64)
+        self.scan_path([loud])
+        quiet = self.process(SKY, "c" * 64, custody="publisher-signed")
+        self.scan_path([quiet])
+        inc = self.case(loud)
+        self.assertIsNone(inc["digest_only"])
+        self.assertEqual(NOW + aegis._REMINDER_DELAYS[0],
+                         inc["next_reminder_at"])
+
+    def test_a_store_that_predates_the_mark_gains_it(self):
+        aegis.EVENT_DB = os.path.join(self.tmp, "old.db")
+        import sqlite3
+        raw = sqlite3.connect(aegis.EVENT_DB)
+        raw.executescript(
+            "CREATE TABLE incidents (id INTEGER PRIMARY KEY, kind TEXT, "
+            "correlation_key TEXT, title TEXT, severity TEXT, status TEXT, "
+            "created_at INTEGER, first_seen INTEGER, last_seen INTEGER, "
+            "updated_at INTEGER, reminder_count INTEGER DEFAULT 0, "
+            "next_reminder_at INTEGER, last_notified_at INTEGER, "
+            "resolution TEXT, subject_json TEXT, last_novel_at INTEGER);"
+            "PRAGMA user_version=1;")
+        raw.commit()
+        raw.close()
+        db = aegis._event_connection()
+        try:
+            cols = {r[1] for r in db.execute("PRAGMA table_info(incidents)")}
+        finally:
+            db.close()
+        self.assertIn("digest_only", cols)
 
 
 if __name__ == "__main__":

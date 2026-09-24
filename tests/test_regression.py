@@ -328,6 +328,14 @@ class Sandbox(unittest.TestCase):
                 "trust": "unsigned", "team": None, "authority": None}
 
         self.notifications = []
+        # The ledger FILE is sandboxed above; its in-process memos are not a
+        # path, so they are cleared here and again at tearDown. Without this a
+        # rung one test awarded to a clang-built fixture was served, from the
+        # memo, to every later test whose fixture had the same bytes -- on
+        # Linux clang output is deterministic, so that was all of them.
+        aegis._CUSTODY_CARRY_CACHE.clear()
+        aegis._GRADED_SHA_CACHE.clear()
+        aegis._SIG_UNANSWERED.clear()
         self._saved["notify"] = aegis.notify
         aegis.notify = lambda title, msg: self.notifications.append((title, msg))
         # check_processes()/check_behavior() read the live process table,
@@ -346,6 +354,9 @@ class Sandbox(unittest.TestCase):
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(aegis, k, v)
+        aegis._CUSTODY_CARRY_CACHE.clear()
+        aegis._GRADED_SHA_CACHE.clear()
+        aegis._SIG_UNANSWERED.clear()
 
         for root, dirs, files in os.walk(self.tmp, topdown=True):
             os.chmod(root, 0o700)
@@ -2351,17 +2362,35 @@ class TestHotDirAppBundle(Sandbox):
             aegis.classify_signature = saved_cs
             aegis.gatekeeper_verdict = saved_gk
         self.assertEqual(len(fs), 1, fs)
-        # MEDIUM until 2026-09-23. The Developer ID signature is now the
-        # publisher custody rung, one step down and routed to the digest; the
-        # Gatekeeper verdict and the notary fingerprint are unchanged.
-        self.assertEqual(fs[0]["severity"], "LOW")
-        self.assertEqual(fs[0]["provenance"], "publisher-signed")
-        self.assertIn("Developer ID team T (X)", fs[0]["detail"])
+        self.assertEqual(fs[0]["severity"], "MEDIUM")
         self.assertEqual(fs[0]["gatekeeper"], "rejected")
         self.assertTrue(fs[0]["fingerprint"].startswith("hotdir:notary:"))
+        # The publisher rung leans on Apple's notarization, and Gatekeeper
+        # just refused this bundle: the control said no, so no rung and no
+        # provenance gate -- the finding routes on its severity alone.
+        self.assertIsNone(fs[0]["provenance"])
         route = aegis.route_findings(fs, seen={})[fs[0]["fingerprint"]]
-        self.assertEqual(("digest", "provenance:publisher-signed"),
-                         (route["route"], route["why"]))
+        self.assertEqual("below-floor", route["why"])
+
+    def test_a_notarized_devid_app_is_silent_and_its_binary_earns_the_rung(self):
+        """The same folder, the other answer: Gatekeeper accepts it, the
+        hot-dir sensor says nothing, and when the process or beacon sensor
+        grades its executable the Developer ID signature is a rung."""
+        app, exe = self._mk_app("Signed.app")
+        saved_cs, saved_gk = aegis.classify_signature, aegis.gatekeeper_verdict
+        aegis.classify_signature = lambda p: {
+            "trust": "developer-id", "team": "T",
+            "authority": "Developer ID Application: X (T)"}
+        aegis.gatekeeper_verdict = lambda p: ("accepted",
+                                              "Notarized Developer ID")
+        try:
+            fs = [f for f in aegis.check_hot_dirs() if f.get("path") == app]
+            graded = aegis._grade_binary("HIGH", exe)
+        finally:
+            aegis.classify_signature = saved_cs
+            aegis.gatekeeper_verdict = saved_gk
+        self.assertEqual(fs, [])
+        self.assertEqual(("MEDIUM", "publisher-signed"), graded[:2])
 
     def test_notarized_app_is_silent(self):
         app, _exe = self._mk_app("Fine.app")
