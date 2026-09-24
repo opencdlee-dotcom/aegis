@@ -135,7 +135,9 @@ CUSTODY_DEBT = {
     ("check_browser_automation", "session-theft"): 3,
     ("check_clipboard", "clipboard"): 1,
     ("check_cron", "persistence"): 2,
-    ("check_persistence", "persistence"): 2,
+    # 1: the NEW finding is graded by what it executes since 2026-09-23;
+    # the remaining site is "Persistence item removed".
+    ("check_persistence", "persistence"): 1,
     ("check_processes", "process"): 1,
     ("check_shell_history", "shell-history"): 1,
     ("check_staging", "staging"): 1,

