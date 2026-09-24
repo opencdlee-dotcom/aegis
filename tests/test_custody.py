@@ -288,6 +288,60 @@ class IntentLedger(CustodySandbox):
             sys.stdin = saved
         self.assertTrue(aegis._intent_attested(p, aegis.sha256(p)))
 
+    def _hook(self, payload, tool):
+        import io
+        saved = sys.stdin
+        try:
+            sys.stdin = io.StringIO(json.dumps(payload))
+            return aegis.cmd_intent(["aegis.py", "intent", "hook", tool])
+        finally:
+            sys.stdin = saved
+
+    def test_hook_mode_attests_every_file_a_v4a_patch_writes(self):
+        """Codex's apply_patch and Hermes's patch(mode=patch) carry no
+        file_path: the paths live inside the patch text, relative to the
+        payload's cwd. Until 2026-09-24 neither agent's edits produced one
+        intent record, so their agent-config writes graded as unexplained."""
+        root = os.path.join(self.tmp, "agentroot")
+        upd = os.path.join(root, "config.toml")
+        add = os.path.join(root, "AGENTS.md")
+        moved = os.path.join(root, "hooks.json")
+        for p, body in ((upd, "[x]\n"), (add, "# a\n"), (moved, "{}")):
+            with open(p, "w") as f:
+                f.write(body)
+        patch = ("*** Begin Patch\n"
+                 "*** Update File: config.toml\n@@\n-[y]\n+[x]\n"
+                 "***Add File: %s\n+# a\n"
+                 "*** Update File: hooks.old.json\n*** Move to: hooks.json\n"
+                 "*** Delete File: old.json\n"
+                 "*** End Patch" % add)
+        # Codex: patch text as a tool_input value, relative to cwd.
+        self.assertEqual(self._hook({"tool_name": "apply_patch", "cwd": root,
+                                     "tool_input": {"command": patch}},
+                                    "codex"), 0)
+        for p in (upd, add, moved):
+            self.assertTrue(aegis._intent_attested(p, aegis.sha256(p)), p)
+        # Delete File has no content to attest; the source of a move is gone.
+        self.assertEqual(aegis._v4a_patch_paths(patch, root),
+                         [upd, add, moved])
+        # Codex freeform: tool_input may be the bare patch string.
+        with open(upd, "w") as f:
+            f.write("[z]\n")
+        self._hook({"tool_name": "apply_patch", "cwd": root,
+                    "tool_input": patch}, "codex")
+        self.assertTrue(aegis._intent_attested(upd, aegis.sha256(upd)))
+        # Hermes: patch mode carries the text under "patch".
+        with open(add, "w") as f:
+            f.write("# b\n")
+        self._hook({"tool_name": "patch", "tool_input":
+                    {"mode": "patch", "patch": patch}}, "hermes")
+        self.assertTrue(aegis._intent_attested(add, aegis.sha256(add)))
+
+    def test_v4a_paths_ignores_prose_that_merely_mentions_a_marker(self):
+        self.assertEqual(aegis._v4a_patch_paths(
+            "see *** Update File: x in the docs", "/r"), [])
+        self.assertEqual(aegis._v4a_patch_paths(12, "/r"), [])
+
     def test_oversized_ledger_prunes_but_keeps_fresh_records(self):
         p = os.path.join(self.tmp, "agentroot", "settings.json")
         with open(p, "w") as f:
