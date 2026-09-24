@@ -244,7 +244,9 @@ this arrive through something the operator set up?*
 
 1. **Signed intent ledger** (`~/.aegis/intent.jsonl`). The agent harness calls
    `aegis.py intent hook <tool>` after each file-writing tool call; Aegis
-   appends one HMAC'd `{ts, path, sha256, tool}` record. A change whose content
+   appends one HMAC'd `{ts, path, sha256, tool}` record per written file — the
+   payload's `file_path`/`path`, or every Add/Update/Move-to target of a V4A
+   patch (Codex `apply_patch`, Hermes `patch`). A change whose content
    hash matches a valid record is `self-attested` → **LOW**. This covers what
    git cannot: untracked files and binaries outside any repo.
 2. **Git self-vs-foreign**. A commit is `self-committed` → **LOW** only when two

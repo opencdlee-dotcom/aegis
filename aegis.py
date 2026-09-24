@@ -19597,6 +19597,47 @@ def cmd_learn(argv):
     return 1
 
 
+_V4A_PATH = re.compile(r"\*\*\*\s*(Add File|Update File|Move to):\s*(.+?)\s*$")
+
+
+def _v4a_patch_paths(text, cwd):
+    """Files a V4A patch (Codex apply_patch, Hermes patch mode=patch) leaves
+    on disk: Add/Update targets, with an Update that is followed by a Move to
+    replaced by its destination. Delete File has no content to attest. Only
+    line-start markers count, so prose that quotes one is not a write."""
+    if not isinstance(text, str):
+        return []
+    out = []
+    for line in text.splitlines():
+        m = _V4A_PATH.match(line)
+        if not m:
+            continue
+        if m.group(1) == "Move to" and out:
+            out.pop()
+        out.append(os.path.normpath(os.path.join(cwd, m.group(2))))
+    return out
+
+
+def _intent_hook_paths(payload):
+    """The written file(s) named by an agent's post-tool-call JSON: a direct
+    path (Claude Code, Hermes write_file / patch mode=replace), else every
+    file a V4A patch in tool_input writes (Codex, Hermes patch mode=patch)."""
+    ti = payload.get("tool_input") or {}
+    if isinstance(ti, dict):
+        p = ti.get("file_path") or ti.get("path")
+        if p:
+            return [p]
+        texts = list(ti.values())
+    else:
+        texts = [ti]
+    cwd = payload.get("cwd") or os.getcwd()
+    out = []
+    for t in texts:
+        for s in (t if isinstance(t, list) else [t]):
+            out.extend(_v4a_patch_paths(s, cwd))
+    return out
+
+
 def cmd_intent(argv):
     """CLI: `intent record <path> [tool]` | `intent hook <tool>` |
     `intent list [n]`. Hook mode reads the harness's tool-call JSON on stdin,
@@ -19611,10 +19652,9 @@ def cmd_intent(argv):
         tool = argv[3] if len(argv) > 3 else "agent"
         try:
             payload = json.loads(sys.stdin.read(1 << 20) or "{}")
-            ti = payload.get("tool_input") or {}
-            p = ti.get("file_path") or ti.get("path") or ""
-            if p and _intent_worthy(p):
-                intent_record(p, tool)
+            for p in _intent_hook_paths(payload):
+                if _intent_worthy(p):
+                    intent_record(p, tool)
         except Exception:
             pass
         return 0
