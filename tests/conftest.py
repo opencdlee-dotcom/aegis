@@ -381,6 +381,8 @@ _MAC_ONLY_CLASSES = frozenset((
     # macOS-shaped fact, and _os_program_update refuses off macOS by design.
     "OneOsUpdateIsOneFinding", "TheGuardRefusesEverythingItShould",
     "AnOsUpdateRecordedAsASwapIsReobservedAsOne",
+    # the publisher custody rung read through codesign's Developer ID verdict
+    "DeveloperIdRung",
 ))
 
 

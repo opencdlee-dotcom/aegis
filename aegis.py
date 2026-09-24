@@ -2298,6 +2298,8 @@ def classify_signature(path):
     # reading them describes neither version. Either way the answer is still
     # returned for this call; it is only not remembered.
     failed = result.pop("probe_failed", False)
+    if failed and stat_sig is not None:
+        _SIG_UNANSWERED[path] = stat_sig
     if (stat_sig is not None and not failed
             and _sig_stat(path) == stat_sig):
         _sigcache.pop(path, None)  # overwrite any prior entry for this path
@@ -2366,6 +2368,13 @@ def _classify_linux(path):
 # probe is a coverage gap, not a clean bill of health, so cmd_scan reports it as
 # a DEGRADED sensor rather than letting the silence read as "everything signed".
 _SIG_PROBE_FAILURES = 0
+
+# {path: stat signature} for every probe that did not answer this scan. A
+# non-answer is never cached (see classify_signature), which is right for the
+# verdict and would make the custody ladder's publisher rung ask codesign (or
+# a cold PowerShell) a SECOND time about a binary its own sensor just failed
+# to classify. Read only by _publisher_signer; reset with the count above.
+_SIG_UNANSWERED = {}
 
 # Every PowerShell-backed probe in this file is sized against MEASUREMENTS of a
 # cold powershell.exe, never a guess. A cap at or near the boot cost is not a
@@ -2995,7 +3004,8 @@ _EVENT_SCHEMA_SQL = """
             last_notified_at INTEGER,
             resolution TEXT,
             subject_json TEXT,
-            last_novel_at INTEGER
+            last_novel_at INTEGER,
+            digest_only TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_incidents_active
             ON incidents(status, next_reminder_at);
@@ -3055,7 +3065,7 @@ _EVENT_SCHEMA_SQL = """
 # Bumped ONLY when _EVENT_SCHEMA_SQL or the ALTER migrations below change.
 # Stamped into the store's own `PRAGMA user_version`, which is what stops the
 # schema being re-executed on every connection open (see _event_connection).
-_EVENT_SCHEMA_VERSION = 1
+_EVENT_SCHEMA_VERSION = 2
 
 # Two retention buckets, not one. `events` used to keep the newest 50,000 rows
 # full stop, and _record_health writes ONE row per sensor per scan (~45). At the
@@ -3152,6 +3162,10 @@ def _event_connection():
                 # new is eligible immediately, the correct verdict on it.
                 db.execute("UPDATE incidents SET last_novel_at=created_at "
                            "WHERE last_novel_at IS NULL")
+            if "digest_only" not in cols:
+                # NULL for every existing row: an incident opened before the
+                # mark existed keeps the reminders it was promised.
+                db.execute("ALTER TABLE incidents ADD COLUMN digest_only TEXT")
             db.execute("PRAGMA user_version=%d" % _EVENT_SCHEMA_VERSION)
             db.commit()
     except sqlite3.DatabaseError as e:
@@ -3486,8 +3500,21 @@ def _mark_novelty(db, incident_id, event_ids, now):
 
 
 def _upsert_incident(db, key, title, severity, kind, now, event_ids,
-                     initially_notified=False, subject=None):
+                     initially_notified=False, subject=None, route=None):
+    """Open or update the incident for `key`; returns its id.
+
+    `route` is the routing verdict (route_findings) for the evidence being
+    attached, when the caller has one. It carries the one reminder rule: an
+    incident OPENED by evidence the gate sent to the digest -- the provenance
+    gate, low confidence, anything below the interrupt tier -- records why in
+    `digest_only`, is never claimed by a reminder, and so is never turned into
+    a notification later by the clock. Evidence that would itself interrupt
+    clears the mark when it attaches, and the incident becomes an ordinary
+    notified one from that moment. Callers without a routing (the correlation
+    and risk tiers, legacy callers) pass None and keep the old behaviour."""
     subject_json = json.dumps(subject, sort_keys=True) if subject else None
+    routed = (route or {}).get("route")
+    digest_why = (route or {}).get("why") if routed == ROUTE_DIGEST else None
     marks = ",".join("?" for _ in _ACTIVE_INCIDENT_STATES)
     row = db.execute(
         "SELECT * FROM incidents WHERE correlation_key=? AND status IN (%s) "
@@ -3505,6 +3532,13 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                    "updated_at=?, subject_json=COALESCE(subject_json,?) "
                    "WHERE id=?",
                    (new_sev, new_status, now, now, subject_json, incident_id))
+        if row["digest_only"] and routed == ROUTE_INTERRUPT:
+            # The one way out: this evidence interrupted on its own merits,
+            # so the operator has just been told, and the case is an ordinary
+            # notified incident from here on.
+            db.execute("UPDATE incidents SET digest_only=NULL, "
+                       "last_notified_at=?, next_reminder_at=? WHERE id=?",
+                       (now, now + _REMINDER_DELAYS[0], incident_id))
         _mark_novelty(db, incident_id, event_ids, now)
     else:
         # FALSE_POSITIVE is a reviewed verdict on the SIGNALS that were seen, not
@@ -3541,10 +3575,11 @@ def _upsert_incident(db, key, title, severity, kind, now, event_ids,
                 "INSERT INTO incidents(kind,correlation_key,title,severity,status,"
                 "created_at,first_seen,last_seen,updated_at,reminder_count,"
                 "next_reminder_at,last_notified_at,subject_json,"
-                "last_novel_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "last_novel_at,digest_only) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (kind, key, title, severity, "OPEN", now, now, now, now, 0,
-                 now + _REMINDER_DELAYS[0], last_notified, subject_json, now))
+                 None if digest_why else now + _REMINDER_DELAYS[0],
+                 last_notified, subject_json, now, digest_why))
             incident_id = cur.lastrowid
     for event_id in event_ids:
         db.execute("INSERT OR IGNORE INTO incident_events(incident_id,event_id) "
@@ -5030,6 +5065,32 @@ def _signal_decision(f, memory):
     return None, 0
 
 
+def _provenance_gate(f):
+    """The custody rung that keeps `f` out of the interrupt tier, or None.
+
+    Custody used to be asked last and could only demote, one step; nothing
+    consulted it before an interrupt, and 190 of the 200 HIGH interrupts the
+    operator closed as noise (30 days to 2026-09-23) carried no rung at all.
+    A finding whose ORIGIN is proven -- a self-tier rung (the operator
+    authored it) or a vouched-tier rung (a signed publisher, a package
+    receipt, an OS update) -- is an attribute-only observation about a known
+    thing, and belongs in the digest, where it stays visible and still counts
+    toward risk at its tier weight.
+
+    Three things are never gated, whatever their custody: CRITICAL, evidence
+    that is attack-DEFINED (a hostile argv, an IOC hit, a conceal imperative
+    -- origin is not innocence), and a tripped decoy/latch/canary, which no
+    provenance explains. Weak rungs (`build-output`, `supervised`, ...)
+    explain nothing here; they only ever buy the grader's one step."""
+    if SEV_ORDER.get(f.get("severity"), -1) >= SEV_ORDER["CRITICAL"]:
+        return None
+    if str(f.get("fingerprint") or "").startswith(_NEVER_TOLERATE_PREFIXES):
+        return None
+    if not _custody_explained(f):
+        return None
+    return f.get("custody") or f.get("provenance")
+
+
 def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
                    seen=None):
     """{fingerprint: {"route", "why", "decision", "verdicts"}} for a batch.
@@ -5052,7 +5113,11 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
     on the very first scan. `adopt` is the same rule for a surface an upgrade
     sees for the first time. Confidence is the second routing axis: a
     high-impact-but-noisy hit (explicit confidence='low') is logged and
-    correlated but routed to the digest instead of interrupting."""
+    correlated but routed to the digest instead of interrupting. Provenance
+    is the third: a finding whose origin custody has proven routes to the
+    digest at any severity below CRITICAL (see _provenance_gate), and says so
+    on the finding itself as `routed`, which the incident view and the report
+    print."""
     if seen is None:
         seen = load_json(SEEN, {})
     allow = set(load_json(ALLOWLIST, []))
@@ -5062,6 +5127,8 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
         if fp in out:
             continue
         decision, verdicts = _signal_decision(f, memory)
+        gate = _provenance_gate(f)
+        f.pop("routed", None)
         if fp in allow:
             route, why, decision = ROUTE_SILENT, "allowlisted", "allowlisted"
         elif fp in seen:
@@ -5071,6 +5138,9 @@ def route_findings(findings, first_run=False, adopt=frozenset(), memory=None,
             route, why = ROUTE_DIGEST, "adopted"
         elif CONFIDENCE_ORDER.get(f.get("confidence", "medium"), 1) <= 0:
             route, why = ROUTE_DIGEST, "low-confidence"
+        elif gate:
+            route, why = ROUTE_DIGEST, "provenance:%s" % gate
+            f["routed"] = "digest: provenance %s" % gate
         elif SEV_ORDER[f["severity"]] < SEV_ORDER[NOTIFY_MIN_SEV]:
             route, why = ROUTE_DIGEST, "below-floor"
         elif decision:
@@ -5795,7 +5865,8 @@ def _apply_correlations(db, new_events, now, initially_notified=False,
         incident_id = _upsert_incident(
             db, "signal:" + (f.get("case_fingerprint") or f["fingerprint"]),
             f["title"], f["severity"], "signal", now, [event_id],
-            notified or bool(decision), subject=f.get("subject"))
+            notified or bool(decision), subject=f.get("subject"),
+            route=verdict)
         if decision == "allowlisted":
             _close_allowlisted(db, incident_id, now)
         elif decision == "tolerated":
@@ -7376,6 +7447,10 @@ def claim_due_incident_reminders(now=None):
             rows = db.execute(
                 "SELECT * FROM incidents WHERE status IN (%s) AND "
                 "next_reminder_at IS NOT NULL AND next_reminder_at<=? "
+                # The reminder rule's enforcement point: a digest-only
+                # incident is never claimed, whoever armed its timer (a
+                # hand `reopen` does) -- see _upsert_incident.
+                "AND digest_only IS NULL "
                 "ORDER BY severity DESC,next_reminder_at" % marks,
                 _ACTIVE_INCIDENT_STATES + (now,)).fetchall()
             for row in rows:
@@ -10331,7 +10406,13 @@ def _check_hot_app(path, st, cutoff):
     # "Verify you built/trust it" is a question custody can often answer
     # outright: an app this machine built, or a copy of one, is the ordinary
     # reading of signed-but-un-notarized on a developer's Mac.
-    graded, rung, rung_note = _grade_binary("MEDIUM", exe, sha=sha)
+    #
+    # Gatekeeper just refused this bundle, and Gatekeeper's notarization check
+    # is the control the publisher rung leans on: the platform said no, so the
+    # signature earns nothing here (publisher_ok=False). The same bytes, once
+    # notarized, earn it from every other sensor.
+    graded, rung, rung_note = _grade_binary("MEDIUM", exe, sha=sha,
+                                            publisher_ok=False)
     return [finding(
         graded, "hot-dir", "Un-notarized app in watched folder",
         "%s [%s] is signed but NOT notarized (Gatekeeper: %s%s), modified %s — "
@@ -17248,6 +17329,14 @@ _PROVENANCE_NOTE = {
                          "publisher can ship a bad build, and a stolen cert "
                          "signs too, so this quiets it rather than clearing "
                          "it.)"),
+    "publisher-signed": ("The binary carries a valid signature from a "
+                         "publisher the platform itself trusts, and the "
+                         "signer names itself — the ORIGIN of these bytes is "
+                         "a known vendor, not a drop. Origin, not innocence: "
+                         "a publisher can ship a bad build and a stolen "
+                         "certificate signs cleanly until it is revoked, so "
+                         "this demotes one step and routes to the digest; "
+                         "attack-defined behaviour keeps its full severity."),
     "package-managed": ("This binary is owned by a package-manager transaction "
                         "on this machine, proven by its receipt on disk — it "
                         "arrived through an install you ran, not a drop. "
@@ -17285,13 +17374,16 @@ _SELF_CUSTODY = ("operator-vouched", "self-attested", "self-committed",
 #                    authority as its baseline   -> a vendor update
 #   package-managed  the binary is owned by a package-manager transaction on
 #                    this machine, proven by its RECEIPT on disk
+#   publisher-signed the binary carries a valid signature from a publisher the
+#                    platform trusts (publisher_sig) that names its signer
+#                    -> a vendor's build, on FIRST sight
 #
 # They are deliberately weaker than _SELF_CUSTODY: those three are claims of
 # AUTHORSHIP, these are claims of ORIGIN. So they demote one step (HIGH ->
 # MEDIUM), never straight to LOW, except `relocated`, which is a proof that
 # the executed content is byte-identical and therefore carries no new code.
 _VOUCHED_CUSTODY = ("relocated", "publisher-stable", "package-managed",
-                    "os-vendor")
+                    "os-vendor", "publisher-signed")
 
 # Recognised-but-weak: git knows the edit is local and unpushed. The note has
 # always read "routine if you made it" while the finding stayed HIGH anyway —
@@ -17340,10 +17432,13 @@ def _demote(severity, provenance, attack_defined=False):
     The three invariants this function exists to hold, all inherited from the
     delegate-surface grader that came before it:
 
-      * grading DEMOTES, it never suppresses — every finding stays in the
-        report at its new level, no finding is dropped, no incident is
-        auto-closed, and nothing here ever writes a dismissal, so a demotion
-        can never feed acquired tolerance;
+      * demotion never suppresses — every finding stays in the report at
+        its new level, no finding is dropped, no incident is auto-closed, and
+        nothing here ever writes a dismissal, so a demotion can never feed
+        acquired tolerance. (Keeping a proven-origin finding out of the
+        interrupt tier is the ROUTING gate's decision, _provenance_gate, not
+        this function's: the finding still reaches the digest and the risk
+        tier at its custody weight.);
       * attack-DEFINED evidence is never demoted, whoever authored it. A
         hostile argv, an IOC hit, a dylib-injection env, a conceal imperative
         keeps its severity even under perfect custody: knowing who wrote a
@@ -17741,8 +17836,88 @@ def _package_receipt(path):
     return None
 
 
+# The OS vendor's own platform signature, per body. Its origin claim is only
+# as good as WHERE the bytes run: inside the platform's protected install tree
+# (TRUSTED_PREFIXES -- the sealed system volume on macOS; SystemRoot and the
+# admin-only Program Files trees on Windows) it is the OS; a copy of the same
+# signed bytes in /tmp, $HOME or %TEMP% is the living-off-the-land shape, and
+# the signature says nothing about who put them there. A third-party vendor's
+# signature (developer-id, app-store, signed-valid) names that vendor wherever
+# it runs; Linux's os-managed is already a claim about the package's own path.
+_PLATFORM_SIGNATURES = ("apple", "os-signed")
+
+
+def _publisher_signer(path):
+    """The signature verdict for `path` when a publisher the platform trusts
+    vouches for these bytes AND names itself, else None.
+
+    `publisher-stable` was the only rung that read a signature, and only on a
+    re-sign in place, so a valid Developer ID binary earned nothing on first
+    sight and beaconed HIGH from $HOME. This is the first-sight half. It reads
+    classify_signature, whose verdict is stat-cached per path, so a binary the
+    sensor has already classified costs no second probe. `publisher_sig` is
+    the per-body vocabulary (developer-id / app-store / apple on macOS; a
+    `strict: detritus` verdict is still developer-id); an ad-hoc, broken,
+    unsigned or unanchored (`signed-other`) signature is never it. A verdict
+    with no team and no authority names nobody the operator could check, so
+    it earns nothing either. Never raises: this runs inside a sensor's
+    grading path, where an error must cost a rung, never a scan.
+
+    A probe that already failed this scan on these exact bytes is not asked
+    again: the answer would be the same non-answer, bought with a second
+    codesign run (or a second cold PowerShell on Windows).
+
+    A platform signature (_PLATFORM_SIGNATURES) earns the rung only inside
+    the system tree, judged on the resolved path so a symlink or a `..`
+    cannot walk a copy in."""
+    if not path:
+        return None
+    failed_on = _SIG_UNANSWERED.get(path)
+    if failed_on is not None and failed_on == _sig_stat(path):
+        return None
+    try:
+        sig = classify_signature(path)
+    except Exception:
+        return None
+    if not (publisher_sig(sig.get("trust"))
+            and (sig.get("team") or sig.get("authority"))):
+        return None
+    if sig.get("trust") in _PLATFORM_SIGNATURES and \
+            not _is_trusted_prefix(os.path.realpath(path)):
+        return None
+    return sig
+
+
+def _publisher_line(sig):
+    """The one line that names who signed and which control stands behind
+    it, so the operator can check the claim rather than take it."""
+    trust, team = sig.get("trust"), sig.get("team")
+    authority = sig.get("authority") or ""
+    if trust == "os-managed":
+        return ("Owned by the distro package %s; the distribution's signed "
+                "package pipeline is the control that stands behind this "
+                "rung." % authority)
+    if trust in ("os-signed", "signed-valid"):
+        return ("Authenticode-signed by %s; the certificate chain and its "
+                "revocation are the control that stands behind this rung."
+                % authority)
+    if trust == "developer-id" and team:
+        name = authority.split(": ", 1)[-1]
+        if name.endswith(" (%s)" % team):
+            name = name[:-len(" (%s)" % team)]
+        who = "Developer ID team %s (%s)" % (team, name)
+    elif trust == "app-store":
+        who = "the Mac App Store%s" % (" for team %s" % team if team else "")
+    elif trust == "apple":
+        who = "Apple (%s)" % (authority or "platform binary")
+    else:
+        who = authority or "team %s" % team
+    return ("Signed by %s; Apple's notarization/revocation is the control "
+            "that stands behind this rung." % who)
+
+
 def _grade_binary(severity, path, attack_defined=False, endpoint=None,
-                  sha=None, parents=None):
+                  sha=None, parents=None, publisher_ok=True):
     """(graded_severity, rung, note) for a finding keyed on a BINARY's identity.
 
     process / net-listener / net-outbound / net-beacon all raise on the same
@@ -17766,6 +17941,12 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     the caller has one (check_processes, and only on a host with a vouch). It
     is the only input here that is not about the file: the `supervised` rung
     asks who STARTED it, which no path, receipt or repo can answer.
+
+    `publisher_ok=False` is a caller saying the platform's own control has
+    already refused these bytes -- the hot-dir sensor after Gatekeeper
+    rejected the bundle. The publisher rung leans on exactly that control
+    (notarization and revocation), so it is not asked; the rest of the ladder
+    is.
     """
     if attack_defined:
         return severity, None, None
@@ -17774,9 +17955,17 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
     # the caller names an endpoint, the vouch must cover that exact endpoint —
     # an identity vouch never widens into "may talk to anywhere".
     if _vouch_covers(path, endpoint):
-        rung = "operator-vouched"
+        rung, signer = "operator-vouched", None
     elif _package_receipt(path):
-        rung = "package-managed"
+        rung, signer = "package-managed", None
+    else:
+        # A publisher the platform itself trusts, on FIRST sight. Asked only
+        # when neither stronger rung answered, so a vouched or receipted
+        # binary never costs a signature lookup here.
+        rung, signer = None, (_publisher_signer(path) if publisher_ok
+                              else None)
+    if rung or signer:
+        rung = rung or "publisher-signed"
     # Last, and weakest: a generated artifact of a repo this machine commits
     # to. Before this rung existed, the two questions above were the ONLY ones
     # asked of a binary, and a developer's machine answers no to both for
@@ -17811,9 +18000,15 @@ def _grade_binary(severity, path, attack_defined=False, endpoint=None,
                 _custody_carry_note(carried))
     # A rung earned HERE is what a later copy elsewhere will inherit. Recorded
     # after the grading decision, never before it, so the ledger only ever
-    # holds rungs that were actually awarded.
-    _custody_remember(sha or _graded_sha(path), rung, path)
-    return _demote(severity, rung), rung, _PROVENANCE_NOTE.get(rung)
+    # holds rungs that were actually awarded. Except a platform signature: it
+    # earned the rung only BECAUSE of where it runs, so a copy of those bytes
+    # elsewhere must not inherit even `copy-of-graded` from it.
+    if not (signer and signer.get("trust") in _PLATFORM_SIGNATURES):
+        _custody_remember(sha or _graded_sha(path), rung, path)
+    note = _PROVENANCE_NOTE.get(rung)
+    if signer:
+        note = "%s %s" % (_publisher_line(signer), note)
+    return _demote(severity, rung), rung, note
 
 
 # --- the vouch tier: a workload the operator signed for, by hand -------------
@@ -22006,9 +22201,10 @@ def _brief_report(findings, new_findings, incidents, sensor_health, first_run,
     if top:
         lines.append("## New since last scan")
         for f in top:
-            lines.append("- %s **%s** — %s" % (
+            lines.append("- %s **%s** — %s%s" % (
                 SEV_ICON[f["severity"]], f["title"],
-                (f["detail"] or "").splitlines()[0][:160]))
+                (f["detail"] or "").splitlines()[0][:160],
+                " (%s)" % f["routed"] if f.get("routed") else ""))
         lines.append("")
     if crit:
         lines.append("## Open CRITICAL incidents")
@@ -22088,8 +22284,9 @@ def _full_report(payload):
             if f["category"] != cur:
                 cur = f["category"]
                 lines.append("## %s" % cur)
-            lines.append("- %s **%s** — %s" % (
-                SEV_ICON[f["severity"]], f["title"], f["detail"]))
+            lines.append("- %s **%s** — %s%s" % (
+                SEV_ICON[f["severity"]], f["title"], f["detail"],
+                " (%s)" % f["routed"] if f.get("routed") else ""))
     return "\n".join(lines) + "\n"
 
 
@@ -22357,6 +22554,7 @@ def _cmd_scan_locked(quiet=False):
     ensure_state()
     # per-scan; a stale count or flag would mislead every later run
     _SIG_PROBE_FAILURES = 0
+    _SIG_UNANSWERED.clear()
     _PROC_ENUM_FAILED = False
     _PROC_ARGV_PARTIAL = False
     _reset_unexamined()
@@ -23605,11 +23803,20 @@ def _evidence_rows(evidence):
         seen["n"] += 1
         seen["first"] = min(seen["first"], row["observed_at"])
         seen["last"] = max(seen["last"], row["observed_at"])
+        # Where the routing gate sent this observation (S5: "digest:
+        # provenance publisher-signed"), newest wins, so the operator sees why
+        # a row did not interrupt.
+        if data.get("routed") and row["observed_at"] >= seen.get(
+                "routed_at", seen["first"]):
+            seen["routed"], seen["routed_at"] = data["routed"], \
+                row["observed_at"]
     for desc, seen in list(folded.items())[:_EVIDENCE_MAX_ROWS]:
         when = _short_ts(seen["last"])
         if seen["n"] > 1:
             when = "%s, %dx since %s" % (when, seen["n"],
                                          _short_ts(seen["first"]))
+        if seen.get("routed"):
+            desc = "%s · %s" % (desc, seen["routed"])
         print("  - %s · %s\n      %s" % (when, seen["source"], desc))
     extra = len(folded) - _EVIDENCE_MAX_ROWS
     if extra > 0:
@@ -23967,6 +24174,10 @@ def cmd_incident(incident_id, action=None, reason=None):
               item["correlation_key"],
               datetime.fromtimestamp(item["created_at"]).isoformat(),
               datetime.fromtimestamp(item["updated_at"]).isoformat()))
+    if item.get("digest_only"):
+        print("  routed:   digest only (%s) — no reminders; it notifies only "
+              "if evidence that would itself interrupt attaches"
+              % item["digest_only"])
     # The honest statement of a standing fact: one line with a count, not one
     # evidence row per scan (still-true re-observations fold into the count).
     if (item.get("occurrences") or 0) > 1:
