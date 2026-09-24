@@ -184,11 +184,16 @@ class TestAllowlistReachesTheIncidentTier(GateSandbox):
 
 
 class TestNotifiedIsPerFinding(GateSandbox):
-    def test_a_digest_routed_signal_still_gets_its_reminder(self):
+    def test_a_digest_routed_signal_is_not_recorded_as_told(self):
         """initially_notified was bool(new_high) for the whole scan: one
         genuine new HIGH marked every incident created that scan as already
-        notified, so a low-confidence HIGH routed to the digest never got the
-        reminder that was its only path to a human."""
+        notified. That half still holds. The reminder half was reversed on
+        2026-09-23 (precision plan S5): this test used to require that the
+        digest-routed incident be REMINDED, as its only path to a human. A
+        digest-only incident is now never claimed by a reminder -- it stays
+        OPEN, counted and listed, and notifies only when evidence that would
+        itself interrupt attaches (see test_provenance_gate.py
+        DigestOnlyIncidentsAreNeverEscalated)."""
         loud = self.process("/opt/a/bin/a", "1" * 64)
         quiet = self.process("/opt/b/bin/b", "2" * 64, confidence="low")
         routing, new_high = self.scan_path([loud, quiet])
@@ -199,11 +204,13 @@ class TestNotifiedIsPerFinding(GateSandbox):
             by_key["signal:" + loud["case_fingerprint"]]["last_notified_at"])
         self.assertIsNone(
             by_key["signal:" + quiet["case_fingerprint"]]["last_notified_at"])
-        # Reminders are scheduled for every OPEN incident; the difference the
-        # gate makes is that the quiet one is not falsely recorded as told.
-        due = aegis.claim_due_incident_reminders(NOW + 7200)
-        self.assertIn("signal:" + quiet["case_fingerprint"],
-                      [i["correlation_key"] for i in due])
+        self.assertEqual(
+            "low-confidence",
+            by_key["signal:" + quiet["case_fingerprint"]]["digest_only"])
+        due = [i["correlation_key"]
+               for i in aegis.claim_due_incident_reminders(NOW + 7200)]
+        self.assertIn("signal:" + loud["case_fingerprint"], due)
+        self.assertNotIn("signal:" + quiet["case_fingerprint"], due)
 
 
 class TestRoutePrecedence(GateSandbox):

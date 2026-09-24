@@ -339,6 +339,8 @@ _MAC_ONLY_CLASSES = frozenset((
     # SIP + the sealed system volume: an OS platform-binary update is a
     # macOS-shaped fact, and _os_program_update refuses off macOS by design.
     "OneOsUpdateIsOneFinding", "TheGuardRefusesEverythingItShould",
+    # the publisher custody rung read through codesign's Developer ID verdict
+    "DeveloperIdRung",
 ))
 
 
