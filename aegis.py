@@ -9399,14 +9399,9 @@ def check_processes():
     warm_signature_cache([c for _p, _o, c, _a in procs
                           if c and not _is_trusted_prefix(c)])
     # Who started each process, for the one rung that asks (_supervised_rung).
-    # The ancestry table is a second read of the process table, so it is built
-    # at most once per scan, on the first finding that could use it, and never
-    # on a host with no vouch to earn that rung from -- the common case, which
-    # pays nothing. A tampered vouch store earns nothing either, so it is
-    # skipped the same way.
-    exe_by_pid = {str(p): c for p, _o, c, _a in procs if c}
-    vouched_any = bool(load_vouches()[0])
-    table = None
+    # Built lazily and at most once per scan, never on a host with no vouch
+    # (_parents_by_pid).
+    parents_of = _parents_by_pid({str(p): c for p, _o, c, _a in procs if c})
     for pid, _owner, comm, _argv in procs:
         if not comm:
             continue
@@ -9443,15 +9438,7 @@ def check_processes():
             # later reusing the same path is a new finding (and not silently
             # covered by an allowlist entry made for the earlier one).
             sha = sha256(comm)
-            parents = []
-            if vouched_any:
-                if table is None:
-                    table = _process_ancestry_table()
-                # "?" for an ancestor with no exe path this user can read: it
-                # is still a link in the chain, and _supervised_rung ends the
-                # walk there rather than stepping over it.
-                parents = [exe_by_pid.get(p) or "?"
-                           for p in _ancestry(pid, table)]
+            parents = parents_of(pid)
             graded, rung, note = _grade_binary(sev, comm, sha=sha,
                                                parents=parents)
             f = finding(
@@ -13761,9 +13748,11 @@ def _outbound_candidate_trust(path):
     return trust
 
 
-def _outbound_findings(rows):
+def _outbound_findings(rows, ancestry=None):
     """One MEDIUM/medium-confidence finding per PROGRAM holding live outbound
-    sockets, over `rows` of (path, remote_ip, remote_port).
+    sockets, over `rows` of (path, remote_ip, remote_port). `ancestry`, when
+    the caller has one, is (path, ip, port) -> the ancestor exe list of the
+    process holding that socket, for the `supervised` rung.
 
     Below the notify floor on purpose (ad-hoc dev binaries talk to the network
     routinely — must not page alone): logged, rendered, and fed to correlation.
@@ -13787,8 +13776,10 @@ def _outbound_findings(rows):
         for path, rip, rport, trust in sorted(by_subject[subject]):
             endpoint = "%s:%s" % (rip, rport)
             endpoints.append(endpoint)
+            parents = ancestry(path, rip, rport) if ancestry else []
             graded, rung, note = _grade_binary("MEDIUM", path,
-                                               endpoint=endpoint)
+                                               endpoint=endpoint,
+                                               parents=parents)
             dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
             # Rank: severity first, then a vouch deviation (the fact the
             # operator must actually adjudicate), then an ungraded rung — all
@@ -13797,9 +13788,9 @@ def _outbound_findings(rows):
                     0 if rung else 1)
             if worst is None or rank > worst[0]:
                 worst = (rank, path, rip, rport, trust, graded, rung, note,
-                         dev_case, dev_note)
-        _r, path, rip, rport, trust, graded, rung, note, dev_case, dev_note \
-            = worst
+                         dev_case, dev_note, parents)
+        _r, path, rip, rport, trust, graded, rung, note, dev_case, dev_note, \
+            parents = worst
         if dev_note:
             note = (note + "\n" + dev_note) if note else dev_note
         shown = endpoints[:_OUTBOUND_DETAIL_ENDPOINTS]
@@ -13821,7 +13812,8 @@ def _outbound_findings(rows):
             # own attribute rather than a replacement.
             remote=rip, port=rport, endpoints=endpoints,
             endpoint_count=len(endpoints), trust=trust, confidence="medium",
-            custody=rung, markers=["outbound-exfil"]))
+            custody=rung, markers=["outbound-exfil"],
+            **({"ancestry": parents} if parents else {})))
     return findings
 
 
@@ -13864,7 +13856,9 @@ def _decode_proc_hex_addr(addr_hex):
 
 
 def _outbound_rows():
-    """[(path, remote_ip, remote_port)] of live outbound TCP, per platform."""
+    """[(path, remote_ip, remote_port, pid)] of live outbound TCP, per
+    platform. The pid is the one the row was attributed from; it is kept so
+    the grader can ask who STARTED the program holding the socket."""
     if IS_LINUX:
         rows = []
         for pf in ("/proc/net/tcp", "/proc/net/tcp6"):
@@ -13887,7 +13881,7 @@ def _outbound_rows():
                 unexamined("pid %s -> %s:%s" % (pid, rip, rport),
                            "its executable could not be read", e)
                 continue
-            out.append((path, rip, rport))
+            out.append((path, rip, rport, pid))
         return out
     if IS_WIN:
         text, rc = _netstat_tcp_rows()
@@ -13907,7 +13901,7 @@ def _outbound_rows():
                 continue
             path = pid_exe.get(parts[4])
             if path:
-                out.append((path, host, port))
+                out.append((path, host, port, parts[4]))
         return out
     text, _, rc = run(NETSTAT_CMD, timeout=15)
     if rc in (124, 127) or not text:
@@ -13929,7 +13923,7 @@ def _outbound_rows():
             comm_cache[pid] = pout.strip() if prc == 0 else ""
         comm = comm_cache[pid]
         if comm:
-            out.append((comm, rip, rport))
+            out.append((comm, rip, rport, pid))
     return out
 
 
@@ -13946,11 +13940,18 @@ def check_outbound():
     seen = set()
     snap_rows = []
     generic_rows = []
-    for path, rip, rport in _outbound_rows():
+    pid_of = {}
+    for row in _outbound_rows():
+        path, rip, rport = row[:3]
         key = "%s:%s:%s" % (path, rip, rport)
         if key in seen:
             continue
         seen.add(key)
+        # Kept beside the rows, never in them: the stored beacon history is
+        # (path, ip, port, trust), and a pid would make every restart a new
+        # row in a snapshot whose whole detection is that nothing moved.
+        pid_of[(str(path), str(rip), str(rport))] = \
+            row[3] if len(row) > 3 else None
         # Trust captured at observation time (sigcache makes the re-ask free)
         # so the stored rows grade without re-classifying long-gone binaries.
         resolvable = path.startswith("/") or (IS_WIN and ":" in path[:3])
@@ -13966,11 +13967,18 @@ def check_outbound():
             findings.append(intel)
         else:
             generic_rows.append((path, rip, rport))
-    findings += _outbound_findings(generic_rows)
+    # Who started the program holding each socket, asked only of a row that
+    # reaches the grader and never on a host with no vouch (_parents_by_pid).
+    parents_of = _parents_by_pid()
+
+    def ancestry(path, rip, rport):
+        return parents_of(pid_of.get((str(path), str(rip), str(rport))))
+    findings += _outbound_findings(generic_rows, ancestry)
     if snap_rows:
         record_observation(BEACON_SENSOR_ID, sorted(snap_rows))
         findings += _beacon_recurrence(
-            _load_observations(BEACON_SENSOR_ID, BEACON_WINDOW_DAYS), snap_rows)
+            _load_observations(BEACON_SENSOR_ID, BEACON_WINDOW_DAYS), snap_rows,
+            ancestry)
     return findings
 
 
@@ -13993,7 +14001,7 @@ _BEACON_BROWSER_RE = re.compile(
     r"(?:\.exe)?(?: Helper(?: \([^/\\]*\))?)?$", re.I)
 
 
-def _beacon_recurrence(history, current_rows):
+def _beacon_recurrence(history, current_rows, ancestry=None):
     """HIGH findings for the beacon residue shape: a (path, remote ip:port)
     pair live in THIS scan and already observed in >= BEACON_MIN_SCANS distinct
     stored scans spanning >= BEACON_MIN_SPAN_SECS, from a non-browser binary
@@ -14010,7 +14018,7 @@ def _beacon_recurrence(history, current_rows):
     sightings = {}
     for ts, rows in history:
         _beacon_add_sighting(sightings, ts, rows)
-    return _beacon_from_sightings(sightings, current_rows)
+    return _beacon_from_sightings(sightings, current_rows, ancestry)
 
 
 def _beacon_add_sighting(sightings, ts, rows):
@@ -14083,8 +14091,14 @@ def _beacon_dispersion(sightings):
     return disp
 
 
-def _beacon_from_sightings(sightings, current_rows):
-    """The recurrence DECISION, over an already-built sightings map."""
+def _beacon_from_sightings(sightings, current_rows, ancestry=None):
+    """The recurrence DECISION, over an already-built sightings map.
+
+    `ancestry`, when the caller has one (check_outbound; never `rehunt`,
+    whose stored rows carry no pid), is (path, ip, port) -> the ancestor exe
+    list of the process holding that socket. It is what the `supervised`
+    rung reads, and it is recorded on the finding as `ancestry` so the
+    replay can re-derive the grade (#352)."""
     findings = []
     rows = sorted(set(tuple(r) for r in current_rows))
     dispersion = _beacon_dispersion(sightings)
@@ -14109,7 +14123,10 @@ def _beacon_from_sightings(sightings, current_rows):
         if not (suspicious_sig(trust) or is_risky_location(path)):
             continue
         endpoint = "%s:%s" % (rip, rport)
-        graded, rung, note = _grade_binary("HIGH", path, endpoint=endpoint)
+        parents = ancestry(path, rip, rport) if ancestry else []
+        graded, rung, note = _grade_binary("HIGH", path, endpoint=endpoint,
+                                           parents=parents)
+        lineage = {"ancestry": parents} if parents else {}
         dev_case, dev_note = _vouch_endpoint_deviation(path, endpoint)
         if dev_note:
             note = (note + "\n" + dev_note) if note else dev_note
@@ -14148,7 +14165,7 @@ def _beacon_from_sightings(sightings, current_rows):
                 path=path, program=path, port=rport, trust=trust,
                 endpoint_count=len(fleet), endpoints=shown,
                 custody=rung, markers=["outbound-exfil", "beacon"],
-                **_class_facts(path, trust, rung)))
+                **dict(_class_facts(path, trust, rung, parents), **lineage)))
             continue
         findings.append(finding(
             graded, "net-beacon",
@@ -14174,7 +14191,7 @@ def _beacon_from_sightings(sightings, current_rows):
             remote=rip, port=rport, trust=trust, scan_count=len(stamps),
             span_secs=span, custody=rung,
             markers=["outbound-exfil", "beacon"],
-            **_class_facts(path, trust, rung)))
+            **dict(_class_facts(path, trust, rung, parents), **lineage)))
     return findings
 
 
@@ -27468,6 +27485,42 @@ def _ancestry(pid, table, depth=ANCESTRY_MAX_DEPTH):
     return chain
 
 
+def _parents_by_pid(exe_by_pid=None):
+    """A function pid -> [ancestor exe path, nearest first], for
+    `_grade_binary(parents=)` -- the only input the `supervised` rung reads
+    that is not about the file.
+
+    The ancestry table is a second read of the process table, so it is built
+    at most once per returned function, on the first pid actually asked
+    about, and never on a host with no vouch to earn that rung from: then the
+    function answers [] and costs nothing, which is the common case. A
+    tampered vouch store earns nothing either, so it is skipped the same way.
+    `exe_by_pid` is the caller's own process rows when it has them
+    (check_processes); otherwise they are read, lazily, from the scan-wide
+    process snapshot. The walk is _ancestry's, pid-reuse guard included.
+
+    Written for #352: check_processes did this inline, so the `supervised`
+    rung answered for a runner's Worker as a PROCESS while the same Worker's
+    beacon, from the same bytes, graded HIGH with no rung."""
+    if not load_vouches()[0]:
+        return lambda pid: []
+    cache = {}
+
+    def parents(pid):
+        if not pid:
+            return []
+        if "table" not in cache:
+            cache["table"] = _process_ancestry_table()
+            cache["exe"] = exe_by_pid if exe_by_pid is not None else {
+                str(p): c for p, _o, c, _a in _iter_processes() if c}
+        # "?" for an ancestor with no exe path this user can read: it is
+        # still a link in the chain, and _supervised_rung ends the walk there
+        # rather than stepping over it.
+        return [cache["exe"].get(p) or "?"
+                for p in _ancestry(str(pid), cache["table"])]
+    return parents
+
+
 def _annotate_ancestry(findings):
     """Attach 'spawned by' lineage to process findings. Enrichment only —
     never a new alert — and computed once per call, because a behavior
@@ -30121,6 +30174,10 @@ _REPLAY_ASSAY_NOT_RUN = {
 # _reobserve_agent_surface); behavior, re-scored from the command preview it
 # recorded (_reobserve_behavior); and hot-dir, re-derived by check_hot_dirs
 # over the item's own directory (_reobserve_hot_dir).
+# The sensors that record `ancestry` as exe paths for the supervised rung.
+# (behavior records a different shape -- [{pid, name}] -- for the operator.)
+_REOBSERVE_ANCESTRY_CATEGORIES = ("process", "net-beacon", "net-outbound")
+
 _REOBSERVE_CATEGORIES = ("process", "net-listener", "net-beacon",
                          "net-outbound", "persistence", "agent-surface",
                          "behavior", "hot-dir")
@@ -30841,9 +30898,10 @@ def _reobserve(f, memo, stats):
     invisible here exactly as it would be on the live install. Answers are
     memoized per subject, so a program seen in two hundred scans is asked once.
 
-    A process record's ancestry (exe paths, nearest first) is passed to
-    _grade_binary as the sensor passes it. The sensor records it only while
-    a vouch exists, so an older record carries none; where a vouched program
+    A process, beacon or outbound record's ancestry (exe paths, nearest
+    first) is passed to _grade_binary as the sensor passes it. The sensor
+    records it only while a vouch exists (the network sensors only since
+    #352), so an older record carries none; where a vouched program
     could then have earned the binary the `supervised` rung, the missing
     field decides the grade, and the finding is counted and replayed as
     recorded rather than graded as if it had no parent."""
@@ -30863,7 +30921,8 @@ def _reobserve(f, memo, stats):
         stats["gone"] += 1
         return f, _REPLAY_GONE
     rotating = str(f["fingerprint"]).startswith("beacon:rotating:")
-    parents = tuple(f.get("ancestry") or ()) if category == "process" else ()
+    lineage = category in _REOBSERVE_ANCESTRY_CATEGORIES
+    parents = tuple(f.get("ancestry") or ()) if lineage else ()
     endpoints = _reobserve_endpoints(f)
     key = (category, path, endpoints, parents, rotating)
     if key not in memo:
@@ -30873,7 +30932,7 @@ def _reobserve(f, memo, stats):
         if base is not None:
             graded, rung = _reobserve_grade(base, path, endpoints, parents,
                                             rotating, memo)
-            if category == "process" and not parents and any(
+            if lineage and not parents and any(
                     _reobserve_grade(base, path, endpoints, (supervisor,),
                                      rotating, memo) != (graded, rung)
                     for supervisor in _reobserve_live(memo, "supervisors")):
