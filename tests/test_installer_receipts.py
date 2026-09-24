@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Two installers that are not package managers, and the receipts they leave.
+"""Installers that are not package managers, and the receipts they leave.
 
 `_package_receipt` reads the receipts of Homebrew, VS Code, pipx, uv's own
-interpreters, winget, Chocolatey and the distro package managers. Two more
+interpreters, winget, Chocolatey and the distro package managers. Four more
 installers on a developer's machine leave a receipt that is just as readable,
 and their binaries were the residue of the live queue:
 
@@ -16,8 +16,13 @@ and their binaries were the residue of the live queue:
     `INSTALLATION_COMPLETE` beside each `<browser>-<revision>/` directory only
     after the download and extract finished. Its Firefox is a "Nightly.app"
     whose seal reads broken, and its headless shell is ad-hoc.
+  * rustup writes `lib/rustlib/components` in every toolchain, and a
+    `manifest-<component>` listing each file that component installed. The
+    toolchain's `cargo` and `rustc` are ad-hoc (#539, #540).
+  * `cargo install` records every crate it installed, and the binaries it put
+    in `<CARGO_HOME>/bin`, in `<CARGO_HOME>/.crates2.json`.
 
-Both receipts are forgeable by anything running as the operator's uid, exactly
+All four receipts are forgeable by anything running as the operator's uid, exactly
 like the Homebrew receipt the ladder already trusts. That is the tier's
 contract, and the last class pins it: one step, never below MEDIUM, and never
 for attack-defined evidence.
@@ -56,11 +61,13 @@ class ReceiptSandbox(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         for k in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME",
-                  "PLAYWRIGHT_BROWSERS_PATH"):
+                  "PLAYWRIGHT_BROWSERS_PATH", "RUSTUP_HOME", "CARGO_HOME"):
             os.environ.pop(k, None)
         os.environ["LOCALAPPDATA"] = os.path.join(self.tmp, "localappdata")
-        aegis._CARGO_DIST_CACHE.clear()
-        self.addCleanup(aegis._CARGO_DIST_CACHE.clear)
+        for cache in (aegis._CARGO_DIST_CACHE, aegis._RUSTUP_CACHE,
+                      aegis._CARGO_INSTALL_CACHE):
+            cache.clear()
+            self.addCleanup(cache.clear)
 
     def touch(self, path, text="x"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -297,6 +304,248 @@ class PlaywrightReceipt(ReceiptSandbox):
                                            "ms-playwright")])
 
 
+class RustupToolchainReceipt(ReceiptSandbox):
+    """`<RUSTUP_HOME>/toolchains/<tc>/lib/rustlib/components` names the
+    installed components; `manifest-<component>` beside it lists what each one
+    wrote, as `file:<path>` or `dir:<path>` relative to the toolchain root.
+    The format is copied from a real rustup install (rust-installer-version 3).
+    """
+
+    TC = "stable-aarch64-apple-darwin"
+
+    def toolchain(self, rustup_home=None, manifests=None, components=None):
+        root = os.path.join(rustup_home or os.path.join(self.home, ".rustup"),
+                            "toolchains", self.TC)
+        if manifests is None:
+            manifests = {
+                "cargo-aarch64-apple-darwin":
+                    "file:bin/cargo\nfile:etc/bash_completion.d/cargo\n",
+                "rustc-aarch64-apple-darwin":
+                    "file:bin/rust-lldb\nfile:bin/rustc\nfile:bin/rustdoc\n",
+                "rust-docs-aarch64-apple-darwin": "dir:share/doc/rust/html\n",
+            }
+        if components is None:
+            components = list(manifests)
+        rustlib = os.path.join(root, "lib", "rustlib")
+        self.touch(os.path.join(rustlib, "components"),
+                   "".join(c + "\n" for c in components))
+        for comp, body in manifests.items():
+            self.touch(os.path.join(rustlib, "manifest-" + comp), body)
+        for name in ("cargo", "rustc", "rustdoc"):
+            self.touch(os.path.join(root, "bin", name))
+        return root
+
+    def label(self, comp):
+        return "rustup:%s:%s" % (self.TC, comp)
+
+    def test_a_file_a_component_manifest_lists_answers(self):
+        root = self.toolchain()
+        self.assertEqual(
+            aegis._package_receipt(os.path.join(root, "bin", "cargo")),
+            self.label("cargo-aarch64-apple-darwin"))
+        self.assertEqual(
+            aegis._package_receipt(os.path.join(root, "bin", "rustc")),
+            self.label("rustc-aarch64-apple-darwin"))
+
+    def test_a_file_no_manifest_lists_does_not(self):
+        root = self.toolchain()
+        dropped = self.touch(os.path.join(root, "bin", "cargo-dropped"))
+        self.assertIsNone(aegis._package_receipt(dropped))
+
+    def test_a_manifest_no_installed_component_names_is_not_read(self):
+        """`components` is rustup's own list of what is installed. A manifest
+        beside it that the list does not name is not one rustup wrote."""
+        root = self.toolchain(manifests={"cargo-x": "file:bin/cargo\n",
+                                         "extra-x": "file:bin/extra\n"},
+                              components=["cargo-x"])
+        extra = self.touch(os.path.join(root, "bin", "extra"))
+        self.assertIsNone(aegis._package_receipt(extra))
+        self.assertEqual(
+            aegis._package_receipt(os.path.join(root, "bin", "cargo")),
+            self.label("cargo-x"))
+
+    def test_a_component_name_with_a_separator_is_refused(self):
+        root = self.toolchain(manifests={}, components=["sub/extra-x"])
+        self.touch(os.path.join(root, "lib", "rustlib", "manifest-sub",
+                                "extra-x"), "file:bin/extra\n")
+        extra = self.touch(os.path.join(root, "bin", "extra"))
+        self.assertIsNone(aegis._package_receipt(extra))
+
+    def test_a_dir_entry_vouches_for_nothing_beneath_it(self):
+        """A `dir:` line names a directory the component unpacked. A file
+        dropped into it later was not part of the install, so only `file:`
+        lines are read."""
+        root = self.toolchain()
+        dropped = self.touch(os.path.join(root, "share", "doc", "rust",
+                                          "html", "dropped"))
+        self.assertIsNone(aegis._package_receipt(dropped))
+
+    def test_the_same_tree_outside_a_rustup_home_does_not(self):
+        root = self.toolchain(rustup_home=os.path.join(self.tmp, "elsewhere"))
+        self.assertIsNone(
+            aegis._package_receipt(os.path.join(root, "bin", "cargo")))
+
+    def test_a_symlink_into_the_toolchain_resolves(self):
+        root = self.toolchain()
+        link = self.symlink_or_skip(os.path.join(root, "bin", "cargo"),
+                                    os.path.join(self.home, "bin", "cargo"))
+        self.assertEqual(aegis._package_receipt(link),
+                         self.label("cargo-aarch64-apple-darwin"))
+
+    def test_a_listed_file_swapped_for_a_link_out_does_not(self):
+        """The manifest names a path inside the toolchain. A link at that path
+        runs whatever it points to, which the manifest never named."""
+        root = self.toolchain()
+        elsewhere = self.touch(os.path.join(self.tmp, "elsewhere-bin"))
+        cargo = os.path.join(root, "bin", "cargo")
+        os.remove(cargo)
+        self.symlink_or_skip(elsewhere, cargo)
+        self.assertIsNone(aegis._package_receipt(cargo))
+
+    def test_a_missing_components_list_is_no_answer(self):
+        root = self.toolchain()
+        os.remove(os.path.join(root, "lib", "rustlib", "components"))
+        self.assertIsNone(
+            aegis._package_receipt(os.path.join(root, "bin", "cargo")))
+
+    def test_rustup_home_is_honoured(self):
+        custom = os.path.join(self.tmp, "custom-rustup")
+        os.environ["RUSTUP_HOME"] = custom
+        root = self.toolchain(rustup_home=custom)
+        self.assertEqual(
+            aegis._package_receipt(os.path.join(root, "bin", "cargo")),
+            self.label("cargo-aarch64-apple-darwin"))
+
+    def test_the_homes_follow_rustup(self):
+        default = os.path.join(self.home, ".rustup")
+        self.assertEqual(aegis._rustup_homes(), [default])
+        os.environ["RUSTUP_HOME"] = "relative/rustup"
+        self.assertEqual(aegis._rustup_homes(), [default])
+        os.environ["RUSTUP_HOME"] = os.path.join(self.tmp, "r")
+        self.assertEqual(aegis._rustup_homes(),
+                         [os.path.join(self.tmp, "r"), default])
+
+    def test_the_parse_is_cached_for_the_scan_and_reset_with_it(self):
+        root = self.toolchain()
+        cargo = os.path.join(root, "bin", "cargo")
+        self.assertTrue(aegis._package_receipt(cargo))
+        os.remove(os.path.join(root, "lib", "rustlib", "components"))
+        self.assertTrue(aegis._package_receipt(cargo),
+                        "the manifests are parsed once per scan")
+        aegis._reset_custody_probes()
+        self.assertIsNone(aegis._package_receipt(cargo),
+                          "the next scan must read the disk again")
+
+    def test_the_proxies_in_cargo_bin_are_left_alone(self):
+        """`~/.cargo/bin/cargo` is a link to, or a copy of, the rustup binary,
+        and rustup-init leaves no receipt for rustup itself: settings.toml
+        names the default toolchain and update-hashes/<tc> holds a
+        channel-manifest hash, and neither records rustup's own bytes. So the
+        proxies get no rung, even beside a fully receipted toolchain."""
+        self.toolchain()
+        self.touch(os.path.join(self.home, ".rustup", "settings.toml"),
+                   'default_toolchain = "%s"\n' % self.TC)
+        bindir = os.path.join(self.home, ".cargo", "bin")
+        rustup = self.touch(os.path.join(bindir, "rustup"), "rustup-bytes")
+        proxy = os.path.join(bindir, "cargo")
+        shutil.copy(rustup, proxy)
+        self.assertIsNone(aegis._package_receipt(rustup))
+        self.assertIsNone(aegis._package_receipt(proxy))
+
+
+class CargoInstallReceipt(ReceiptSandbox):
+    """`<CARGO_HOME>/.crates2.json` is cargo's own record of `cargo install`.
+    Each key is `"<crate> <version> (<source>)"` and lists the `bins` that the
+    install put in `<CARGO_HOME>/bin`. The shape is copied from a real file."""
+
+    KEY = ("tool 1.2.3 "
+           "(registry+https://github.com/rust-lang/crates.io-index)")
+
+    def install(self, cargo_home=None, installs=None, raw=None):
+        cargo_home = cargo_home or os.path.join(self.home, ".cargo")
+        if installs is None:
+            installs = {self.KEY: {"version_req": None, "bins": ["tool"],
+                                   "features": [], "profile": "release"}}
+        self.touch(os.path.join(cargo_home, ".crates2.json"),
+                   raw if raw is not None
+                   else json.dumps({"installs": installs}))
+        return cargo_home
+
+    def test_a_listed_bin_answers(self):
+        tool = self.touch(os.path.join(self.install(), "bin", "tool"))
+        self.assertEqual(aegis._package_receipt(tool),
+                         "cargo-install:tool@1.2.3")
+
+    def test_a_bin_the_record_does_not_list_does_not(self):
+        bindir = os.path.join(self.install(), "bin")
+        for name in ("other", "rustup", "cargo"):
+            path = self.touch(os.path.join(bindir, name))
+            self.assertIsNone(aegis._package_receipt(path), name)
+
+    def test_a_same_named_copy_outside_cargo_bin_does_not(self):
+        self.install()
+        copy = self.touch(os.path.join(self.home, "Downloads", "tool"))
+        self.assertIsNone(aegis._package_receipt(copy))
+
+    def test_a_malformed_or_misshapen_record_is_no_answer(self):
+        tool = os.path.join(self.home, ".cargo", "bin", "tool")
+        self.touch(tool)
+        for raw in ("{not json", "[]", '{"installs": []}',
+                    '{"installs": {"tool 1.2.3 (x)": {"bins": "tool"}}}',
+                    '{"installs": {"tool 1.2.3 (x)": ["tool"]}}'):
+            aegis._CARGO_INSTALL_CACHE.clear()
+            self.install(raw=raw)
+            self.assertIsNone(aegis._package_receipt(tool), raw)
+
+    def test_a_bin_name_that_climbs_out_of_bin_is_refused(self):
+        cargo_home = self.install(installs={
+            self.KEY: {"bins": ["../outside"]}})
+        outside = self.touch(os.path.join(cargo_home, "outside"))
+        self.assertIsNone(aegis._package_receipt(outside))
+
+    def test_a_symlink_into_cargo_bin_resolves(self):
+        tool = self.touch(os.path.join(self.install(), "bin", "tool"))
+        link = self.symlink_or_skip(tool, os.path.join(self.home, "bin", "t"))
+        self.assertEqual(aegis._package_receipt(link),
+                         "cargo-install:tool@1.2.3")
+
+    def test_a_listed_bin_swapped_for_a_link_out_does_not(self):
+        """cargo writes a file at `bin/<name>`. A link there runs whatever it
+        points to, which the record never named."""
+        bindir = os.path.join(self.install(), "bin")
+        elsewhere = self.touch(os.path.join(self.tmp, "elsewhere-bin"))
+        tool = self.symlink_or_skip(elsewhere, os.path.join(bindir, "tool"))
+        self.assertIsNone(aegis._package_receipt(tool))
+        self.assertIsNone(aegis._package_receipt(elsewhere))
+
+    def test_cargo_home_is_honoured(self):
+        custom = os.path.join(self.tmp, "custom-cargo")
+        os.environ["CARGO_HOME"] = custom
+        tool = self.touch(os.path.join(self.install(custom), "bin", "tool"))
+        self.assertEqual(aegis._package_receipt(tool),
+                         "cargo-install:tool@1.2.3")
+
+    def test_the_homes_follow_cargo(self):
+        default = os.path.join(self.home, ".cargo")
+        self.assertEqual(aegis._cargo_homes(), [default])
+        os.environ["CARGO_HOME"] = "relative/cargo"
+        self.assertEqual(aegis._cargo_homes(), [default])
+        os.environ["CARGO_HOME"] = os.path.join(self.tmp, "c")
+        self.assertEqual(aegis._cargo_homes(),
+                         [os.path.join(self.tmp, "c"), default])
+
+    def test_the_parse_is_cached_for_the_scan_and_reset_with_it(self):
+        cargo_home = self.install()
+        tool = self.touch(os.path.join(cargo_home, "bin", "tool"))
+        self.assertTrue(aegis._package_receipt(tool))
+        os.remove(os.path.join(cargo_home, ".crates2.json"))
+        self.assertTrue(aegis._package_receipt(tool),
+                        "the record is parsed once per scan")
+        aegis._reset_custody_probes()
+        self.assertIsNone(aegis._package_receipt(tool),
+                          "the next scan must read the disk again")
+
+
 class AnInstallerReceiptIsVouchedTierOnly(ReceiptSandbox):
     """Same-uid-forgeable, like the Homebrew receipt: one step, never below
     MEDIUM, and nothing at all for attack-defined evidence."""
@@ -327,6 +576,24 @@ class AnInstallerReceiptIsVouchedTierOnly(ReceiptSandbox):
             self.assertEqual(self.graded(path, attack_defined=True),
                              ("HIGH", None, None), path)
 
+    def test_the_rust_toolchain_receipts_grade_as_package_managed(self):
+        tc = os.path.join(self.home, ".rustup", "toolchains", "stable-x")
+        rustlib = os.path.join(tc, "lib", "rustlib")
+        self.touch(os.path.join(rustlib, "components"), "cargo-x\n")
+        self.touch(os.path.join(rustlib, "manifest-cargo-x"),
+                   "file:bin/cargo\n")
+        cargo = self.touch(os.path.join(tc, "bin", "cargo"))
+        cargo_home = os.path.join(self.home, ".cargo")
+        self.touch(os.path.join(cargo_home, ".crates2.json"),
+                   json.dumps({"installs": {"tool 1.0.0 (x)":
+                                            {"bins": ["tool"]}}}))
+        tool = self.touch(os.path.join(cargo_home, "bin", "tool"))
+        for path in (cargo, tool):
+            sev, rung, _ = self.graded(path)
+            self.assertEqual((sev, rung), ("MEDIUM", "package-managed"), path)
+            self.assertEqual(self.graded(path, attack_defined=True),
+                             ("HIGH", None, None), path)
+
 
 @unittest.skipUnless(REAL_MAC, "reads this Mac's own installer receipts")
 class LiveReceiptsOnThisMac(unittest.TestCase):
@@ -334,8 +601,49 @@ class LiveReceiptsOnThisMac(unittest.TestCase):
     wrote on this body. Skipped wherever they are absent."""
 
     def setUp(self):
-        aegis._CARGO_DIST_CACHE.clear()
-        self.addCleanup(aegis._CARGO_DIST_CACHE.clear)
+        for cache in (aegis._CARGO_DIST_CACHE, aegis._RUSTUP_CACHE,
+                      aegis._CARGO_INSTALL_CACHE):
+            cache.clear()
+            self.addCleanup(cache.clear)
+
+    def test_the_rustup_toolchain_cargo_and_rustc_answer(self):
+        home = (os.environ.get("RUSTUP_HOME")
+                or os.path.expanduser("~/.rustup"))
+        found = []
+        for tc in sorted(glob.glob(os.path.join(home, "toolchains", "*"))):
+            if not os.path.isfile(os.path.join(tc, "lib", "rustlib",
+                                               "components")):
+                continue
+            for name in ("cargo", "rustc"):
+                exe = os.path.join(tc, "bin", name)
+                if os.path.isfile(exe):
+                    found.append((exe, os.path.basename(tc), name))
+        if not found:
+            self.skipTest("no rustup toolchain on this body")
+        for exe, tc, name in found:
+            got = aegis._package_receipt(exe) or ""
+            self.assertTrue(got.startswith("rustup:%s:%s-" % (tc, name)),
+                            (exe, got))
+
+    def test_the_cargo_install_bins_on_disk_answer(self):
+        home = (os.environ.get("CARGO_HOME")
+                or os.path.expanduser("~/.cargo"))
+        try:
+            with open(os.path.join(home, ".crates2.json")) as f:
+                installs = json.load(f).get("installs") or {}
+        except (OSError, ValueError):
+            installs = {}
+        found = []
+        for key, rec in installs.items():
+            crate, version = key.split(" ")[:2]
+            for b in rec.get("bins") or []:
+                if os.path.isfile(os.path.join(home, "bin", b)):
+                    found.append((os.path.join(home, "bin", b),
+                                  "cargo-install:%s@%s" % (crate, version)))
+        if not found:
+            self.skipTest("no cargo-install binary present on this body")
+        for exe, want in found:
+            self.assertEqual(aegis._package_receipt(exe), want)
 
     def test_uv_answers_from_its_cargo_dist_receipt(self):
         uv = os.path.expanduser("~/.local/bin/uv")

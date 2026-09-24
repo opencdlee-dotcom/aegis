@@ -16849,9 +16849,12 @@ def _reset_custody_probes():
     _REPO_ROOT_CACHE.clear()
     _REPO_SELFNESS_CACHE.clear()
     _BUILD_OUTPUT_CACHE.clear()
-    # Not a git probe, but the same per-scan lifetime: the parsed cargo-dist
-    # receipts (see _cargo_dist_receipts).
+    # Not a git probe, but the same per-scan lifetime: the parsed installer
+    # receipts (see _cargo_dist_receipts, _rustup_toolchain_files and
+    # _cargo_install_records).
     _CARGO_DIST_CACHE.clear()
+    _RUSTUP_CACHE.clear()
+    _CARGO_INSTALL_CACHE.clear()
 
 
 def _repo_root_of(git, d):
@@ -17614,7 +17617,7 @@ def _choco_receipt(real):
     return None
 
 
-# --- installer receipts: two installers that are not package managers --------
+# --- installer receipts: installers that are not package managers ------------
 #
 # The cargo-dist installer (`curl ... | sh` for uv and most Rust CLIs) and
 # Playwright's browser download both leave a receipt as readable as Homebrew's,
@@ -17786,6 +17789,156 @@ def _playwright_receipt(real):
     return None
 
 
+# The Rust toolchain installers: rustup, and `cargo install`. Both keep a
+# record that names every file they wrote, which is a stronger receipt than a
+# marker beside a directory, and both are same-uid-forgeable exactly like the
+# Homebrew receipt — so they answer only the vouched tier (see the section
+# comment above). The rustup PROXIES in <CARGO_HOME>/bin (`cargo`, `rustc`,
+# ... are links to, or copies of, the rustup binary) get nothing: rustup-init
+# leaves no receipt for rustup itself. settings.toml names the default
+# toolchain and update-hashes/<tc> holds a channel-manifest hash; neither
+# records rustup's own bytes.
+
+# Parsed per toolchain / per cargo home, for one scan; cleared by
+# _reset_custody_probes like _CARGO_DIST_CACHE.
+_RUSTUP_CACHE = {}
+_CARGO_INSTALL_CACHE = {}
+
+
+def _rustup_homes():
+    """RUSTUP_HOME when it names an absolute directory, and ~/.rustup as well
+    (Aegis's environment is not the shell that ran rustup)."""
+    roots = []
+    env = os.environ.get("RUSTUP_HOME")
+    if env and os.path.isabs(env):
+        roots.append(env)
+    default = os.path.join(HOME, ".rustup")
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
+def _rustup_toolchain_files(toolchain):
+    """{normcased path relative to `toolchain`: component} for every `file:`
+    line of every installed component's manifest.
+
+    Format read from a real rustup install (rust-installer-version 3):
+    lib/rustlib/components lists the installed components one per line, and
+    lib/rustlib/manifest-<component> lists what that component wrote, as
+    `file:<path>` or `dir:<path>` relative to the toolchain root. Only a
+    component `components` names is read, and only `file:` lines count: a
+    `dir:` line names a directory, and a file dropped into it afterwards was
+    never part of the install."""
+    if toolchain in _RUSTUP_CACHE:
+        return _RUSTUP_CACHE[toolchain]
+    rustlib = os.path.join(toolchain, "lib", "rustlib")
+    files = {}
+    listed = _read_text(os.path.join(rustlib, "components"), limit=64 * 1024)
+    for comp in (listed or "").splitlines():
+        comp = comp.strip()
+        if comp in ("", ".", "..") or os.path.basename(comp) != comp:
+            continue
+        manifest = _read_text(os.path.join(rustlib, "manifest-" + comp),
+                              limit=4 * 1024 * 1024)
+        for line in (manifest or "").splitlines():
+            if line.startswith("file:"):
+                rel = line[len("file:"):].strip()
+                if rel:
+                    rel = os.path.normpath(rel.replace("/", os.sep))
+                    files[os.path.normcase(rel)] = comp
+    _RUSTUP_CACHE[toolchain] = files
+    return files
+
+
+def _rustup_receipt(real):
+    """A file rustup installed: `real` resolves inside
+    <RUSTUP_HOME>/toolchains/<tc>/ and a manifest of an installed component
+    of that toolchain lists it. Resolved first, so a listed path that has been
+    swapped for a link out of the toolchain answers nothing."""
+    if not real:
+        return None
+    target = _binary_key(real)
+    for home in _rustup_homes():
+        base = os.path.join(_binary_key(home), "toolchains")
+        if not target.startswith(base + os.sep):
+            continue
+        rest = target[len(base) + 1:].split(os.sep, 1)
+        if len(rest) < 2 or not rest[0] or not rest[1]:
+            continue
+        comp = _rustup_toolchain_files(os.path.join(base, rest[0])).get(rest[1])
+        if comp:
+            return "rustup:%s:%s" % (rest[0], comp)
+    return None
+
+
+def _cargo_homes():
+    """CARGO_HOME when it names an absolute directory, and ~/.cargo as well."""
+    roots = []
+    env = os.environ.get("CARGO_HOME")
+    if env and os.path.isabs(env):
+        roots.append(env)
+    default = os.path.join(HOME, ".cargo")
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
+def _listed_file_key(path):
+    """The comparison key for a file a record lists: its directory resolved,
+    its own name kept. Unlike _binary_key it does not follow a link AT the
+    listed path: the record names the file the installer wrote there, not
+    wherever a link put there later points."""
+    return os.path.normcase(os.path.join(
+        os.path.realpath(os.path.dirname(path)), os.path.basename(path)))
+
+
+def _cargo_install_records(cargo_home):
+    """{listed file key: label} from <cargo_home>/.crates2.json, cargo's own
+    record of `cargo install`: `installs` maps "<crate> <version> (<source>)"
+    to a record whose `bins` are the files it put in <cargo_home>/bin. Only a
+    plain file name counts, as for cargo-dist."""
+    if cargo_home in _CARGO_INSTALL_CACHE:
+        return _CARGO_INSTALL_CACHE[cargo_home]
+    found = {}
+    try:
+        data = json.loads(_read_text(os.path.join(cargo_home, ".crates2.json"),
+                                     limit=1024 * 1024) or "")
+    except ValueError:
+        data = None
+    installs = data.get("installs") if isinstance(data, dict) else None
+    bindir = os.path.join(cargo_home, "bin")
+    for key, rec in (installs.items() if isinstance(installs, dict) else ()):
+        parts = key.split(" ")
+        if not parts[0] or not isinstance(rec, dict):
+            continue
+        bins = rec.get("bins")
+        if not isinstance(bins, list):
+            continue
+        label = "cargo-install:%s" % parts[0]
+        if len(parts) > 1 and parts[1]:
+            label += "@%s" % parts[1]
+        for b in bins:
+            if (isinstance(b, str) and b not in ("", ".", "..")
+                    and os.path.basename(b) == b):
+                found[_listed_file_key(os.path.join(bindir, b))] = label
+    _CARGO_INSTALL_CACHE[cargo_home] = found
+    return found
+
+
+def _cargo_install_receipt(real):
+    """A binary `cargo install` put in <CARGO_HOME>/bin and recorded in
+    .crates2.json. Same-uid forgeable like the Homebrew receipt, hence
+    vouched-tier only (see the section comment above)."""
+    if not real:
+        return None
+    target = _binary_key(real)
+    for home in _cargo_homes():
+        hit = _cargo_install_records(home).get(target)
+        if hit:
+            return hit
+    return None
+
+
 def _os_package_receipt(real):
     """The OS-NATIVE package manager's claim on `real`.
 
@@ -17805,9 +17958,36 @@ def _os_package_receipt(real):
 # _os_package_receipt is LAST on purpose: the probes above it are pure path
 # arithmetic, while it can cost up to three subprocesses on Linux. Cheap
 # questions first, so the expensive one is only asked when no cheap answer won.
+#
+# Roster: installers on the reference Mac (2026-09-23) whose binaries land in
+# user-writable paths, and whether a receipt here names them. A receipt is
+# implemented only where the installer writes a record that names the file.
+#   covered  Homebrew        <prefix>/Cellar          INSTALL_RECEIPT.json
+#   covered  pipx            .../pipx/venvs/<v>       pipx_metadata.json
+#   covered  uv Pythons      ~/.local/share/uv/python BUILD
+#   covered  uv standalone   ~/.local/bin/uv, uvx     cargo-dist receipt
+#   covered  Playwright      ms-playwright/<b>-<rev>  INSTALLATION_COMPLETE
+#   covered  rustup          ~/.rustup/toolchains     manifest-<component>
+#   covered  cargo install   ~/.cargo/bin/<bin>       .crates2.json
+#   none     rustup proxies  ~/.cargo/bin/cargo, ...  no receipt for rustup
+#   none     mise            ~/.local/share/mise/installs: .mise.backend.toml
+#            names the backend, not files (its one install here, node, is
+#            Developer ID signed and never reaches the ladder)
+#   none     bun             ~/.bun/bin/bun: no record (Developer ID signed)
+#   n/a      uv tools        uv-receipt.toml names the ~/.local/bin entry
+#            points, but they are scripts; the interpreter they run is covered
+#            as a uv Python
+#   n/a      npm global      prefix ~/.local has no lib/node_modules here;
+#            package bins are scripts run by node
+#   absent   pyenv, go (~/go/bin), deno: not installed here; no receipt
+#            format checked
+# Seen here with no installer record: vendor-installed Claude Code, Codex and
+# a Node under an agent's home (all Developer ID signed), and an ad-hoc
+# ~/.local/bin/herdr, which stays uncovered.
 _PACKAGE_RECEIPTS = (_homebrew_receipt, _vscode_receipt, _pipx_receipt,
                      _uv_python_receipt, _winget_receipt, _choco_receipt,
                      _playwright_receipt, _cargo_dist_receipt,
+                     _rustup_receipt, _cargo_install_receipt,
                      _os_package_receipt)
 
 
