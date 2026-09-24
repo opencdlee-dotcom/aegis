@@ -16,6 +16,7 @@ counted as not re-derivable and replayed as recorded — never guessed.
 """
 import contextlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -25,6 +26,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aegis  # noqa: E402
 from conftest import PUBLISHER_TRUST, SUSPICIOUS_TRUST  # noqa: E402
 from test_backtest_replay import NOW, ReplaySandbox  # noqa: E402
+
+def same_file(a, b):
+    return os.path.realpath(a) == os.path.realpath(b)
+
 
 PLIST = "/opt/replay-persist/LaunchAgents/com.example.job.plist"
 PROGRAM = "/opt/replay-persist/bin/runner"
@@ -268,9 +273,8 @@ class ARecordThatCannotBeRebuiltIsCountedNotGuessed(PersistenceReplay):
 
 class AnAgentExecTargetIsRegradedAgainstItsRecordedBytes(ReplaySandbox):
     """The delegate-surface diff: provenance is asked again, of the bytes the
-    record names, through diff_agent_surface itself."""
-
-    CONFIG = "/opt/replay-agent/settings.json"
+    record names, through diff_agent_surface itself — and only for an entry
+    the sensor's own parser still registers in the config as it is now."""
 
     def setUp(self):
         super().setUp()
@@ -279,8 +283,29 @@ class AnAgentExecTargetIsRegradedAgainstItsRecordedBytes(ReplaySandbox):
             f.write(b"#!/bin/sh\necho replay\n")
         self.cmd = "bash " + self.target
         self.key = aegis._exec_identity(self.cmd, [])
+        self.CONFIG = self.config(
+            os.path.join("agent", "settings.json"),
+            {"mcpServers": {"replay": {"command": self.cmd}}})
         self.stub("classify_signature", lambda path: {
             "trust": SUSPICIOUS_TRUST, "team": None, "authority": None})
+
+    def config(self, rel, doc):
+        """A config file the sensor's parser reads, under the sandbox."""
+        path = os.path.join(self.tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        return path
+
+    def recorded_target(self, config, key, program, sha):
+        """A recorded "target changed" finding, in diff_agent_surface's
+        shape, for an entry `key` of `config` resolved to `program`."""
+        return aegis.finding(
+            "HIGH", "agent-surface",
+            "Agent exec target changed underneath a static config", "d",
+            "agent-surface:target:%s:%s:%s" % (config, key, sha[:12]),
+            path=config, program=program, provenance=None,
+            markers=["agent-surface", "exec", "supply-chain"])
 
     def ent(self, sha):
         return {"cmd": self.cmd, "args": [], "target": self.target,
@@ -305,8 +330,10 @@ class AnAgentExecTargetIsRegradedAgainstItsRecordedBytes(ReplaySandbox):
         self.assertEqual(1, len(found))
         self.assertEqual("HIGH", found[0]["severity"])
         inc = self.seed(found[0])
+        # Custody is asked at the target's realpath (P2d), and a temp dir is
+        # reached through a symlink on macOS.
         self.stub("_git_provenance", lambda path: (
-            "self-committed" if path == self.target else None))
+            "self-committed" if same_file(path, self.target) else None))
         r = aegis._backtest_replay(now=NOW, reobserve=True)
         stats = r["reobserve"]
         self.assertEqual(1, stats["reobserved"])
@@ -357,6 +384,101 @@ class AnAgentExecTargetIsRegradedAgainstItsRecordedBytes(ReplaySandbox):
         inc = self.seed(found[0])
         r = aegis._backtest_replay(now=NOW, reobserve=True)
         self.assertEqual({"the config's content is not recorded": 1},
+                         r["reobserve"]["not_rederivable"])
+        self.assertIn(inc, r["reopened"])
+
+    def test_an_entry_the_current_parser_no_longer_registers_is_dropped(self):
+        """#521's shape: a host's runtime process table was parsed as a
+        delegate config, and a toolchain upgrade under a command it had
+        already run read as its exec target changing. The current parser
+        registers nothing in it, so today's sensor has nothing to diff."""
+        table = self.config(
+            os.path.join("agent", "process_manager", "chat_processes.json"),
+            [{"command": "npm run build", "osPid": 4242,
+              "startedAtMs": 1783928938426, "turnId": "t-1"}])
+        npm = os.path.join(self.tmp, "toolchain", "npm")
+        inc = self.seed(self.recorded_target(
+            table, aegis._exec_identity("npm run build", []), npm, "a" * 64))
+        r = aegis._backtest_replay(now=NOW, reobserve=True)
+        stats = r["reobserve"]
+        self.assertEqual([], r["problems"])
+        self.assertEqual(1, stats["reobserved"])
+        self.assertEqual(1, stats["no_longer_emitted"])
+        self.assertEqual({}, stats["not_rederivable"])
+        self.assertEqual({"the current parser registers no such entry": 1},
+                         stats["dropped_why"])
+        self.assertEqual(1, r["routes"]["agent-surface"]["dropped"])
+        self.assertNotIn(inc, r["reopened"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            aegis.cmd_backtest_replay(now=NOW, reobserve=True)
+        self.assertIn("the current parser registers no such entry 1",
+                      out.getvalue())
+
+    def test_an_entry_the_resolver_now_points_elsewhere_is_regraded_there(self):
+        """#453's shape: the old resolver took the glue command in front of
+        a hook for its target, so an update of that program read as the
+        hook's payload being swapped. Today's parser resolves the same entry
+        to the script, and the sensor would diff THAT script's bytes and ask
+        THAT script's custody."""
+        script = os.path.join(self.tmp, "hooks", "post.js")
+        os.makedirs(os.path.dirname(script))
+        with open(script, "wb") as f:
+            f.write(b"console.log('hook')\n")
+        cfg = self.config(os.path.join("agent", "hooks.json"), {
+            "mcpServers": {"post": {"command": "node", "args": [script]}}})
+        glue = os.path.join(self.tmp, "glue")        # what the old resolver named
+        with open(glue, "wb") as f:
+            f.write(b"glue\n")
+        inc = self.seed(self.recorded_target(
+            cfg, aegis._exec_identity("node", [script]), glue,
+            aegis.sha256(glue)))
+        asked = []
+
+        def provenance(path):
+            asked.append(path)
+            return "self-committed" if same_file(path, script) else None
+
+        self.stub("_git_provenance", provenance)
+        r = aegis._backtest_replay(now=NOW, reobserve=True)
+        stats = r["reobserve"]
+        self.assertEqual([], r["problems"])
+        self.assertTrue(any(same_file(p, script) for p in asked), asked)
+        self.assertFalse(any(same_file(p, glue) for p in asked), asked)
+        self.assertEqual({}, stats["not_rederivable"])
+        self.assertEqual(1, stats["reobserved"])
+        self.assertEqual(1, stats["custody_changed"])
+        self.assertEqual(0, r["routes"]["agent-surface"]["interrupt"])
+        self.assertNotIn(inc, r["reopened"])
+
+    def test_an_unchanged_entry_is_still_held_to_its_recorded_bytes(self):
+        """The entry is registered and resolves to the recorded program, but
+        the program's bytes moved on after the record: replayed as
+        recorded, exactly as before the config was re-parsed."""
+        inc = self.seed(self.recorded_target(
+            self.CONFIG, self.key, self.target, "0" * 64))
+        r = aegis._backtest_replay(now=NOW, reobserve=True)
+        self.assertEqual({aegis._REPLAY_MOVED_ON: 1},
+                         r["reobserve"]["not_rederivable"])
+        self.assertIn(inc, r["reopened"])
+
+    def test_a_config_gone_from_disk_is_counted(self):
+        inc = self.seed(self.recorded_target(
+            os.path.join(self.tmp, "agent", "gone.json"), self.key,
+            self.target, aegis.sha256(self.target)))
+        r = aegis._backtest_replay(now=NOW, reobserve=True)
+        self.assertEqual(1, r["reobserve"]["gone"])
+        self.assertEqual("gone from disk", r["split"]["as-recorded"][inc][0])
+
+    def test_a_positional_key_is_not_read_as_a_missing_entry(self):
+        """Fingerprints minted before the exec identity fix name the entry by
+        its JSON pointer, which the current parser never produces: absent
+        from the parse is not evidence the entry went away."""
+        legacy = "mcpServers.replay|" + self.cmd
+        inc = self.seed(self.recorded_target(
+            self.CONFIG, legacy, self.target, aegis.sha256(self.target)))
+        r = aegis._backtest_replay(now=NOW, reobserve=True)
+        self.assertEqual({"the fingerprint names a positional exec key": 1},
                          r["reobserve"]["not_rederivable"])
         self.assertIn(inc, r["reopened"])
 
