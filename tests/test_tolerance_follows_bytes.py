@@ -225,110 +225,106 @@ class _Sandbox(unittest.TestCase):
 
 
 class TestVerdictsConvergeAcrossPaths(_Sandbox):
-    """The end-to-end claim: three verdicts on one binary seen at three
-    different paths now reach the floor, where before they were three buckets
-    of one and taught nothing."""
+    """The end-to-end claim: a verdict on one binary covers the same bytes
+    wherever they are next seen.
 
-    def _teach_three_paths(self, sha=SHA, code="benign-positive"):
-        """Returns the incident ids, youngest last."""
-        ids = []
-        for i, path in enumerate(PATHS):
-            at = NOW + i * 600
-            # Each path is its own case, exactly as the live store recorded
-            # them: the fingerprint is content-keyed but the incidents were
-            # opened separately as the binary appeared in each location.
-            f = _process_finding(path, sha=sha)
-            f["fingerprint"] = "process:sha:%s:%d" % (sha, i)
-            self._ingest(f, at)
-            incident = self._latest_incident()
-            self.assertEqual(incident["status"], "OPEN")
-            self._dismiss(incident["id"], at + 30, code=code)
-            ids.append(incident["id"])
-        return ids
+    Before #51, thirty verdicts spread over twenty-eight path buckets taught
+    nothing. #51 gave the bytes their own identity at the path floor of
+    three; S6 (2026-09-23) moved the exact bytes to a floor of ONE
+    (_TOLERANCE_FLOOR["exact"]), because an exact-bytes identity generalizes
+    to nothing the operator did not judge — asking three times about one
+    fact was the teaching evaporating in its purest form. Every other guard
+    is unchanged, and the path identity keeps three."""
 
-    def test_three_paths_one_binary_reaches_the_floor(self):
-        self._teach_three_paths()
+    def _teach_one(self, sha=SHA, code="benign-positive", path=PATHS[0],
+                   at=NOW):
+        """One verdict on `sha` at `path`; returns the incident id."""
+        f = _process_finding(path, sha=sha)
+        f["fingerprint"] = "process:sha:%s:%s" % (sha, path)
+        self._ingest(f, at)
+        incident = self._latest_incident()
+        self.assertEqual(incident["status"], "OPEN")
+        self._dismiss(incident["id"], at + 30, code=code)
+        return incident["id"]
+
+    def test_one_verdict_reaches_the_floor(self):
+        self._teach_one()
         tolerance = self._memory(NOW + 9000)[0]
         self.assertIn("process:content:%s" % SHA, tolerance)
         self.assertEqual(tolerance["process:content:%s" % SHA][0],
-                         aegis._TOLERANCE_MIN_VERDICTS)
+                         aegis._TOLERANCE_FLOOR["exact"])
+
+    def test_the_copies_at_the_other_paths_open_pre_closed(self):
+        """Each path is its own case, exactly as the live store recorded
+        them; after one verdict the rest are the same bytes and close as
+        auto-tolerated instead of asking again."""
+        self._teach_one()
+        for i, path in enumerate(PATHS[1:], 1):
+            f = _process_finding(path)
+            f["fingerprint"] = "process:sha:%s:%d" % (SHA, i)
+            self._ingest(f, NOW + i * 600)
+            incident = self._latest_incident()
+            self.assertEqual((incident["status"], incident["resolution"]),
+                             ("FALSE_POSITIVE", "auto-tolerated"), path)
 
     def test_the_next_sighting_at_a_fourth_path_is_tolerated(self):
-        self._teach_three_paths()
+        self._teach_one()
         memory = self._memory(NOW + 9000)
         fresh = _process_finding("/Users/c/somewhere/else/.venv/bin/python3")
         decision, verdicts = aegis._signal_decision(fresh, memory)
         self.assertEqual(decision, "tolerated")
-        self.assertGreaterEqual(verdicts, aegis._TOLERANCE_MIN_VERDICTS)
+        self.assertGreaterEqual(verdicts, aegis._TOLERANCE_FLOOR["exact"])
 
     def test_different_bytes_at_a_taught_path_still_alert(self):
         """Antigen specificity, and the direction that matters: tolerance
         earned on one binary must never cover a DIFFERENT one, even at a path
         the operator has already blessed."""
-        self._teach_three_paths()
+        self._teach_one()
         memory = self._memory(NOW + 9000)
         impostor = _process_finding(PATHS[0], sha=OTHER_SHA)
         self.assertEqual(aegis._signal_decision(impostor, memory)[0], None)
 
-    def test_two_verdicts_are_not_enough(self):
-        for i, path in enumerate(PATHS[:2]):
-            at = NOW + i * 600
-            f = _process_finding(path)
-            f["fingerprint"] = "process:sha:%s:%d" % (SHA, i)
-            self._ingest(f, at)
-            self._dismiss(self._latest_incident()["id"], at + 30)
+    def test_the_path_identity_still_needs_three(self):
+        """Only the exact bytes moved to one. Two verdicts on two different
+        binaries at one path leave the path identity below its floor, so a
+        third binary there still alerts."""
+        self._teach_one(sha=SHA, at=NOW)
+        self._teach_one(sha=OTHER_SHA, at=NOW + 600)
         memory = self._memory(NOW + 9000)
-        fresh = _process_finding("/Users/c/elsewhere/.venv/bin/python3")
-        self.assertEqual(aegis._signal_decision(fresh, memory)[0], None)
+        third = _process_finding(PATHS[0], sha="c" * 64)
+        self.assertEqual(aegis._signal_decision(third, memory)[0], None)
 
     def test_false_positive_verdicts_teach_nothing_here(self):
         """Only benign-positive is a statement about the subject; a
         false-positive says the RULE was wrong."""
-        self._teach_three_paths(code="false-positive")
+        self._teach_one(code="false-positive")
         tolerance = self._memory(NOW + 9000)[0]
         self.assertNotIn("process:content:%s" % SHA, tolerance)
 
     def test_critical_is_never_tolerated(self):
-        self._teach_three_paths()
+        self._teach_one()
         memory = self._memory(NOW + 9000)
         crit = _process_finding(PATHS[0], severity="CRITICAL")
         self.assertEqual(aegis._signal_decision(crit, memory)[0], None)
 
     def test_a_dispute_reaches_the_content_identity(self):
-        """A reopen must revoke BOTH identities the subject accumulated under,
-        or tolerance keeps closing the very incidents just reopened.
+        """A dispute must revoke BOTH identities the subject accumulated
+        under, or tolerance keeps closing the very incidents disputed.
 
-        The dispute here is INVESTIGATING, not `reopen`, and that is the only
-        form this can take. A reopen deletes the dismissal rows the count is
-        built on, so it drops the identity below the floor and the suppression
-        memory never consults the disputed set at all — the test would pass
-        while proving nothing. Nor can a fourth verdict be added first:
-        tolerance is already engaged by then, so the fourth incident is
-        auto-closed and there is no OPEN row left for the operator to rule on.
-        Moving an incident to an active state is a dispute that leaves the
-        verdicts standing, which is exactly the case the disputed set exists
-        for.
+        The dispute here is INVESTIGATING on a still-open copy, because that
+        is the form that leaves the verdict standing: a reopen of the judged
+        incident deletes the dismissal row the count is built on, so it would
+        drop the identity below the floor and never consult the disputed set
+        at all — the test would pass while proving nothing. The disputed copy
+        is opened BEFORE the verdict, because once tolerance engages no
+        further copy stays OPEN long enough to be moved.
         """
-        # The disputed incident is opened and moved to INVESTIGATING BEFORE
-        # the third verdict lands, because once tolerance engages no further
-        # incident on this identity stays OPEN long enough to be moved.
-        for i, path in enumerate(PATHS[:2]):
-            at = NOW + i * 600
-            f = _process_finding(path)
-            f["fingerprint"] = "process:sha:%s:%d" % (SHA, i)
-            self._ingest(f, at)
-            self._dismiss(self._latest_incident()["id"], at + 30)
-
         f = _process_finding("/Users/c/fourth/.venv/bin/python3")
         f["fingerprint"] = "process:sha:%s:disputed" % SHA
-        self._ingest(f, NOW + 1800)
+        self._ingest(f, NOW)
         self.assertTrue(aegis.transition_incident(
-            self._latest_incident()["id"], "INVESTIGATING", now=NOW + 1830))
-
-        f = _process_finding(PATHS[2])
-        f["fingerprint"] = "process:sha:%s:2" % SHA
-        self._ingest(f, NOW + 2400)
-        self._dismiss(self._latest_incident()["id"], NOW + 2430)
+            self._latest_incident()["id"], "INVESTIGATING", now=NOW + 30))
+        self._teach_one(at=NOW + 600)
 
         tolerance, _rot, disputed = self._memory(NOW + 9000)[:3]
         self.assertIn("process:content:%s" % SHA, tolerance)

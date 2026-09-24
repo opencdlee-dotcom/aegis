@@ -3716,6 +3716,9 @@ def _category_dismissal_weights(db, now, window=90 * 86400):
 #     facts — only hash churn generalizes. New endpoint = new incident.
 #   · It takes REPEATED EXPOSURE: >= _TOLERANCE_MIN_VERDICTS distinct dismissed
 #     incidents inside _TOLERANCE_WINDOW, so one hasty dismissal teaches nothing.
+#     (That floor is for identities that reach bytes nobody reviewed. The
+#     exact bytes, a publisher's team id and a package receipt need one;
+#     _TOLERANCE_FLOOR is the table.)
 #   · INFLAMMATION OVERRIDES: never CRITICAL, never above the severity the
 #     operator actually reviewed, never for attack-defined fingerprints, and
 #     never while any incident on that identity is active (a `reopen` is a
@@ -3726,6 +3729,18 @@ def _category_dismissal_weights(db, now, window=90 * 86400):
 # --------------------------------------------------------------------------- #
 
 _TOLERANCE_MIN_VERDICTS = 3
+# Verdicts an identity needs before it tolerates, by what it generalizes over
+# -- the ONE table: exact bytes = 1 · signer / package = 1 · build repo /
+# supervisor / producer = 3 · path identities = 3. The floor of three exists
+# because a path- or class-shaped identity reaches bytes nobody reviewed. An
+# exact-bytes identity (#51's content identity) reaches nothing the operator
+# did not judge, so asking three times about one fact only made the teaching
+# evaporate; a publisher chain or an install receipt is anchored outside this
+# uid, so one verdict is the claim. `derived` classes are built from things
+# the operator's own tools move, and keep three.
+_TOLERANCE_FLOOR = {"exact": 1, "anchored": 1,
+                    "derived": _TOLERANCE_MIN_VERDICTS,
+                    "path": _TOLERANCE_MIN_VERDICTS}
 _TOLERANCE_WINDOW = 180 * 86400
 # A trailing :<hex> component of this shape is a content hash, not identity.
 _TOLERANCE_HASH_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
@@ -4107,7 +4122,9 @@ def _subject_endpoint_classes(sub):
             ("beacon:%s:#ip:#port" % path, "%s:%s" % (ip, port))]
 
 
-_PRODUCER_MIN_SIBLINGS = 3
+# A producer class is derived (from launcher bytes and a payload path the
+# operator's tools write), so it keeps the derived floor (_TOLERANCE_FLOOR).
+_PRODUCER_MIN_SIBLINGS = _TOLERANCE_FLOOR["derived"]
 
 
 def _producer_class(sub):
@@ -4191,7 +4208,9 @@ def _finding_content_identity(f):
     bytes, so replacing a vouched binary mints a new identity that has earned
     nothing, and every existing guard still applies (never CRITICAL, never
     above the reviewed severity, never a disputed identity, never
-    attack-defined, and still three distinct verdicts).
+    attack-defined). Because it reaches nothing the operator did not judge,
+    it tolerates on ONE verdict, not the three a path needs
+    (_TOLERANCE_FLOOR["exact"], 2026-09-23).
     """
     sub = f.get("subject")
     if sub:
@@ -4442,14 +4461,15 @@ def _producer_memory(db, now):
 # started it. Each is a class a verdict can name, and a class does not move
 # when the path or the bytes do.
 #
-# Width is set by what anchors the class, not by how useful it would be:
+# Width is set by what anchors the class, not by how useful it would be, and
+# its floor is read from _TOLERANCE_FLOOR:
 #   anchored  a publisher's team id (a signing chain this uid cannot mint) or
 #             a package receipt (an install transaction the operator ran; the
 #             honest limits written above _homebrew_receipt apply unchanged)
 #             -- ONE verdict;
-#   content   a build repo or a supervisor, derived from things the operator's
-#             own tools move and an attacker at this uid can reach -- the same
-#             floor of three every other tolerance identity keeps.
+#   derived   a build repo or a supervisor, derived from things the operator's
+#             own tools move and an attacker at this uid can reach -- the
+#             floor of three the path identities keep.
 # Every other guard is unchanged: never CRITICAL, never attack-defined, never
 # above the severity the operator reviewed, never a disputed class, never a
 # _NEVER_TOLERATE_PREFIXES fingerprint.
@@ -4461,7 +4481,6 @@ def _producer_memory(db, now):
 # signer, receipt or repo says nothing about that script -- the rule S3 wrote
 # for chain legs, applied to the widest join there is.
 _CLASS_CATEGORIES = frozenset(("process", "net-beacon"))
-_CLASS_MIN_VERDICTS = {"anchored": 1, "content": _TOLERANCE_MIN_VERDICTS}
 # The finding fields a class is read from. _class_facts writes them at
 # emission; _incident_classes pre-filters the store on them, which is sound
 # only because _finding_classes reads nothing else to name a class.
@@ -4537,11 +4556,11 @@ def _finding_classes(f):
     elif custody == "build-output":
         repo = str(f.get("build_repo") or "")
         if repo and os.path.isabs(repo):
-            out.append(("buildrepo:%s" % repo, "content"))
+            out.append(("buildrepo:%s" % repo, "derived"))
     elif custody == "supervised":
         sup = str(f.get("supervisor") or "")
         if _CONTENT_SHA_RE.match(sup):
-            out.append(("supervisor:%s" % sup.lower(), "content"))
+            out.append(("supervisor:%s" % sup.lower(), "derived"))
     return out
 
 
@@ -4660,18 +4679,19 @@ def _class_verdicts(db, now):
 
 def _class_memory(db, now):
     """{class_key: (verdicts, max_reviewed_sev)} for classes past the floor
-    their width sets (_CLASS_MIN_VERDICTS)."""
+    their width sets (_TOLERANCE_FLOOR)."""
     return {k: (len(b["inc"]), b["sev"])
             for k, b in _class_verdicts(db, now).items()
-            if len(b["inc"]) >= _CLASS_MIN_VERDICTS.get(
+            if len(b["inc"]) >= _TOLERANCE_FLOOR.get(
                 b["width"], _TOLERANCE_MIN_VERDICTS)}
 
 
-def _tolerance_memory(db, now):
-    """{identity: (distinct_verdicts, max_reviewed_sev_order)} from the
-    operator's own benign-positive dismissals of signal incidents inside the
-    window. Only identities past the verdict floor are returned."""
-    memory = {}
+def _tolerance_verdicts(db, now):
+    """{identity: {"incidents", "sev", "width"}} from the operator's own
+    benign-positive dismissals of signal incidents inside the window, before
+    any floor is applied. `width` is "path" for the path-keyed identity and
+    "exact" for the content-keyed one (_TOLERANCE_FLOOR)."""
+    seen = {}
     try:
         rows = db.execute(
             "SELECT d.incident_id, d.correlation_key, i.severity, "
@@ -4681,25 +4701,31 @@ def _tolerance_memory(db, now):
             "AND d.correlation_key LIKE 'signal:%'",
             (now - _TOLERANCE_WINDOW,)).fetchall()
     except Exception:
-        return memory
-    seen = {}
+        return seen
     for row in rows:
         # Both identities a verdict counts toward: the path-keyed one and,
         # where the subject or key names the bytes, the content-keyed one.
-        # A single verdict contributes one incident to each bucket, so the
-        # floor of three still means three DISTINCT incidents either way.
-        for ident in (_incident_identity(row)[0],
-                      _incident_content_identity(row)):
+        # A single verdict contributes one incident to each bucket, so a
+        # floor always counts DISTINCT incidents either way.
+        for ident, width in ((_incident_identity(row)[0], "path"),
+                             (_incident_content_identity(row), "exact")):
             if not ident:
                 continue
-            bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1})
+            bucket = seen.setdefault(ident, {"incidents": set(), "sev": -1,
+                                             "width": width})
             bucket["incidents"].add(row["incident_id"])
             bucket["sev"] = max(bucket["sev"],
                                 SEV_ORDER.get(row["severity"], -1))
-    for ident, bucket in seen.items():
-        if len(bucket["incidents"]) >= _TOLERANCE_MIN_VERDICTS:
-            memory[ident] = (len(bucket["incidents"]), bucket["sev"])
-    return memory
+    return seen
+
+
+def _tolerance_memory(db, now):
+    """{identity: (distinct_verdicts, max_reviewed_sev_order)} for the
+    identities past the floor their width sets: one verdict for the exact
+    bytes, three for a path (_TOLERANCE_FLOOR)."""
+    return {ident: (len(b["incidents"]), b["sev"])
+            for ident, b in _tolerance_verdicts(db, now).items()
+            if len(b["incidents"]) >= _TOLERANCE_FLOOR[b["width"]]}
 
 
 def _disputed_identities(db):
@@ -22072,9 +22098,14 @@ def _authority_org(authority, team):
 
 
 def _class_description(klass, f):
-    """A class key in the operator's words, from the evidence that names it."""
+    """A class key -- or the exact-bytes identity -- in the operator's words,
+    from the evidence that names it."""
     kind, _sep, rest = str(klass).partition(":")
     f = f or {}
+    if kind in ("process", "beacon") and rest.startswith("content:"):
+        sha, _sep, endpoint = rest[len("content:"):].partition(":")
+        return "these exact bytes (sha256 %s…)%s — anywhere" % (
+            sha[:8], " talking to %s" % endpoint if endpoint else "")
     if kind == "signer":
         org = _authority_org(f.get("authority"), rest)
         return "anything signed by team %s%s — wherever it runs" % (
@@ -22091,49 +22122,70 @@ def _class_description(klass, f):
     return str(klass)
 
 
-def _class_lessons(db, incident_ids, now, verdicts=None, disputed=None):
-    """One dict per class the evidence of `incident_ids` names: its key and
-    description, the verdicts the store already holds for it, the floor its
-    width sets, whether it is disputed, how many of `incident_ids` name it
-    and how many of those are among its verdicts. Counted by the same
-    _class_verdicts the memory is built from, so a lesson can never claim a
-    count the decision does not see."""
+def _class_lessons(db, incident_ids, now, verdicts=None, disputed=None,
+                   exact=None):
+    """One dict per lesson the evidence of `incident_ids` carries -- the
+    exact bytes first, then each class: its key and description, the
+    verdicts the store already holds for it, the floor its width sets
+    (_TOLERANCE_FLOOR), whether it is disputed, how many of `incident_ids`
+    name it and how many of those are among its verdicts. Counted by the
+    same _class_verdicts / _tolerance_verdicts the memory is built from, so a
+    lesson can never claim a count the decision does not see."""
     if verdicts is None:
         verdicts = _class_verdicts(db, now)
+    if exact is None:
+        exact = _tolerance_verdicts(db, now)
     if disputed is None:
         disputed = _disputed_identities(db)
     ids = set(incident_ids)
     named = {}
+    marks = ",".join("?" for _ in incident_ids)
+    rows = db.execute(
+        "SELECT id, correlation_key, subject_json FROM incidents "
+        "WHERE id IN (%s) AND correlation_key LIKE 'signal:%%'" % marks,
+        tuple(incident_ids)).fetchall() if incident_ids else []
+    for row in rows:
+        ident = _incident_content_identity(row)
+        if ident:
+            entry = named.setdefault(ident, {"width": "exact", "finding": None,
+                                             "named": set()})
+            entry["named"].add(row["id"])
     for iid in incident_ids:
         for klass, width, f in _incident_classes(db, iid):
             entry = named.setdefault(klass, {"width": width, "finding": f,
                                              "named": set()})
             entry["named"].add(iid)
     out = []
-    for klass in sorted(named):
+    for klass in sorted(named, key=lambda k: (named[k]["width"] != "exact",
+                                              k)):
         entry = named[klass]
-        bucket = verdicts.get(klass) or {"inc": set()}
+        if entry["width"] == "exact":
+            held = (exact.get(klass) or {}).get("incidents") or set()
+        else:
+            held = (verdicts.get(klass) or {}).get("inc") or set()
         out.append({
             "klass": klass,
+            "width": entry["width"],
             "desc": _class_description(klass, entry["finding"]),
-            "verdicts": len(bucket["inc"]),
-            "floor": _CLASS_MIN_VERDICTS.get(entry["width"],
-                                             _TOLERANCE_MIN_VERDICTS),
+            "verdicts": len(held),
+            "floor": _TOLERANCE_FLOOR.get(entry["width"],
+                                          _TOLERANCE_MIN_VERDICTS),
             "disputed": klass in disputed,
             "named": len(entry["named"]),
-            "counted": len(bucket["inc"] & ids)})
+            "counted": len(held & ids)})
     return out
 
 
 def _print_class_lessons(incident_ids, now=None):
     """Print what a benign-positive verdict on `incident_ids` just taught,
-    one line per class, and append each class whose floor THIS verdict
-    crossed to actions.jsonl.
+    one line for the exact bytes and one per class, and append each lesson
+    whose floor THIS verdict crossed to actions.jsonl.
 
     A class is the widest thing a verdict can buy -- at width one, every
-    binary a publisher ever signs -- so it is never the silent case, exactly
-    as the identity floor is not (_tolerance_escalation). Read-only on the
-    store, and never raises: a reporting extra must not be able to fail an
+    binary a publisher ever signs -- and the exact bytes now tolerate on the
+    first verdict, so neither is ever the silent case, exactly as the
+    identity floor is not (_tolerance_escalation). Read-only on the store,
+    and never raises: a reporting extra must not be able to fail an
     operator's verdict."""
     try:
         now = _epoch(now)
@@ -22156,28 +22208,31 @@ def _print_class_lessons(incident_ids, now=None):
             count = "%d of %d verdicts" % (n, floor)
         print("Learned: %s (%s)" % (lesson["desc"], count))
         if not lesson["disputed"] and n >= floor > n - lesson["counted"]:
-            log_action("class-tolerance-granted", lesson["klass"],
+            log_action("tolerance-granted" if lesson["width"] == "exact"
+                       else "class-tolerance-granted", lesson["klass"],
                        "auto-close-enabled", verdicts=n,
                        incident_ids=sorted(incident_ids),
                        window_days=_TOLERANCE_WINDOW // 86400)
     if any(not lesson["disputed"] and lesson["verdicts"] >= lesson["floor"]
            for lesson in lessons):
-        print("  Future non-CRITICAL findings in a class that tolerates now "
-              "open PRE-CLOSED.\n  Revoke a class by disputing any one of "
-              "them: aegis.py incident <id> reopen")
+        print("  Future non-CRITICAL findings in what tolerates now open "
+              "PRE-CLOSED.\n  Revoke it by disputing any one of them: "
+              "aegis.py incident <id> reopen")
 
 
 def _family_teaching(db, families):
-    """{family key: [`would teach:` lines]} -- the classes a benign-positive
-    verdict on each family would teach, counted once for the whole listing.
-    A family whose evidence names no class gets no line: its verdict teaches
-    the identity it is grouped on, which the label already names."""
+    """{family key: [`would teach:` lines]} -- the exact bytes and classes a
+    benign-positive verdict on each family would teach, counted once for the
+    whole listing. A family whose evidence names neither gets no line: its
+    verdict teaches the identity it is grouped on, which the label names."""
     try:
         now = _epoch()
         verdicts = _class_verdicts(db, now)
+        exact = _tolerance_verdicts(db, now)
         disputed = _disputed_identities(db)
         return {key: _would_teach_lines(_class_lessons(
-                    db, [r["id"] for r in rows], now, verdicts, disputed))
+                    db, [r["id"] for r in rows], now, verdicts, disputed,
+                    exact))
                 for key, _label, rows in families}
     except Exception as e:
         log_run("family teaching preview failed: %s" % e)

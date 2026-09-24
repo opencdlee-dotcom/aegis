@@ -14,7 +14,10 @@ Widths, and why they differ: a team id is anchored in a signing chain this
 uid cannot mint, and a package receipt in an install transaction the
 operator ran, so one verdict tolerates. A build repo or a supervisor is
 derived from content the operator's own tools move, so it keeps the floor of
-three.
+three. And the exact bytes (#51's content identity) generalize to nothing at
+all -- the operator judged those bytes -- so they tolerate at one verdict too:
+asking for three judgements of one fact is teaching evaporating in its purest
+form.
 
 Every tolerance guard still applies: never CRITICAL, never attack-defined,
 never above the reviewed severity, never a disputed class. An interpreter
@@ -49,13 +52,17 @@ def _sha(n):
     return hashlib.sha256(str(n).encode("ascii")).hexdigest()
 
 
-def _proc(path, sha, trust=SUSPICIOUS_TRUST, severity="HIGH", **facts):
-    """A process finding shaped as check_processes emits one, facts and all."""
+def _proc(path, sha, trust=SUSPICIOUS_TRUST, severity="HIGH", case=None,
+          **facts):
+    """A process finding shaped as check_processes emits one, facts and all.
+    `case` overrides the case key, for a test that needs the same bytes to
+    open separate incidents (as copies at several paths did on the live
+    store before #46 keyed the case on the bytes)."""
     return aegis.finding(
         severity, "process", "Suspicious running process",
         "%s (%s) running from user-writable path" % (path, trust),
         "process:%s:%s:%s" % (path, trust, sha),
-        case_fingerprint="process:sha:%s" % sha,
+        case_fingerprint=case or "process:sha:%s" % sha,
         subject=aegis._subject("process", path, trust=trust, content=sha),
         path=path, trust=trust, sha256=sha, **facts)
 
@@ -131,17 +138,17 @@ class TheClassesAFindingNames(unittest.TestCase):
         f = _proc("/opt/x/bin/tool", _sha(1), package="homebrew:jq@1.7.1")
         self.assertEqual(aegis._finding_classes(f), [])
 
-    def test_build_output_names_its_repo_at_content_width(self):
+    def test_build_output_names_its_repo_at_derived_width(self):
         f = _built("%s/app/staging/A.app/Contents/MacOS/a" % REPO, _sha(1))
         self.assertEqual(aegis._finding_classes(f),
-                         [("buildrepo:%s" % REPO, "content")])
+                         [("buildrepo:%s" % REPO, "derived")])
 
     def test_a_supervised_run_names_its_supervisor_bytes(self):
         f = _proc("/Users/c/runner/bin.2.337.0/Runner.Worker", _sha(1),
                   custody="supervised", supervisor=SUPERVISOR_SHA,
                   supervisor_path="/Users/c/runner/bin.2.337.0/Runner.Listener")
         self.assertEqual(aegis._finding_classes(f),
-                         [("supervisor:%s" % SUPERVISOR_SHA, "content")])
+                         [("supervisor:%s" % SUPERVISOR_SHA, "derived")])
 
     def test_signer_comes_first_then_custody(self):
         f = _signed("/Users/c/w/tool", _sha(1), custody="build-output",
@@ -482,6 +489,86 @@ class ADisputeRevokesTheClass(_Sandbox):
         self.assertIn("buildrepo:%s" % REPO, memory[2])
         self.assertEqual(aegis._signal_decision(
             _built("%s/dist/a9" % REPO, _sha(9)), memory), (None, 0))
+
+
+class ExactBytesTolerateAtOneVerdict(_Sandbox):
+    """#51's content identity names exact bytes, so it generalizes to nothing
+    the operator did not judge. It tolerates at ONE verdict; every other
+    guard stands."""
+
+    A = "/Users/c/w/a/bin/tool"
+    B = "/Users/c/Downloads/Tool.app/Contents/MacOS/tool"
+    C = "/Users/c/.ai/worktrees/x/app/staging/tool"
+
+    def test_one_verdict_tolerates_the_same_bytes_at_another_path(self):
+        self.judge(_proc(self.A, _sha(1)), NOW)
+        self.assertEqual(
+            self.memory(NOW + 600)[0].get("process:content:%s" % _sha(1)),
+            (1, aegis.SEV_ORDER["HIGH"]))
+        self.assertEqual(self.decide(_proc(self.B, _sha(1)), NOW + 600),
+                         ("tolerated", 1))
+
+    def test_never_above_the_severity_the_operator_reviewed(self):
+        self.seed_verdict(_proc(self.A, _sha(1), severity="MEDIUM"), NOW)
+        self.assertEqual(
+            self.decide(_proc(self.B, _sha(1), severity="HIGH"), NOW + 600),
+            (None, 0))
+        self.assertEqual(
+            self.decide(_proc(self.B, _sha(1), severity="MEDIUM"), NOW + 600),
+            ("tolerated", 1))
+
+    def test_different_bytes_at_the_same_path_are_not_covered(self):
+        self.judge(_proc(self.A, _sha(1)), NOW)
+        self.assertEqual(self.decide(_proc(self.A, _sha(2)), NOW + 600),
+                         (None, 0))
+
+    def test_critical_is_never_tolerated(self):
+        self.judge(_proc(self.A, _sha(1)), NOW)
+        self.assertEqual(
+            self.decide(_proc(self.B, _sha(1), severity="CRITICAL"),
+                        NOW + 600), (None, 0))
+
+    def test_a_reopen_on_a_tolerated_copy_revokes_it(self):
+        self.judge(_proc(self.A, _sha(1), case="process:case-a"), NOW)
+        b = self.ingest(_proc(self.B, _sha(1), case="process:case-b"),
+                        NOW + 600)
+        self.assertEqual(b["resolution"], "auto-tolerated")
+        self.assertTrue(aegis.transition_incident(b["id"], "OPEN",
+                                                  now=NOW + 900))
+        memory = self.memory(NOW + 1200)
+        self.assertIn("process:content:%s" % _sha(1), memory[2])
+        self.assertEqual(aegis._signal_decision(_proc(self.C, _sha(1)),
+                                                memory), (None, 0))
+
+    def test_reopening_the_judged_incident_revokes_it(self):
+        iid = self.judge(_proc(self.A, _sha(1)), NOW)
+        self.assertTrue(aegis.transition_incident(iid, "OPEN", now=NOW + 300))
+        self.assertEqual(self.decide(_proc(self.B, _sha(1)), NOW + 600),
+                         (None, 0))
+
+    def test_the_path_identity_keeps_its_floor_of_three(self):
+        """Only the exact bytes moved to one. Two verdicts on two different
+        builds at one path do not tolerate a third build there."""
+        for n in (1, 2):
+            self.judge(_proc(self.A, _sha(n)), NOW + n * 600)
+        self.assertEqual(self.decide(_proc(self.A, _sha(3)), NOW + 3000),
+                         (None, 0))
+
+    def test_the_lesson_names_the_bytes(self):
+        incident = self.ingest(_proc(self.A, _sha(1)), NOW)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            aegis.cmd_incident(incident["id"], "benign-positive")
+        self.assertIn(
+            "Learned: these exact bytes (sha256 %s…) — anywhere "
+            "(1 verdict, tolerates now)" % _sha(1)[:8], out.getvalue())
+
+    def test_one_table_names_every_floor(self):
+        self.assertEqual(aegis._TOLERANCE_FLOOR,
+                         {"exact": 1, "anchored": 1, "derived": 3,
+                          "path": 3})
+        self.assertEqual(aegis._PRODUCER_MIN_SIBLINGS,
+                         aegis._TOLERANCE_FLOOR["derived"])
 
 
 class FindingClassesIsTheOnlySpelling(_Sandbox):
