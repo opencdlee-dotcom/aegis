@@ -42,6 +42,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aegis  # noqa: E402
+from test_regression import needs_the_real_body  # noqa: E402
 
 GIT = aegis._git_bin()
 
@@ -528,6 +529,10 @@ class SkillCustodyThroughRealpath(_SkillFixture):
 
 
 @unittest.skipUnless(GIT, "no git binary on this machine")
+# Real git on the real kernel. Under simbody's win flags on a POSIX host this
+# class crossed into the Windows git path the simulation cannot fake (CI,
+# #65/#70); the real Windows legs ran and passed it.
+@needs_the_real_body
 class SkillCustodyRealGit(_SkillFixture):
     """The same question put to a real repository: a fixture cannot test a
     parser, and git's refusal to answer about a path under a symlink is
